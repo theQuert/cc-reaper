@@ -1,4 +1,4 @@
-# Claude Code Cleanup
+# cc-reaper
 
 Automated cleanup for orphan Claude Code processes (subagents, MCP servers, plugins) that leak memory after sessions end.
 
@@ -34,8 +34,8 @@ Manual intervention needed
 ## Quick Start
 
 ```bash
-git clone https://github.com/theQuert/claude-code-cleanup.git
-cd claude-code-cleanup
+git clone https://github.com/theQuert/cc-reaper.git
+cd cc-reaper
 chmod +x install.sh
 ./install.sh
 ```
@@ -47,7 +47,7 @@ chmod +x install.sh
 Add to `~/.zshrc` or `~/.bashrc`:
 
 ```bash
-source /path/to/claude-code-cleanup/shell/claude-cleanup.sh
+source /path/to/cc-reaper/shell/claude-cleanup.sh
 ```
 
 Commands available after restart:
@@ -149,7 +149,7 @@ proc-janitor status   # check daemon health
 ## File Structure
 
 ```
-claude-code-cleanup/
+cc-reaper/
 ├── install.sh                      # One-command installer
 ├── hooks/
 │   └── stop-cleanup-orphans.sh     # Claude Code Stop hook
@@ -169,4 +169,4 @@ claude-code-cleanup/
 
 ## License
 
-MIT
+Apache 2.0
