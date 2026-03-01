@@ -1,0 +1,49 @@
+# proc-janitor configuration for Claude Code
+# Install location: ~/.config/proc-janitor/config.toml
+# Documentation: https://github.com/jhlee0409/proc-janitor
+#
+# Requires: brew install jhlee0409/tap/proc-janitor
+
+# ─── Scan Settings ───────────────────────────────────────────────────────────
+
+# How often the daemon scans for orphaned processes (seconds, 1-3600)
+scan_interval = 30
+
+# Time to wait before killing a newly detected orphan (seconds, 0-3600)
+# Set higher than scan_interval to avoid false positives during normal subagent work.
+grace_period = 60
+
+# Time to wait after SIGTERM before sending SIGKILL (seconds, 1-60)
+sigterm_timeout = 5
+
+# ─── Target Patterns ────────────────────────────────────────────────────────
+# Only orphaned processes (PPID=1) matching these patterns will be cleaned.
+
+targets = [
+    "node.*claude",
+    "claude.*stream-json",
+    "node.*mcp",
+    "npm exec @supabase",
+    "npm exec @upstash",
+    "npm exec mcp-",
+    "node.*context7-mcp",
+    "node.*sequential",
+    "chroma-mcp.*persistent",
+    "worker-service.cjs.*--daemon"
+]
+
+# ─── Whitelist Patterns ─────────────────────────────────────────────────────
+# Processes that should NEVER be killed, even if they match a target.
+
+whitelist = [
+    "node.*server",
+    "pm2"
+]
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+
+[logging]
+enabled = true
+# NOTE: Replace ~ with your actual home directory path after copying
+path = "~/.proc-janitor/logs"
+retention_days = 7
