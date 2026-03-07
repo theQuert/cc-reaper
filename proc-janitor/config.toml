@@ -29,7 +29,12 @@ targets = [
     "node.*context7-mcp",
     "node.*sequential",
     "chroma-mcp.*persistent",
-    "worker-service.cjs.*--daemon"
+    "worker-service.cjs.*--daemon",
+    "node.*claude-mem.*mcp-server",
+    "uv.*chroma-mcp",
+    "uvx.*chroma-mcp",
+    "python.*chroma-mcp",
+    "bun.*worker-service",
 ]
 
 # ─── Whitelist Patterns ─────────────────────────────────────────────────────

@@ -14,8 +14,9 @@ This is a [widely reported issue](https://github.com/anthropics/claude-code/issu
 |---|---|---|
 | Subagents | `claude --output-format stream-json` | 180-300 MB each |
 | MCP servers | `npm exec @supabase/mcp-server-supabase`, `context7-mcp`, etc. | 40-110 MB each |
-| claude-mem worker | `worker-service.cjs --daemon` | 100 MB |
-| chroma-mcp | `chroma-mcp --client-type persistent` | 350 MB |
+| claude-mem MCP | `node claude-mem/mcp-server.cjs` | 35-75 MB each |
+| claude-mem worker | `worker-service.cjs --daemon` (bun) | 100 MB |
+| chroma-mcp | `chroma-mcp --client-type persistent` (via uv/uvx) | 350-950 MB |
 
 ## Solution: Three-Layer Defense
 
@@ -52,7 +53,8 @@ source /path/to/cc-reaper/shell/claude-cleanup.sh
 
 Commands available after restart:
 
-- `claude-ram` — show RAM usage breakdown (read-only)
+- `claude-ram` — show RAM usage breakdown with per-session details (read-only)
+- `claude-sessions` — list all active sessions with idle detection and process tree RAM
 - `claude-cleanup` — kill orphan processes immediately
 
 ### 2. Claude Code Stop Hook
@@ -159,6 +161,10 @@ cc-reaper/
 │   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-cleanup)
 └── README.md
 ```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Related Issues
 
