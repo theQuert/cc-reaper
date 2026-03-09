@@ -12,6 +12,9 @@
 - **Orphans section** in `claude-ram` — New `--- Orphans (PPID=1) ---` section for quick visibility
 - **Interactive daemon choice** in installer — Users choose between proc-janitor (feature-rich) and LaunchAgent (zero-dependency)
 
+### Fixed
+- **proc-janitor whitelist too broad** — `"node.*server"` was matching `node.*mcp-server`, preventing daemon from cleaning MCP server orphans. Narrowed to `"node.*(dev-server|http-server|next.*server)"` to only protect actual web dev servers
+
 ### Updated
 - **Broader MCP pattern coverage** across all layers (shell, stop hook, proc-janitor):
   - `npx.*mcp-server` — Catches third-party MCP servers installed via npx (Cloudflare, GitHub, etc.)

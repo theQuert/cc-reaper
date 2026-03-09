@@ -42,7 +42,7 @@ targets = [
 # Processes that should NEVER be killed, even if they match a target.
 
 whitelist = [
-    "node.*server",
+    "node.*(dev-server|http-server|next.*server)",
     "pm2"
 ]
 
