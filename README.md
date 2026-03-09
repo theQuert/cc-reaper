@@ -4,7 +4,7 @@ Automated cleanup for orphan Claude Code processes (subagents, MCP servers, plug
 
 ## The Problem
 
-Claude Code spawns subagent processes and MCP servers for each session. When sessions end (especially abnormally), these processes become orphans (PPID=1) and keep consuming RAM — often 200-400 MB each. With multiple sessions over a day, this can accumulate to 7+ GB of wasted memory.
+Claude Code spawns subagent processes and MCP servers for each session. When sessions end (especially abnormally), these processes become orphans (PPID=1) and keep consuming RAM and CPU — often 200-400 MB each, with some (like Cloudflare's MCP server) hitting 550%+ CPU. With multiple sessions over a day, this can accumulate to 7+ GB of wasted memory.
 
 This is a [widely reported issue](https://github.com/anthropics/claude-code/issues/20369) affecting macOS and Linux users.
 
@@ -13,7 +13,7 @@ This is a [widely reported issue](https://github.com/anthropics/claude-code/issu
 | Process Type | Pattern | Typical Size |
 |---|---|---|
 | Subagents | `claude --output-format stream-json` | 180-300 MB each |
-| MCP servers | `npm exec @supabase/mcp-server-supabase`, `context7-mcp`, etc. | 40-110 MB each |
+| MCP servers | `npm exec @supabase/mcp-server-supabase`, `context7-mcp`, `npx mcp-server-cloudflare`, etc. | 40-110 MB each |
 | claude-mem MCP | `node claude-mem/mcp-server.cjs` | 35-75 MB each |
 | claude-mem worker | `worker-service.cjs --daemon` (bun) | 100 MB |
 | chroma-mcp | `chroma-mcp --client-type persistent` (via uv/uvx) | 350-950 MB |
@@ -26,10 +26,11 @@ Session ends normally
 
 Session crashes / terminal force-closed
   └── proc-janitor daemon — scans every 30s, kills orphans after 60s grace
+  └── OR: LaunchAgent — zero-dependency macOS native, scans every 10min (PPID=1)
 
 Manual intervention needed
-  └── claude-cleanup — on-demand cleanup
-  └── claude-ram — check RAM usage breakdown
+  └── claude-cleanup — on-demand cleanup (TTY + PPID=1 detection)
+  └── claude-ram — check RAM/CPU usage breakdown with orphan visibility
 ```
 
 ## Quick Start
@@ -53,9 +54,9 @@ source /path/to/cc-reaper/shell/claude-cleanup.sh
 
 Commands available after restart:
 
-- `claude-ram` — show RAM usage breakdown with per-session details (read-only)
+- `claude-ram` — show RAM/CPU usage breakdown with per-session details and orphan visibility (read-only)
 - `claude-sessions` — list all active sessions with idle detection and process tree RAM
-- `claude-cleanup` — kill orphan processes immediately
+- `claude-cleanup` — kill orphan processes immediately (TTY + PPID=1 detection)
 
 ### 2. Claude Code Stop Hook
 
@@ -100,21 +101,40 @@ Add to `~/.claude/settings.json` in the `"Stop"` hooks array:
 
 </details>
 
-### 3. proc-janitor Daemon
+### 3. Background Daemon (choose one)
 
-Install:
+#### Option A: LaunchAgent (zero-dependency, macOS only)
+
+Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1.
 
 ```bash
-# macOS
-brew install jhlee0409/tap/proc-janitor
+mkdir -p ~/.cc-reaper/logs
+cp launchd/cc-reaper-monitor.sh ~/.cc-reaper/
+chmod +x ~/.cc-reaper/cc-reaper-monitor.sh
 
-# Or via Cargo
-cargo install proc-janitor
+# Install and replace __HOME__ with actual path
+sed "s|__HOME__|$HOME|g" launchd/com.cc-reaper.orphan-monitor.plist \
+  > ~/Library/LaunchAgents/com.cc-reaper.orphan-monitor.plist
+launchctl load ~/Library/LaunchAgents/com.cc-reaper.orphan-monitor.plist
 ```
 
-Copy config:
+Useful commands:
 
 ```bash
+launchctl list | grep cc-reaper           # check if running
+cat ~/.cc-reaper/logs/monitor.log         # view cleanup log
+launchctl unload ~/Library/LaunchAgents/com.cc-reaper.orphan-monitor.plist  # stop
+```
+
+#### Option B: proc-janitor (feature-rich)
+
+Rust-based daemon with grace period, whitelist, and detailed logging. Requires Homebrew or Cargo.
+
+```bash
+# Install
+brew install jhlee0409/tap/proc-janitor   # or: cargo install proc-janitor
+
+# Copy config
 mkdir -p ~/.config/proc-janitor
 cp proc-janitor/config.toml ~/.config/proc-janitor/config.toml
 chmod 600 ~/.config/proc-janitor/config.toml
@@ -125,11 +145,8 @@ Edit `~/.config/proc-janitor/config.toml` and replace `~` in the log path with y
 Start daemon:
 
 ```bash
-# macOS (auto-start on boot)
-brew services start jhlee0409/tap/proc-janitor
-
-# Manual
-proc-janitor start
+brew services start jhlee0409/tap/proc-janitor   # auto-start on boot
+proc-janitor start                                # or manual
 ```
 
 Useful commands:
@@ -144,21 +161,25 @@ proc-janitor status   # check daemon health
 
 | Tool | Required | Install |
 |---|---|---|
-| [proc-janitor](https://github.com/jhlee0409/proc-janitor) | Recommended | `brew install jhlee0409/tap/proc-janitor` |
 | bash/zsh | Required | Pre-installed on macOS/Linux |
+| macOS LaunchAgent | Option A (recommended) | Built-in, zero dependencies |
+| [proc-janitor](https://github.com/jhlee0409/proc-janitor) | Option B | `brew install jhlee0409/tap/proc-janitor` |
 | Claude Code | — | The tool this project cleans up after |
 
 ## File Structure
 
 ```
 cc-reaper/
-├── install.sh                      # One-command installer
+├── install.sh                      # One-command installer (interactive daemon choice)
 ├── hooks/
 │   └── stop-cleanup-orphans.sh     # Claude Code Stop hook
+├── launchd/
+│   ├── cc-reaper-monitor.sh        # LaunchAgent monitor script (PPID=1 detection)
+│   └── com.cc-reaper.orphan-monitor.plist  # LaunchAgent config (10-min interval)
 ├── proc-janitor/
-│   └── config.toml                 # Daemon config with Claude-specific patterns
+│   └── config.toml                 # proc-janitor daemon config (alternative to LaunchAgent)
 ├── shell/
-│   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-cleanup)
+│   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-cleanup, claude-sessions)
 └── README.md
 ```
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0] - 2026-03-09
+
+### Added
+- **LaunchAgent daemon** — Zero-dependency macOS native alternative to proc-janitor
+  - `launchd/cc-reaper-monitor.sh` — Lightweight orphan monitor (PPID=1 detection)
+  - `launchd/com.cc-reaper.orphan-monitor.plist` — LaunchAgent config (runs every 10 minutes)
+  - Includes SIGKILL fallback for unresponsive processes and log rotation
+- **PPID=1 orphan detection** in `claude-cleanup` — Catches orphans reparented to launchd after crashes, complementing existing TTY-based filtering
+- **CPU metrics** in `claude-ram` — All sections now show CPU% alongside RAM
+- **Orphans section** in `claude-ram` — New `--- Orphans (PPID=1) ---` section for quick visibility
+- **Interactive daemon choice** in installer — Users choose between proc-janitor (feature-rich) and LaunchAgent (zero-dependency)
+
+### Updated
+- **Broader MCP pattern coverage** across all layers (shell, stop hook, proc-janitor):
+  - `npx.*mcp-server` — Catches third-party MCP servers installed via npx (Cloudflare, GitHub, etc.)
+- **Installer** now 5-step flow with input validation and context-aware help output
+
 ## [0.2.0] - 2026-03-08
 
 ### Added
