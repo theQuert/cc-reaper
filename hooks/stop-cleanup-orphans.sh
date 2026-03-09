@@ -9,7 +9,8 @@
 ps aux | grep "[c]laude.*stream-json" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
 
 # Kill orphan MCP servers not attached to any TTY (background orphans)
-ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]ode.*context7|[n]ode.*sequential" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
+# Includes generic mcp-server-* pattern to catch third-party MCP servers (Cloudflare, GitHub, etc.)
+ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[n]ode.*sequential" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
 
 # Kill orphan claude-mem worker-service daemons (background)
 ps aux | grep "[w]orker-service.cjs.*--daemon" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null

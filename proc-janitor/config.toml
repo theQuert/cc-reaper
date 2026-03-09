@@ -26,6 +26,7 @@ targets = [
     "npm exec @supabase",
     "npm exec @upstash",
     "npm exec mcp-",
+    "npx.*mcp-server",
     "node.*context7-mcp",
     "node.*sequential",
     "chroma-mcp.*persistent",

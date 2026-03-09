@@ -5,7 +5,7 @@
 claude-cleanup() {
   echo "=== Claude Code Orphan Process Cleanup ==="
   local orphan_count=$(ps aux | grep -E "[c]laude.*stream-json|[c]laude.*--dangerously.*\?\?" | grep -v grep | wc -l | tr -d ' ')
-  local mcp_count=$(ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[u]v.*chroma-mcp|[u]vx.*chroma-mcp|[b]un.*worker-service|[n]ode.*claude-mem" | grep -v grep | wc -l | tr -d ' ')
+  local mcp_count=$(ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[u]v.*chroma-mcp|[u]vx.*chroma-mcp|[b]un.*worker-service|[n]ode.*claude-mem" | grep -v grep | wc -l | tr -d ' ')
 
   if [ "$orphan_count" -eq 0 ] && [ "$mcp_count" -eq 0 ]; then
     echo "No orphan processes found."
@@ -17,7 +17,8 @@ claude-cleanup() {
   # Kill orphan subagents (stream-json = subagent pattern)
   ps aux | grep "[c]laude.*stream-json" | awk '{print $2}' | xargs kill 2>/dev/null
   # Kill orphan MCP servers not attached to a TTY (background orphans)
-  ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[n]ode.*sequential" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
+  # Includes npx-spawned mcp-server-* (Cloudflare, GitHub, etc.)
+  ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[n]ode.*sequential" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
   # Kill orphan claude-mem worker-service daemons
   ps aux | grep "[w]orker-service.cjs.*--daemon" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
   # Kill orphan claude-mem MCP servers
@@ -27,8 +28,12 @@ claude-cleanup() {
   # Kill orphan bun worker-service processes
   ps aux | grep "[b]un.*worker-service" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
 
+  # Catch any remaining orphans by PPID=1 (reparented to launchd after crash)
+  # Uses bracket expressions to avoid self-matching; specific patterns only
+  ps -eo pid,ppid,command | awk '$2 == 1' | grep -E "[c]laude.*stream-json|[n]ode.*mcp-server|[n]px.*mcp-server|[c]hroma-mcp|[w]orker-service\.cjs|[n]ode.*claude-mem" | awk '{print $1}' | xargs kill 2>/dev/null
+
   sleep 1
-  local remaining=$(ps aux | grep -E "[c]laude.*stream-json|[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-" | grep -v grep | wc -l | tr -d ' ')
+  local remaining=$(ps aux | grep -E "[c]laude.*stream-json|[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server" | grep -v grep | wc -l | tr -d ' ')
   echo "Cleaned. Remaining: $remaining processes"
 }
 
@@ -55,13 +60,16 @@ claude-ram() {
 
   echo ""
   echo "--- Subagents ---"
-  ps aux | grep "[c]laude.*stream-json" | awk '{sum+=$6; count++} END {printf "  %d subagents, %.0f MB\n", count, sum/1024}'
+  ps aux | grep "[c]laude.*stream-json" | awk '{sum+=$6; cpu+=$3; count++} END {printf "  %d subagents, %.0f MB, %.1f%% CPU\n", count, sum/1024, cpu}'
 
   echo "--- MCP Servers ---"
-  ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[n]ode.*sequential|[w]orker-service|[n]ode.*claude-mem|[u]v.*chroma-mcp|[p]ython.*chroma-mcp|[b]un.*worker-service" | awk '{sum+=$6; count++} END {printf "  %d processes, %.0f MB\n", count, sum/1024}'
+  ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[n]ode.*sequential|[w]orker-service|[n]ode.*claude-mem|[u]v.*chroma-mcp|[p]ython.*chroma-mcp|[b]un.*worker-service" | awk '{sum+=$6; cpu+=$3; count++} END {printf "  %d processes, %.0f MB, %.1f%% CPU\n", count, sum/1024, cpu}'
+
+  echo "--- Orphans (PPID=1) ---"
+  ps -eo pid,ppid,rss,%cpu,command | awk '$2 == 1' | grep -E "[c]laude.*stream-json|[n]ode.*mcp-server|[n]px.*mcp-server|[c]hroma-mcp|[w]orker-service\.cjs|[n]ode.*claude-mem" | awk '{sum+=$3; cpu+=$4; count++} END {printf "  %d orphans, %.0f MB, %.1f%% CPU\n", count, sum/1024, cpu}'
 
   echo "--- Total ---"
-  ps aux | grep -iE "[c]laude|[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[w]orker-service|[n]ode.*sequential|[n]ode.*claude-mem|[u]v.*chroma-mcp|[p]ython.*chroma-mcp|[b]un.*worker-service" | awk '{sum+=$6} END {printf "  %.0f MB (%.1f GB)\n", sum/1024, sum/1024/1024}'
+  ps aux | grep -iE "[c]laude|[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[w]orker-service|[n]ode.*sequential|[n]ode.*claude-mem|[u]v.*chroma-mcp|[p]ython.*chroma-mcp|[b]un.*worker-service" | awk '{sum+=$6; cpu+=$3} END {printf "  %.0f MB (%.1f GB), %.1f%% CPU\n", sum/1024, sum/1024/1024, cpu}'
 }
 
 # List all active Claude Code sessions with idle detection

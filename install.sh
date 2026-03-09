@@ -59,58 +59,112 @@ else
   echo ""
 fi
 
-# ─── 3. proc-janitor ────────────────────────────────────────────────────────
+# ─── 3. Daemon setup (proc-janitor OR LaunchAgent) ──────────────────────────
 
-echo "[3/4] Setting up proc-janitor..."
+echo "[3/5] Setting up background daemon..."
+echo ""
+echo "  Choose a daemon for continuous orphan cleanup:"
+echo "    a) proc-janitor  — Feature-rich Rust daemon (grace period, whitelist, logging)"
+echo "                       Requires: Homebrew or Cargo"
+echo "    b) LaunchAgent   — Zero-dependency macOS native (10-min interval, PPID=1 detection)"
+echo "                       Requires: nothing (built-in macOS)"
+echo ""
+printf "  Your choice [a/b] (default: b): "
+read -r DAEMON_CHOICE
+DAEMON_CHOICE="${DAEMON_CHOICE:-b}"
+while [ "$DAEMON_CHOICE" != "a" ] && [ "$DAEMON_CHOICE" != "b" ]; do
+  printf "  Invalid choice. Please enter 'a' or 'b' (default: b): "
+  read -r DAEMON_CHOICE
+  DAEMON_CHOICE="${DAEMON_CHOICE:-b}"
+done
 
-if command -v proc-janitor &>/dev/null; then
-  echo "  proc-janitor already installed."
-else
-  if command -v brew &>/dev/null; then
-    echo "  Installing via Homebrew..."
-    brew install jhlee0409/tap/proc-janitor
-  elif command -v cargo &>/dev/null; then
-    echo "  Installing via Cargo..."
-    cargo install proc-janitor
+if [ "$DAEMON_CHOICE" = "a" ]; then
+  # ─── proc-janitor path ───
+  echo "  Setting up proc-janitor..."
+
+  if command -v proc-janitor &>/dev/null; then
+    echo "  proc-janitor already installed."
   else
-    echo "  WARNING: Neither brew nor cargo found. Install manually:"
-    echo "    brew install jhlee0409/tap/proc-janitor"
-    echo "    OR: cargo install proc-janitor"
+    if command -v brew &>/dev/null; then
+      echo "  Installing via Homebrew..."
+      brew install jhlee0409/tap/proc-janitor
+    elif command -v cargo &>/dev/null; then
+      echo "  Installing via Cargo..."
+      cargo install proc-janitor
+    else
+      echo "  WARNING: Neither brew nor cargo found. Install manually:"
+      echo "    brew install jhlee0409/tap/proc-janitor"
+      echo "    OR: cargo install proc-janitor"
+    fi
   fi
-fi
 
-# Copy config
-JANITOR_CONFIG_DIR="$HOME_DIR/.config/proc-janitor"
-mkdir -p "$JANITOR_CONFIG_DIR"
+  # Copy config
+  JANITOR_CONFIG_DIR="$HOME_DIR/.config/proc-janitor"
+  mkdir -p "$JANITOR_CONFIG_DIR"
 
-if [ -f "$JANITOR_CONFIG_DIR/config.toml" ]; then
-  echo "  Config already exists, skipping. See proc-janitor/config.toml for reference."
+  if [ -f "$JANITOR_CONFIG_DIR/config.toml" ]; then
+    echo "  Config already exists, skipping. See proc-janitor/config.toml for reference."
+  else
+    sed "s|~/.proc-janitor|$HOME_DIR/.proc-janitor|g" "$SCRIPT_DIR/proc-janitor/config.toml" > "$JANITOR_CONFIG_DIR/config.toml"
+    chmod 600 "$JANITOR_CONFIG_DIR/config.toml"
+    echo "  Config installed to $JANITOR_CONFIG_DIR/config.toml"
+  fi
+
+  echo "[4/5] Starting proc-janitor daemon..."
+  if command -v brew &>/dev/null && command -v proc-janitor &>/dev/null; then
+    brew services start jhlee0409/tap/proc-janitor 2>/dev/null || true
+    echo "  Daemon started (brew services)."
+  elif command -v proc-janitor &>/dev/null; then
+    echo "  Run manually: proc-janitor start"
+  fi
+
 else
-  # Replace ~ with actual home path in config
-  sed "s|~/.proc-janitor|$HOME_DIR/.proc-janitor|g" "$SCRIPT_DIR/proc-janitor/config.toml" > "$JANITOR_CONFIG_DIR/config.toml"
-  chmod 600 "$JANITOR_CONFIG_DIR/config.toml"
-  echo "  Config installed to $JANITOR_CONFIG_DIR/config.toml"
+  # ─── LaunchAgent path ───
+  echo "  Setting up LaunchAgent (zero-dependency)..."
+
+  REAPER_DIR="$HOME_DIR/.cc-reaper"
+  mkdir -p "$REAPER_DIR/logs"
+
+  # Copy monitor script
+  cp "$SCRIPT_DIR/launchd/cc-reaper-monitor.sh" "$REAPER_DIR/"
+  chmod +x "$REAPER_DIR/cc-reaper-monitor.sh"
+
+  # Install plist with actual home path
+  PLIST_DIR="$HOME_DIR/Library/LaunchAgents"
+  mkdir -p "$PLIST_DIR"
+  PLIST_FILE="$PLIST_DIR/com.cc-reaper.orphan-monitor.plist"
+
+  sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/com.cc-reaper.orphan-monitor.plist" > "$PLIST_FILE"
+
+  # Load the LaunchAgent
+  launchctl unload "$PLIST_FILE" 2>/dev/null || true
+  launchctl load "$PLIST_FILE"
+
+  echo "  LaunchAgent installed and started."
+  echo "  Monitor runs every 10 minutes, logs at $REAPER_DIR/logs/"
+
+  echo "[4/5] LaunchAgent active — skipping proc-janitor."
 fi
 
-# ─── 4. Start daemon ────────────────────────────────────────────────────────
+# ─── 5. Uninstall hint ────────────────────────────────────────────────────────
 
-echo "[4/4] Starting proc-janitor daemon..."
-
-if command -v brew &>/dev/null && command -v proc-janitor &>/dev/null; then
-  brew services start jhlee0409/tap/proc-janitor 2>/dev/null || true
-  echo "  Daemon started (brew services)."
-elif command -v proc-janitor &>/dev/null; then
-  echo "  Run manually: proc-janitor start"
-fi
-
-# ─── Done ────────────────────────────────────────────────────────────────────
+echo "[5/5] Done."
 
 echo ""
 echo "=== Installation complete ==="
 echo ""
 echo "Available commands (restart terminal or 'source $SHELL_RC'):"
-echo "  claude-ram        Show Claude Code RAM usage breakdown"
-echo "  claude-cleanup    Immediately kill orphan processes"
-echo "  proc-janitor scan Show detected orphans (dry run)"
+echo "  claude-ram          Show Claude Code RAM/CPU usage breakdown"
+echo "  claude-cleanup      Immediately kill orphan processes"
+echo "  claude-sessions     List active sessions with idle detection"
+if [ "$DAEMON_CHOICE" = "a" ]; then
+echo "  proc-janitor scan   Show detected orphans (dry run)"
 echo "  proc-janitor clean  Kill detected orphans"
 echo "  proc-janitor status Check daemon health"
+else
+echo ""
+echo "LaunchAgent commands:"
+echo "  launchctl list | grep cc-reaper   Check if monitor is running"
+echo "  cat ~/.cc-reaper/logs/monitor.log View cleanup log"
+echo "  launchctl unload ~/Library/LaunchAgents/com.cc-reaper.orphan-monitor.plist  Stop"
+fi
