@@ -1,11 +1,24 @@
 #!/bin/bash
 set -e
 
-echo "=== Claude Code Cleanup - Installer ==="
-echo ""
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOME_DIR="$HOME"
+
+# ─── Detect install vs update ────────────────────────────────────────────────
+IS_UPDATE=false
+if grep -q "claude-cleanup.sh" "$HOME_DIR/.zshrc" 2>/dev/null || \
+   grep -q "claude-cleanup.sh" "$HOME_DIR/.bashrc" 2>/dev/null || \
+   [ -f "$HOME_DIR/.claude/hooks/stop-cleanup-orphans.sh" ]; then
+  IS_UPDATE=true
+fi
+
+if $IS_UPDATE; then
+  echo "=== cc-reaper — Update ==="
+  echo "Existing installation detected. Updating to latest version..."
+else
+  echo "=== cc-reaper — Install ==="
+fi
+echo ""
 
 # ─── 1. Shell functions ─────────────────────────────────────────────────────
 
@@ -33,7 +46,11 @@ fi
 
 # ─── 2. Stop hook ───────────────────────────────────────────────────────────
 
-echo "[2/4] Installing Claude Code Stop hook..."
+if $IS_UPDATE; then
+  echo "[2/4] Updating Claude Code Stop hook..."
+else
+  echo "[2/4] Installing Claude Code Stop hook..."
+fi
 
 HOOKS_DIR="$HOME_DIR/.claude/hooks"
 mkdir -p "$HOOKS_DIR"
@@ -45,7 +62,7 @@ SETTINGS_FILE="$HOME_DIR/.claude/settings.json"
 HOOK_CMD="\"\\$HOME\"/.claude/hooks/stop-cleanup-orphans.sh"
 
 if [ -f "$SETTINGS_FILE" ] && grep -q "stop-cleanup-orphans" "$SETTINGS_FILE" 2>/dev/null; then
-  echo "  Stop hook already configured in settings.json, skipping."
+  echo "  Hook script updated. settings.json already configured."
 else
   echo "  Hook script copied to $HOOKS_DIR/"
   echo "  NOTE: You need to manually add the hook to $SETTINGS_FILE."
@@ -61,7 +78,11 @@ fi
 
 # ─── 3. Daemon setup (proc-janitor OR LaunchAgent) ──────────────────────────
 
-echo "[3/5] Setting up background daemon..."
+if $IS_UPDATE; then
+  echo "[3/5] Updating background daemon..."
+else
+  echo "[3/5] Setting up background daemon..."
+fi
 echo ""
 echo "  Choose a daemon for continuous orphan cleanup:"
 echo "    a) proc-janitor  — Feature-rich Rust daemon (grace period, whitelist, logging)"
@@ -103,7 +124,17 @@ if [ "$DAEMON_CHOICE" = "a" ]; then
   mkdir -p "$JANITOR_CONFIG_DIR"
 
   if [ -f "$JANITOR_CONFIG_DIR/config.toml" ]; then
-    echo "  Config already exists, skipping. See proc-janitor/config.toml for reference."
+    if $IS_UPDATE; then
+      echo "  Config exists — comparing with latest..."
+      if diff -q "$SCRIPT_DIR/proc-janitor/config.toml" "$JANITOR_CONFIG_DIR/config.toml" >/dev/null 2>&1; then
+        echo "  Config already up to date."
+      else
+        echo "  Config differs from latest. Review changes:"
+        echo "    diff $SCRIPT_DIR/proc-janitor/config.toml $JANITOR_CONFIG_DIR/config.toml"
+      fi
+    else
+      echo "  Config already exists, skipping. See proc-janitor/config.toml for reference."
+    fi
   else
     sed "s|~/.proc-janitor|$HOME_DIR/.proc-janitor|g" "$SCRIPT_DIR/proc-janitor/config.toml" > "$JANITOR_CONFIG_DIR/config.toml"
     chmod 600 "$JANITOR_CONFIG_DIR/config.toml"
@@ -151,7 +182,11 @@ fi
 echo "[5/5] Done."
 
 echo ""
-echo "=== Installation complete ==="
+if $IS_UPDATE; then
+  echo "=== Update complete ==="
+else
+  echo "=== Installation complete ==="
+fi
 echo ""
 echo "Available commands (restart terminal or 'source $SHELL_RC'):"
 echo "  claude-ram          Show Claude Code RAM/CPU usage breakdown"

@@ -4,32 +4,50 @@
 # Immediately kill orphan Claude Code processes
 claude-cleanup() {
   echo "=== Claude Code Orphan Process Cleanup ==="
+
+  # ─── PGID-based cleanup (primary) ────────────────────────────────────────
+  # Find orphaned process groups: the PGID leader has PPID=1 (reparented to launchd)
+  # and the group contains Claude-related processes. Kill entire group at once.
+  local pgid_kills=0
+  local orphan_pgids
+  orphan_pgids=$(ps -eo pid,ppid,pgid 2>/dev/null | awk '$1 == $3 && $2 == 1 {print $3}' | sort -u)
+  for pgid in $orphan_pgids; do
+    # Check if this group contains Claude/MCP processes
+    local match_count
+    match_count=$(ps -eo pgid,command 2>/dev/null | awk -v pgid="$pgid" '$1 == pgid' | grep -cE "claude|mcp|chroma|worker-service" 2>/dev/null || echo 0)
+    if [ "$match_count" -gt 0 ]; then
+      local group_pids
+      group_pids=$(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
+      local group_size
+      group_size=$(echo "$group_pids" | wc -l | tr -d ' ')
+      echo "  Killing orphaned process group PGID=$pgid ($group_size processes)"
+      kill -- -"$pgid" 2>/dev/null
+      pgid_kills=$((pgid_kills + group_size))
+    fi
+  done
+
+  # ─── Pattern-based fallback ──────────────────────────────────────────────
+  # Catches processes that escaped their process group (e.g., called setsid())
   local orphan_count=$(ps aux | grep -E "[c]laude.*stream-json|[c]laude.*--dangerously.*\?\?" | grep -v grep | wc -l | tr -d ' ')
   local mcp_count=$(ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[u]v.*chroma-mcp|[u]vx.*chroma-mcp|[b]un.*worker-service|[n]ode.*claude-mem" | grep -v grep | wc -l | tr -d ' ')
 
-  if [ "$orphan_count" -eq 0 ] && [ "$mcp_count" -eq 0 ]; then
+  if [ "$pgid_kills" -eq 0 ] && [ "$orphan_count" -eq 0 ] && [ "$mcp_count" -eq 0 ]; then
     echo "No orphan processes found."
     return 0
   fi
 
-  echo "Found: $orphan_count orphan subagents, $mcp_count MCP processes"
+  [ "$pgid_kills" -gt 0 ] && echo "  PGID-based: killed $pgid_kills processes"
+  [ "$orphan_count" -gt 0 ] || [ "$mcp_count" -gt 0 ] && echo "  Pattern fallback: $orphan_count subagents, $mcp_count MCP processes"
 
-  # Kill orphan subagents (stream-json = subagent pattern)
+  # Pattern-based kills for stragglers
   ps aux | grep "[c]laude.*stream-json" | awk '{print $2}' | xargs kill 2>/dev/null
-  # Kill orphan MCP servers not attached to a TTY (background orphans)
-  # Includes npx-spawned mcp-server-* (Cloudflare, GitHub, etc.)
   ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[n]ode.*sequential" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-  # Kill orphan claude-mem worker-service daemons
   ps aux | grep "[w]orker-service.cjs.*--daemon" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-  # Kill orphan claude-mem MCP servers
   ps aux | grep "[n]ode.*claude-mem.*mcp-server" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-  # Kill orphan uv/uvx chroma-mcp processes
   ps aux | grep -E "[u]v.*chroma-mcp|[u]vx.*chroma-mcp|[p]ython.*chroma-mcp" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-  # Kill orphan bun worker-service processes
   ps aux | grep "[b]un.*worker-service" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
 
-  # Catch any remaining orphans by PPID=1 (reparented to launchd after crash)
-  # Uses bracket expressions to avoid self-matching; specific patterns only
+  # PPID=1 fallback for any remaining orphans
   ps -eo pid,ppid,command | awk '$2 == 1' | grep -E "[c]laude.*stream-json|[n]ode.*mcp-server|[n]px.*mcp-server|[c]hroma-mcp|[w]orker-service\.cjs|[n]ode.*claude-mem" | awk '{print $1}' | xargs kill 2>/dev/null
 
   sleep 1

@@ -20,18 +20,24 @@ This is a [widely reported issue](https://github.com/anthropics/claude-code/issu
 
 ## Solution: Three-Layer Defense
 
+All layers use **PGID-based process group cleanup** as the primary method — killing entire process groups spawned by a Claude session with a single `kill -- -$PGID`. Pattern-based detection is kept as a fallback for edge cases.
+
 ```
 Session ends normally
-  └── Stop hook (stop-cleanup-orphans.sh) — immediate cleanup
+  └── Stop hook — kills session's process group via PGID (catches all children)
 
 Session crashes / terminal force-closed
   └── proc-janitor daemon — scans every 30s, kills orphans after 60s grace
-  └── OR: LaunchAgent — zero-dependency macOS native, scans every 10min (PPID=1)
+  └── OR: LaunchAgent — zero-dependency macOS native, PGID group kill + PPID=1 fallback
 
 Manual intervention needed
-  └── claude-cleanup — on-demand cleanup (TTY + PPID=1 detection)
+  └── claude-cleanup — finds orphaned PGIDs (leader has PPID=1), kills entire groups
   └── claude-ram — check RAM/CPU usage breakdown with orphan visibility
 ```
+
+### Why PGID?
+
+Claude Code sessions are process group leaders (PGID = session PID). All spawned MCP servers, subagents, and their children inherit this PGID. This means one `kill -- -$PGID` reliably cleans up everything — including third-party MCP servers that pattern matching might miss.
 
 ## Quick Start
 
@@ -41,6 +47,8 @@ cd cc-reaper
 chmod +x install.sh
 ./install.sh
 ```
+
+**Updating:** Re-run `./install.sh` after `git pull` — it detects existing installations and updates hook/monitor scripts to the latest version automatically.
 
 ## Manual Setup
 
@@ -56,7 +64,7 @@ Commands available after restart:
 
 - `claude-ram` — show RAM/CPU usage breakdown with per-session details and orphan visibility (read-only)
 - `claude-sessions` — list all active sessions with idle detection and process tree RAM
-- `claude-cleanup` — kill orphan processes immediately (TTY + PPID=1 detection)
+- `claude-cleanup` — kill orphan processes immediately (PGID group kill + pattern fallback)
 
 ### 2. Claude Code Stop Hook
 
@@ -170,11 +178,11 @@ proc-janitor status   # check daemon health
 
 ```
 cc-reaper/
-├── install.sh                      # One-command installer (interactive daemon choice)
+├── install.sh                      # One-command installer/updater (interactive daemon choice)
 ├── hooks/
-│   └── stop-cleanup-orphans.sh     # Claude Code Stop hook
+│   └── stop-cleanup-orphans.sh     # Claude Code Stop hook (PGID + pattern fallback)
 ├── launchd/
-│   ├── cc-reaper-monitor.sh        # LaunchAgent monitor script (PPID=1 detection)
+│   ├── cc-reaper-monitor.sh        # LaunchAgent monitor script (PGID + PPID=1 fallback)
 │   └── com.cc-reaper.orphan-monitor.plist  # LaunchAgent config (10-min interval)
 ├── proc-janitor/
 │   └── config.toml                 # proc-janitor daemon config (alternative to LaunchAgent)

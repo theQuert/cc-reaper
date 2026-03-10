@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0] - 2026-03-10
+
+### Added
+- **PGID-based process group cleanup** — Primary detection method across all three layers
+  - Stop hook uses session's PGID to kill all child processes (MCP servers, subagents) in one shot, catching unknown third-party servers without pattern maintenance
+  - `claude-cleanup` finds orphaned process groups (PGID leader has PPID=1) and kills entire groups via `kill -- -$PGID`
+  - LaunchAgent monitor uses PGID-first scanning with pattern-based fallback, avoids duplicate kills
+- **Installer update mode** — Re-running `install.sh` detects existing installation and shows "Update" messaging; always overwrites hook/monitor scripts to latest version; shows config diff hint for proc-janitor
+
+### Changed
+- All three cleanup layers now use a two-pass strategy: PGID-based (primary) → pattern-based (fallback for processes that escaped their group via `setsid()`)
+- Stop hook excludes own PID and parent PID from group kill to ensure clean shutdown
+- `claude-cleanup` output now shows separate counts for PGID-based and pattern-based kills
+
 ## [0.3.0] - 2026-03-09
 
 ### Added
