@@ -28,7 +28,7 @@ targets = [
     "npm exec mcp-",
     "npx.*mcp-server",
     "node.*context7-mcp",
-    "node.*sequential",
+    "node.*sequential-thinking",
     "chroma-mcp.*persistent",
     "worker-service.cjs.*--daemon",
     "node.*claude-mem.*mcp-server",
