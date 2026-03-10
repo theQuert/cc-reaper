@@ -12,7 +12,14 @@ claude-cleanup() {
   local orphan_pgids
   orphan_pgids=$(ps -eo pid,ppid,pgid 2>/dev/null | awk '$1 == $3 && $2 == 1 {print $3}' | sort -u)
   for pgid in $orphan_pgids; do
-    # Check if this group contains Claude/MCP processes
+    # Only kill groups whose leader is a Claude session (stream-json subagent)
+    # Skip intentional daemons (worker-service --daemon) and non-Claude leaders
+    local leader_cmd
+    leader_cmd=$(ps -o command= -p "$pgid" 2>/dev/null)
+    if ! echo "$leader_cmd" | grep -qE "claude.*stream-json|claude.*--session-id"; then
+      continue
+    fi
+    # Verify group contains Claude/MCP processes
     local match_count
     match_count=$(ps -eo pgid,command 2>/dev/null | awk -v pgid="$pgid" '$1 == pgid' | grep -cE "claude|mcp|chroma|worker-service" 2>/dev/null || echo 0)
     if [ "$match_count" -gt 0 ]; then

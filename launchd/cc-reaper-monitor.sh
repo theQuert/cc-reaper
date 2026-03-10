@@ -24,13 +24,17 @@ log() {
 killed_pgids=()
 orphan_pgids=$(ps -eo pid,ppid,pgid 2>/dev/null | awk '$1 == $3 && $2 == 1 {print $3}' | sort -u)
 for pgid in $orphan_pgids; do
-  match=$(ps -eo pgid,command 2>/dev/null | awk -v pgid="$pgid" '$1 == pgid' | grep -cE "claude|mcp|chroma|worker-service" 2>/dev/null || echo 0)
-  if [ "$match" -gt 0 ]; then
-    group_info=$(ps -eo pid,pgid,%cpu,%mem,command 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {printf "PID=%s CPU=%s%% MEM=%s%% ", $1, $3, $4}')
-    log "KILL group PGID=$pgid ($group_info)"
-    kill -- -"$pgid" 2>/dev/null
-    killed_pgids+=("$pgid")
+  # SAFETY: Only kill groups whose leader is a Claude CLI session (stream-json subagent).
+  # Never match by group membership — that risks killing Chrome, Cursor, or other apps
+  # whose process groups happen to contain a "claude" or "mcp" subprocess.
+  leader_cmd=$(ps -o command= -p "$pgid" 2>/dev/null)
+  if ! echo "$leader_cmd" | grep -qE "claude.*stream-json"; then
+    continue
   fi
+  group_info=$(ps -eo pid,pgid,%cpu,%mem,command 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {printf "PID=%s CPU=%s%% MEM=%s%% ", $1, $3, $4}')
+  log "KILL group PGID=$pgid ($group_info)"
+  kill -- -"$pgid" 2>/dev/null
+  killed_pgids+=("$pgid")
 done
 
 # ─── Pattern-based fallback ──────────────────────────────────────────────────
