@@ -13,10 +13,10 @@ This is a [widely reported issue](https://github.com/anthropics/claude-code/issu
 | Process Type | Pattern | Typical Size |
 |---|---|---|
 | Subagents | `claude --output-format stream-json` | 180-300 MB each |
-| MCP servers | `npm exec @supabase/mcp-server-supabase`, `context7-mcp`, `npx mcp-server-cloudflare`, etc. | 40-110 MB each |
-| claude-mem MCP | `node claude-mem/mcp-server.cjs` | 35-75 MB each |
+| MCP servers (short-lived) | `npx mcp-server-cloudflare`, `npm exec mcp-*`, etc. | 40-110 MB each |
 | claude-mem worker | `worker-service.cjs --daemon` (bun) | 100 MB |
-| chroma-mcp | `chroma-mcp --client-type persistent` (via uv/uvx) | 350-950 MB |
+
+> **Not killed**: Long-running MCP servers shared across sessions (Supabase, Stripe, context7, claude-mem, chroma-mcp) are whitelisted. They are only cleaned up via PGID when their owning session ends.
 
 ## Solution: Three-Layer Defense
 
@@ -50,7 +50,19 @@ chmod +x install.sh
 ./install.sh
 ```
 
-**Updating:** Re-run `./install.sh` after `git pull` — it detects existing installations and updates hook/monitor scripts to the latest version automatically.
+**Updating:**
+
+```bash
+git pull
+./install.sh
+```
+
+The installer auto-updates hook and shell functions. For proc-janitor users, manually sync the config:
+
+```bash
+cp proc-janitor/config.toml ~/.config/proc-janitor/config.toml
+# Edit the log path: replace ~ with your actual home directory
+```
 
 ## Manual Setup
 

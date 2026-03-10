@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.1] - 2026-03-10
+
+### Fixed
+- **MCP server false-positive kills** — Long-running MCP servers (Supabase, Stripe, context7, claude-mem, chroma-mcp) were being killed by pattern-based fallback and proc-janitor, causing repeated disconnections across sessions
+- **Overly broad patterns removed** — `node.*claude` and `node.*mcp` matched nearly any node-based MCP process; replaced with specific patterns that only target known short-lived orphans
+
+### Changed
+- Long-running MCP servers are now **whitelisted** in proc-janitor and excluded from pattern-based kill in stop hook and `claude-cleanup`
+- PGID-based cleanup (primary) still handles session-scoped cleanup correctly — MCP servers are killed when their owning session ends, but not across sessions
+- Updated README with explicit proc-janitor config update instructions
+
 ## [0.4.0] - 2026-03-10
 
 ### Added

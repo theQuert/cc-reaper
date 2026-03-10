@@ -20,10 +20,11 @@ fi
 # Catches processes that escaped the process group (e.g., called setsid())
 # Only targets detached processes (TTY="??") to avoid killing active sessions.
 ps aux | grep "[c]laude.*stream-json" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-ps aux | grep -E "[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[n]ode.*sequential-thinking" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
+ps aux | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
 ps aux | grep "[w]orker-service.cjs.*--daemon" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-ps aux | grep "[n]ode.*claude-mem.*mcp-server" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-ps aux | grep -E "[c]hroma-mcp.*persistent|[u]v.*chroma-mcp|[p]ython.*chroma-mcp" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
+# NOTE: claude-mem, chroma-mcp, context7 are NOT killed here — they are
+# long-running MCP servers shared across sessions. PGID cleanup (above)
+# handles same-session processes; these survive for other sessions.
 ps aux | grep "[b]un.*worker-service" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
 
 echo "[cleanup] Orphan Claude processes cleaned up."

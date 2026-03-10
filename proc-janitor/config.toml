@@ -20,21 +20,12 @@ sigterm_timeout = 5
 # Only orphaned processes (PPID=1) matching these patterns will be cleaned.
 
 targets = [
-    "node.*claude",
     "claude.*stream-json",
-    "node.*mcp",
-    "npm exec @supabase",
     "npm exec @upstash",
     "npm exec mcp-",
     "npx.*mcp-server",
-    "node.*context7-mcp",
     "node.*sequential-thinking",
-    "chroma-mcp.*persistent",
     "worker-service.cjs.*--daemon",
-    "node.*claude-mem.*mcp-server",
-    "uv.*chroma-mcp",
-    "uvx.*chroma-mcp",
-    "python.*chroma-mcp",
     "bun.*worker-service",
 ]
 
@@ -43,7 +34,12 @@ targets = [
 
 whitelist = [
     "node.*(dev-server|http-server|next.*server)",
-    "pm2"
+    "pm2",
+    "npm exec @supabase",
+    "npm exec @stripe",
+    "context7-mcp",
+    "claude-mem.*mcp-server",
+    "chroma-mcp",
 ]
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
