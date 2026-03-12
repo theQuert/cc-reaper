@@ -79,6 +79,8 @@ Commands available after restart:
 - `claude-ram` — show RAM/CPU usage breakdown with per-session details and orphan visibility (read-only)
 - `claude-sessions` — list all active sessions with idle detection and process tree RAM
 - `claude-cleanup` — kill orphan processes immediately (PGID group kill + pattern fallback)
+- `claude-guard` — automatic session reaper: kills bloated sessions (RSS > threshold) and excess idle sessions
+- `claude-guard --dry-run` — preview what claude-guard would kill without actually killing
 
 ### 2. Claude Code Stop Hook
 
@@ -179,6 +181,33 @@ proc-janitor clean    # kill detected orphans
 proc-janitor status   # check daemon health
 ```
 
+## Automatic Session Guard
+
+`claude-guard` is an automatic session reaper that prevents runaway memory consumption. It operates in two phases:
+
+1. **Bloated session kill** — Sessions whose tree RSS (process + all children) exceeds `CC_MAX_RSS_MB` are killed immediately via PGID, regardless of whether they're idle or active. This addresses the [~42 GB/hr memory leak](https://github.com/anthropics/claude-code/issues/4953#issuecomment-4043206738) caused by unreleased streaming ArrayBuffers.
+2. **Idle session eviction** — If session count still exceeds `CC_MAX_SESSIONS`, the oldest idle sessions are killed.
+
+```bash
+claude-guard            # run the guard (kills bloated + excess idle)
+claude-guard --dry-run  # preview without killing
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CC_MAX_SESSIONS` | 3 | Max allowed concurrent sessions before idle eviction |
+| `CC_IDLE_THRESHOLD` | 1 | CPU% below which a session is considered idle |
+| `CC_MAX_RSS_MB` | 4096 | Tree RSS threshold (MB); sessions exceeding this are killed regardless of activity |
+
+Example: lower the threshold to 2 GB for memory-constrained machines:
+
+```bash
+export CC_MAX_RSS_MB=2048
+claude-guard
+```
+
 ## Dependencies
 
 | Tool | Required | Install |
@@ -201,7 +230,7 @@ cc-reaper/
 ├── proc-janitor/
 │   └── config.toml                 # proc-janitor daemon config (alternative to LaunchAgent)
 ├── shell/
-│   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-cleanup, claude-sessions)
+│   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-cleanup, claude-sessions, claude-guard)
 └── README.md
 ```
 

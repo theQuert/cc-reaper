@@ -97,6 +97,32 @@ claude-ram() {
   ps aux | grep -iE "[c]laude|[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[w]orker-service|[n]ode.*sequential-thinking|[n]ode.*claude-mem|[u]v.*chroma-mcp|[p]ython.*chroma-mcp|[b]un.*worker-service" | awk '{sum+=$6; cpu+=$3} END {printf "  %.0f MB (%.1f GB), %.1f%% CPU\n", sum/1024, sum/1024/1024, cpu}'
 }
 
+# Calculate tree RSS (MB) for a given PID: process + children + grandchildren
+_claude_tree_rss() {
+  local pid=$1
+  local rss=$(ps -p "$pid" -o rss= 2>/dev/null | tr -d ' ')
+  [ -z "$rss" ] && echo 0 && return
+  local tree_mb=$((rss / 1024))
+
+  local children=()
+  while IFS= read -r cpid; do
+    [ -z "$cpid" ] && continue
+    children+=("$cpid")
+    local crss=$(ps -p "$cpid" -o rss= 2>/dev/null | tr -d ' ')
+    [ -n "$crss" ] && tree_mb=$((tree_mb + crss / 1024))
+  done < <(pgrep -P "$pid" 2>/dev/null)
+
+  for cpid in "${children[@]}"; do
+    while IFS= read -r gcpid; do
+      [ -z "$gcpid" ] && continue
+      local gcrss=$(ps -p "$gcpid" -o rss= 2>/dev/null | tr -d ' ')
+      [ -n "$gcrss" ] && tree_mb=$((tree_mb + gcrss / 1024))
+    done < <(pgrep -P "$cpid" 2>/dev/null)
+  done
+
+  echo "$tree_mb"
+}
+
 # List all active Claude Code sessions with idle detection
 claude-sessions() {
   echo "=== Claude Code Active Sessions ==="
@@ -135,29 +161,17 @@ claude-sessions() {
       idle_count=$((idle_count + 1))
     fi
 
-    # Count all descendant processes and their RAM
+    # Count descendant processes and calculate tree RAM
     local child_count=0
-    local tree_ram=$rss_mb
-
-    # Direct children
-    local children=()
+    local tree_ram=$(_claude_tree_rss "$pid")
     while IFS= read -r cpid; do
       [ -z "$cpid" ] && continue
-      children+=("$cpid")
       child_count=$((child_count + 1))
-      local crss=$(ps -p "$cpid" -o rss= 2>/dev/null | tr -d ' ')
-      [ -n "$crss" ] && tree_ram=$((tree_ram + crss / 1024))
-    done < <(pgrep -P "$pid" 2>/dev/null)
-
-    # Grandchildren
-    for cpid in "${children[@]}"; do
       while IFS= read -r gcpid; do
         [ -z "$gcpid" ] && continue
         child_count=$((child_count + 1))
-        local gcrss=$(ps -p "$gcpid" -o rss= 2>/dev/null | tr -d ' ')
-        [ -n "$gcrss" ] && tree_ram=$((tree_ram + gcrss / 1024))
       done < <(pgrep -P "$cpid" 2>/dev/null)
-    done
+    done < <(pgrep -P "$pid" 2>/dev/null)
 
     printf "  %-7s %7s %6s %-14s %-8s %s (%s MB tree)\n" \
       "$pid" "${rss_mb}" "${cpu}%" "$etime" "$proc_status" "$child_count" "$tree_ram"
@@ -181,5 +195,153 @@ claude-sessions() {
     echo ""
     echo "  WARNING: $session_count sessions is excessive. Each session + MCP servers = 400-900 MB."
     echo "  Consider keeping max 2-3 active sessions."
+  fi
+}
+
+# Automatic session guard: kills bloated (RSS threshold) and idle sessions
+# Usage: claude-guard [--dry-run]
+# Config env vars:
+#   CC_MAX_SESSIONS  — max allowed sessions (default: 3)
+#   CC_IDLE_THRESHOLD — CPU% below which a session is idle (default: 1)
+#   CC_MAX_RSS_MB    — tree RSS threshold in MB; sessions exceeding this are killed (default: 4096)
+claude-guard() {
+  local dry_run=false
+  [ "$1" = "--dry-run" ] && dry_run=true
+
+  # ─── Configuration ─────────────────────────────────────────────────────
+  local max_sessions=${CC_MAX_SESSIONS:-3}
+  local idle_threshold=${CC_IDLE_THRESHOLD:-1}
+  local max_rss_mb=${CC_MAX_RSS_MB:-4096}
+
+  # Validate CC_MAX_RSS_MB is numeric
+  if ! echo "$max_rss_mb" | grep -qE '^[0-9]+$'; then
+    echo "  WARNING: CC_MAX_RSS_MB='$max_rss_mb' is not numeric, using default 4096"
+    max_rss_mb=4096
+  fi
+
+  echo "=== Claude Guard ==="
+  echo "  Config: max_sessions=$max_sessions, idle_threshold=${idle_threshold}%, max_rss=${max_rss_mb} MB"
+  echo ""
+
+  # ─── Gather sessions ───────────────────────────────────────────────────
+  local session_pids=()
+  while IFS= read -r line; do
+    session_pids+=("$line")
+  done < <(ps -eo pid,command | grep "[c]laude --dangerously" | awk '{print $1}')
+
+  local session_count=${#session_pids[@]}
+  if [ "$session_count" -eq 0 ]; then
+    echo "  No Claude Code sessions running."
+    return 0
+  fi
+
+  # ─── Classify sessions ─────────────────────────────────────────────────
+  local bloated_pids=()
+  local bloated_rss=()
+  local idle_pids=()
+  local idle_etimes=()
+  local live_count=0
+
+  printf "  %-7s %8s %6s %-14s %s\n" "PID" "TREE_MB" "CPU%" "ELAPSED" "STATUS"
+  printf "  %-7s %8s %6s %-14s %s\n" "-------" "--------" "------" "--------------" "--------"
+
+  for pid in "${session_pids[@]}"; do
+    local info=$(ps -p "$pid" -o rss=,%cpu=,etime= 2>/dev/null)
+    [ -z "$info" ] && continue
+
+    local cpu=$(echo "$info" | awk '{print $2}')
+    local etime=$(echo "$info" | awk '{print $3}')
+    local tree_mb=$(_claude_tree_rss "$pid")
+    local cpu_int=$(echo "$cpu" | awk '{printf "%d", $1}')
+
+    # Determine status: bloated takes priority over idle
+    local status="LIVE"
+    if [ "$tree_mb" -ge "$max_rss_mb" ]; then
+      status="[BLOATED]"
+      bloated_pids+=("$pid")
+      bloated_rss+=("$tree_mb")
+    elif [ "$cpu_int" -lt "$idle_threshold" ]; then
+      status="[IDLE]"
+      idle_pids+=("$pid")
+      idle_etimes+=("$etime")
+    else
+      live_count=$((live_count + 1))
+    fi
+
+    printf "  %-7s %7s %6s %-14s %s\n" "$pid" "${tree_mb}" "${cpu}%" "$etime" "$status"
+  done
+
+  echo ""
+  echo "  Sessions: $session_count total, ${#bloated_pids[@]} bloated, ${#idle_pids[@]} idle, $live_count live"
+
+  # ─── Phase 1: Kill bloated sessions (regardless of count) ──────────────
+  local killed=0
+  local freed_mb=0
+
+  if [ ${#bloated_pids[@]} -gt 0 ]; then
+    echo ""
+    echo "  --- Killing bloated sessions (tree RSS > ${max_rss_mb} MB) ---"
+    for i in "${!bloated_pids[@]}"; do
+      local bpid=${bloated_pids[$i]}
+      local brss=${bloated_rss[$i]}
+      if $dry_run; then
+        echo "  [DRY-RUN] Would kill PID $bpid (tree RSS: ${brss} MB, threshold: ${max_rss_mb} MB)"
+      else
+        # Get PGID for group kill
+        local pgid=$(ps -o pgid= -p "$bpid" 2>/dev/null | tr -d ' ')
+        if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
+          kill -- -"$pgid" 2>/dev/null
+        else
+          kill "$bpid" 2>/dev/null
+        fi
+        echo "  Killed PID $bpid (tree RSS: ${brss} MB, threshold: ${max_rss_mb} MB)"
+        killed=$((killed + 1))
+        freed_mb=$((freed_mb + brss))
+        # macOS desktop notification
+        osascript -e "display notification \"Killed session PID $bpid — ${brss} MB (threshold: ${max_rss_mb} MB)\" with title \"Claude Guard\" subtitle \"Bloated session reaped\"" 2>/dev/null &
+      fi
+    done
+  fi
+
+  # ─── Phase 2: Kill idle sessions if over max_sessions ──────────────────
+  local remaining=$((session_count - killed))
+  if [ "$remaining" -gt "$max_sessions" ] && [ ${#idle_pids[@]} -gt 0 ]; then
+    local to_kill=$((remaining - max_sessions))
+    [ "$to_kill" -gt "${#idle_pids[@]}" ] && to_kill=${#idle_pids[@]}
+
+    echo ""
+    echo "  --- Killing $to_kill idle session(s) to reach limit of $max_sessions ---"
+    for i in $(seq 0 $((to_kill - 1))); do
+      local ipid=${idle_pids[$i]}
+      local ietime=${idle_etimes[$i]}
+      local irss=$(_claude_tree_rss "$ipid")
+      if $dry_run; then
+        echo "  [DRY-RUN] Would kill PID $ipid (idle ${ietime}, tree RSS: ${irss} MB)"
+      else
+        local pgid=$(ps -o pgid= -p "$ipid" 2>/dev/null | tr -d ' ')
+        if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
+          kill -- -"$pgid" 2>/dev/null
+        else
+          kill "$ipid" 2>/dev/null
+        fi
+        echo "  Killed PID $ipid (idle ${ietime}, tree RSS: ${irss} MB)"
+        killed=$((killed + 1))
+        freed_mb=$((freed_mb + irss))
+      fi
+    done
+  fi
+
+  # ─── Summary ───────────────────────────────────────────────────────────
+  echo ""
+  if [ "$killed" -gt 0 ]; then
+    echo "  Reaped $killed session(s), freed ~${freed_mb} MB"
+    # Summary notification
+    if ! $dry_run; then
+      osascript -e "display notification \"Reaped $killed session(s), freed ~${freed_mb} MB\" with title \"Claude Guard\" subtitle \"Cleanup complete\"" 2>/dev/null &
+    fi
+  elif $dry_run && [ ${#bloated_pids[@]} -eq 0 ] && [ "$remaining" -le "$max_sessions" ]; then
+    echo "  All clear — no sessions to reap."
+  elif ! $dry_run; then
+    echo "  All clear — no sessions to reap."
   fi
 }

@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0] - 2026-03-12
+
+### Added
+- **`claude-guard` automatic session reaper** — Two-phase guard that kills bloated sessions (tree RSS exceeds threshold) and evicts excess idle sessions
+  - Phase 1: Kill sessions whose tree RSS (process + all children/grandchildren) exceeds `CC_MAX_RSS_MB` (default: 4096 MB), regardless of idle/active status
+  - Phase 2: Kill oldest idle sessions if count exceeds `CC_MAX_SESSIONS`
+  - PGID-based process group termination ensures all child processes are cleaned up
+  - macOS desktop notifications when sessions are reaped
+  - `--dry-run` flag to preview without killing
+- **`CC_MAX_RSS_MB` environment variable** — Configurable RSS threshold (default: 4096 MB) with non-numeric value fallback and warning
+- **`_claude_tree_rss` helper function** — Reusable tree RSS calculator (process + children + grandchildren), extracted from `claude-sessions`
+
+### Changed
+- `claude-sessions` refactored to use shared `_claude_tree_rss` helper, reducing code duplication
+
 ## [0.4.1] - 2026-03-10
 
 ### Fixed
