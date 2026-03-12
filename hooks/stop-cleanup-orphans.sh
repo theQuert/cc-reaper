@@ -9,11 +9,24 @@
 # This hook inherits the Claude session's process group (PGID).
 # Kill all processes in our group — catches ALL children including unknown
 # third-party MCP servers, without needing pattern maintenance.
+#
+# WHITELIST: Long-running MCP servers shared across sessions are excluded.
+# They survive session ends so other sessions can continue using them.
+# Pattern-based fallback below also excludes these (see NOTE comment).
+MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp"
+
 SESSION_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
 if [ -n "$SESSION_PGID" ] && [ "$SESSION_PGID" != "0" ] && [ "$SESSION_PGID" != "1" ]; then
-  # Kill group members except this script and the Claude CLI parent
-  ps -eo pid,pgid 2>/dev/null | awk -v pgid="$SESSION_PGID" -v me="$$" -v parent="$PPID" \
-    '$2 == pgid && $1 != me && $1 != parent {print $1}' | xargs kill 2>/dev/null
+  # Kill group members except: this script, Claude CLI parent, whitelisted MCP servers
+  while IFS= read -r pid; do
+    [ -z "$pid" ] && continue
+    pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+    if echo "$pid_cmd" | grep -qE "$MCP_WHITELIST"; then
+      continue
+    fi
+    kill "$pid" 2>/dev/null
+  done < <(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$SESSION_PGID" -v me="$$" -v parent="$PPID" \
+    '$2 == pgid && $1 != me && $1 != parent {print $1}')
 fi
 
 # ─── Pattern-based fallback ──────────────────────────────────────────────────

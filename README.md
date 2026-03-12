@@ -16,7 +16,7 @@ This is a [widely reported issue](https://github.com/anthropics/claude-code/issu
 | MCP servers (short-lived) | `npx mcp-server-cloudflare`, `npm exec mcp-*`, etc. | 40-110 MB each |
 | claude-mem worker | `worker-service.cjs --daemon` (bun) | 100 MB |
 
-> **Not killed**: Long-running MCP servers shared across sessions (Supabase, Stripe, context7, claude-mem, chroma-mcp) are whitelisted. They are only cleaned up via PGID when their owning session ends.
+> **Not killed**: Long-running MCP servers shared across sessions (Supabase, Stripe, context7, claude-mem, chroma-mcp) are whitelisted across all cleanup layers — including PGID group kills. When a session ends, its stop hook and `claude-guard` skip whitelisted MCP servers so other sessions can continue using them.
 
 ## Solution: Three-Layer Defense
 

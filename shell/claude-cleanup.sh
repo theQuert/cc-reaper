@@ -198,6 +198,26 @@ claude-sessions() {
   fi
 }
 
+# Kill a session's process group while preserving whitelisted MCP servers
+# Usage: _claude_pgid_kill <pid>
+_claude_pgid_kill() {
+  local target_pid=$1
+  local MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp"
+  local pgid=$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ')
+  if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
+    while IFS= read -r pid; do
+      [ -z "$pid" ] && continue
+      local pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+      if echo "$pid_cmd" | grep -qE "$MCP_WHITELIST"; then
+        continue
+      fi
+      kill "$pid" 2>/dev/null
+    done < <(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
+  else
+    kill "$target_pid" 2>/dev/null
+  fi
+}
+
 # Automatic session guard: kills bloated (RSS threshold) and idle sessions
 # Usage: claude-guard [--dry-run]
 # Config env vars:
@@ -287,13 +307,8 @@ claude-guard() {
       if $dry_run; then
         echo "  [DRY-RUN] Would kill PID $bpid (tree RSS: ${brss} MB, threshold: ${max_rss_mb} MB)"
       else
-        # Get PGID for group kill
-        local pgid=$(ps -o pgid= -p "$bpid" 2>/dev/null | tr -d ' ')
-        if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
-          kill -- -"$pgid" 2>/dev/null
-        else
-          kill "$bpid" 2>/dev/null
-        fi
+        # Kill session group, preserving whitelisted MCP servers
+        _claude_pgid_kill "$bpid"
         echo "  Killed PID $bpid (tree RSS: ${brss} MB, threshold: ${max_rss_mb} MB)"
         killed=$((killed + 1))
         freed_mb=$((freed_mb + brss))
@@ -318,12 +333,8 @@ claude-guard() {
       if $dry_run; then
         echo "  [DRY-RUN] Would kill PID $ipid (idle ${ietime}, tree RSS: ${irss} MB)"
       else
-        local pgid=$(ps -o pgid= -p "$ipid" 2>/dev/null | tr -d ' ')
-        if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
-          kill -- -"$pgid" 2>/dev/null
-        else
-          kill "$ipid" 2>/dev/null
-        fi
+        # Kill session group, preserving whitelisted MCP servers
+        _claude_pgid_kill "$ipid"
         echo "  Killed PID $ipid (idle ${ietime}, tree RSS: ${irss} MB)"
         killed=$((killed + 1))
         freed_mb=$((freed_mb + irss))

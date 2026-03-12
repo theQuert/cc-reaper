@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.1] - 2026-03-12
+
+### Fixed
+- **PGID kill now whitelists long-running MCP servers** — Stop hook and `claude-guard` previously killed ALL processes in a session's PGID group, including shared MCP servers (Supabase, Stripe, context7, claude-mem, chroma-mcp). When a session ended, its MCP servers were killed even if other active sessions were still using them, causing "disabled" status in those sessions.
+- **New `_claude_pgid_kill` helper** — Extracted whitelist-aware PGID kill logic into a shared function used by both `claude-guard` (Phase 1 bloated + Phase 2 idle) and the stop hook. Iterates group members individually, skipping whitelisted MCP servers instead of blind `kill -- -$PGID`.
+
 ## [0.5.0] - 2026-03-12
 
 ### Added
