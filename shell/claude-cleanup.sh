@@ -97,6 +97,12 @@ claude-ram() {
   ps aux | grep -iE "[c]laude|[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[w]orker-service|[n]ode.*sequential-thinking|[n]ode.*claude-mem|[u]v.*chroma-mcp|[p]ython.*chroma-mcp|[b]un.*worker-service" | awk '{sum+=$6; cpu+=$3} END {printf "  %.0f MB (%.1f GB), %.1f%% CPU\n", sum/1024, sum/1024/1024, cpu}'
 }
 
+# Count open file descriptors for a given PID (via lsof)
+_claude_process_fds() {
+  local pid=$1
+  lsof -p "$pid" 2>/dev/null | tail -n +2 | wc -l | tr -d ' '
+}
+
 # Calculate tree RSS (MB) for a given PID: process + children + grandchildren
 _claude_tree_rss() {
   local pid=$1
@@ -121,6 +127,91 @@ _claude_tree_rss() {
   done
 
   echo "$tree_mb"
+}
+
+# Show file descriptor usage for Claude Code processes
+claude-fd() {
+  echo "=== Claude Code File Descriptor Usage ==="
+  echo ""
+
+  # ─── System FD limits ─────────────────────────────────────────────────
+  local sys_max=$(sysctl -n kern.maxfiles 2>/dev/null || echo "unknown")
+  local proc_max=$(sysctl -n kern.maxfilesperproc 2>/dev/null || echo "unknown")
+  local ulimit_n=$(ulimit -n 2>/dev/null || echo "unknown")
+  echo "  System limits: kern.maxfiles=$sys_max  kern.maxfilesperproc=$proc_max  ulimit=$ulimit_n"
+  echo ""
+
+  # ─── Per-session FD count ──────────────────────────────────────────────
+  local max_fd=${CC_MAX_FD:-10000}
+  echo "--- CLI Sessions (FD threshold: $max_fd) ---"
+  printf "  %-7s %8s %8s %6s %-14s %s\n" "PID" "FDs" "RSS(MB)" "CPU%" "ELAPSED" "STATUS"
+  printf "  %-7s %8s %8s %6s %-14s %s\n" "-------" "--------" "--------" "------" "--------------" "--------"
+
+  local session_pids=()
+  while IFS= read -r line; do
+    session_pids+=("$line")
+  done < <(ps -eo pid,command | grep "[c]laude --dangerously" | awk '{print $1}')
+
+  local total_fds=0
+  local leak_count=0
+
+  for pid in "${session_pids[@]}"; do
+    local info=$(ps -p "$pid" -o rss=,%cpu=,etime= 2>/dev/null)
+    [ -z "$info" ] && continue
+
+    local rss=$(echo "$info" | awk '{print $1}')
+    local cpu=$(echo "$info" | awk '{print $2}')
+    local etime=$(echo "$info" | awk '{print $3}')
+    local rss_mb=$((rss / 1024))
+    local fds=$(_claude_process_fds "$pid")
+    [ -z "$fds" ] && fds=0
+    total_fds=$((total_fds + fds))
+
+    local status=""
+    if [ "$fds" -ge "$max_fd" ]; then
+      status="[FD-LEAK]"
+      leak_count=$((leak_count + 1))
+    fi
+
+    printf "  %-7s %8s %7s %6s %-14s %s\n" "$pid" "$fds" "${rss_mb}" "${cpu}%" "$etime" "$status"
+  done
+
+  if [ ${#session_pids[@]} -eq 0 ]; then
+    echo "  No Claude Code sessions running."
+  else
+    echo ""
+    echo "  Total: ${#session_pids[@]} sessions, $total_fds FDs, $leak_count leaking"
+  fi
+
+  # ─── VirtualMachine processes (read-only report) ───────────────────────
+  echo ""
+  echo "--- VirtualMachine Processes (read-only) ---"
+  local vm_pids=()
+  while IFS= read -r line; do
+    vm_pids+=("$line")
+  done < <(pgrep -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null)
+
+  if [ ${#vm_pids[@]} -eq 0 ]; then
+    echo "  No VirtualMachine processes found."
+  else
+    printf "  %-7s %8s %8s %s\n" "PID" "FDs" "RSS(MB)" "NOTE"
+    printf "  %-7s %8s %8s %s\n" "-------" "--------" "--------" "----"
+    for pid in "${vm_pids[@]}"; do
+      local fds=$(_claude_process_fds "$pid")
+      local rss=$(ps -p "$pid" -o rss= 2>/dev/null | tr -d ' ')
+      local rss_mb=$((${rss:-0} / 1024))
+      local note=""
+      [ "$fds" -ge "$max_fd" ] && note="WARNING: high FD count"
+      printf "  %-7s %8s %7s  %s\n" "$pid" "$fds" "${rss_mb}" "$note"
+    done
+  fi
+
+  # ─── Advice ────────────────────────────────────────────────────────────
+  if [ "$leak_count" -gt 0 ]; then
+    echo ""
+    echo "  *** $leak_count session(s) exceeding FD threshold ($max_fd). ***"
+    echo "  *** Run 'claude-guard' to auto-reap leaking sessions. ***"
+  fi
 }
 
 # List all active Claude Code sessions with idle detection
@@ -232,15 +323,20 @@ claude-guard() {
   local max_sessions=${CC_MAX_SESSIONS:-3}
   local idle_threshold=${CC_IDLE_THRESHOLD:-1}
   local max_rss_mb=${CC_MAX_RSS_MB:-4096}
+  local max_fd=${CC_MAX_FD:-10000}
 
-  # Validate CC_MAX_RSS_MB is numeric
+  # Validate numeric configs
   if ! echo "$max_rss_mb" | grep -qE '^[0-9]+$'; then
     echo "  WARNING: CC_MAX_RSS_MB='$max_rss_mb' is not numeric, using default 4096"
     max_rss_mb=4096
   fi
+  if ! echo "$max_fd" | grep -qE '^[0-9]+$'; then
+    echo "  WARNING: CC_MAX_FD='$max_fd' is not numeric, using default 10000"
+    max_fd=10000
+  fi
 
   echo "=== Claude Guard ==="
-  echo "  Config: max_sessions=$max_sessions, idle_threshold=${idle_threshold}%, max_rss=${max_rss_mb} MB"
+  echo "  Config: max_sessions=$max_sessions, idle_threshold=${idle_threshold}%, max_rss=${max_rss_mb} MB, max_fd=$max_fd"
   echo ""
 
   # ─── Gather sessions ───────────────────────────────────────────────────
@@ -256,14 +352,16 @@ claude-guard() {
   fi
 
   # ─── Classify sessions ─────────────────────────────────────────────────
+  local fdleak_pids=()
+  local fdleak_fds=()
   local bloated_pids=()
   local bloated_rss=()
   local idle_pids=()
   local idle_etimes=()
   local live_count=0
 
-  printf "  %-7s %8s %6s %-14s %s\n" "PID" "TREE_MB" "CPU%" "ELAPSED" "STATUS"
-  printf "  %-7s %8s %6s %-14s %s\n" "-------" "--------" "------" "--------------" "--------"
+  printf "  %-7s %8s %6s %6s %-14s %s\n" "PID" "TREE_MB" "FDs" "CPU%" "ELAPSED" "STATUS"
+  printf "  %-7s %8s %6s %6s %-14s %s\n" "-------" "--------" "------" "------" "--------------" "--------"
 
   for pid in "${session_pids[@]}"; do
     local info=$(ps -p "$pid" -o rss=,%cpu=,etime= 2>/dev/null)
@@ -273,10 +371,16 @@ claude-guard() {
     local etime=$(echo "$info" | awk '{print $3}')
     local tree_mb=$(_claude_tree_rss "$pid")
     local cpu_int=$(echo "$cpu" | awk '{printf "%d", $1}')
+    local fds=$(_claude_process_fds "$pid")
+    [ -z "$fds" ] && fds=0
 
-    # Determine status: bloated takes priority over idle
+    # Determine status: fd-leak > bloated > idle
     local status="LIVE"
-    if [ "$tree_mb" -ge "$max_rss_mb" ]; then
+    if [ "$fds" -ge "$max_fd" ]; then
+      status="[FD-LEAK]"
+      fdleak_pids+=("$pid")
+      fdleak_fds+=("$fds")
+    elif [ "$tree_mb" -ge "$max_rss_mb" ]; then
       status="[BLOATED]"
       bloated_pids+=("$pid")
       bloated_rss+=("$tree_mb")
@@ -288,15 +392,36 @@ claude-guard() {
       live_count=$((live_count + 1))
     fi
 
-    printf "  %-7s %7s %6s %-14s %s\n" "$pid" "${tree_mb}" "${cpu}%" "$etime" "$status"
+    printf "  %-7s %7s %6s %6s %-14s %s\n" "$pid" "${tree_mb}" "$fds" "${cpu}%" "$etime" "$status"
   done
 
   echo ""
-  echo "  Sessions: $session_count total, ${#bloated_pids[@]} bloated, ${#idle_pids[@]} idle, $live_count live"
+  echo "  Sessions: $session_count total, ${#fdleak_pids[@]} fd-leak, ${#bloated_pids[@]} bloated, ${#idle_pids[@]} idle, $live_count live"
 
-  # ─── Phase 1: Kill bloated sessions (regardless of count) ──────────────
+  # ─── Phase 0: Kill FD-leaking sessions (regardless of count) ──────────
   local killed=0
   local freed_mb=0
+
+  if [ ${#fdleak_pids[@]} -gt 0 ]; then
+    echo ""
+    echo "  --- Killing FD-leaking sessions (FDs > $max_fd) ---"
+    for i in "${!fdleak_pids[@]}"; do
+      local fpid=${fdleak_pids[$i]}
+      local ffds=${fdleak_fds[$i]}
+      local frss=$(_claude_tree_rss "$fpid")
+      if $dry_run; then
+        echo "  [DRY-RUN] Would kill PID $fpid (FDs: $ffds, threshold: $max_fd)"
+      else
+        _claude_pgid_kill "$fpid"
+        echo "  Killed PID $fpid (FDs: $ffds, threshold: $max_fd)"
+        killed=$((killed + 1))
+        freed_mb=$((freed_mb + frss))
+        osascript -e "display notification \"Killed session PID $fpid — $ffds FDs (threshold: $max_fd)\" with title \"Claude Guard\" subtitle \"FD-leak session reaped\"" 2>/dev/null &
+      fi
+    done
+  fi
+
+  # ─── Phase 1: Kill bloated sessions (regardless of count) ──────────────
 
   if [ ${#bloated_pids[@]} -gt 0 ]; then
     echo ""

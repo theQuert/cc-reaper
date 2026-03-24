@@ -16,6 +16,8 @@ This is a [widely reported issue](https://github.com/anthropics/claude-code/issu
 | MCP servers (short-lived) | `npx mcp-server-cloudflare`, `npm exec mcp-*`, etc. | 40-110 MB each |
 | claude-mem worker | `worker-service.cjs --daemon` (bun) | 100 MB |
 
+| File descriptors | VM processes, settings.json, MCP stdio pipes | ~6,200 FDs/hr leak rate |
+
 > **Not killed**: Long-running MCP servers shared across sessions (Supabase, Stripe, context7, claude-mem, chroma-mcp) are whitelisted across all cleanup layers — including PGID group kills. When a session ends, its stop hook and `claude-guard` skip whitelisted MCP servers so other sessions can continue using them.
 
 ## Solution: Three-Layer Defense
@@ -77,9 +79,10 @@ source /path/to/cc-reaper/shell/claude-cleanup.sh
 Commands available after restart:
 
 - `claude-ram` — show RAM/CPU usage breakdown with per-session details and orphan visibility (read-only)
+- `claude-fd` — show file descriptor usage per session and VirtualMachine processes (read-only)
 - `claude-sessions` — list all active sessions with idle detection and process tree RAM
 - `claude-cleanup` — kill orphan processes immediately (PGID group kill + pattern fallback)
-- `claude-guard` — automatic session reaper: kills bloated sessions (RSS > threshold) and excess idle sessions
+- `claude-guard` — automatic session reaper: kills FD-leaking, bloated (RSS > threshold), and excess idle sessions
 - `claude-guard --dry-run` — preview what claude-guard would kill without actually killing
 
 ### 2. Claude Code Stop Hook
@@ -183,10 +186,11 @@ proc-janitor status   # check daemon health
 
 ## Automatic Session Guard
 
-`claude-guard` is an automatic session reaper that prevents runaway memory consumption. It operates in two phases:
+`claude-guard` is an automatic session reaper that prevents runaway resource consumption. It operates in three phases:
 
-1. **Bloated session kill** — Sessions whose tree RSS (process + all children) exceeds `CC_MAX_RSS_MB` are killed immediately via PGID, regardless of whether they're idle or active. This addresses the [~42 GB/hr memory leak](https://github.com/anthropics/claude-code/issues/4953#issuecomment-4043206738) caused by unreleased streaming ArrayBuffers.
-2. **Idle session eviction** — If session count still exceeds `CC_MAX_SESSIONS`, the oldest idle sessions are killed.
+1. **FD-leak session kill** — Sessions whose open file descriptor count exceeds `CC_MAX_FD` are killed immediately. This addresses the [widely reported FD exhaustion issue](https://github.com/anthropics/claude-code/issues/29888) where VM processes leak ~6,200 FDs/hour, eventually causing system-wide "Operation not permitted" errors.
+2. **Bloated session kill** — Sessions whose tree RSS (process + all children) exceeds `CC_MAX_RSS_MB` are killed immediately via PGID, regardless of whether they're idle or active. This addresses the [~42 GB/hr memory leak](https://github.com/anthropics/claude-code/issues/4953#issuecomment-4043206738) caused by unreleased streaming ArrayBuffers.
+3. **Idle session eviction** — If session count still exceeds `CC_MAX_SESSIONS`, the oldest idle sessions are killed.
 
 ```bash
 claude-guard            # run the guard (kills bloated + excess idle)
@@ -200,11 +204,13 @@ claude-guard --dry-run  # preview without killing
 | `CC_MAX_SESSIONS` | 3 | Max allowed concurrent sessions before idle eviction |
 | `CC_IDLE_THRESHOLD` | 1 | CPU% below which a session is considered idle |
 | `CC_MAX_RSS_MB` | 4096 | Tree RSS threshold (MB); sessions exceeding this are killed regardless of activity |
+| `CC_MAX_FD` | 10000 | File descriptor threshold; sessions exceeding this are killed as FD-leak |
 
-Example: lower the threshold to 2 GB for memory-constrained machines:
+Example: lower the thresholds for constrained machines:
 
 ```bash
 export CC_MAX_RSS_MB=2048
+export CC_MAX_FD=5000
 claude-guard
 ```
 
@@ -230,7 +236,7 @@ cc-reaper/
 ├── proc-janitor/
 │   └── config.toml                 # proc-janitor daemon config (alternative to LaunchAgent)
 ├── shell/
-│   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-cleanup, claude-sessions, claude-guard)
+│   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-fd, claude-cleanup, claude-sessions, claude-guard)
 └── README.md
 ```
 
@@ -244,6 +250,9 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 - [anthropics/claude-code#22554](https://github.com/anthropics/claude-code/issues/22554) — Subagent processes not terminating on macOS
 - [anthropics/claude-code#25545](https://github.com/anthropics/claude-code/issues/25545) — Excessive RAM when idle
 - [thedotmack/claude-mem#650](https://github.com/thedotmack/claude-mem/issues/650) — worker-service spawns subagents that don't exit
+- [anthropics/claude-code#29888](https://github.com/anthropics/claude-code/issues/29888) — VM process FD leak (~6,200/hr)
+- [anthropics/claude-code#28896](https://github.com/anthropics/claude-code/issues/28896) — settings.json FD leak (1 per tool call)
+- [anthropics/claude-code#37482](https://github.com/anthropics/claude-code/issues/37482) — MCP server stdio pipe breaks (orphaned FDs)
 
 ## License
 

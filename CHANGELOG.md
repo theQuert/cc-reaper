@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.6.0] - 2026-03-24
+
+### Added
+- **`claude-fd` command** — Read-only file descriptor usage report for Claude Code sessions and VirtualMachine processes
+  - Shows system FD limits (kern.maxfiles, kern.maxfilesperproc, ulimit)
+  - Per-session FD count with `[FD-LEAK]` warning when exceeding threshold
+  - VirtualMachine process FD monitoring (read-only, no kill — these are system-level)
+- **FD-leak detection in `claude-guard`** — New Phase 0 (highest priority) kills sessions whose open FD count exceeds `CC_MAX_FD`
+  - Priority order: FD-leak > bloated (RSS) > idle
+  - Guard output table now includes FDs column
+  - macOS desktop notifications for FD-leak kills
+- **`CC_MAX_FD` environment variable** — Configurable FD threshold (default: 10000) with non-numeric value fallback
+- **`_claude_process_fds` helper** — Reusable FD counter via `lsof -p`
+
+### Context
+Addresses the widely reported file descriptor exhaustion issue ([#29888](https://github.com/anthropics/claude-code/issues/29888), [#28896](https://github.com/anthropics/claude-code/issues/28896), [#37482](https://github.com/anthropics/claude-code/issues/37482)) where Claude Code leaks ~6,200 FDs/hour via VM processes, eventually causing system-wide "Operation not permitted" errors. Normal sessions use ~200-500 FDs; the 10,000 default threshold catches leaks well before system exhaustion.
+
 ## [0.5.1] - 2026-03-12
 
 ### Fixed
