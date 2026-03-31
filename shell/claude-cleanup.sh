@@ -293,7 +293,7 @@ claude-sessions() {
 # Usage: _claude_pgid_kill <pid>
 _claude_pgid_kill() {
   local target_pid=$1
-  local MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp"
+  local MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|sequentialthinking|codex.*mcp"
   local pgid=$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ')
   if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
     while IFS= read -r pid; do

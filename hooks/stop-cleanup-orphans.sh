@@ -13,7 +13,7 @@
 # WHITELIST: Long-running MCP servers shared across sessions are excluded.
 # They survive session ends so other sessions can continue using them.
 # Pattern-based fallback below also excludes these (see NOTE comment).
-MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp"
+MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|sequentialthinking|codex.*mcp"
 
 SESSION_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
 if [ -n "$SESSION_PGID" ] && [ "$SESSION_PGID" != "0" ] && [ "$SESSION_PGID" != "1" ]; then
@@ -33,7 +33,7 @@ fi
 # Catches processes that escaped the process group (e.g., called setsid())
 # Only targets detached processes (TTY="??") to avoid killing active sessions.
 ps aux | grep "[c]laude.*stream-json" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-ps aux | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
+ps aux | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | grep -vE "$MCP_WHITELIST" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
 ps aux | grep "[w]orker-service.cjs.*--daemon" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
 # NOTE: claude-mem, chroma-mcp, context7 are NOT killed here — they are
 # long-running MCP servers shared across sessions. PGID cleanup (above)

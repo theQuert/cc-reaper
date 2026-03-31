@@ -39,7 +39,10 @@ done
 
 # ─── Pattern-based fallback ──────────────────────────────────────────────────
 # Catches processes that escaped their process group (e.g., called setsid())
-orphans=$(ps -eo pid,ppid,%cpu,%mem,etime,command | awk '$2 == 1' | grep -E "[c]laude.*stream-json|[n]ode.*mcp-server|[n]px.*mcp-server|[c]hroma-mcp|[w]orker-service\.cjs|[n]ode.*claude-mem|[n]ode.*claude.*subagent")
+# Whitelist: long-running MCP servers shared across sessions
+MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|sequentialthinking|codex.*mcp"
+
+orphans=$(ps -eo pid,ppid,%cpu,%mem,etime,command | awk '$2 == 1' | grep -E "[c]laude.*stream-json|[n]ode.*mcp-server|[n]px.*mcp-server|[w]orker-service\.cjs|[n]ode.*claude.*subagent" | grep -vE "$MCP_WHITELIST")
 
 count=${#killed_pgids[@]}
 kill_pids=()

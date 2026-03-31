@@ -40,6 +40,8 @@ whitelist = [
     "context7-mcp",
     "claude-mem.*mcp-server",
     "chroma-mcp",
+    "chrome-devtools-mcp",
+    "mcp-remote",
 ]
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
