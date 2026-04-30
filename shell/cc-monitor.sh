@@ -436,7 +436,7 @@ _cc_monitor_enrich_findings() {
 
   while IFS="$(printf '\t')" read -r avg_cpu max_cpu row_samples pid ppid pgid tty etime rss_mb cmd; do
     [ -z "$pid" ] && continue
-    local family classification label reason action
+    local family="" classification="" label="" reason="" action=""
     family=$(_cc_monitor_family "$cmd")
     classification=$(_cc_monitor_classification "$ppid" "$tty" "$etime" "$cmd" "$family")
 
@@ -696,7 +696,7 @@ cc-monitor() {
     duration=0
   fi
 
-  local tmp_dir raw_file agg_file findings_file samples
+  local tmp_dir="" raw_file="" agg_file="" findings_file="" samples=""
   tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor.XXXXXX") || return 1
   raw_file="$tmp_dir/raw.tsv"
   agg_file="$tmp_dir/agg.tsv"

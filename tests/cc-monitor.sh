@@ -135,6 +135,19 @@ CC_MONITOR_SNAPSHOT_FILE="$snapshot_file" bash "$ROOT_DIR/shell/cc-monitor.sh" -
 expect_contains "human mode reports progress on stderr" "$human_stderr" 'cc-monitor: sampling process state'
 expect_contains "human mode still prints report on stdout" "$human_stdout" '=== cc-monitor: heat attribution ==='
 
+if command -v zsh >/dev/null 2>&1; then
+  zsh_stdout="$tmp_dir/zsh.out"
+  zsh_stderr="$tmp_dir/zsh.err"
+  CC_MONITOR_SNAPSHOT_FILE="$snapshot_file" zsh -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --once --top 1" > "$zsh_stdout" 2> "$zsh_stderr"
+  expect_contains "zsh source mode prints report" "$zsh_stdout" '^=== cc-monitor: heat attribution ==='
+  if grep -q '^family=' "$zsh_stdout"; then
+    printf "not ok - zsh source mode does not leak local variables\n"
+    failures=$((failures + 1))
+  else
+    printf "ok - zsh source mode does not leak local variables\n"
+  fi
+fi
+
 if [ "$failures" -gt 0 ]; then
   printf "%s validation failure(s)\n" "$failures"
   exit 1
