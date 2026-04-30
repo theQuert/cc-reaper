@@ -1,0 +1,85 @@
+# cc-monitor Specification Delta — monitor-apply-modules
+
+## ADDED Requirements
+
+### Requirement: Monitor optionally dispatches optimization modules
+The system SHALL provide an opt-in path to apply a user-selected optimization module after the read-only report is printed, while preserving the default read-only behavior.
+
+#### Scenario: TTY interactive menu with safe candidates
+- **WHEN** the user runs `cc-monitor` on a controlling terminal (both stdin and stdout are TTYs), without `--json`, `--no-prompt`, or `--apply`, AND the report contains at least one `SAFE_TO_REAP` finding
+- **THEN** the monitor SHALL print the human report and append a numbered menu listing the available optimization modules, mark a recommended option, and read the user's choice from the controlling TTY.
+
+#### Scenario: TTY interactive menu with heat candidates only
+- **WHEN** the user runs `cc-monitor` interactively, the report contains no `SAFE_TO_REAP` findings, AND family-level RSS or per-process CPU exceeds the recommendation thresholds
+- **THEN** the monitor SHALL display the menu, mark `claude-guard --dry-run` as the recommended option (or fall back to `proc-janitor scan` when `claude-guard` is unavailable), and SHALL list the destructive modules as additional choices for users who deliberately opt in.
+
+#### Scenario: TTY interactive menu without candidates
+- **WHEN** the user runs `cc-monitor` interactively but the report contains no `SAFE_TO_REAP` findings AND no family-level heat above the recommendation thresholds
+- **THEN** the monitor SHALL NOT display the menu and SHALL exit after printing the report without sending signals.
+
+#### Scenario: Recommended module unavailable on PATH
+- **WHEN** the menu is displayed and the module that the recommendation logic would pick is not available on PATH or as a sourced shell function, but other modules are available
+- **THEN** the monitor SHALL fall back to recommending the first available preview-only module (`claude-guard --dry-run` or `proc-janitor scan`); if no preview-only module is available, no option is marked as recommended.
+
+#### Scenario: Non-TTY suppresses menu
+- **WHEN** stdin, stdout, or stderr is not a TTY (for example output or error stream is piped or redirected)
+- **THEN** the monitor SHALL skip the menu, behave as a read-only report, and SHALL NOT prompt for input. (The stderr check exists because the menu and confirmation prompts render to stderr; redirecting stderr would otherwise produce an invisible prompt.)
+
+#### Scenario: `--no-prompt` suppresses menu
+- **WHEN** the user runs `cc-monitor --no-prompt`
+- **THEN** the monitor SHALL skip the menu and SHALL NOT send signals, regardless of TTY state.
+
+#### Scenario: `--json` suppresses menu unconditionally
+- **WHEN** the user runs `cc-monitor --json` (with or without `--no-prompt`)
+- **THEN** the monitor SHALL emit only the JSON report and SHALL NOT print or read any menu or confirmation text.
+
+#### Scenario: User declines via Enter or skip
+- **WHEN** the menu is displayed and the user presses Enter or selects the skip option
+- **THEN** the monitor SHALL exit with status 0 without dispatching any module.
+
+#### Scenario: User selects a destructive module interactively
+- **WHEN** the menu is displayed and the user picks a destructive module (`claude-cleanup`, `claude-guard`, or `proc-janitor clean`)
+- **THEN** the monitor SHALL print a confirmation prompt of the form `Run <module>? [y/N]` and SHALL only dispatch the module when the user answers `y` or `Y`; any other input or empty input SHALL be treated as decline.
+
+#### Scenario: User selects a non-destructive module interactively
+- **WHEN** the menu is displayed and the user picks a non-destructive module (`claude-guard --dry-run` or `proc-janitor scan`)
+- **THEN** the monitor SHALL dispatch the module without an additional confirmation prompt.
+
+#### Scenario: Module binary not on PATH (interactive)
+- **WHEN** the menu is displayed and one or more module binaries are not available on PATH
+- **THEN** the monitor SHALL omit the unavailable modules from the numbered menu and SHALL print a one-line install hint per missing module after the menu.
+
+### Requirement: Monitor supports script-friendly module dispatch
+The system SHALL accept a `--apply <module>` flag that runs sampling, prints the report, then dispatches the named module non-interactively.
+
+#### Scenario: `--apply` dispatches module without confirmation
+- **WHEN** the user runs `cc-monitor --apply claude-cleanup`
+- **THEN** the monitor SHALL complete sampling, print the human report, dispatch `claude-cleanup`, and propagate the module's exit code; the monitor SHALL NOT print a confirmation prompt or interactive menu.
+
+#### Scenario: `--apply` accepts canonical module names
+- **WHEN** the user runs `cc-monitor --apply <name>` with `<name>` in {`claude-cleanup`, `claude-guard`, `claude-guard-dry`, `proc-janitor-scan`, `proc-janitor-clean`}
+- **THEN** the monitor SHALL dispatch the corresponding command (`claude-cleanup`, `claude-guard`, `claude-guard --dry-run`, `proc-janitor scan`, `proc-janitor clean`).
+
+#### Scenario: `--apply` rejects unknown module
+- **WHEN** the user runs `cc-monitor --apply <unknown>`
+- **THEN** the monitor SHALL exit with status 2 and print an error to stderr listing the valid module names.
+
+#### Scenario: `--apply` rejects missing binary
+- **WHEN** the user runs `cc-monitor --apply <module>` and the underlying binary is not available on PATH
+- **THEN** the monitor SHALL exit with status 127 and print an error to stderr identifying the missing binary.
+
+#### Scenario: `--apply` cannot be combined with `--json`
+- **WHEN** the user runs `cc-monitor --apply <module> --json` (in any flag order)
+- **THEN** the monitor SHALL exit with status 2 and print `--apply cannot be combined with --json` to stderr without sampling or dispatching.
+
+#### Scenario: Dispatched module exits non-zero
+- **WHEN** a dispatched module (whether via `--apply` or interactive menu) exits with a non-zero status
+- **THEN** the monitor SHALL exit with the same status and SHALL preserve the module's stderr output.
+
+#### Scenario: Dispatch banner separates report from action
+- **WHEN** the monitor is about to dispatch a module (via either `--apply` or an interactive menu choice that has been confirmed)
+- **THEN** the monitor SHALL print a banner of the form `=== Dispatching <module label> ===` to stderr before executing the module, so the read-only report and the destructive action are visually separated.
+
+#### Scenario: Dispatch resolves sourced shell functions
+- **WHEN** the user has installed cleanup modules by sourcing this repo's shell scripts (for example `source shell/claude-cleanup.sh` from `.zshrc`) and `cc-monitor` is invoked from the same shell
+- **THEN** dispatching the module SHALL invoke the sourced shell function rather than searching only PATH, and SHALL NOT fail with `command not found` when no matching binary exists on PATH.

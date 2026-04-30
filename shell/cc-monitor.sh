@@ -719,7 +719,7 @@ _cc_monitor_recommended_module() {
 }
 
 _cc_monitor_is_tty() {
-  [ -t 0 ] && [ -t 1 ]
+  [ -t 0 ] && [ -t 1 ] && [ -t 2 ]
 }
 
 _cc_monitor_prompt_apply() {
@@ -744,6 +744,24 @@ _cc_monitor_prompt_apply() {
       printf "  -  %s — install: %s\n" "$(_cc_monitor_module_label "$m")" "$(_cc_monitor_install_hint "$m")" >&2
     done
     return 1
+  fi
+
+  if [ -n "$recommended" ]; then
+    local recommended_available=false
+    for m in "${available[@]}"; do
+      [ "$m" = "$recommended" ] && recommended_available=true
+    done
+    if [ "$recommended_available" != "true" ]; then
+      recommended=""
+      for m in "${available[@]}"; do
+        case "$m" in
+          claude-guard-dry|proc-janitor-scan)
+            recommended=$m
+            break
+            ;;
+        esac
+      done
+    fi
   fi
 
   printf "\nOptimization options:\n" >&2
@@ -771,8 +789,14 @@ _cc_monitor_prompt_apply() {
   fi
 
   if echo "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "${#available[@]}" ]; then
-    echo "${available[$((choice - 1))]}"
-    return 0
+    local idx=0
+    for m in "${available[@]}"; do
+      idx=$((idx + 1))
+      if [ "$idx" = "$choice" ]; then
+        echo "$m"
+        return 0
+      fi
+    done
   fi
   return 1
 }
@@ -802,10 +826,15 @@ _cc_monitor_dispatch_module() {
     esac
   fi
 
-  local cmd
-  cmd=$(_cc_monitor_module_command "$module")
-  # shellcheck disable=SC2086
-  eval "command $cmd"
+  printf "\n=== Dispatching %s ===\n" "$(_cc_monitor_module_label "$module")" >&2
+  case "$module" in
+    claude-cleanup)     claude-cleanup ;;
+    claude-guard)       claude-guard ;;
+    claude-guard-dry)   claude-guard --dry-run ;;
+    proc-janitor-scan)  proc-janitor scan ;;
+    proc-janitor-clean) proc-janitor clean ;;
+    *) return 2 ;;
+  esac
 }
 
 cc-monitor() {
