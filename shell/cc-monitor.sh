@@ -642,13 +642,13 @@ _cc_monitor_json_report() {
   printf '}\n'
 }
 
-_cc_monitor_module_command() {
+_cc_monitor_all_modules() {
+  echo "claude-cleanup claude-guard claude-guard-dry proc-janitor-scan proc-janitor-clean"
+}
+
+_cc_monitor_is_known_module() {
   case "$1" in
-    claude-cleanup)       echo "claude-cleanup" ;;
-    claude-guard)         echo "claude-guard" ;;
-    claude-guard-dry)     echo "claude-guard --dry-run" ;;
-    proc-janitor-scan)    echo "proc-janitor scan" ;;
-    proc-janitor-clean)   echo "proc-janitor clean" ;;
+    claude-cleanup|claude-guard|claude-guard-dry|proc-janitor-scan|proc-janitor-clean) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -724,12 +724,18 @@ _cc_monitor_is_tty() {
 
 _cc_monitor_prompt_apply() {
   local findings_file=$1
-  local recommended=""
-  recommended=$(_cc_monitor_recommended_module "$findings_file") || recommended=""
+  local recommended=${2:-}
+  if [ -z "$recommended" ]; then
+    recommended=$(_cc_monitor_recommended_module "$findings_file") || recommended=""
+  fi
 
-  local all_modules=(claude-cleanup claude-guard claude-guard-dry proc-janitor-scan proc-janitor-clean)
-  local available=() unavailable=()
+  local all_modules=()
   local m
+  for m in $(_cc_monitor_all_modules); do
+    all_modules+=("$m")
+  done
+
+  local available=() unavailable=()
   for m in "${all_modules[@]}"; do
     if _cc_monitor_module_available "$m"; then
       available+=("$m")
@@ -903,14 +909,9 @@ cc-monitor() {
     return 2
   fi
 
-  if [ -n "$apply_module" ]; then
-    case "$apply_module" in
-      claude-cleanup|claude-guard|claude-guard-dry|proc-janitor-scan|proc-janitor-clean) ;;
-      *)
-        echo "cc-monitor: unknown module '$apply_module'. Valid: claude-cleanup, claude-guard, claude-guard-dry, proc-janitor-scan, proc-janitor-clean" >&2
-        return 2
-        ;;
-    esac
+  if [ -n "$apply_module" ] && ! _cc_monitor_is_known_module "$apply_module"; then
+    echo "cc-monitor: unknown module '$apply_module'. Valid: $(_cc_monitor_all_modules | tr ' ' ',' | sed 's/,/, /g')" >&2
+    return 2
   fi
 
   _cc_monitor_is_positive_int "$duration" || { echo "cc-monitor: duration must be a positive integer" >&2; return 2; }
@@ -947,13 +948,11 @@ cc-monitor() {
     elif [ "$no_prompt" != "true" ] && _cc_monitor_is_tty; then
       local recommended=""
       recommended=$(_cc_monitor_recommended_module "$findings_file") || recommended=""
-      if [ -n "$recommended" ]; then
-        local chosen=""
-        chosen=$(_cc_monitor_prompt_apply "$findings_file") || chosen=""
-        if [ -n "$chosen" ]; then
-          _cc_monitor_dispatch_module "$chosen" "false"
-          dispatch_rc=$?
-        fi
+      local chosen=""
+      [ -n "$recommended" ] && chosen=$(_cc_monitor_prompt_apply "$findings_file" "$recommended") || true
+      if [ -n "$chosen" ]; then
+        _cc_monitor_dispatch_module "$chosen" "false"
+        dispatch_rc=$?
       fi
     fi
   fi
