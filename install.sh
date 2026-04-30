@@ -25,6 +25,7 @@ echo ""
 echo "[1/4] Installing shell functions..."
 
 SHELL_SOURCE="source \"$SCRIPT_DIR/shell/claude-cleanup.sh\""
+MONITOR_SOURCE="source \"$SCRIPT_DIR/shell/cc-monitor.sh\""
 
 # Detect shell config file
 if [ -n "$ZSH_VERSION" ] || [ -f "$HOME_DIR/.zshrc" ]; then
@@ -42,6 +43,13 @@ else
   echo "# Claude Code cleanup functions" >> "$SHELL_RC"
   echo "$SHELL_SOURCE" >> "$SHELL_RC"
   echo "  Added to $SHELL_RC"
+fi
+
+if grep -q "cc-monitor.sh" "$SHELL_RC" 2>/dev/null; then
+  echo "  cc-monitor already in $SHELL_RC, skipping."
+else
+  echo "$MONITOR_SOURCE" >> "$SHELL_RC"
+  echo "  Added cc-monitor to $SHELL_RC"
 fi
 
 # ─── 2. Stop hook ───────────────────────────────────────────────────────────
@@ -189,6 +197,7 @@ else
 fi
 echo ""
 echo "Available commands (restart terminal or 'source $SHELL_RC'):"
+echo "  cc-monitor          Explain current CPU heat contributors (read-only)"
 echo "  claude-ram          Show Claude Code RAM/CPU usage breakdown"
 echo "  claude-cleanup      Immediately kill orphan processes"
 echo "  claude-sessions     List active sessions with idle detection"

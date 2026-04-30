@@ -3,12 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- **`cc-monitor` command** — Read-only heat attribution monitor that samples process state, groups CPU pressure by process family, classifies findings as `SAFE_TO_REAP`, `ASK_BEFORE_KILL`, or `DO_NOT_KILL`, and supports `--once` plus `--json` output.
 - **Agent process cleanup coverage** — `claude-cleanup` and the LaunchAgent monitor now detect stale or orphaned agent-browser, Chrome-for-Testing, Puppeteer temporary Chrome profiles, and Codex CLI/native process families.
 - **`CC_AGENT_STALE_MINUTES` environment variable** — Configurable stale-age threshold for browser automation and detached Codex/MCP cleanup, defaulting to 360 minutes.
 - **Pattern validation script** — `tests/agent-process-patterns.sh` validates positive and negative cleanup candidates without spawning or killing processes.
 
 ### Changed
 - proc-janitor config now targets orphaned agent-browser, Puppeteer profile, and Codex process patterns while explicitly whitelisting user/system apps and shared services.
+- Shared MCP protection now includes Supabase and Stripe child process aliases such as `mcp-server-supabase`.
 - README and Claude guidance now document the expanded safety boundaries and validation command.
 
 ## [0.6.0] - 2026-03-24

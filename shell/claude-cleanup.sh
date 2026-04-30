@@ -3,7 +3,7 @@
 
 # Shared-service and user-process protections for agent cleanup.
 _cc_reaper_protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|npm exec @stripe|@stripe/mcp|claude-mem|chroma-mcp|cloudflare/mcp-server|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|cloudflare/mcp-server|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
 }
 
 _cc_reaper_is_protected_cmd() {

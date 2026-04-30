@@ -66,6 +66,10 @@ expect_no "react-scripts dev server is not a candidate" \
   _cc_reaper_is_agent_cleanup_candidate 123 "??" "03:00:00" \
   "node /repo/web/default/node_modules/react-scripts/scripts/start.js"
 
+expect_no "Supabase MCP child process is protected" \
+  _cc_reaper_is_agent_cleanup_candidate 123 "??" "03:00:00" \
+  "node /Users/me/.npm/_npx/53c4795544aaa350/node_modules/.bin/mcp-server-supabase --access-token sbp_secret"
+
 expect_no "ChatGPT app is protected" \
   _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
   "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"

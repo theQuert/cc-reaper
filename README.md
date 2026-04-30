@@ -36,6 +36,7 @@ Session crashes / terminal force-closed
   └── OR: LaunchAgent — zero-dependency macOS native, PGID group kill + PPID=1 fallback
 
 Manual intervention needed
+  └── cc-monitor — explain current CPU heat by process family before cleanup
   └── claude-cleanup — finds orphaned PGIDs and stale agent-browser/Puppeteer/Codex stragglers
   └── claude-ram — check RAM/CPU usage breakdown with orphan visibility
 ```
@@ -77,10 +78,14 @@ Add to `~/.zshrc` or `~/.bashrc`:
 
 ```bash
 source /path/to/cc-reaper/shell/claude-cleanup.sh
+source /path/to/cc-reaper/shell/cc-monitor.sh
 ```
 
 Commands available after restart:
 
+- `cc-monitor` — explain current CPU heat contributors by process family before cleanup (read-only)
+- `cc-monitor --once` — take one process snapshot and return immediately
+- `cc-monitor --json` — emit structured JSON for future automation
 - `claude-ram` — show RAM/CPU usage breakdown with per-session details and orphan visibility (read-only)
 - `claude-fd` — show file descriptor usage per session and VirtualMachine processes (read-only)
 - `claude-sessions` — list all active sessions with idle detection and process tree RAM
@@ -222,6 +227,41 @@ claude-cleanup
 
 `CC_AGENT_STALE_MINUTES` is used by `claude-cleanup` and the LaunchAgent monitor. Lower it only if browser automation frequently leaks on your machine; the default is intentionally conservative.
 
+## Heat Diagnostics
+
+Run `cc-monitor` when the laptop is hot and you want to understand the cause before cleaning anything:
+
+```bash
+cc-monitor              # sample for 60s at 5s intervals
+cc-monitor --once       # immediate snapshot
+cc-monitor --json       # machine-readable output
+```
+
+The monitor is read-only. It groups processes into families such as editor, cmux, Codex, Claude, MCP, agent-browser, Chrome, dev server, system, and other. Each finding is classified as:
+
+| Classification | Meaning |
+|---|---|
+| `SAFE_TO_REAP` | Stale or orphaned process that matches existing cc-reaper cleanup criteria |
+| `ASK_BEFORE_KILL` | Active user tool or recent automation; inspect before stopping |
+| `DO_NOT_KILL` | System, security, UI, or normal browsing process |
+
+JSON output includes command strings for automation, with common token/key/secret/password argument values redacted.
+
+Example:
+
+```text
+=== cc-monitor: heat attribution ===
+Sample: once, snapshots: 1
+Mode: read-only (no signals sent)
+
+Top contributors:
+   1. cmux                     pid 62199   avg  93.00% max  93.00% rss   561 MB  ASK_BEFORE_KILL  cmux
+   2. WindowServer             pid 384     avg  14.90% max  14.90% rss   128 MB  DO_NOT_KILL      system
+
+Safe cleanup candidates:
+  PID 37915   agent-browser  avg   0.00% max   0.00% - stale or orphaned browser automation matches cc-reaper cleanup criteria
+```
+
 ## Dependencies
 
 | Tool | Required | Install |
@@ -244,6 +284,7 @@ cc-reaper/
 ├── proc-janitor/
 │   └── config.toml                 # proc-janitor daemon config (alternative to LaunchAgent)
 ├── shell/
+│   ├── cc-monitor.sh               # Read-only heat attribution monitor
 │   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-fd, claude-cleanup, claude-sessions, claude-guard)
 ├── tests/
 │   └── agent-process-patterns.sh   # Lightweight matcher/candidate validation
