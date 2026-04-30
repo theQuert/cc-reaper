@@ -84,8 +84,33 @@ _cc_monitor_is_detached_or_orphan() {
   [ "$ppid" = "1" ] || [ "$tty" = "??" ] || [ "$tty" = "?" ]
 }
 
+_cc_monitor_runaway_cpu_threshold() {
+  local v=${CC_RUNAWAY_CPU:-80}
+  echo "$v" | grep -qE '^[0-9]+([.][0-9]+)?$' || v=80
+  awk -v x="$v" 'BEGIN { exit !(x+0 > 0) }' || v=80
+  echo "$v"
+}
+
+_cc_monitor_runaway_min_threshold() {
+  local v=${CC_RUNAWAY_MIN:-60}
+  echo "$v" | grep -qE '^[0-9]+$' || v=60
+  [ "$v" -gt 0 ] || v=60
+  echo "$v"
+}
+
+_cc_monitor_is_runaway() {
+  local avg_cpu=$1
+  local etime=$2
+  local cpu_threshold etime_threshold elapsed_seconds
+  cpu_threshold=$(_cc_monitor_runaway_cpu_threshold)
+  etime_threshold=$(_cc_monitor_runaway_min_threshold)
+  elapsed_seconds=$(_cc_monitor_etime_to_seconds "$etime")
+  awk -v a="$avg_cpu" -v b="$cpu_threshold" 'BEGIN { exit !(a+0 >= b+0) }' \
+    && [ "$elapsed_seconds" -ge "$((etime_threshold * 60))" ]
+}
+
 _cc_monitor_protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|cloudflare/mcp-server|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
 }
 
 _cc_monitor_is_protected_cmd() {
@@ -239,6 +264,8 @@ _cc_monitor_reason() {
       echo "agent session appears attached or recent; exit the session before killing" ;;
     ASK_BEFORE_KILL:mcp)
       echo "MCP process may be shared or attached; confirm ownership before stopping" ;;
+    ASK_BEFORE_KILL:runaway)
+      echo "protected process appears stuck (sustained high CPU over long elapsed time); review and kill if not actively serving" ;;
     DO_NOT_KILL:system)
       echo "system, security, or UI process; do not terminate directly" ;;
     DO_NOT_KILL:chrome)
@@ -277,6 +304,8 @@ _cc_monitor_action() {
       echo "Exit the attached agent session cleanly before considering a kill." ;;
     ASK_BEFORE_KILL:mcp)
       echo "Check which agent owns the MCP process before stopping it." ;;
+    ASK_BEFORE_KILL:runaway)
+      echo "Run 'kill $pid' to terminate the stuck protected process, or 'claude-guard' to auto-reap runaway protected processes." ;;
     DO_NOT_KILL:system)
       echo "Do not kill system/security/UI processes; reduce workload or wait for the system task to finish." ;;
     DO_NOT_KILL:chrome)
@@ -445,7 +474,12 @@ _cc_monitor_enrich_findings() {
     family=$(_cc_monitor_family "$cmd")
     classification=$(_cc_monitor_classification "$ppid" "$tty" "$etime" "$cmd" "$family")
 
-    if [ "$classification" != "SAFE_TO_REAP" ] && ! _cc_monitor_float_ge "$avg_cpu" "$min_cpu"; then
+    if _cc_monitor_is_protected_cmd "$cmd" && _cc_monitor_is_runaway "$avg_cpu" "$etime"; then
+      family="runaway"
+      classification="ASK_BEFORE_KILL"
+    fi
+
+    if [ "$classification" != "SAFE_TO_REAP" ] && [ "$family" != "runaway" ] && ! _cc_monitor_float_ge "$avg_cpu" "$min_cpu"; then
       continue
     fi
 
@@ -547,6 +581,19 @@ _cc_monitor_human_report() {
     ' "$findings_file"
   fi
 
+  local runaway_count
+  runaway_count=$(awk -F '\t' '$10 == "runaway" && $11 == "ASK_BEFORE_KILL" { count++ } END { print count+0 }' "$findings_file")
+  if [ "$runaway_count" -gt 0 ]; then
+    echo ""
+    echo "Stuck/runaway protected processes:"
+    awk -F '\t' '
+      $10 == "runaway" && $11 == "ASK_BEFORE_KILL" {
+        printf "  PID %-7s %-24s avg %6.2f%% etime %s — %s\n", $4, $12, $1, $8, $13
+        printf "    suggested: kill %s\n", $4
+      }
+    ' "$findings_file"
+  fi
+
   echo ""
   echo "Suggested actions:"
   awk -F '\t' '
@@ -624,6 +671,21 @@ _cc_monitor_json_report() {
     fi
     printf '    {"pid": %s, "family": "%s", "avg_cpu": %.2f, "reason": "%s"}' \
       "$pid" "$(_cc_monitor_json_escape "$family")" "$avg_cpu" "$(_cc_monitor_json_escape "$reason")"
+  done < "$findings_file"
+  printf '\n  ],\n'
+
+  printf '  "runaway_candidates": [\n'
+  first=true
+  while IFS="$(printf '\t')" read -r avg_cpu max_cpu sample_count pid ppid pgid tty etime rss_mb family classification label reason action cmd; do
+    [ "$family" = "runaway" ] && [ "$classification" = "ASK_BEFORE_KILL" ] || continue
+    if [ "$first" = "true" ]; then
+      first=false
+    else
+      printf ',\n'
+    fi
+    printf '    {"pid": %s, "label": "%s", "avg_cpu": %.2f, "etime": "%s", "reason": "%s"}' \
+      "$pid" "$(_cc_monitor_json_escape "$label")" "$avg_cpu" \
+      "$(_cc_monitor_json_escape "$etime")" "$(_cc_monitor_json_escape "$reason")"
   done < "$findings_file"
   printf '\n  ],\n'
 

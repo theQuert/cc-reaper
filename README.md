@@ -216,6 +216,10 @@ claude-guard --dry-run  # preview without killing
 | `CC_MAX_RSS_MB` | 4096 | Tree RSS threshold (MB); sessions exceeding this are killed regardless of activity |
 | `CC_MAX_FD` | 10000 | File descriptor threshold; sessions exceeding this are killed as FD-leak |
 | `CC_AGENT_STALE_MINUTES` | 360 | Age threshold for stale agent-browser, Puppeteer Chrome, and detached Codex/MCP cleanup |
+| `CC_RUNAWAY_CPU` | 80 | CPU% above which a protected process is treated as stuck/runaway (combined with `CC_RUNAWAY_MIN`) |
+| `CC_RUNAWAY_MIN` | 60 | Minutes of elapsed time required before a hot protected process is treated as runaway |
+| `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds `claude-guard` waits (Ctrl+C to abort) before SIGTERM-ing runaway protected processes |
+| `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip `claude-guard`'s runaway phase entirely |
 
 Example: lower the thresholds for constrained machines:
 

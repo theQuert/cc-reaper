@@ -46,3 +46,7 @@ bash tests/agent-process-patterns.sh  # Validate agent/browser/Codex cleanup mat
 | `CC_IDLE_THRESHOLD` | 1 | CPU% below which a session is considered idle |
 | `CC_MAX_RSS_MB` | 4096 | Tree RSS threshold (MB); sessions exceeding this are killed regardless of activity |
 | `CC_MAX_FD` | 10000 | File descriptor threshold; sessions exceeding this are killed as FD-leak |
+| `CC_RUNAWAY_CPU` | 80 | CPU% above which a protected process is treated as stuck/runaway |
+| `CC_RUNAWAY_MIN` | 60 | Minutes of elapsed time required before a hot protected process is runaway |
+| `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds claude-guard waits before SIGTERM-ing runaway protected processes |
+| `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip claude-guard's runaway phase |

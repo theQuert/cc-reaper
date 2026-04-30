@@ -3,7 +3,7 @@
 
 # Shared-service and user-process protections for agent cleanup.
 _cc_reaper_protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|cloudflare/mcp-server|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
 }
 
 _cc_reaper_is_protected_cmd() {
@@ -440,6 +440,47 @@ _claude_pgid_kill() {
 #   CC_MAX_SESSIONS  — max allowed sessions (default: 3)
 #   CC_IDLE_THRESHOLD — CPU% below which a session is idle (default: 1)
 #   CC_MAX_RSS_MB    — tree RSS threshold in MB; sessions exceeding this are killed (default: 4096)
+_cc_guard_etime_to_seconds() {
+  echo "${1// /}" | awk '
+    {
+      days=0
+      time_part=$0
+      if (index(time_part, "-") > 0) {
+        split(time_part, day_parts, "-")
+        days=day_parts[1]+0
+        time_part=day_parts[2]
+      }
+      split(time_part, parts, ":")
+      if (length(parts[3]) > 0) {
+        print days * 86400 + (parts[1]+0) * 3600 + (parts[2]+0) * 60 + (parts[3]+0)
+      } else if (length(parts[2]) > 0) {
+        print days * 86400 + (parts[1]+0) * 60 + (parts[2]+0)
+      } else {
+        print days * 86400 + (parts[1]+0)
+      }
+    }
+  '
+}
+
+# Print TSV (pid, cpu, etime, command) for protected processes that have
+# sustained CPU% >= cpu_threshold over etime >= min_minutes.
+_cc_guard_runaway_protected_pids() {
+  local cpu_threshold=$1
+  local min_minutes=$2
+  local protected_pattern
+  protected_pattern=$(_cc_reaper_protected_pattern)
+  local min_seconds=$((min_minutes * 60))
+  ps -axo pid=,etime=,%cpu=,command= 2>/dev/null | while read -r pid etime cpu rest; do
+    [ -z "$pid" ] && continue
+    echo "$rest" | grep -qE "$protected_pattern" || continue
+    awk -v a="$cpu" -v b="$cpu_threshold" 'BEGIN { exit !(a+0 >= b+0) }' || continue
+    local secs
+    secs=$(_cc_guard_etime_to_seconds "$etime")
+    [ "$secs" -ge "$min_seconds" ] || continue
+    printf "%s\t%s\t%s\t%s\n" "$pid" "$cpu" "$etime" "$rest"
+  done
+}
+
 claude-guard() {
   local dry_run=false
   [ "$1" = "--dry-run" ] && dry_run=true
@@ -449,6 +490,10 @@ claude-guard() {
   local idle_threshold=${CC_IDLE_THRESHOLD:-1}
   local max_rss_mb=${CC_MAX_RSS_MB:-4096}
   local max_fd=${CC_MAX_FD:-10000}
+  local runaway_cpu=${CC_RUNAWAY_CPU:-80}
+  local runaway_min=${CC_RUNAWAY_MIN:-60}
+  local runaway_grace=${CC_RUNAWAY_GRACE_SEC:-5}
+  local runaway_disable=${CC_RUNAWAY_DISABLE:-0}
 
   # Validate numeric configs
   if ! echo "$max_rss_mb" | grep -qE '^[0-9]+$'; then
@@ -459,10 +504,43 @@ claude-guard() {
     echo "  WARNING: CC_MAX_FD='$max_fd' is not numeric, using default 10000"
     max_fd=10000
   fi
+  echo "$runaway_cpu" | grep -qE '^[0-9]+([.][0-9]+)?$' || runaway_cpu=80
+  echo "$runaway_min" | grep -qE '^[0-9]+$' || runaway_min=60
+  echo "$runaway_grace" | grep -qE '^[0-9]+$' || runaway_grace=5
 
   echo "=== Claude Guard ==="
-  echo "  Config: max_sessions=$max_sessions, idle_threshold=${idle_threshold}%, max_rss=${max_rss_mb} MB, max_fd=$max_fd"
+  echo "  Config: max_sessions=$max_sessions, idle_threshold=${idle_threshold}%, max_rss=${max_rss_mb} MB, max_fd=$max_fd, runaway=${runaway_cpu}%/${runaway_min}min"
   echo ""
+
+  # ─── Phase 0.5: Runaway protected processes ───────────────────────────
+  if [ "$runaway_disable" != "1" ]; then
+    local runaway_lines
+    runaway_lines=$(_cc_guard_runaway_protected_pids "$runaway_cpu" "$runaway_min")
+    if [ -n "$runaway_lines" ]; then
+      echo "  --- Runaway protected processes (CPU >= ${runaway_cpu}% for >= ${runaway_min} min) ---"
+      printf '%s\n' "$runaway_lines" | awk -F '\t' '
+        { printf "  PID %-7s  CPU %6s%%  ETIME %-14s  %s\n", $1, $2, $3, substr($4, 1, 80) }
+      '
+      if $dry_run; then
+        echo "  [DRY-RUN] Would SIGTERM the above PIDs (PGID-aware)."
+      else
+        echo "  Sending SIGTERM in ${runaway_grace} seconds (Ctrl+C to abort)..."
+        sleep "$runaway_grace"
+        local rkilled=0 rfreed=0
+        while IFS=$'\t' read -r rpid rcpu retime rrest; do
+          [ -z "$rpid" ] && continue
+          local rrss
+          rrss=$(_claude_tree_rss "$rpid" 2>/dev/null || echo 0)
+          _claude_pgid_kill "$rpid" >/dev/null 2>&1
+          rkilled=$((rkilled + 1))
+          rfreed=$((rfreed + ${rrss:-0}))
+          osascript -e "display notification \"Reaped runaway PID $rpid (CPU ${rcpu}%, etime ${retime})\" with title \"Claude Guard\" subtitle \"Runaway protected process\"" 2>/dev/null &
+        done <<< "$runaway_lines"
+        echo "  Reaped $rkilled runaway protected process(es), freed ~${rfreed} MB"
+      fi
+      echo ""
+    fi
+  fi
 
   # ─── Gather sessions ───────────────────────────────────────────────────
   local session_pids=()
