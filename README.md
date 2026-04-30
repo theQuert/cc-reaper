@@ -285,6 +285,37 @@ cc-monitor --once --apply proc-janitor-scan     # preview-only via daemon
 
 `--apply` skips the confirmation prompt — the flag is itself the explicit opt-in. It cannot be combined with `--json` (exit 2). Module exit codes propagate.
 
+### Stuck/runaway protected processes
+
+Long-running MCP servers, dev servers, and security daemons are intentionally `protected` — `claude-cleanup` will never kill them. But "protected" is not absolute: a process pinned at high CPU for hours is broken, regardless of category.
+
+`cc-monitor` and `claude-guard` detect **runaway protected processes** when both thresholds are met:
+
+- average CPU% ≥ `CC_RUNAWAY_CPU` (default `80`)
+- elapsed time ≥ `CC_RUNAWAY_MIN` minutes (default `60`)
+
+`cc-monitor` then reclassifies the finding from `DO_NOT_KILL` to family `runaway` / `ASK_BEFORE_KILL`, and prints a dedicated "Stuck/runaway protected processes" section with a copy-pasteable kill line:
+
+```text
+Stuck/runaway protected processes:
+  PID 9594    node    avg 102.70% etime 09:07:51 — protected process appears stuck (sustained high CPU over long elapsed time); review and kill if not actively serving
+    suggested: kill 9594
+```
+
+`claude-guard` adds a Phase 0.5 that reaps these PIDs in PGID-aware mode after `CC_RUNAWAY_GRACE_SEC` (default 5) seconds, so you can `Ctrl+C` if the report surprises you:
+
+```text
+=== Claude Guard ===
+  Config: max_sessions=3, idle_threshold=1%, max_rss=4096 MB, max_fd=10000, runaway=80%/60min
+
+  --- Runaway protected processes (CPU >= 80% for >= 60 min) ---
+  PID 9594    CPU 102.7%  ETIME 09:07:51   node /Users/.../mcp-server-cloudflare run abc
+  Sending SIGTERM in 5 seconds (Ctrl+C to abort)...
+  Reaped 1 runaway protected process(es), freed ~340 MB
+```
+
+Set `CC_RUNAWAY_DISABLE=1` to skip the runaway phase entirely. JSON consumers see runaway entries in the existing `findings` array (with `family: "runaway"`) plus a dedicated `runaway_candidates` array.
+
 Example:
 
 ```text

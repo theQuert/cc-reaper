@@ -3,17 +3,28 @@
 ## [Unreleased]
 
 ### Added
+- **`cc-monitor --apply <module>`** — One-shot dispatch flag that runs sampling, prints the report, then dispatches one of `claude-cleanup`, `claude-guard`, `claude-guard-dry`, `proc-janitor-scan`, or `proc-janitor-clean` non-interactively. Cannot be combined with `--json` (exit 2); module exit codes propagate.
+- **`cc-monitor` interactive optimization menu** — On a TTY without `--json`/`--no-prompt`/`--apply`, when the report contains `SAFE_TO_REAP` candidates or family-level heat, `cc-monitor` appends a numbered menu listing available cleanup modules with a `(recommended)` marker; destructive choices require a `[y/N]` confirmation. Modules whose binary is missing on PATH are hidden with an install hint. `--no-prompt` opts out.
+- **Runaway-protected detection** — `cc-monitor` reclassifies any protected process matching `CC_RUNAWAY_CPU` (default 80%) for `CC_RUNAWAY_MIN` (default 60 min) from `DO_NOT_KILL` to family `runaway` / `ASK_BEFORE_KILL` and prints a dedicated `Stuck/runaway protected processes:` section with a copy-pasteable `kill <pid>` per entry. JSON output gains a `runaway_candidates` array.
+- **`claude-guard` Phase 0.5** — Detects runaway protected processes via the same thresholds, prints the list, waits `CC_RUNAWAY_GRACE_SEC` (default 5) seconds for `Ctrl+C`, then PGID-kills with desktop notifications. Honors `--dry-run` and `CC_RUNAWAY_DISABLE=1` opt-out.
+- **`CC_RUNAWAY_*` environment variables** — `CC_RUNAWAY_CPU`, `CC_RUNAWAY_MIN`, `CC_RUNAWAY_GRACE_SEC`, and `CC_RUNAWAY_DISABLE` for runaway tuning.
+- **Dispatch banner** — `cc-monitor` prints `=== Dispatching <module label> ===` to stderr before executing a chosen module so the read-only report and the destructive action are visually separated.
 - **`cc-monitor` command** — Read-only heat attribution monitor that samples process state, groups CPU pressure by process family, classifies findings as `SAFE_TO_REAP`, `ASK_BEFORE_KILL`, or `DO_NOT_KILL`, and supports `--once` plus `--json` output.
 - **Agent process cleanup coverage** — `claude-cleanup` and the LaunchAgent monitor now detect stale or orphaned agent-browser, Chrome-for-Testing, Puppeteer temporary Chrome profiles, and Codex CLI/native process families.
 - **`CC_AGENT_STALE_MINUTES` environment variable** — Configurable stale-age threshold for browser automation and detached Codex/MCP cleanup, defaulting to 360 minutes.
 - **Pattern validation script** — `tests/agent-process-patterns.sh` validates positive and negative cleanup candidates without spawning or killing processes.
 
 ### Changed
+- Protected pattern in both `cc-monitor` and `claude-cleanup` now also matches the `mcp-server-cloudflare` cmd form (the path-style `cloudflare/mcp-server` already covered the `@cloudflare/...` install layout).
+- Module list iteration in `cc-monitor` switched from word-splitting to newline-delimited reads so it is robust regardless of shell IFS.
 - proc-janitor config now targets orphaned agent-browser, Puppeteer profile, and Codex process patterns while explicitly whitelisting user/system apps and shared services.
 - Shared MCP protection now includes Supabase and Stripe child process aliases such as `mcp-server-supabase`.
 - README and Claude guidance now document the expanded safety boundaries and validation command.
 
 ### Fixed
+- `cc-monitor` interactive menu now selects the correct module under both bash and zsh; previously, zsh's 1-based array indexing caused the indexed-access path to pick the wrong entry or empty.
+- `cc-monitor` dispatch now resolves cleanup modules installed as sourced shell functions (the canonical install via `.zshrc`); the previous `eval command <name>` bypassed function lookup and returned `127`.
+- `.gitignore` extended to exclude `.env`, `.claude/`, and the large `2026-03-07_x-claude-*.json` research dumps so workspace artifacts are not staged with `git add -A`. GitHub push protection caught one such accident before it landed.
 - `cc-monitor` human mode now prints sampling progress immediately, so the default 60-second sample no longer appears stuck.
 
 ## [0.6.0] - 2026-03-24
