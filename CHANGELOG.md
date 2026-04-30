@@ -13,6 +13,9 @@
 - Shared MCP protection now includes Supabase and Stripe child process aliases such as `mcp-server-supabase`.
 - README and Claude guidance now document the expanded safety boundaries and validation command.
 
+### Fixed
+- `cc-monitor` human mode now prints sampling progress immediately, so the default 60-second sample no longer appears stuck.
+
 ## [0.6.0] - 2026-03-24
 
 ### Added

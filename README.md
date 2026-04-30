@@ -232,7 +232,7 @@ claude-cleanup
 Run `cc-monitor` when the laptop is hot and you want to understand the cause before cleaning anything:
 
 ```bash
-cc-monitor              # sample for 60s at 5s intervals
+cc-monitor              # sample for 60s at 5s intervals; progress prints to stderr
 cc-monitor --once       # immediate snapshot
 cc-monitor --json       # machine-readable output
 ```

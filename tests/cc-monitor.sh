@@ -128,6 +128,13 @@ expect_contains "json includes do-not-kill" "$json_file" '"classification": "DO_
 expect_contains "json includes family totals" "$json_file" '"family_totals"'
 expect_contains "json redacts access tokens" "$json_file" '--access-token \[redacted\]'
 
+human_stdout="$tmp_dir/human.out"
+human_stderr="$tmp_dir/human.err"
+CC_MONITOR_SNAPSHOT_FILE="$snapshot_file" bash "$ROOT_DIR/shell/cc-monitor.sh" --duration 1 --interval 1 --top 1 > "$human_stdout" 2> "$human_stderr"
+
+expect_contains "human mode reports progress on stderr" "$human_stderr" 'cc-monitor: sampling process state'
+expect_contains "human mode still prints report on stdout" "$human_stdout" '=== cc-monitor: heat attribution ==='
+
 if [ "$failures" -gt 0 ]; then
   printf "%s validation failure(s)\n" "$failures"
   exit 1

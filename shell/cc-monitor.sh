@@ -348,23 +348,31 @@ _cc_monitor_collect_samples() {
   local once=$2
   local duration=$3
   local interval=$4
+  local progress=$5
 
   : > "$outfile"
   if [ "$once" = "true" ]; then
+    [ "$progress" = "true" ] && printf "cc-monitor: collecting one process snapshot..." >&2
     _cc_monitor_snapshot >> "$outfile"
+    [ "$progress" = "true" ] && printf " done\n" >&2
     echo 1
     return
   fi
 
   local elapsed=0
   local samples=0
+  if [ "$progress" = "true" ]; then
+    printf "cc-monitor: sampling process state for %ss every %ss" "$duration" "$interval" >&2
+  fi
   while :; do
     _cc_monitor_snapshot >> "$outfile"
     samples=$((samples + 1))
+    [ "$progress" = "true" ] && printf "." >&2
     [ "$elapsed" -ge "$duration" ] && break
     sleep "$interval"
     elapsed=$((elapsed + interval))
   done
+  [ "$progress" = "true" ] && printf " done (%s snapshots)\n" "$samples" >&2
   echo "$samples"
 }
 
@@ -694,7 +702,10 @@ cc-monitor() {
   agg_file="$tmp_dir/agg.tsv"
   findings_file="$tmp_dir/findings.tsv"
 
-  samples=$(_cc_monitor_collect_samples "$raw_file" "$once" "$duration" "$interval")
+  local progress=false
+  [ "$json" = "false" ] && progress=true
+
+  samples=$(_cc_monitor_collect_samples "$raw_file" "$once" "$duration" "$interval" "$progress")
   _cc_monitor_aggregate_samples "$raw_file" "$agg_file"
   _cc_monitor_enrich_findings "$agg_file" "$findings_file" "$min_cpu"
 
