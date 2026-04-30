@@ -17,6 +17,11 @@ Options:
   --interval SECONDS  Sampling interval (default: 5)
   --top N             Number of top contributors in human output (default: 10)
   --min-cpu PERCENT   Minimum average CPU to report, except safe candidates (default: 1)
+  --apply MODULE      Run an optimization module after the report (skips menu/confirm).
+                      Modules: claude-cleanup, claude-guard, claude-guard-dry,
+                      proc-janitor-scan, proc-janitor-clean.
+                      Cannot be combined with --json.
+  --no-prompt         Disable the interactive optimization menu on a TTY.
   -h, --help          Show this help
 
 Environment:

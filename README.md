@@ -86,6 +86,8 @@ Commands available after restart:
 - `cc-monitor` — explain current CPU heat contributors by process family before cleanup (read-only)
 - `cc-monitor --once` — take one process snapshot and return immediately
 - `cc-monitor --json` — emit structured JSON for future automation
+- `cc-monitor --apply <module>` — sample, print report, then dispatch a cleanup module (skips menu/confirm; cannot combine with `--json`)
+- `cc-monitor --no-prompt` — disable the interactive optimization menu on a TTY
 - `claude-ram` — show RAM/CPU usage breakdown with per-session details and orphan visibility (read-only)
 - `claude-fd` — show file descriptor usage per session and VirtualMachine processes (read-only)
 - `claude-sessions` — list all active sessions with idle detection and process tree RAM
@@ -246,6 +248,38 @@ The monitor is read-only. It groups processes into families such as editor, cmux
 | `DO_NOT_KILL` | System, security, UI, or normal browsing process |
 
 JSON output includes command strings for automation, with common token/key/secret/password argument values redacted.
+
+### Optimize after monitoring
+
+After printing the report, `cc-monitor` can dispatch the right cleanup module so you don't have to switch commands.
+
+**Interactive mode** (default on a TTY when the report has `SAFE_TO_REAP` candidates or family-level heat):
+
+```text
+$ cc-monitor --once
+=== cc-monitor: heat attribution ===
+... report ...
+
+Optimization options:
+  1. claude-cleanup (kill all stale orphans) (recommended)
+  2. claude-guard --dry-run (preview only)
+  3. proc-janitor scan (preview only)
+  4. skip
+> 1
+Run claude-cleanup (kill all stale orphans)? [y/N] y
+```
+
+The recommended option is `claude-cleanup` when stale/orphan candidates exist, otherwise `claude-guard --dry-run` when family RSS or per-process CPU is high. The menu is skipped when no candidates exist, on `--json`, when stdin/stdout is not a TTY, or when `--no-prompt` is passed. Modules whose binary is not on `PATH` are hidden from the menu and listed below with an install hint.
+
+**Script-friendly mode** with `--apply`:
+
+```bash
+cc-monitor --once --apply claude-cleanup        # kill stale orphans
+cc-monitor --once --apply claude-guard-dry      # preview-only
+cc-monitor --once --apply proc-janitor-scan     # preview-only via daemon
+```
+
+`--apply` skips the confirmation prompt — the flag is itself the explicit opt-in. It cannot be combined with `--json` (exit 2). Module exit codes propagate.
 
 Example:
 

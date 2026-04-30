@@ -45,11 +45,11 @@
 
 ## 6. Docs
 
-- [ ] 6.1 Update `README.md` Key Commands and add an "Optimize after monitor" subsection with `--apply` and `--no-prompt` usage
-- [ ] 6.2 Update `shell/cc-monitor.sh` `_cc_monitor_usage` help text with new flags
+- [x] 6.1 Update `README.md` Key Commands and add an "Optimize after monitor" subsection with `--apply` and `--no-prompt` usage
+- [x] 6.2 Update `shell/cc-monitor.sh` `_cc_monitor_usage` help text with new flags
 
 ## 7. Validation
 
-- [ ] 7.1 Run `bash -n shell/cc-monitor.sh` for syntax check
-- [ ] 7.2 Run `bash tests/cc-monitor.sh` to confirm existing tests still pass
-- [ ] 7.3 Run `bash tests/cc-monitor-optimize.sh` to confirm new tests pass
+- [x] 7.1 Run `bash -n shell/cc-monitor.sh` for syntax check
+- [x] 7.2 Run `bash tests/cc-monitor.sh` to confirm existing tests still pass
+- [x] 7.3 Run `bash tests/cc-monitor-optimize.sh` to confirm new tests pass
