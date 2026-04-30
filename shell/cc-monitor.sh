@@ -643,7 +643,12 @@ _cc_monitor_json_report() {
 }
 
 _cc_monitor_all_modules() {
-  echo "claude-cleanup claude-guard claude-guard-dry proc-janitor-scan proc-janitor-clean"
+  printf '%s\n' \
+    claude-cleanup \
+    claude-guard \
+    claude-guard-dry \
+    proc-janitor-scan \
+    proc-janitor-clean
 }
 
 _cc_monitor_is_known_module() {
@@ -731,9 +736,9 @@ _cc_monitor_prompt_apply() {
 
   local all_modules=()
   local m
-  for m in $(_cc_monitor_all_modules); do
+  while IFS= read -r m; do
     all_modules+=("$m")
-  done
+  done < <(_cc_monitor_all_modules)
 
   local available=() unavailable=()
   for m in "${all_modules[@]}"; do
@@ -910,7 +915,7 @@ cc-monitor() {
   fi
 
   if [ -n "$apply_module" ] && ! _cc_monitor_is_known_module "$apply_module"; then
-    echo "cc-monitor: unknown module '$apply_module'. Valid: $(_cc_monitor_all_modules | tr ' ' ',' | sed 's/,/, /g')" >&2
+    echo "cc-monitor: unknown module '$apply_module'. Valid: $(_cc_monitor_all_modules | paste -sd , - | sed 's/,/, /g')" >&2
     return 2
   fi
 
@@ -949,7 +954,9 @@ cc-monitor() {
       local recommended=""
       recommended=$(_cc_monitor_recommended_module "$findings_file") || recommended=""
       local chosen=""
-      [ -n "$recommended" ] && chosen=$(_cc_monitor_prompt_apply "$findings_file" "$recommended") || true
+      if [ -n "$recommended" ]; then
+        chosen=$(_cc_monitor_prompt_apply "$findings_file" "$recommended") || chosen=""
+      fi
       if [ -n "$chosen" ]; then
         _cc_monitor_dispatch_module "$chosen" "false"
         dispatch_rc=$?
