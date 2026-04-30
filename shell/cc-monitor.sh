@@ -637,6 +637,172 @@ _cc_monitor_json_report() {
   printf '}\n'
 }
 
+_cc_monitor_module_command() {
+  case "$1" in
+    claude-cleanup)       echo "claude-cleanup" ;;
+    claude-guard)         echo "claude-guard" ;;
+    claude-guard-dry)     echo "claude-guard --dry-run" ;;
+    proc-janitor-scan)    echo "proc-janitor scan" ;;
+    proc-janitor-clean)   echo "proc-janitor clean" ;;
+    *) return 1 ;;
+  esac
+}
+
+_cc_monitor_module_label() {
+  case "$1" in
+    claude-cleanup)       echo "claude-cleanup (kill all stale orphans)" ;;
+    claude-guard)         echo "claude-guard (kill RSS/FD/idle violators)" ;;
+    claude-guard-dry)     echo "claude-guard --dry-run (preview only)" ;;
+    proc-janitor-scan)    echo "proc-janitor scan (preview only)" ;;
+    proc-janitor-clean)   echo "proc-janitor clean (kill detected orphans)" ;;
+    *) return 1 ;;
+  esac
+}
+
+_cc_monitor_module_destructive() {
+  case "$1" in
+    claude-cleanup|claude-guard|proc-janitor-clean) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_cc_monitor_module_binary() {
+  case "$1" in
+    claude-cleanup)                       echo "claude-cleanup" ;;
+    claude-guard|claude-guard-dry)        echo "claude-guard" ;;
+    proc-janitor-scan|proc-janitor-clean) echo "proc-janitor" ;;
+    *) return 1 ;;
+  esac
+}
+
+_cc_monitor_module_available() {
+  local binary
+  binary=$(_cc_monitor_module_binary "$1") || return 1
+  command -v "$binary" >/dev/null 2>&1
+}
+
+_cc_monitor_install_hint() {
+  case "$1" in
+    claude-cleanup|claude-guard|claude-guard-dry)
+      echo "source shell/claude-cleanup.sh from this repo"
+      ;;
+    proc-janitor-scan|proc-janitor-clean)
+      echo "brew install proc-janitor (or cargo install proc-janitor)"
+      ;;
+  esac
+}
+
+_cc_monitor_recommended_module() {
+  local findings_file=$1
+  if awk -F '\t' '$11 == "SAFE_TO_REAP" { found=1; exit } END { exit !found }' "$findings_file"; then
+    echo "claude-cleanup"
+    return 0
+  fi
+  if awk -F '\t' '
+      ($1+0) >= 60 { hot=1 }
+      { rss[$10]+=$9 }
+      END {
+        if (hot) exit 0
+        for (f in rss) if (rss[f] >= 1024) exit 0
+        exit 1
+      }
+    ' "$findings_file"; then
+    echo "claude-guard-dry"
+    return 0
+  fi
+  return 1
+}
+
+_cc_monitor_is_tty() {
+  [ -t 0 ] && [ -t 1 ]
+}
+
+_cc_monitor_prompt_apply() {
+  local findings_file=$1
+  local recommended=""
+  recommended=$(_cc_monitor_recommended_module "$findings_file") || recommended=""
+
+  local all_modules=(claude-cleanup claude-guard claude-guard-dry proc-janitor-scan proc-janitor-clean)
+  local available=() unavailable=()
+  local m
+  for m in "${all_modules[@]}"; do
+    if _cc_monitor_module_available "$m"; then
+      available+=("$m")
+    else
+      unavailable+=("$m")
+    fi
+  done
+
+  if [ "${#available[@]}" -eq 0 ]; then
+    printf "\nOptimization options: none available on PATH.\n" >&2
+    for m in "${all_modules[@]}"; do
+      printf "  -  %s — install: %s\n" "$(_cc_monitor_module_label "$m")" "$(_cc_monitor_install_hint "$m")" >&2
+    done
+    return 1
+  fi
+
+  printf "\nOptimization options:\n" >&2
+  local i=0 mark
+  for m in "${available[@]}"; do
+    i=$((i + 1))
+    mark=""
+    [ "$m" = "$recommended" ] && mark=" (recommended)"
+    printf "  %d. %s%s\n" "$i" "$(_cc_monitor_module_label "$m")" "$mark" >&2
+  done
+  local skip_index=$((i + 1))
+  printf "  %d. skip\n" "$skip_index" >&2
+  for m in "${unavailable[@]}"; do
+    printf "  -  %s — install: %s\n" "$(_cc_monitor_module_label "$m")" "$(_cc_monitor_install_hint "$m")" >&2
+  done
+  printf "> " >&2
+
+  local choice=""
+  if ! { read -r choice < /dev/tty; } 2>/dev/null; then
+    return 1
+  fi
+
+  if [ -z "$choice" ] || [ "$choice" = "$skip_index" ]; then
+    return 1
+  fi
+
+  if echo "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "${#available[@]}" ]; then
+    echo "${available[$((choice - 1))]}"
+    return 0
+  fi
+  return 1
+}
+
+_cc_monitor_dispatch_module() {
+  local module=$1
+  local skip_confirm=$2
+
+  if ! _cc_monitor_module_available "$module"; then
+    local binary
+    binary=$(_cc_monitor_module_binary "$module")
+    echo "cc-monitor: module '$module' not available on PATH (binary: $binary)" >&2
+    return 127
+  fi
+
+  if [ "$skip_confirm" != "true" ] && _cc_monitor_module_destructive "$module"; then
+    local label
+    label=$(_cc_monitor_module_label "$module")
+    printf "Run %s? [y/N] " "$label" >&2
+    local answer=""
+    if ! { read -r answer < /dev/tty; } 2>/dev/null; then
+      return 0
+    fi
+    case "$answer" in
+      y|Y|yes|YES) ;;
+      *) return 0 ;;
+    esac
+  fi
+
+  local cmd
+  cmd=$(_cc_monitor_module_command "$module")
+  # shellcheck disable=SC2086
+  eval "command $cmd"
+}
+
 cc-monitor() {
   local once=false
   local json=false
@@ -644,6 +810,8 @@ cc-monitor() {
   local interval=${CC_MONITOR_INTERVAL:-5}
   local top=${CC_MONITOR_TOP:-10}
   local min_cpu=${CC_MONITOR_MIN_CPU:-1}
+  local apply_module=""
+  local no_prompt=false
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -675,6 +843,15 @@ cc-monitor() {
         min_cpu=$2
         shift 2
         ;;
+      --apply)
+        [ "$#" -ge 2 ] || { echo "cc-monitor: --apply requires a module name" >&2; return 2; }
+        apply_module=$2
+        shift 2
+        ;;
+      --no-prompt)
+        no_prompt=true
+        shift
+        ;;
       -h|--help)
         _cc_monitor_usage
         return 0
@@ -686,6 +863,21 @@ cc-monitor() {
         ;;
     esac
   done
+
+  if [ -n "$apply_module" ] && [ "$json" = "true" ]; then
+    echo "cc-monitor: --apply cannot be combined with --json" >&2
+    return 2
+  fi
+
+  if [ -n "$apply_module" ]; then
+    case "$apply_module" in
+      claude-cleanup|claude-guard|claude-guard-dry|proc-janitor-scan|proc-janitor-clean) ;;
+      *)
+        echo "cc-monitor: unknown module '$apply_module'. Valid: claude-cleanup, claude-guard, claude-guard-dry, proc-janitor-scan, proc-janitor-clean" >&2
+        return 2
+        ;;
+    esac
+  fi
 
   _cc_monitor_is_positive_int "$duration" || { echo "cc-monitor: duration must be a positive integer" >&2; return 2; }
   _cc_monitor_is_positive_int "$interval" || { echo "cc-monitor: interval must be a positive integer" >&2; return 2; }
@@ -709,13 +901,31 @@ cc-monitor() {
   _cc_monitor_aggregate_samples "$raw_file" "$agg_file"
   _cc_monitor_enrich_findings "$agg_file" "$findings_file" "$min_cpu"
 
+  local dispatch_rc=0
   if [ "$json" = "true" ]; then
     _cc_monitor_json_report "$findings_file" "$duration" "$interval" "$samples" "$once"
   else
     _cc_monitor_human_report "$findings_file" "$duration" "$interval" "$samples" "$once" "$top"
+
+    if [ -n "$apply_module" ]; then
+      _cc_monitor_dispatch_module "$apply_module" "true"
+      dispatch_rc=$?
+    elif [ "$no_prompt" != "true" ] && _cc_monitor_is_tty; then
+      local recommended=""
+      recommended=$(_cc_monitor_recommended_module "$findings_file") || recommended=""
+      if [ -n "$recommended" ]; then
+        local chosen=""
+        chosen=$(_cc_monitor_prompt_apply "$findings_file") || chosen=""
+        if [ -n "$chosen" ]; then
+          _cc_monitor_dispatch_module "$chosen" "false"
+          dispatch_rc=$?
+        fi
+      fi
+    fi
   fi
 
   rm -rf "$tmp_dir"
+  return "$dispatch_rc"
 }
 
 if [ -n "${BASH_VERSION:-}" ]; then
