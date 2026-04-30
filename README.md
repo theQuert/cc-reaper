@@ -15,10 +15,13 @@ This is a [widely reported issue](https://github.com/anthropics/claude-code/issu
 | Subagents | `claude --output-format stream-json` | 180-300 MB each |
 | MCP servers (short-lived) | `npx mcp-server-cloudflare`, `npm exec mcp-*`, etc. | 40-110 MB each |
 | claude-mem worker | `worker-service.cjs --daemon` (bun) | 100 MB |
+| Agent browser sessions | `agent-browser-darwin-arm64`, Chrome-for-Testing with `agent-browser-chrome-*` profiles | 100-600 MB each |
+| Puppeteer headless Chrome | Chrome/Chrome Helper with `puppeteer_dev_chrome_profile-*` profiles | Can pin CPU/GPU |
+| Codex background sessions | `node /usr/local/bin/codex`, `@openai/codex/.../codex --yolo` | Session + MCP tree |
 
 | File descriptors | VM processes, settings.json, MCP stdio pipes | ~6,200 FDs/hr leak rate |
 
-> **Not killed**: Long-running MCP servers shared across sessions (Supabase, Stripe, context7, claude-mem, chroma-mcp) are whitelisted across all cleanup layers — including PGID group kills. When a session ends, its stop hook and `claude-guard` skip whitelisted MCP servers so other sessions can continue using them.
+> **Not killed**: User apps and system services such as ChatGPT.app, cmux.app, Bitdefender, Spotlight (`mdworker`/`mds_stores`), normal Chrome browsing, and web dev servers are protected. Long-running MCP servers shared across sessions (Supabase, Stripe, claude-mem, chroma-mcp, Cloudflare/sequential-thinking variants) are also protected. Stale browser/Codex cleanup only targets orphaned or old automation processes.
 
 ## Solution: Three-Layer Defense
 
@@ -33,7 +36,7 @@ Session crashes / terminal force-closed
   └── OR: LaunchAgent — zero-dependency macOS native, PGID group kill + PPID=1 fallback
 
 Manual intervention needed
-  └── claude-cleanup — finds orphaned PGIDs (leader has PPID=1), kills entire groups
+  └── claude-cleanup — finds orphaned PGIDs and stale agent-browser/Puppeteer/Codex stragglers
   └── claude-ram — check RAM/CPU usage breakdown with orphan visibility
 ```
 
@@ -81,7 +84,7 @@ Commands available after restart:
 - `claude-ram` — show RAM/CPU usage breakdown with per-session details and orphan visibility (read-only)
 - `claude-fd` — show file descriptor usage per session and VirtualMachine processes (read-only)
 - `claude-sessions` — list all active sessions with idle detection and process tree RAM
-- `claude-cleanup` — kill orphan processes immediately (PGID group kill + pattern fallback)
+- `claude-cleanup` — kill orphan processes immediately (PGID group kill + pattern fallback, plus stale agent-browser/Puppeteer/Codex cleanup)
 - `claude-guard` — automatic session reaper: kills FD-leaking, bloated (RSS > threshold), and excess idle sessions
 - `claude-guard --dry-run` — preview what claude-guard would kill without actually killing
 
@@ -205,14 +208,19 @@ claude-guard --dry-run  # preview without killing
 | `CC_IDLE_THRESHOLD` | 1 | CPU% below which a session is considered idle |
 | `CC_MAX_RSS_MB` | 4096 | Tree RSS threshold (MB); sessions exceeding this are killed regardless of activity |
 | `CC_MAX_FD` | 10000 | File descriptor threshold; sessions exceeding this are killed as FD-leak |
+| `CC_AGENT_STALE_MINUTES` | 360 | Age threshold for stale agent-browser, Puppeteer Chrome, and detached Codex/MCP cleanup |
 
 Example: lower the thresholds for constrained machines:
 
 ```bash
 export CC_MAX_RSS_MB=2048
 export CC_MAX_FD=5000
+export CC_AGENT_STALE_MINUTES=120
 claude-guard
+claude-cleanup
 ```
+
+`CC_AGENT_STALE_MINUTES` is used by `claude-cleanup` and the LaunchAgent monitor. Lower it only if browser automation frequently leaks on your machine; the default is intentionally conservative.
 
 ## Dependencies
 
@@ -237,6 +245,8 @@ cc-reaper/
 │   └── config.toml                 # proc-janitor daemon config (alternative to LaunchAgent)
 ├── shell/
 │   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-fd, claude-cleanup, claude-sessions, claude-guard)
+├── tests/
+│   └── agent-process-patterns.sh   # Lightweight matcher/candidate validation
 └── README.md
 ```
 

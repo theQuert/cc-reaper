@@ -15,7 +15,7 @@ cc-reaper is a shell-based utility that cleans up orphan Claude Code processes (
 
 ## Development Notes
 
-**No build system, tests, or linters.** This is a pure shell script project. Changes are validated manually.
+**No build system or linter.** This is a pure shell script project. Changes are validated with shell syntax checks and lightweight validation scripts under `tests/`.
 
 **Process detection patterns** use grep bracket expressions (e.g., `[c]laude` instead of `claude`) to prevent grep from matching its own process. The stop hook uses TTY filtering (`awk '$7 == "??"'`) to only kill processes without a controlling terminal (true orphans). The manual `claude-cleanup` function is intentionally more aggressive (no TTY filter).
 
@@ -35,6 +35,7 @@ claude-guard --dry-run  # Preview what claude-guard would kill
 proc-janitor scan       # Dry-run orphan detection
 proc-janitor clean      # Kill detected orphans
 proc-janitor status     # Check daemon health
+bash tests/agent-process-patterns.sh  # Validate agent/browser/Codex cleanup matchers
 ```
 
 ## Environment Variables

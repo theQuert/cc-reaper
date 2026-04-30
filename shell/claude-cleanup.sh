@@ -1,6 +1,113 @@
 # Claude Code cleanup shell functions
 # Add to ~/.zshrc or ~/.bashrc: source /path/to/claude-cleanup.sh
 
+# Shared-service and user-process protections for agent cleanup.
+_cc_reaper_protected_pattern() {
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|npm exec @stripe|@stripe/mcp|claude-mem|chroma-mcp|cloudflare/mcp-server|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+}
+
+_cc_reaper_is_protected_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "$(_cc_reaper_protected_pattern)"
+}
+
+_cc_reaper_agent_stale_seconds() {
+  local minutes=${CC_AGENT_STALE_MINUTES:-360}
+  if ! echo "$minutes" | grep -qE '^[0-9]+$' || [ "$minutes" -eq 0 ]; then
+    minutes=360
+  fi
+  echo $((minutes * 60))
+}
+
+_cc_reaper_etime_to_seconds() {
+  local etime=${1// /}
+  local days=0
+  local time_part=$etime
+  if [[ "$time_part" == *-* ]]; then
+    days=${time_part%%-*}
+    time_part=${time_part#*-}
+  fi
+
+  local a=0 b=0 c=0
+  IFS=: read -r a b c <<< "$time_part"
+  if [ -n "$c" ]; then
+    echo $((days * 86400 + a * 3600 + b * 60 + c))
+  elif [ -n "$b" ]; then
+    echo $((days * 86400 + a * 60 + b))
+  else
+    echo $((days * 86400 + a))
+  fi
+}
+
+_cc_reaper_is_stale_etime() {
+  local etime=$1
+  local seconds=$(_cc_reaper_etime_to_seconds "$etime")
+  [ "$seconds" -ge "$(_cc_reaper_agent_stale_seconds)" ]
+}
+
+_cc_reaper_is_detached_or_orphan() {
+  local ppid=$1
+  local tty=$2
+  [ "$ppid" = "1" ] || [ "$tty" = "??" ] || [ "$tty" = "?" ]
+}
+
+_cc_reaper_is_agent_browser_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "agent-browser-darwin-arm64|Google Chrome for Testing.*agent-browser-chrome-|agent-browser-chrome-"
+}
+
+_cc_reaper_is_puppeteer_chrome_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "puppeteer_dev_chrome_profile-"
+}
+
+_cc_reaper_is_codex_agent_cmd() {
+  local cmd=$1
+  if echo "$cmd" | grep -qE "codex app-server|app-server-broker"; then
+    return 1
+  fi
+  echo "$cmd" | grep -qE "node /usr/local/bin/codex( --yolo| resume|$)|@openai/codex.*/codex/codex( --yolo| resume|$)|/codex/codex( --yolo| resume|$)"
+}
+
+_cc_reaper_is_agent_mcp_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "npm exec @upstash/context7-mcp|context7-mcp|chrome-devtools-mcp|npm exec mcp-remote|mcp-remote|npm exec mcp-|npx.*mcp-server"
+}
+
+_cc_reaper_is_agent_cleanup_candidate() {
+  local ppid=$1
+  local tty=$2
+  local etime=$3
+  local cmd=$4
+
+  _cc_reaper_is_protected_cmd "$cmd" && return 1
+
+  if _cc_reaper_is_agent_browser_cmd "$cmd" || _cc_reaper_is_puppeteer_chrome_cmd "$cmd"; then
+    [ "$ppid" = "1" ] || _cc_reaper_is_stale_etime "$etime"
+    return
+  fi
+
+  if _cc_reaper_is_codex_agent_cmd "$cmd" || _cc_reaper_is_agent_mcp_cmd "$cmd"; then
+    [ "$ppid" = "1" ] || { _cc_reaper_is_detached_or_orphan "$ppid" "$tty" && _cc_reaper_is_stale_etime "$etime"; }
+    return
+  fi
+
+  return 1
+}
+
+_cc_reaper_kill_group_filtered() {
+  local pgid=$1
+  local killed=0
+  while IFS= read -r pid; do
+    [ -z "$pid" ] && continue
+    local pid_cmd
+    pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+    _cc_reaper_is_protected_cmd "$pid_cmd" && continue
+    kill "$pid" 2>/dev/null && killed=$((killed + 1))
+  done < <(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
+  echo "$killed"
+}
+
 # Immediately kill orphan Claude Code processes
 claude-cleanup() {
   echo "=== Claude Code Orphan Process Cleanup ==="
@@ -16,20 +123,21 @@ claude-cleanup() {
     # Skip intentional daemons (worker-service --daemon) and non-Claude leaders
     local leader_cmd
     leader_cmd=$(ps -o command= -p "$pgid" 2>/dev/null)
-    if ! echo "$leader_cmd" | grep -qE "claude.*stream-json|claude.*--session-id"; then
+    if ! echo "$leader_cmd" | grep -qE "claude.*stream-json|claude.*--session-id|node /usr/local/bin/codex( --yolo| resume|$)|@openai/codex.*/codex/codex( --yolo| resume|$)|/codex/codex( --yolo| resume|$)"; then
       continue
     fi
     # Verify group contains Claude/MCP processes
     local match_count
-    match_count=$(ps -eo pgid,command 2>/dev/null | awk -v pgid="$pgid" '$1 == pgid' | grep -cE "claude|mcp|chroma|worker-service" 2>/dev/null || echo 0)
+    match_count=$(ps -eo pgid,command 2>/dev/null | awk -v pgid="$pgid" '$1 == pgid' | grep -cE "claude|codex|mcp|chroma|worker-service|agent-browser|Chrome for Testing|puppeteer_dev_chrome_profile" 2>/dev/null || echo 0)
     if [ "$match_count" -gt 0 ]; then
       local group_pids
       group_pids=$(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
       local group_size
       group_size=$(echo "$group_pids" | wc -l | tr -d ' ')
       echo "  Killing orphaned process group PGID=$pgid ($group_size processes)"
-      kill -- -"$pgid" 2>/dev/null
-      pgid_kills=$((pgid_kills + group_size))
+      local killed_in_group
+      killed_in_group=$(_cc_reaper_kill_group_filtered "$pgid")
+      pgid_kills=$((pgid_kills + killed_in_group))
     fi
   done
 
@@ -37,14 +145,31 @@ claude-cleanup() {
   # Catches processes that escaped their process group (e.g., called setsid())
   local orphan_count=$(ps aux | grep -E "[c]laude.*stream-json|[c]laude.*--dangerously.*\?\?" | grep -v grep | wc -l | tr -d ' ')
   local mcp_count=$(ps aux | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[b]un.*worker-service" | grep -v grep | wc -l | tr -d ' ')
+  local agent_count=0
 
-  if [ "$pgid_kills" -eq 0 ] && [ "$orphan_count" -eq 0 ] && [ "$mcp_count" -eq 0 ]; then
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    local pid ppid tty etime cmd
+    pid=$(echo "$line" | awk '{print $1}')
+    ppid=$(echo "$line" | awk '{print $2}')
+    tty=$(echo "$line" | awk '{print $3}')
+    etime=$(echo "$line" | awk '{print $4}')
+    cmd=$(echo "$line" | awk '{for(i=5;i<=NF;i++) printf "%s ", $i; print ""}')
+
+    if _cc_reaper_is_agent_cleanup_candidate "$ppid" "$tty" "$etime" "$cmd"; then
+      echo "  Killing stale agent process PID=$pid ELAPSED=$etime CMD=$(echo "$cmd" | head -c 100)"
+      kill "$pid" 2>/dev/null && agent_count=$((agent_count + 1))
+    fi
+  done < <(ps -eo pid=,ppid=,tty=,etime=,command= 2>/dev/null)
+
+  if [ "$pgid_kills" -eq 0 ] && [ "$orphan_count" -eq 0 ] && [ "$mcp_count" -eq 0 ] && [ "$agent_count" -eq 0 ]; then
     echo "No orphan processes found."
     return 0
   fi
 
   [ "$pgid_kills" -gt 0 ] && echo "  PGID-based: killed $pgid_kills processes"
   [ "$orphan_count" -gt 0 ] || [ "$mcp_count" -gt 0 ] && echo "  Pattern fallback: $orphan_count subagents, $mcp_count MCP processes"
+  [ "$agent_count" -gt 0 ] && echo "  Agent fallback: killed $agent_count stale browser/Codex processes"
 
   # Pattern-based kills for stragglers
   ps aux | grep "[c]laude.*stream-json" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
@@ -58,7 +183,7 @@ claude-cleanup() {
   ps -eo pid,ppid,command | awk '$2 == 1' | grep -E "[c]laude.*stream-json|[n]px.*mcp-server|[w]orker-service\.cjs" | awk '{print $1}' | xargs kill 2>/dev/null
 
   sleep 1
-  local remaining=$(ps aux | grep -E "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server" | grep -v grep | wc -l | tr -d ' ')
+  local remaining=$(ps aux | grep -E "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[a]gent-browser-darwin-arm64|puppeteer_dev_chrome_profile|agent-browser-chrome-|[c]odex --yolo" | grep -v grep | wc -l | tr -d ' ')
   echo "Cleaned. Remaining: $remaining processes"
 }
 

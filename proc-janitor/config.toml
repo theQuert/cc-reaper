@@ -27,6 +27,11 @@ targets = [
     "node.*sequential-thinking",
     "worker-service.cjs.*--daemon",
     "bun.*worker-service",
+    "agent-browser-darwin-arm64",
+    "Google Chrome for Testing.*agent-browser-chrome-",
+    "puppeteer_dev_chrome_profile-",
+    "node /usr/local/bin/codex",
+    "@openai/codex.*/codex/codex",
 ]
 
 # ─── Whitelist Patterns ─────────────────────────────────────────────────────
@@ -42,6 +47,13 @@ whitelist = [
     "chroma-mcp",
     "chrome-devtools-mcp",
     "mcp-remote",
+    "codex app-server",
+    "app-server-broker",
+    "ChatGPT.app",
+    "cmux.app",
+    "Bitdefender",
+    "mdworker",
+    "mds_stores",
 ]
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
