@@ -1,2 +1,6 @@
 .DS_Store
 *.log
+.env
+.env.*
+.claude/
+2026-03-07_x-claude-*.json
