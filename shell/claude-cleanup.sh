@@ -171,16 +171,17 @@ claude-cleanup() {
   [ "$orphan_count" -gt 0 ] || [ "$mcp_count" -gt 0 ] && echo "  Pattern fallback: $orphan_count subagents, $mcp_count MCP processes"
   [ "$agent_count" -gt 0 ] && echo "  Agent fallback: killed $agent_count stale browser/Codex processes"
 
-  # Pattern-based kills for stragglers
-  ps aux | grep "[c]laude.*stream-json" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-  ps aux | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-  ps aux | grep "[w]orker-service.cjs.*--daemon" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-  ps aux | grep "[b]un.*worker-service" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-  # NOTE: claude-mem, chroma-mcp, context7, supabase, stripe are NOT killed —
-  # they are long-running MCP servers shared across sessions.
-
-  # PPID=1 fallback for any remaining orphans (excludes long-running MCP servers)
-  ps -eo pid,ppid,command | awk '$2 == 1' | grep -E "[c]laude.*stream-json|[n]px.*mcp-server|[w]orker-service\.cjs" | awk '{print $1}' | xargs kill 2>/dev/null
+  # Pattern-based kill for orphans ONLY (PPID=1 — parent already dead)
+  # Uses PPID filtering instead of TTY checking because:
+  # - On macOS, active MCP daemons have TTY=?? (same as orphans)
+  # - On Linux, SSH/docker sessions show TTY=? for all processes
+  # - PPID=1 is the only reliable cross-platform orphan indicator
+  ps -eo pid=,ppid=,command= 2>/dev/null | grep "[c]laude.*stream-json" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
+  ps -eo pid=,ppid=,command= 2>/dev/null | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
+  ps -eo pid=,ppid=,command= 2>/dev/null | grep "[w]orker-service.cjs.*--daemon" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
+  ps -eo pid=,ppid=,command= 2>/dev/null | grep "[b]un.*worker-service" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
+  # NOTE: claude-mem, chroma-mcp, context7, supabase, stripe are still excluded
+  # because their processes won't match these grep patterns (different command names).
 
   sleep 1
   local remaining=$(ps aux | grep -E "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[a]gent-browser-darwin-arm64|puppeteer_dev_chrome_profile|agent-browser-chrome-|[c]odex --yolo" | grep -v grep | wc -l | tr -d ' ')
