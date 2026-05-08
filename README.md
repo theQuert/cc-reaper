@@ -138,6 +138,11 @@ Add to `~/.claude/settings.json` in the `"Stop"` hooks array:
 
 </details>
 
+> **⚠️ Safety**: The Stop hook now includes built-in safety mechanisms:
+> - **Ancestor protection**: Walks the full process tree (`$$` → PID 1) and never kills any ancestor process. This prevents accidental termination of the Claude CLI when an intermediate shell is involved.
+> - **TTY filtering**: By default, only kills processes without a controlling terminal (TTY=`?`/`??` — truly detached orphans). Active terminal sessions are never killed.
+> - **Environment variables**: See [Stop Hook Configuration](#stop-hook-configuration) for tuning options.
+
 ### 3. Background Daemon (choose one)
 
 #### Option A: LaunchAgent (zero-dependency, macOS only)
@@ -232,6 +237,37 @@ claude-cleanup
 ```
 
 `CC_AGENT_STALE_MINUTES` is used by `claude-cleanup` and the LaunchAgent monitor. Lower it only if browser automation frequently leaks on your machine; the default is intentionally conservative.
+
+### Stop Hook Configuration
+
+These environment variables control the [Stop hook](#2-claude-code-stop-hook) behavior. They are checked each time the hook runs.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CC_STOP_HOOK_DISABLE` | 0 | Set to `1` to skip all cleanup (the hook becomes a no-op). Useful if the hook interferes with your workflow. |
+| `CC_STOP_HOOK_AGGRESSIVE` | 0 | Set to `1` to skip TTY filtering and kill all processes in the session's process group (original behavior). By default, the hook only kills detached processes (TTY=`?`/`??`). |
+
+**When to disable the Stop hook:**
+
+```bash
+# Option A: Disable temporarily for the current terminal session
+export CC_STOP_HOOK_DISABLE=1
+
+# Option B: Add to ~/.zshrc or ~/.bashrc for permanent disable
+echo 'export CC_STOP_HOOK_DISABLE=1' >> ~/.zshrc
+
+# Option C: Remove from settings.json entirely (see manual setup section)
+```
+
+**When to use aggressive mode:**
+
+If you notice orphans leaking after session ends and the default TTY filter is too conservative, enable aggressive mode:
+
+```bash
+export CC_STOP_HOOK_AGGRESSIVE=1
+```
+
+This restores the original PGID cleanup that kills all processes in the session's group regardless of TTY status.
 
 ## Heat Diagnostics
 
