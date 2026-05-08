@@ -7,8 +7,8 @@
 #
 # Safety:
 #   CC_STOP_HOOK_DISABLE=1     — Skip all cleanup (no-op)
-#   CC_STOP_HOOK_AGGRESSIVE=1  — Skip TTY filtering, kill all PGID members
-#                                (original behavior, default: only detached TTY)
+#   CC_STOP_HOOK_AGGRESSIVE=1  — Skip PPID filtering, kill all PGID members
+#                                (default: only PPID=1 — truly orphaned)
 
 [ "${CC_STOP_HOOK_DISABLE:-0}" = "1" ] && exit 0
 
@@ -23,19 +23,26 @@ while [ "$_pid" -gt 1 ] 2>/dev/null; do
   _pid=$(ps -o ppid= -p "$_pid" 2>/dev/null | tr -d ' ')
 done
 
+# ─── Shared MCP whitelist ────────────────────────────────────────────────────
+MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|sequentialthinking|codex.*mcp"
+
 # ─── PGID-based cleanup (primary) ────────────────────────────────────────────
 # This hook inherits the Claude session's process group (PGID).
-# Kill all processes in our group — catches ALL children including unknown
+# Kill processes in our group — catches ALL children including unknown
 # third-party MCP servers, without needing pattern maintenance.
 #
-# WHITELIST: Long-running MCP servers shared across sessions are excluded.
-# They survive session ends so other sessions can continue using them.
-# Pattern-based fallback below also excludes these (see NOTE comment).
+# PPID=1 FILTER: By default, ONLY processes whose parent has already exited
+# (PPID=1, reparented to init) are killed. This prevents accidental termination
+# of:
+#   - The Claude CLI itself (would have PPID=shell != 1)
+#   - Active subagents still processing (PPID=Claude CLI != 1)
+#   - MCP servers that might be shared with other sessions (PPID != 1)
 #
-# TTY FILTER: By default, only detached processes (TTY="?" or "??") are killed,
-# preventing accidental termination of active terminal sessions. Set
-# CC_STOP_HOOK_AGGRESSIVE=1 to skip this check and kill all group members.
-MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|sequentialthinking|codex.*mcp"
+# Processes with PPID=1 are truly orphaned — their parent died, and they would
+# leak until the next LaunchAgent/proc-janitor sweep. Killing them here is safe.
+#
+# WHITELIST: Long-running MCP servers shared across sessions are also excluded.
+# CC_STOP_HOOK_AGGRESSIVE=1 skips the PPID=1 check (original behavior).
 
 SESSION_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
 if [ -n "$SESSION_PGID" ] && [ "$SESSION_PGID" != "0" ] && [ "$SESSION_PGID" != "1" ]; then
@@ -47,20 +54,17 @@ if [ -n "$SESSION_PGID" ] && [ "$SESSION_PGID" != "0" ] && [ "$SESSION_PGID" != 
       continue
     fi
 
+    # PPID filter: only kill truly orphaned processes (PPID=1)
+    # Their parent is already dead, so they are safe to reap.
+    if [ "${CC_STOP_HOOK_AGGRESSIVE:-0}" != "1" ]; then
+      pid_ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+      [ "$pid_ppid" != "1" ] && continue
+    fi
+
     # Skip whitelisted MCP servers (shared across sessions)
     pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
     if echo "$pid_cmd" | grep -qE "$MCP_WHITELIST"; then
       continue
-    fi
-
-    # TTY filter: only kill detached processes by default
-    # (processes without a controlling terminal — TTY = "?" or "??")
-    if [ "${CC_STOP_HOOK_AGGRESSIVE:-0}" != "1" ]; then
-      pid_tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
-      # Skip if process has a real controlling terminal (pts/0, ttys000, etc.)
-      if [ -n "$pid_tty" ] && ! echo "$pid_tty" | grep -qE '^\?+$'; then
-        continue
-      fi
     fi
 
     kill "$pid" 2>/dev/null
@@ -69,14 +73,15 @@ fi
 
 # ─── Pattern-based fallback ──────────────────────────────────────────────────
 # Catches processes that escaped the process group (e.g., called setsid())
-# Only targets detached processes (TTY="??") to avoid killing active sessions.
-ps aux | grep "[c]laude.*stream-json" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-ps aux | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | grep -vE "$MCP_WHITELIST" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
-ps aux | grep "[w]orker-service.cjs.*--daemon" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
+# Only targets orphans (PPID=1) to avoid killing active processes.
+# Uses ps -eo for cross-platform compatibility (macOS "??" vs Linux "?")
+ps -eo pid=,ppid=,command= 2>/dev/null | grep "[c]laude.*stream-json" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
+ps -eo pid=,ppid=,command= 2>/dev/null | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | awk -v wl="$MCP_WHITELIST" '$2 == 1 && $0 !~ wl {print $1}' | xargs kill 2>/dev/null
+ps -eo pid=,ppid=,command= 2>/dev/null | grep "[w]orker-service.cjs.*--daemon" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
 # NOTE: claude-mem, chroma-mcp, context7 are NOT killed here — they are
 # long-running MCP servers shared across sessions. PGID cleanup (above)
 # handles same-session processes; these survive for other sessions.
-ps aux | grep "[b]un.*worker-service" | awk '$7 == "??" {print $2}' | xargs kill 2>/dev/null
+ps -eo pid=,ppid=,command= 2>/dev/null | grep "[b]un.*worker-service" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
 
 echo "[cleanup] Orphan Claude processes cleaned up."
 exit 0
