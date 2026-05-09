@@ -13,9 +13,11 @@
 [ "${CC_STOP_HOOK_DISABLE:-0}" = "1" ] && exit 0
 
 # ─── Ancestor PID whitelist ──────────────────────────────────────────────────
-# Walk the process tree from $$ upward to PID 1, collecting all ancestor PIDs.
-# These are NEVER killed — prevents accidentally killing the Claude CLI when an
-# intermediate shell (sh -c, bash -c) sits between us and the CLI.
+# Walk the process tree from $$ upward, collecting all ancestor PIDs.
+# The loop stops at PID 1 (init/systemd), which is never included because the
+# kernel protects init from SIGTERM. These ancestors are NEVER killed by us —
+# this prevents accidentally killing the Claude CLI when an intermediate shell
+# (sh -c, bash -c) sits between the hook and the CLI process.
 _ancestors=""
 _pid=$$
 while [ "$_pid" -gt 1 ] 2>/dev/null; do
