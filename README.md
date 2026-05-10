@@ -29,7 +29,7 @@ PGID-based process group cleanup is used by proc-janitor and manual tools. The S
 
 ```
 Session ends normally
-  └── Stop hook — kills orphaned processes (PPID=1) in session's group. With `CC_STOP_HOOK_AGGRESSIVE=1`, kills full PGID group.
+  └── Stop hook — primary pass kills orphaned processes (PPID=1) in session's PGID; secondary pattern sweep catches orphans that escaped the group (e.g., via setsid). With `CC_STOP_HOOK_AGGRESSIVE=1`, skips PPID=1 check but still protects ancestors and MCP whitelist.
 
 Session crashes / terminal force-closed
   └── proc-janitor daemon — scans every 30s, kills orphans after 60s grace
@@ -43,7 +43,7 @@ Manual intervention needed
 
 ### Why PGID?
 
-Claude Code sessions are process group leaders (PGID = session PID). All spawned MCP servers, subagents, and their children inherit this PGID. This means one `kill -- -$PGID` reliably cleans up everything — including third-party MCP servers that pattern matching might miss.
+Claude Code sessions are process group leaders (PGID = session PID). All spawned MCP servers, subagents, and their children inherit this PGID. For proc-janitor and manual tools (`claude-cleanup`, `claude-guard`), one `kill -- -$PGID` reliably cleans up everything in the group — including third-party MCP servers that pattern matching might miss. The Stop hook defaults to a safer PPID=1 orphan-only mode to avoid accidentally killing the active Claude CLI.
 
 **Safety**: PGID cleanup only targets groups whose **leader** is a Claude CLI session (`claude.*stream-json`). It never matches by group membership — other apps like Chrome and Cursor have `claude` subprocesses in their process groups, so matching by membership would kill them.
 
@@ -245,7 +245,7 @@ These environment variables control the [Stop hook](#2-claude-code-stop-hook) be
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CC_STOP_HOOK_DISABLE` | 0 | Set to `1` to skip all cleanup (the hook becomes a no-op). Useful if the hook interferes with your workflow. |
-| `CC_STOP_HOOK_AGGRESSIVE` | 0 | Set to `1` to skip PPID=1 filtering and kill all processes in the session's process group (original behavior). By default, the hook only kills truly orphaned processes (PPID=1). |
+| `CC_STOP_HOOK_AGGRESSIVE` | 0 | Set to `1` to skip PPID=1 filtering and kill PGID members (still skips ancestor PIDs and MCP whitelist). By default, the hook only kills truly orphaned processes (PPID=1). |
 
 **Why PPID=1 filtering?**
 
@@ -275,7 +275,7 @@ If you notice orphans leaking after session ends and the default PPID=1 filter i
 export CC_STOP_HOOK_AGGRESSIVE=1
 ```
 
-This restores the original PGID cleanup that kills all processes in the session's group regardless of orgphan status.
+This restores the original PGID cleanup that kills PGID members regardless of orphan status (ancestors and MCP whitelist still protected).
 
 ## Heat Diagnostics
 
@@ -390,7 +390,7 @@ Safe cleanup candidates:
 cc-reaper/
 ├── install.sh                      # One-command installer/updater (interactive daemon choice)
 ├── hooks/
-│   └── stop-cleanup-orphans.sh     # Claude Code Stop hook (PGID + pattern fallback)
+│   └── stop-cleanup-orphans.sh     # Claude Code Stop hook (PPID=1 orphan filtering + pattern fallback)
 ├── launchd/
 │   ├── cc-reaper-monitor.sh        # LaunchAgent monitor script (PGID + PPID=1 fallback)
 │   └── com.cc-reaper.orphan-monitor.plist  # LaunchAgent config (10-min interval)
@@ -400,7 +400,10 @@ cc-reaper/
 │   ├── cc-monitor.sh               # Read-only heat attribution monitor
 │   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-fd, claude-cleanup, claude-sessions, claude-guard)
 ├── tests/
-│   └── agent-process-patterns.sh   # Lightweight matcher/candidate validation
+│   ├── agent-process-patterns.sh   # Cleanup-candidate matcher validation
+│   ├── cc-monitor-optimize.sh      # cc-monitor optimization menu tests
+│   ├── cc-monitor-runaway.sh       # Runaway protected process detection tests
+│   └── ppid-fallback.sh            # PPID=1 fallback kill + whitelist validation
 └── README.md
 ```
 
