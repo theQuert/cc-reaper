@@ -58,7 +58,7 @@ expect_no "Codex app-server is protected" \
   _cc_reaper_is_agent_cleanup_candidate 1 "??" "01-00:00:00" \
   "node /usr/local/bin/codex app-server"
 
-expect_yes "detached stale chrome-devtools MCP candidate" \
+expect_no "detached stale chrome-devtools MCP is now protected" \
   _cc_reaper_is_agent_cleanup_candidate 123 "??" "03:00:00" \
   "chrome-devtools-mcp npm_config_legacy_peer_deps=true"
 
@@ -73,6 +73,18 @@ expect_no "Supabase MCP child process is protected" \
 expect_no "ChatGPT app is protected" \
   _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
   "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+
+expect_no "mcp-server-cloudflare is protected" \
+  _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
+  "node /usr/local/bin/mcp-server-cloudflare run abc"
+
+expect_no "@stripe/mcp is protected" \
+  _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
+  "npm exec @stripe/mcp"
+
+expect_no "sequential-thinking is protected" \
+  _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
+  "node sequential-thinking"
 
 if [ "$failures" -gt 0 ]; then
   printf "%s validation failure(s)\n" "$failures"

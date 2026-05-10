@@ -3,7 +3,7 @@
 
 # Shared-service and user-process protections for agent cleanup.
 _cc_reaper_protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|cloudflare/mcp-server|mcp-server-cloudflare|mcp-remote|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|cloudflare/mcp-server|mcp-server-cloudflare|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
 }
 
 _cc_reaper_is_protected_cmd() {
@@ -108,6 +108,20 @@ _cc_reaper_kill_group_filtered() {
   echo "$killed"
 }
 
+# PPID=1 fallback: kill remaining orphan processes matching target patterns.
+# Protected-pattern whitelist is applied so shared MCP services are skipped.
+_cc_reaper_ppid_fallback() {
+  ps -eo pid=,ppid=,command= 2>/dev/null | awk '$2 == 1' | while IFS= read -r line; do
+    local _pid _cmd
+    _pid=$(echo "$line" | awk '{print $1}')
+    _cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+    if echo "$_cmd" | grep -qE "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"; then
+      _cc_reaper_is_protected_cmd "$_cmd" && continue
+      kill "$_pid" 2>/dev/null
+    fi
+  done
+}
+
 # Immediately kill orphan Claude Code processes
 claude-cleanup() {
   echo "=== Claude Code Orphan Process Cleanup ==="
@@ -171,18 +185,7 @@ claude-cleanup() {
   [ "$orphan_count" -gt 0 ] || [ "$mcp_count" -gt 0 ] && echo "  Pattern fallback: $orphan_count subagents, $mcp_count MCP processes"
   [ "$agent_count" -gt 0 ] && echo "  Agent fallback: killed $agent_count stale browser/Codex processes"
 
-  # PPID=1 fallback: remaining orphans matching target patterns
-  # Protected-pattern whitelist applied — shared MCP services (context7, mcp-remote,
-  # supabase, stripe, etc.) are skipped even if orphaned.
-  ps -eo pid=,ppid=,command= 2>/dev/null | awk '$2 == 1' | while IFS= read -r line; do
-    local _pid _cmd
-    _pid=$(echo "$line" | awk '{print $1}')
-    _cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
-    if echo "$_cmd" | grep -qE "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"; then
-      _cc_reaper_is_protected_cmd "$_cmd" && continue
-      kill "$_pid" 2>/dev/null
-    fi
-  done
+  _cc_reaper_ppid_fallback
 
   sleep 1
   local remaining=$(ps aux | grep -E "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[a]gent-browser-darwin-arm64|puppeteer_dev_chrome_profile|agent-browser-chrome-|[c]odex --yolo" | grep -v grep | wc -l | tr -d ' ')
@@ -420,7 +423,7 @@ claude-sessions() {
 # Usage: _claude_pgid_kill <pid>
 _claude_pgid_kill() {
   local target_pid=$1
-  local MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|sequentialthinking|codex.*mcp"
+  local MCP_WHITELIST="supabase|@stripe/mcp|context7|context7-mcp|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|sequential-thinking|codex.*mcp"
   local pgid=$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ')
   if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
     while IFS= read -r pid; do

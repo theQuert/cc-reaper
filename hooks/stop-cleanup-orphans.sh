@@ -7,7 +7,7 @@
 #
 # Safety:
 #   CC_STOP_HOOK_DISABLE=1     — Skip all cleanup (no-op)
-#   CC_STOP_HOOK_AGGRESSIVE=1  — Skip PPID filtering, kill all PGID members
+#   CC_STOP_HOOK_AGGRESSIVE=1  — Skip PPID filtering, kill PGID members (ancestors + MCP whitelist still protected)
 #                                (default: only PPID=1 — truly orphaned)
 
 [ "${CC_STOP_HOOK_DISABLE:-0}" = "1" ] && exit 0
@@ -26,7 +26,7 @@ while [ "$_pid" -gt 1 ] 2>/dev/null; do
 done
 
 # ─── Shared MCP whitelist ────────────────────────────────────────────────────
-MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|sequentialthinking|sequential-thinking|codex.*mcp"
+MCP_WHITELIST="supabase|@stripe/mcp|context7|context7-mcp|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|sequential-thinking|codex.*mcp"
 
 # ─── PGID-based cleanup (primary) ────────────────────────────────────────────
 # This hook inherits the Claude session's process group (PGID).
