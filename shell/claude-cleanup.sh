@@ -3,7 +3,7 @@
 
 # Shared-service and user-process protections for agent cleanup.
 _cc_reaper_protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|cloudflare/mcp-server|mcp-server-cloudflare|mcp-remote|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
 }
 
 _cc_reaper_is_protected_cmd() {
@@ -171,17 +171,18 @@ claude-cleanup() {
   [ "$orphan_count" -gt 0 ] || [ "$mcp_count" -gt 0 ] && echo "  Pattern fallback: $orphan_count subagents, $mcp_count MCP processes"
   [ "$agent_count" -gt 0 ] && echo "  Agent fallback: killed $agent_count stale browser/Codex processes"
 
-  # Pattern-based kill for orphans ONLY (PPID=1 — parent already dead)
-  # Uses PPID filtering instead of TTY checking because:
-  # - On macOS, active MCP daemons have TTY=?? (same as orphans)
-  # - On Linux, SSH/docker sessions show TTY=? for all processes
-  # - PPID=1 is the only reliable cross-platform orphan indicator
-  ps -eo pid=,ppid=,command= 2>/dev/null | grep "[c]laude.*stream-json" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
-  ps -eo pid=,ppid=,command= 2>/dev/null | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
-  ps -eo pid=,ppid=,command= 2>/dev/null | grep "[w]orker-service.cjs.*--daemon" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
-  ps -eo pid=,ppid=,command= 2>/dev/null | grep "[b]un.*worker-service" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
-  # NOTE: claude-mem, chroma-mcp, context7, supabase, stripe are still excluded
-  # because their processes won't match these grep patterns (different command names).
+  # PPID=1 fallback: remaining orphans matching target patterns
+  # Protected-pattern whitelist applied — shared MCP services (context7, mcp-remote,
+  # supabase, stripe, etc.) are skipped even if orphaned.
+  ps -eo pid=,ppid=,command= 2>/dev/null | awk '$2 == 1' | while IFS= read -r line; do
+    local _pid _cmd
+    _pid=$(echo "$line" | awk '{print $1}')
+    _cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+    if echo "$_cmd" | grep -qE "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"; then
+      _cc_reaper_is_protected_cmd "$_cmd" && continue
+      kill "$_pid" 2>/dev/null
+    fi
+  done
 
   sleep 1
   local remaining=$(ps aux | grep -E "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[a]gent-browser-darwin-arm64|puppeteer_dev_chrome_profile|agent-browser-chrome-|[c]odex --yolo" | grep -v grep | wc -l | tr -d ' ')

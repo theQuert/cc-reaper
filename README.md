@@ -25,11 +25,11 @@ This is a [widely reported issue](https://github.com/anthropics/claude-code/issu
 
 ## Solution: Three-Layer Defense
 
-All layers use **PGID-based process group cleanup** as the primary method — killing entire process groups spawned by a Claude session with a single `kill -- -$PGID`. Pattern-based detection is kept as a fallback for edge cases.
+PGID-based process group cleanup is used by proc-janitor and manual tools. The Stop hook defaults to **PPID=1 orphan-only cleanup** for safety; `CC_STOP_HOOK_AGGRESSIVE=1` restores broad PGID group cleanup. Pattern-based detection is kept as a fallback for edge cases.
 
 ```
 Session ends normally
-  └── Stop hook — kills session's process group via PGID (catches all children)
+  └── Stop hook — kills orphaned processes (PPID=1) in session's group. With `CC_STOP_HOOK_AGGRESSIVE=1`, kills full PGID group.
 
 Session crashes / terminal force-closed
   └── proc-janitor daemon — scans every 30s, kills orphans after 60s grace

@@ -26,7 +26,7 @@ while [ "$_pid" -gt 1 ] 2>/dev/null; do
 done
 
 # ─── Shared MCP whitelist ────────────────────────────────────────────────────
-MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|sequentialthinking|codex.*mcp"
+MCP_WHITELIST="supabase|@stripe/mcp|context7|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|sequentialthinking|sequential-thinking|codex.*mcp"
 
 # ─── PGID-based cleanup (primary) ────────────────────────────────────────────
 # This hook inherits the Claude session's process group (PGID).
