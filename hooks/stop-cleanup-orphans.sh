@@ -26,7 +26,7 @@ while [ "$_pid" -gt 1 ] 2>/dev/null; do
 done
 
 # ─── Shared MCP whitelist ────────────────────────────────────────────────────
-MCP_WHITELIST="supabase|@stripe/mcp|context7|context7-mcp|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|sequential-thinking|codex.*mcp"
+MCP_WHITELIST="supabase|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|context7|context7-mcp|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|sequential-thinking|codex.*mcp"
 
 # ─── PGID-based cleanup (primary) ────────────────────────────────────────────
 # This hook inherits the Claude session's process group (PGID).
@@ -77,13 +77,15 @@ fi
 # Catches processes that escaped the process group (e.g., called setsid())
 # Only targets orphans (PPID=1) to avoid killing active processes.
 # Uses ps -eo for cross-platform compatibility (macOS "??" vs Linux "?")
-ps -eo pid=,ppid=,command= 2>/dev/null | grep "[c]laude.*stream-json" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
-ps -eo pid=,ppid=,command= 2>/dev/null | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | awk -v wl="$MCP_WHITELIST" '$2 == 1 && $0 !~ wl {print $1}' | xargs kill 2>/dev/null
-ps -eo pid=,ppid=,command= 2>/dev/null | grep "[w]orker-service.cjs.*--daemon" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
+# NOTE: Uses while-read loops instead of xargs to avoid invoking kill when
+# no matching PIDs exist (BSD/macOS xargs calls kill once on empty input).
+ps -eo pid=,ppid=,command= 2>/dev/null | grep "[c]laude.*stream-json" | awk '$2 == 1 {print $1}' | while IFS= read -r _pid; do [ -n "$_pid" ] && kill "$_pid" 2>/dev/null; done
+ps -eo pid=,ppid=,command= 2>/dev/null | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | awk -v wl="$MCP_WHITELIST" '$2 == 1 && $0 !~ wl {print $1}' | while IFS= read -r _pid; do [ -n "$_pid" ] && kill "$_pid" 2>/dev/null; done
+ps -eo pid=,ppid=,command= 2>/dev/null | grep "[w]orker-service.cjs.*--daemon" | awk '$2 == 1 {print $1}' | while IFS= read -r _pid; do [ -n "$_pid" ] && kill "$_pid" 2>/dev/null; done
 # NOTE: claude-mem, chroma-mcp, context7 are NOT killed here — they are
 # long-running MCP servers shared across sessions. PGID cleanup (above)
 # handles same-session processes; these survive for other sessions.
-ps -eo pid=,ppid=,command= 2>/dev/null | grep "[b]un.*worker-service" | awk '$2 == 1 {print $1}' | xargs kill 2>/dev/null
+ps -eo pid=,ppid=,command= 2>/dev/null | grep "[b]un.*worker-service" | awk '$2 == 1 {print $1}' | while IFS= read -r _pid; do [ -n "$_pid" ] && kill "$_pid" 2>/dev/null; done
 
 echo "[cleanup] Orphan Claude processes cleaned up."
 exit 0
