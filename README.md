@@ -269,7 +269,7 @@ echo 'export CC_STOP_HOOK_DISABLE=1' >> ~/.zshrc
 
 **When to use aggressive mode:**
 
-If you notice orphans leaking after session ends and the default PPID=1 filter is too conservative (rare), enable aggressive mode:
+If you notice active subagents or MCP servers still parented by a dying session that are not being cleaned up (because their PPID != 1 while the parent is in the process of exiting), enable aggressive mode:
 
 ```bash
 export CC_STOP_HOOK_AGGRESSIVE=1

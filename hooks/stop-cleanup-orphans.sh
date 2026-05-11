@@ -76,16 +76,16 @@ fi
 # ─── Pattern-based fallback ──────────────────────────────────────────────────
 # Catches processes that escaped the process group (e.g., called setsid())
 # Only targets orphans (PPID=1) to avoid killing active processes.
-# Uses ps -eo for cross-platform compatibility (macOS "??" vs Linux "?")
-# NOTE: Uses while-read loops instead of xargs to avoid invoking kill when
-# no matching PIDs exist (BSD/macOS xargs calls kill once on empty input).
-ps -eo pid=,ppid=,command= 2>/dev/null | grep "[c]laude.*stream-json" | awk '$2 == 1 {print $1}' | while IFS= read -r _pid; do [ -n "$_pid" ] && kill "$_pid" 2>/dev/null; done
-ps -eo pid=,ppid=,command= 2>/dev/null | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking" | awk -v wl="$MCP_WHITELIST" '$2 == 1 && $0 !~ wl {print $1}' | while IFS= read -r _pid; do [ -n "$_pid" ] && kill "$_pid" 2>/dev/null; done
-ps -eo pid=,ppid=,command= 2>/dev/null | grep "[w]orker-service.cjs.*--daemon" | awk '$2 == 1 {print $1}' | while IFS= read -r _pid; do [ -n "$_pid" ] && kill "$_pid" 2>/dev/null; done
-# NOTE: claude-mem, chroma-mcp, context7 are NOT killed here — they are
-# long-running MCP servers shared across sessions. PGID cleanup (above)
-# handles same-session processes; these survive for other sessions.
-ps -eo pid=,ppid=,command= 2>/dev/null | grep "[b]un.*worker-service" | awk '$2 == 1 {print $1}' | while IFS= read -r _pid; do [ -n "$_pid" ] && kill "$_pid" 2>/dev/null; done
+# All target patterns are filtered through MCP_WHITELIST to protect shared
+# MCP servers and user-managed launchd/systemd daemons.
+ps -eo pid=,ppid=,command= 2>/dev/null | awk '$2 == 1' | while IFS= read -r line; do
+  _pid=$(echo "$line" | awk '{print $1}')
+  _cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+  if echo "$_cmd" | grep -qE "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"; then
+    echo "$_cmd" | grep -qE "$MCP_WHITELIST" && continue
+    kill "$_pid" 2>/dev/null
+  fi
+done
 
 echo "[cleanup] Orphan Claude processes cleaned up."
 exit 0
