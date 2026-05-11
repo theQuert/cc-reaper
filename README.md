@@ -25,11 +25,11 @@ This is a [widely reported issue](https://github.com/anthropics/claude-code/issu
 
 ## Solution: Three-Layer Defense
 
-All layers use **PGID-based process group cleanup** as the primary method — killing entire process groups spawned by a Claude session with a single `kill -- -$PGID`. Pattern-based detection is kept as a fallback for edge cases.
+PGID-based process group cleanup is used by proc-janitor and manual tools. The Stop hook defaults to **PPID=1 orphan-only cleanup** for safety; `CC_STOP_HOOK_AGGRESSIVE=1` restores broad PGID group cleanup. Pattern-based detection is kept as a fallback for edge cases.
 
 ```
 Session ends normally
-  └── Stop hook — kills session's process group via PGID (catches all children)
+  └── Stop hook — primary pass kills orphaned processes (PPID=1) in session's PGID; secondary pattern sweep catches orphans that escaped the group (e.g., via setsid). With `CC_STOP_HOOK_AGGRESSIVE=1`, skips PPID=1 check but still protects ancestors and MCP whitelist.
 
 Session crashes / terminal force-closed
   └── proc-janitor daemon — scans every 30s, kills orphans after 60s grace
@@ -43,7 +43,7 @@ Manual intervention needed
 
 ### Why PGID?
 
-Claude Code sessions are process group leaders (PGID = session PID). All spawned MCP servers, subagents, and their children inherit this PGID. This means one `kill -- -$PGID` reliably cleans up everything — including third-party MCP servers that pattern matching might miss.
+Claude Code sessions are process group leaders (PGID = session PID). All spawned MCP servers, subagents, and their children inherit this PGID. For proc-janitor and manual tools (`claude-cleanup`, `claude-guard`), one `kill -- -$PGID` reliably cleans up everything in the group — including third-party MCP servers that pattern matching might miss. The Stop hook defaults to a safer PPID=1 orphan-only mode to avoid accidentally killing the active Claude CLI.
 
 **Safety**: PGID cleanup only targets groups whose **leader** is a Claude CLI session (`claude.*stream-json`). It never matches by group membership — other apps like Chrome and Cursor have `claude` subprocesses in their process groups, so matching by membership would kill them.
 
@@ -137,6 +137,11 @@ Add to `~/.claude/settings.json` in the `"Stop"` hooks array:
 ```
 
 </details>
+
+> **⚠️ Safety**: The Stop hook now includes built-in safety mechanisms:
+> - **Orphan-only filtering** (PPID=1): By default, only kills processes whose parent has already exited (PPID=1, reparented to init). This is the definitive indicator of orphan status — unlike TTY filtering, it works correctly in SSH, Docker, tmux, and all terminal environments. Active Claude sessions, subagents, and shared MCP servers (PPID ≠ 1) are never killed.
+> - **Ancestor protection**: Walks the full process tree (`$$` → PID 1) and never kills any ancestor process. This prevents accidental termination of the Claude CLI when an intermediate shell is involved.
+> - **Environment variables**: See [Stop Hook Configuration](#stop-hook-configuration) for tuning options.
 
 ### 3. Background Daemon (choose one)
 
@@ -232,6 +237,45 @@ claude-cleanup
 ```
 
 `CC_AGENT_STALE_MINUTES` is used by `claude-cleanup` and the LaunchAgent monitor. Lower it only if browser automation frequently leaks on your machine; the default is intentionally conservative.
+
+### Stop Hook Configuration
+
+These environment variables control the [Stop hook](#2-claude-code-stop-hook) behavior. They are checked each time the hook runs.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CC_STOP_HOOK_DISABLE` | 0 | Set to `1` to skip all cleanup (the hook becomes a no-op). Useful if the hook interferes with your workflow. |
+| `CC_STOP_HOOK_AGGRESSIVE` | 0 | Set to `1` to skip PPID=1 filtering and kill PGID members (still skips ancestor PIDs and MCP whitelist). By default, the hook only kills truly orphaned processes (PPID=1). |
+
+**Why PPID=1 filtering?**
+
+A process with PPID=1 has been reparented to init — its original parent has exited. This is the **only reliable indicator** that a process is truly orphaned and safe to reap. TTY filtering is not used because:
+
+- In SSH, Docker, and remote terminal environments, **all** processes have TTY=`?` — TTY filtering would be a no-op (kill nothing) or dangerous (kill everything including the Claude CLI).
+- On macOS, orphans show TTY=`??` while on Linux they show TTY=`?` — handling both requires platform-specific code.
+- PPID=1 is **universal**: works identically on macOS, Linux, in containers, and over SSH.
+
+**When to disable the Stop hook:**
+
+```bash
+# Option A: Disable temporarily for the current terminal session
+export CC_STOP_HOOK_DISABLE=1
+
+# Option B: Add to ~/.zshrc or ~/.bashrc for permanent disable
+echo 'export CC_STOP_HOOK_DISABLE=1' >> ~/.zshrc
+
+# Option C: Remove from settings.json entirely (see manual setup section)
+```
+
+**When to use aggressive mode:**
+
+If you notice active subagents or MCP servers still parented by a dying session that are not being cleaned up (because their PPID != 1 while the parent is in the process of exiting), enable aggressive mode:
+
+```bash
+export CC_STOP_HOOK_AGGRESSIVE=1
+```
+
+This restores the original PGID cleanup that kills PGID members regardless of orphan status (ancestors and MCP whitelist still protected).
 
 ## Heat Diagnostics
 
@@ -346,7 +390,7 @@ Safe cleanup candidates:
 cc-reaper/
 ├── install.sh                      # One-command installer/updater (interactive daemon choice)
 ├── hooks/
-│   └── stop-cleanup-orphans.sh     # Claude Code Stop hook (PGID + pattern fallback)
+│   └── stop-cleanup-orphans.sh     # Claude Code Stop hook (PPID=1 orphan filtering + pattern fallback)
 ├── launchd/
 │   ├── cc-reaper-monitor.sh        # LaunchAgent monitor script (PGID + PPID=1 fallback)
 │   └── com.cc-reaper.orphan-monitor.plist  # LaunchAgent config (10-min interval)
@@ -356,7 +400,10 @@ cc-reaper/
 │   ├── cc-monitor.sh               # Read-only heat attribution monitor
 │   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-fd, claude-cleanup, claude-sessions, claude-guard)
 ├── tests/
-│   └── agent-process-patterns.sh   # Lightweight matcher/candidate validation
+│   ├── agent-process-patterns.sh   # Cleanup-candidate matcher validation
+│   ├── cc-monitor-optimize.sh      # cc-monitor optimization menu tests
+│   ├── cc-monitor-runaway.sh       # Runaway protected process detection tests
+│   └── ppid-fallback.sh            # PPID=1 fallback kill + whitelist validation
 └── README.md
 ```
 

@@ -110,7 +110,7 @@ _cc_monitor_is_runaway() {
 }
 
 _cc_monitor_protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|cloudflare/mcp-server|mcp-server-cloudflare|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
 }
 
 _cc_monitor_is_protected_cmd() {
