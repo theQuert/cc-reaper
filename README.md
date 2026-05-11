@@ -277,6 +277,19 @@ export CC_STOP_HOOK_AGGRESSIVE=1
 
 This restores the original PGID cleanup that kills PGID members regardless of orphan status (ancestors and MCP whitelist still protected).
 
+**Caveat: user-managed daemons (LaunchAgent / systemd):**
+
+The pattern-based fallback in the Stop hook also sweeps PPID=1 processes globally (not scoped to the session's PGID). Shared MCP servers are protected by `MCP_WHITELIST`, but if you run a long-lived daemon under `launchctl` / systemd whose command matches one of the cleanup patterns — e.g., a headless `claude --stream-json` workflow or a `worker-service.cjs --daemon` — it is legitimately PPID=1 and will be killed when any Stop hook fires.
+
+If this applies to you, choose one:
+
+```bash
+# Easiest: disable the Stop hook entirely (other layers — proc-janitor / LaunchAgent — still clean up orphans)
+export CC_STOP_HOOK_DISABLE=1
+
+# Or: extend MCP_WHITELIST in hooks/stop-cleanup-orphans.sh to include your daemon's command pattern.
+```
+
 ## Heat Diagnostics
 
 Run `cc-monitor` when the laptop is hot and you want to understand the cause before cleaning anything:

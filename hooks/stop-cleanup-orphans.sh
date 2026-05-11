@@ -76,8 +76,15 @@ fi
 # ─── Pattern-based fallback ──────────────────────────────────────────────────
 # Catches processes that escaped the process group (e.g., called setsid())
 # Only targets orphans (PPID=1) to avoid killing active processes.
-# All target patterns are filtered through MCP_WHITELIST to protect shared
-# MCP servers and user-managed launchd/systemd daemons.
+# Target patterns are filtered through MCP_WHITELIST so shared MCP servers
+# survive.
+#
+# CAVEAT: A user-managed daemon launched by launchd/systemd that matches one
+# of the target patterns (e.g., `claude --stream-json` or
+# `worker-service.cjs --daemon` started by a LaunchAgent) is legitimately
+# PPID=1 by design and will be killed here. If you run such a daemon, either:
+#   - export CC_STOP_HOOK_DISABLE=1 in the user environment, or
+#   - extend MCP_WHITELIST above to include your daemon's command pattern.
 ps -eo pid=,ppid=,command= 2>/dev/null | awk '$2 == 1' | while IFS= read -r line; do
   _pid=$(echo "$line" | awk '{print $1}')
   _cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')

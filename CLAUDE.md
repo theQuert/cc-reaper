@@ -62,6 +62,7 @@ All tests are standalone bash scripts that can be run directly. Tests under `tes
 ```bash
 bash tests/agent-process-patterns.sh   # Validate cleanup-candidate matchers (browser/Codex/MCP)
 bash tests/ppid-fallback.sh            # Validate _cc_reaper_ppid_fallback (PPID=1 + whitelist)
+bash tests/stop-hook-env.sh            # Validate CC_STOP_HOOK_DISABLE / CC_STOP_HOOK_AGGRESSIVE
 bash tests/cc-monitor-optimize.sh      # Validate cc-monitor optimization menu logic
 bash tests/cc-monitor-runaway.sh       # Validate runaway protected process detection
 bash -n shell/claude-cleanup.sh        # Syntax check

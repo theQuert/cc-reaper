@@ -3,6 +3,12 @@
 ## [Unreleased]
 
 ### Added
+- **Stop hook safety layers** — `hooks/stop-cleanup-orphans.sh` now defaults to **PPID=1 orphan-only** cleanup (replacing fragile TTY filtering that broke under SSH/Docker/tmux), walks the process tree from `$$` upward and protects every ancestor PID, and exposes two new env vars:
+  - `CC_STOP_HOOK_DISABLE=1` — skip all cleanup (no-op).
+  - `CC_STOP_HOOK_AGGRESSIVE=1` — skip the PPID=1 check and fall back to PGID-member cleanup (ancestors + MCP whitelist still protected).
+- **Stop hook MCP whitelist parity** — Hook now shares the full protected set with `shell/claude-cleanup.sh`, `shell/cc-monitor.sh`, `launchd/cc-reaper-monitor.sh`, and `proc-janitor/config.toml` (added Stripe variants `npm exec @stripe` / `mcp-server-stripe` / `stripe.*mcp`, plus `context7-mcp`, `chrome-devtools-mcp`, `mcp-remote`, `mcp-server-cloudflare`, `sequential-thinking`).
+- **`tests/ppid-fallback.sh`** — Mock-based regression for `_cc_reaper_ppid_fallback()` covering PPID=1 selection and whitelist exclusions.
+- **`tests/stop-hook-env.sh`** — Mock-based regression for `CC_STOP_HOOK_DISABLE` and `CC_STOP_HOOK_AGGRESSIVE` behavior in the Stop hook.
 - **`cc-monitor --apply <module>`** — One-shot dispatch flag that runs sampling, prints the report, then dispatches one of `claude-cleanup`, `claude-guard`, `claude-guard-dry`, `proc-janitor-scan`, or `proc-janitor-clean` non-interactively. Cannot be combined with `--json` (exit 2); module exit codes propagate.
 - **`cc-monitor` interactive optimization menu** — On a TTY without `--json`/`--no-prompt`/`--apply`, when the report contains `SAFE_TO_REAP` candidates or family-level heat, `cc-monitor` appends a numbered menu listing available cleanup modules with a `(recommended)` marker; destructive choices require a `[y/N]` confirmation. Modules whose binary is missing on PATH are hidden with an install hint. `--no-prompt` opts out.
 - **Runaway-protected detection** — `cc-monitor` reclassifies any protected process matching `CC_RUNAWAY_CPU` (default 80%) for `CC_RUNAWAY_MIN` (default 60 min) from `DO_NOT_KILL` to family `runaway` / `ASK_BEFORE_KILL` and prints a dedicated `Stuck/runaway protected processes:` section with a copy-pasteable `kill <pid>` per entry. JSON output gains a `runaway_candidates` array.
