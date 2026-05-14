@@ -25,6 +25,20 @@ while [ "$_pid" -gt 1 ] 2>/dev/null; do
   _pid=$(ps -o ppid= -p "$_pid" 2>/dev/null | tr -d ' ')
 done
 
+# ─── Orphan-parent set ───────────────────────────────────────────────────────
+# A process is a true orphan when its parent has exited and it was reparented.
+# On macOS that target is PID 1 (launchd). On Linux, a process whose Claude
+# session exited is reparented to the invoking user's `systemd --user` manager,
+# NOT PID 1 — so PID=1-only filtering misses every orphan on Linux. Build the
+# set of orphan-parent PPIDs once: always PID 1, plus this user's
+# `systemd --user` manager(s) if present (matched by UID so another user's
+# manager is never included). macOS / no-systemd hosts resolve to exactly
+# " 1 ", so behavior there is unchanged. Space-padded for `case`/awk matching.
+_uid=$(id -u 2>/dev/null)
+_systemd_user_pids=$(ps -eo pid=,uid=,command= 2>/dev/null \
+  | awk -v uid="$_uid" '$2 == uid && /systemd --user/ {print $1}' | tr '\n' ' ')
+ORPHAN_PPIDS=" 1 ${_systemd_user_pids}"
+
 # ─── Shared MCP whitelist ────────────────────────────────────────────────────
 MCP_WHITELIST="supabase|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|context7|context7-mcp|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|sequential-thinking|codex.*mcp"
 
@@ -56,11 +70,12 @@ if [ -n "$SESSION_PGID" ] && [ "$SESSION_PGID" != "0" ] && [ "$SESSION_PGID" != 
       continue
     fi
 
-    # PPID filter: only kill truly orphaned processes (PPID=1)
-    # Their parent is already dead, so they are safe to reap.
+    # PPID filter: only kill truly orphaned processes — those reparented to an
+    # orphan parent (PID 1, or this user's `systemd --user` manager on Linux).
+    # Their session is gone, so they are safe to reap.
     if [ "${CC_STOP_HOOK_AGGRESSIVE:-0}" != "1" ]; then
       pid_ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-      [ "$pid_ppid" != "1" ] && continue
+      case "$ORPHAN_PPIDS" in *" $pid_ppid "*) ;; *) continue ;; esac
     fi
 
     # Skip whitelisted MCP servers (shared across sessions)
@@ -75,19 +90,24 @@ fi
 
 # ─── Pattern-based fallback ──────────────────────────────────────────────────
 # Catches processes that escaped the process group (e.g., called setsid())
-# Only targets orphans (PPID=1) to avoid killing active processes.
-# Target patterns are filtered through MCP_WHITELIST so shared MCP servers
-# survive.
+# Only targets orphans — processes reparented to an orphan parent (PID 1, or
+# this user's `systemd --user` manager on Linux) — to avoid killing active
+# processes. Target patterns are filtered through MCP_WHITELIST so shared MCP
+# servers survive.
 #
 # CAVEAT: A user-managed daemon launched by launchd/systemd that matches one
 # of the target patterns (e.g., `claude --stream-json` or
-# `worker-service.cjs --daemon` started by a LaunchAgent) is legitimately
-# PPID=1 by design and will be killed here. If you run such a daemon, either:
+# `worker-service.cjs --daemon` started by a LaunchAgent or a `systemd --user`
+# unit) is legitimately parented to an orphan parent by design and will be
+# killed here. If you run such a daemon, either:
 #   - export CC_STOP_HOOK_DISABLE=1 in the user environment, or
 #   - extend MCP_WHITELIST above to include your daemon's command pattern.
-ps -eo pid=,ppid=,command= 2>/dev/null | awk '$2 == 1' | while IFS= read -r line; do
+ps -eo pid=,ppid=,command= 2>/dev/null | awk -v set="$ORPHAN_PPIDS" 'index(set, " " $2 " ")' | while IFS= read -r line; do
   _pid=$(echo "$line" | awk '{print $1}')
   _cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+  # Never kill an orphan parent itself (e.g. the `systemd --user` manager) —
+  # it is a reparent target, not an orphan.
+  case "$ORPHAN_PPIDS" in *" $_pid "*) continue ;; esac
   if echo "$_cmd" | grep -qE "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"; then
     echo "$_cmd" | grep -qE "$MCP_WHITELIST" && continue
     kill "$_pid" 2>/dev/null

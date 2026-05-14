@@ -44,6 +44,10 @@ ps() {
 800 2 node /usr/local/bin/claude --dangerously-allow-all --session-id def stream-json
 900 1 node /usr/local/bin/mcp-server-cloudflare run xyz
 EOF
+  elif [ "$1" = "-eo" ] && [ "$2" = "pid=,uid=,command=" ]; then
+    # No `systemd --user` manager → orphan-parent set resolves to exactly "1",
+    # keeping this PID=1 regression fixture deterministic across platforms.
+    :
   else
     command ps "$@"
   fi

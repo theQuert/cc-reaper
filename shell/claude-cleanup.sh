@@ -11,6 +11,44 @@ _cc_reaper_is_protected_cmd() {
   echo "$cmd" | grep -qE "$(_cc_reaper_protected_pattern)"
 }
 
+# Orphan-parent set: the PPIDs that mark a process as a true orphan (its
+# session exited and the process was reparented).
+#   - PID 1 is always included: the kernel reparent target on macOS (launchd)
+#     and on Linux without a per-user manager.
+#   - On Linux, the invoking user's `systemd --user` manager is also included:
+#     it is the per-user reparent target, so a Claude subagent or MCP server
+#     whose session exited lands there with PPID=<systemd --user pid>, not 1.
+# Only the current user's manager(s) count — another user's manager is never
+# treated as an orphan parent. macOS / hosts without `systemd --user` resolve
+# to exactly "1", so detection behaves identically to the prior PID=1-only logic.
+# Memoized: the `systemd --user` PID is stable for the login session lifetime.
+# Tests reset _CC_REAPER_ORPHAN_PPIDS="" between scenarios.
+_CC_REAPER_ORPHAN_PPIDS=""
+_cc_reaper_orphan_ppids() {
+  if [ -z "$_CC_REAPER_ORPHAN_PPIDS" ]; then
+    local uid systemd_user_pids
+    uid=$(id -u 2>/dev/null)
+    systemd_user_pids=$(ps -eo pid=,uid=,command= 2>/dev/null \
+      | awk -v uid="$uid" '$2 == uid && /systemd --user/ {print $1}' \
+      | tr '\n' ' ')
+    systemd_user_pids=${systemd_user_pids% }
+    if [ -n "$systemd_user_pids" ]; then
+      _CC_REAPER_ORPHAN_PPIDS="1 $systemd_user_pids"
+    else
+      _CC_REAPER_ORPHAN_PPIDS="1"
+    fi
+  fi
+  echo "$_CC_REAPER_ORPHAN_PPIDS"
+}
+
+# True when $1 is a PPID in the orphan-parent set.
+_cc_reaper_is_orphan_ppid() {
+  case " $(_cc_reaper_orphan_ppids) " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 _cc_reaper_agent_stale_seconds() {
   local minutes=${CC_AGENT_STALE_MINUTES:-360}
   if ! echo "$minutes" | grep -qE '^[0-9]+$' || [ "$minutes" -eq 0 ]; then
@@ -48,7 +86,7 @@ _cc_reaper_is_stale_etime() {
 _cc_reaper_is_detached_or_orphan() {
   local ppid=$1
   local tty=$2
-  [ "$ppid" = "1" ] || [ "$tty" = "??" ] || [ "$tty" = "?" ]
+  _cc_reaper_is_orphan_ppid "$ppid" || [ "$tty" = "??" ] || [ "$tty" = "?" ]
 }
 
 _cc_reaper_is_agent_browser_cmd() {
@@ -83,12 +121,12 @@ _cc_reaper_is_agent_cleanup_candidate() {
   _cc_reaper_is_protected_cmd "$cmd" && return 1
 
   if _cc_reaper_is_agent_browser_cmd "$cmd" || _cc_reaper_is_puppeteer_chrome_cmd "$cmd"; then
-    [ "$ppid" = "1" ] || _cc_reaper_is_stale_etime "$etime"
+    _cc_reaper_is_orphan_ppid "$ppid" || _cc_reaper_is_stale_etime "$etime"
     return
   fi
 
   if _cc_reaper_is_codex_agent_cmd "$cmd" || _cc_reaper_is_agent_mcp_cmd "$cmd"; then
-    [ "$ppid" = "1" ] || { _cc_reaper_is_detached_or_orphan "$ppid" "$tty" && _cc_reaper_is_stale_etime "$etime"; }
+    _cc_reaper_is_orphan_ppid "$ppid" || { _cc_reaper_is_detached_or_orphan "$ppid" "$tty" && _cc_reaper_is_stale_etime "$etime"; }
     return
   fi
 
@@ -108,13 +146,19 @@ _cc_reaper_kill_group_filtered() {
   echo "$killed"
 }
 
-# PPID=1 fallback: kill remaining orphan processes matching target patterns.
-# Protected-pattern whitelist is applied so shared MCP services are skipped.
+# Orphan-parent fallback: kill remaining orphan processes matching target
+# patterns. An orphan parent is PID 1 or, on Linux, the user's `systemd --user`
+# manager. Protected-pattern whitelist is applied so shared MCP services are
+# skipped.
 _cc_reaper_ppid_fallback() {
-  ps -eo pid=,ppid=,command= 2>/dev/null | awk '$2 == 1' | while IFS= read -r line; do
+  local ppid_set=" $(_cc_reaper_orphan_ppids) "
+  ps -eo pid=,ppid=,command= 2>/dev/null | awk -v set="$ppid_set" 'index(set, " " $2 " ")' | while IFS= read -r line; do
     local _pid _cmd
     _pid=$(echo "$line" | awk '{print $1}')
     _cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+    # Never kill an orphan parent itself (e.g. the `systemd --user` manager) —
+    # it is a reparent target, not an orphan.
+    case "$ppid_set" in *" $_pid "*) continue ;; esac
     if echo "$_cmd" | grep -qE "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"; then
       _cc_reaper_is_protected_cmd "$_cmd" && continue
       kill "$_pid" 2>/dev/null
@@ -127,12 +171,17 @@ claude-cleanup() {
   echo "=== Claude Code Orphan Process Cleanup ==="
 
   # ─── PGID-based cleanup (primary) ────────────────────────────────────────
-  # Find orphaned process groups: the PGID leader has PPID=1 (reparented to launchd)
-  # and the group contains Claude-related processes. Kill entire group at once.
+  # Find orphaned process groups: the PGID leader has been reparented to an
+  # orphan parent (PID 1 on macOS/launchd, or the user's `systemd --user`
+  # manager on Linux) and the group contains Claude-related processes. Kill
+  # entire group at once.
   local pgid_kills=0
   local orphan_pgids
-  orphan_pgids=$(ps -eo pid,ppid,pgid 2>/dev/null | awk '$1 == $3 && $2 == 1 {print $3}' | sort -u)
+  local ppid_set=" $(_cc_reaper_orphan_ppids) "
+  orphan_pgids=$(ps -eo pid,ppid,pgid 2>/dev/null | awk -v set="$ppid_set" '$1 == $3 && index(set, " " $2 " ") {print $3}' | sort -u)
   for pgid in $orphan_pgids; do
+    # Never treat an orphan parent (e.g. `systemd --user`) as an orphan group leader.
+    case "$ppid_set" in *" $pgid "*) continue ;; esac
     # Only kill groups whose leader is a Claude session (stream-json subagent)
     # Skip intentional daemons (worker-service --daemon) and non-Claude leaders
     local leader_cmd
@@ -220,8 +269,9 @@ claude-ram() {
   echo "--- MCP Servers ---"
   ps aux | grep -E "[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[n]ode.*sequential-thinking|[w]orker-service|[n]ode.*claude-mem|[u]v.*chroma-mcp|[p]ython.*chroma-mcp|[b]un.*worker-service|[n]pm exec @supabase" | awk '{sum+=$6; cpu+=$3; count++} END {printf "  %d processes, %.0f MB, %.1f%% CPU\n", count, sum/1024, cpu}'
 
-  echo "--- Orphans (PPID=1) ---"
-  ps -eo pid,ppid,rss,%cpu,command | awk '$2 == 1' | grep -E "[c]laude.*stream-json|[n]ode.*mcp-server|[n]px.*mcp-server|[c]hroma-mcp|[w]orker-service\.cjs|[n]ode.*claude-mem" | awk '{sum+=$3; cpu+=$4; count++} END {printf "  %d orphans, %.0f MB, %.1f%% CPU\n", count, sum/1024, cpu}'
+  echo "--- Orphans (reparented: PPID=1 / systemd --user) ---"
+  local ppid_set=" $(_cc_reaper_orphan_ppids) "
+  ps -eo pid,ppid,rss,%cpu,command | awk -v set="$ppid_set" 'index(set, " " $2 " ")' | grep -E "[c]laude.*stream-json|[n]ode.*mcp-server|[n]px.*mcp-server|[c]hroma-mcp|[w]orker-service\.cjs|[n]ode.*claude-mem" | awk '{sum+=$3; cpu+=$4; count++} END {printf "  %d orphans, %.0f MB, %.1f%% CPU\n", count, sum/1024, cpu}'
 
   echo "--- Total ---"
   ps aux | grep -iE "[c]laude|[n]pm exec @supabase|[n]pm exec @upstash|[n]pm exec mcp-|[n]ode.*mcp-server|[n]px.*mcp-server|[n]ode.*context7|[c]hroma-mcp|[w]orker-service|[n]ode.*sequential-thinking|[n]ode.*claude-mem|[u]v.*chroma-mcp|[p]ython.*chroma-mcp|[b]un.*worker-service" | awk '{sum+=$6; cpu+=$3} END {printf "  %.0f MB (%.1f GB), %.1f%% CPU\n", sum/1024, sum/1024/1024, cpu}'

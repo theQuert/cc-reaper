@@ -29,7 +29,7 @@ PGID-based process group cleanup is used by proc-janitor and manual tools. The S
 
 ```
 Session ends normally
-  └── Stop hook — primary pass kills orphaned processes (PPID=1) in session's PGID; secondary pattern sweep catches orphans that escaped the group (e.g., via setsid). With `CC_STOP_HOOK_AGGRESSIVE=1`, skips PPID=1 check but still protects ancestors and MCP whitelist.
+  └── Stop hook — primary pass kills orphaned processes (reparented to PID 1, or on Linux to the user's `systemd --user` manager) in session's PGID; secondary pattern sweep catches orphans that escaped the group (e.g., via setsid). With `CC_STOP_HOOK_AGGRESSIVE=1`, skips the orphan-parent check but still protects ancestors and MCP whitelist.
 
 Session crashes / terminal force-closed
   └── proc-janitor daemon — scans every 30s, kills orphans after 60s grace
@@ -139,7 +139,7 @@ Add to `~/.claude/settings.json` in the `"Stop"` hooks array:
 </details>
 
 > **⚠️ Safety**: The Stop hook now includes built-in safety mechanisms:
-> - **Orphan-only filtering** (PPID=1): By default, only kills processes whose parent has already exited (PPID=1, reparented to init). This is the definitive indicator of orphan status — unlike TTY filtering, it works correctly in SSH, Docker, tmux, and all terminal environments. Active Claude sessions, subagents, and shared MCP servers (PPID ≠ 1) are never killed.
+> - **Orphan-only filtering**: By default, only kills processes whose parent has already exited — those reparented to an *orphan parent*. On macOS that is PID 1 (launchd); on Linux it is PID 1 **or the invoking user's `systemd --user` manager** (the per-user reparent target — Linux orphans land there, not on PID 1). This is the definitive indicator of orphan status — unlike TTY filtering, it works correctly in SSH, Docker, tmux, and all terminal environments. Active Claude sessions, subagents, and shared MCP servers (still parented by a live process) are never killed.
 > - **Ancestor protection**: Walks the full process tree (`$$` → PID 1) and never kills any ancestor process. This prevents accidental termination of the Claude CLI when an intermediate shell is involved.
 > - **Environment variables**: See [Stop Hook Configuration](#stop-hook-configuration) for tuning options.
 
@@ -245,15 +245,15 @@ These environment variables control the [Stop hook](#2-claude-code-stop-hook) be
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CC_STOP_HOOK_DISABLE` | 0 | Set to `1` to skip all cleanup (the hook becomes a no-op). Useful if the hook interferes with your workflow. |
-| `CC_STOP_HOOK_AGGRESSIVE` | 0 | Set to `1` to skip PPID=1 filtering and kill PGID members (still skips ancestor PIDs and MCP whitelist). By default, the hook only kills truly orphaned processes (PPID=1). |
+| `CC_STOP_HOOK_AGGRESSIVE` | 0 | Set to `1` to skip orphan-parent filtering and kill PGID members (still skips ancestor PIDs and MCP whitelist). By default, the hook only kills truly orphaned processes. |
 
-**Why PPID=1 filtering?**
+**Why orphan-parent filtering?**
 
-A process with PPID=1 has been reparented to init — its original parent has exited. This is the **only reliable indicator** that a process is truly orphaned and safe to reap. TTY filtering is not used because:
+A process is *orphaned* once its original parent has exited and the OS reparents it. macOS reparents to PID 1 (launchd). Linux reparents a process whose login/session scope is gone to the invoking user's **`systemd --user` manager**, not PID 1 — so a PID=1-only check misses every orphan on Linux. cc-reaper builds an **orphan-parent set** once per run: PID 1, plus this user's `systemd --user` manager(s) if present (matched by UID, so another user's manager is never included; the manager PID itself is a reparent target, never a kill candidate). A process whose `PPID` is in that set is truly orphaned and safe to reap. TTY filtering is not used because:
 
 - In SSH, Docker, and remote terminal environments, **all** processes have TTY=`?` — TTY filtering would be a no-op (kill nothing) or dangerous (kill everything including the Claude CLI).
 - On macOS, orphans show TTY=`??` while on Linux they show TTY=`?` — handling both requires platform-specific code.
-- PPID=1 is **universal**: works identically on macOS, Linux, in containers, and over SSH.
+- Orphan-parent filtering is **universal**: works identically on macOS, Linux, in containers, and over SSH. On macOS / hosts without a `systemd --user` manager the set is exactly `{1}`, so behavior is unchanged.
 
 **When to disable the Stop hook:**
 
@@ -279,7 +279,7 @@ This restores the original PGID cleanup that kills PGID members regardless of or
 
 **Caveat: user-managed daemons (LaunchAgent / systemd):**
 
-The pattern-based fallback in the Stop hook also sweeps PPID=1 processes globally (not scoped to the session's PGID). Shared MCP servers are protected by `MCP_WHITELIST`, but if you run a long-lived daemon under `launchctl` / systemd whose command matches one of the cleanup patterns — e.g., a headless `claude --stream-json` workflow or a `worker-service.cjs --daemon` — it is legitimately PPID=1 and will be killed when any Stop hook fires.
+The pattern-based fallback in the Stop hook also sweeps orphan-parent processes globally (not scoped to the session's PGID). Shared MCP servers are protected by `MCP_WHITELIST`, but if you run a long-lived daemon under `launchctl` / systemd whose command matches one of the cleanup patterns — e.g., a headless `claude --stream-json` workflow or a `worker-service.cjs --daemon`, whether started by a LaunchAgent or a `systemd --user` unit — it is legitimately parented to an orphan parent and will be killed when any Stop hook fires.
 
 If this applies to you, choose one:
 

@@ -9,7 +9,7 @@ cc-reaper is a shell-based utility that cleans up orphan Claude Code processes (
 ## Repository Structure
 
 - `install.sh` — Automated 4-stage installer (shell functions → stop hook → proc-janitor → daemon startup)
-- `hooks/stop-cleanup-orphans.sh` — Claude Code Stop hook; kills orphans using PPID=1 filtering (only truly orphaned processes reparented to init)
+- `hooks/stop-cleanup-orphans.sh` — Claude Code Stop hook; kills orphans using orphan-parent filtering (only truly orphaned processes — reparented to PID 1, or on Linux to the user's `systemd --user` manager)
 - `shell/claude-cleanup.sh` — Shell functions: `claude-cleanup` (kill orphans), `claude-ram` (RAM report), `claude-fd` (FD usage report), `claude-sessions` (session list), `claude-guard` (auto-reaper with RSS/FD threshold + idle detection)
 - `shell/cc-monitor.sh` — Read-only heat attribution monitor (`cc-monitor`, `cc-monitor --apply`)
 - `proc-janitor/config.toml` — Daemon config with target patterns, whitelist, and grace period settings
@@ -20,13 +20,13 @@ cc-reaper is a shell-based utility that cleans up orphan Claude Code processes (
 
 **No build system or linter.** This is a pure shell script project. Changes are validated with shell syntax checks (`bash -n`) and lightweight validation scripts under `tests/`.
 
-**Process detection patterns** use grep bracket expressions (e.g., `[c]laude` instead of `claude`) to prevent grep from matching its own process. The stop hook uses **PPID=1 filtering** (not TTY filtering) to identify true orphans — processes reparented to init after their parent exited. This works correctly across macOS, Linux, containers, and SSH sessions. The manual `claude-cleanup` function is intentionally more aggressive (three-phase: PGID-based group kill → pattern fallback for detached processes → PPID=1 orphan sweep).
+**Process detection patterns** use grep bracket expressions (e.g., `[c]laude` instead of `claude`) to prevent grep from matching its own process. The stop hook uses **orphan-parent filtering** (not TTY filtering) to identify true orphans — processes whose session exited and were reparented. The orphan-parent set is PID 1 on macOS (launchd) and, on Linux, PID 1 **plus the invoking user's `systemd --user` manager** (the per-user reparent target — Linux orphans land there, not on PID 1). Only the current user's manager counts, matched by UID. This works correctly across macOS, Linux, containers, and SSH sessions. The manual `claude-cleanup` function is intentionally more aggressive (three-phase: PGID-based group kill → pattern fallback for detached processes → orphan-parent sweep).
 
 **Safety layers in the Stop hook**:
 1. **Ancestor protection**: Walks the process tree from `$$` upward and never kills any ancestor PID (prevents SIGTERM-ing the Claude CLI when an intermediate shell sits between hook and CLI).
-2. **PPID=1 filter** (default): Only kills processes whose parent has already exited. Active processes with a living parent are skipped.
+2. **Orphan-parent filter** (default): Only kills processes whose parent has already exited — those reparented to PID 1, or (on Linux) to the invoking user's `systemd --user` manager. Active processes with a living parent are skipped. The `systemd --user` manager PID is itself a reparent target, never a kill candidate.
 3. **MCP whitelist**: Shared long-running MCP servers (Supabase, Stripe, context7, claude-mem, chroma-mcp, Cloudflare, sequential-thinking) are always excluded.
-4. **`CC_STOP_HOOK_AGGRESSIVE=1`**: Skips the PPID=1 check but still preserves ancestors and the MCP whitelist.
+4. **`CC_STOP_HOOK_AGGRESSIVE=1`**: Skips the orphan-parent check but still preserves ancestors and the MCP whitelist.
 
 **proc-janitor** is an external Rust daemon (installed via Homebrew or Cargo). The config.toml here only configures its behavior — the daemon code lives at github.com/jhlee0409/proc-janitor.
 
@@ -91,4 +91,4 @@ bash -n hooks/stop-cleanup-orphans.sh  # Syntax check
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CC_STOP_HOOK_DISABLE` | 0 | Set to `1` to skip all cleanup (hook becomes no-op) |
-| `CC_STOP_HOOK_AGGRESSIVE` | 0 | Set to `1` to skip PPID=1 filtering. Still skips ancestors and MCP whitelist. |
+| `CC_STOP_HOOK_AGGRESSIVE` | 0 | Set to `1` to skip orphan-parent filtering. Still skips ancestors and MCP whitelist. |
