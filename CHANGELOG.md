@@ -8,6 +8,13 @@
   - `disk-janitor` — hourly **read-only** `--check` (disk free % + Time Machine local-snapshot pin detection) and Sunday-04:00 `--clean` of rebuildable-only caches (go/yarn/pip/brew/bun/Spotify/ShipIt/CoreSimulator + `docker system prune -af`, never `--volumes`) plus gated TM snapshot thinning.
   - `worktree-janitor` — manual multi-repo git worktree inventory with dual safety gate (dirty or active-process-cwd ⇒ KEEP), dry-run by default, `--apply` to remove; branches/commits never deleted.
   - `install.sh` now installs the three scripts to `~/.cc-reaper/` and loads the three LaunchAgents.
+  - **Hardening baked in before merge (2026-06-10 live-smoke + adversarial review)** — stubbed tests passed while live runs exposed environment-semantics bugs; all fixed with regression tests:
+    - `resource-watch` memory metric read vm_stat's `Pages stored in compressor` (pre-compression — reported 56 GB on a 36 GB machine); now reads `Pages occupied by compressor` and honors vm_stat's own header page size over `hw.pagesize`.
+    - `disk-janitor` measured `df -P /` — the sealed APFS system snapshot that reads ~93% free regardless of real usage; now measures `/System/Volumes/Data` (env-overridable via `CC_DJ_VOLUME`) for both threshold checks and TM-thinning freed-space accounting.
+    - `worktree-janitor` ran one `lsof` per candidate pid; any vanished pid (routine pgrep→lsof race) was misread as failure, conservatively marking EVERY worktree `active`. Now one batched `lsof` per run, vanished pids simply absent, plus cwd dedup before symlink resolution.
+    - Clean-target failures were swallowed by `| tee` (pipeline exit = tee's); exit codes are now captured before logging, so a failing `go clean`/`brew cleanup`/`docker prune` is logged as non-zero instead of success.
+    - Healthy `resource-watch` runs leaked exit 1 from a false tail-test (`[ breach ] && notify`), making launchd record every 10-min run as failed; snapshot now returns 0 deterministically.
+    - osascript notification strings escape embedded quotes/backslashes; `_cc_dj_init_dirs` fails loudly to stderr instead of silently dropping all logging; ~28 subshell forks removed from the 144×/day resource-watch hot path (builtin `read`/`[[ =~ ]]` instead of `echo | awk`/`echo | grep`).
 - **Stop hook safety layers** — `hooks/stop-cleanup-orphans.sh` now defaults to **PPID=1 orphan-only** cleanup (replacing fragile TTY filtering that broke under SSH/Docker/tmux), walks the process tree from `$$` upward and protects every ancestor PID, and exposes two new env vars:
   - `CC_STOP_HOOK_DISABLE=1` — skip all cleanup (no-op).
   - `CC_STOP_HOOK_AGGRESSIVE=1` — skip the PPID=1 check and fall back to PGID-member cleanup (ancestors + MCP whitelist still protected).
