@@ -149,7 +149,7 @@ if [ "$DAEMON_CHOICE" = "a" ]; then
     echo "  Config installed to $JANITOR_CONFIG_DIR/config.toml"
   fi
 
-  echo "[4/5] Starting proc-janitor daemon..."
+  echo "[4/6] Starting proc-janitor daemon..."
   if command -v brew &>/dev/null && command -v proc-janitor &>/dev/null; then
     brew services start jhlee0409/tap/proc-janitor 2>/dev/null || true
     echo "  Daemon started (brew services)."
@@ -182,12 +182,42 @@ else
   echo "  LaunchAgent installed and started."
   echo "  Monitor runs every 10 minutes, logs at $REAPER_DIR/logs/"
 
-  echo "[4/5] LaunchAgent active — skipping proc-janitor."
+  echo "[4/6] LaunchAgent active — skipping proc-janitor."
 fi
 
-# ─── 5. Uninstall hint ────────────────────────────────────────────────────────
+# ─── 5. Resource & disk janitor (LaunchAgents) ──────────────────────────────
 
-echo "[5/5] Done."
+if $IS_UPDATE; then
+  echo "[5/6] Updating resource & disk janitor..."
+else
+  echo "[5/6] Installing resource & disk janitor..."
+fi
+
+REAPER_DIR="$HOME_DIR/.cc-reaper"
+mkdir -p "$REAPER_DIR/logs" "$REAPER_DIR/state"
+PLIST_DIR="$HOME_DIR/Library/LaunchAgents"
+mkdir -p "$PLIST_DIR"
+
+for SCRIPT in resource-watch disk-janitor worktree-janitor; do
+  cp "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/"
+  chmod +x "$REAPER_DIR/$SCRIPT.sh"
+done
+
+for AGENT in resource-watch disk-check weekly-clean; do
+  AGENT_PLIST="$PLIST_DIR/com.cc-reaper.$AGENT.plist"
+  sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/com.cc-reaper.$AGENT.plist" > "$AGENT_PLIST"
+  launchctl unload "$AGENT_PLIST" 2>/dev/null || true
+  launchctl load "$AGENT_PLIST"
+done
+
+echo "  resource-watch: snapshot every 10 min (alerts on load/disk/memory thresholds)"
+echo "  disk-check:     read-only disk + TM-snapshot check every hour"
+echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
+echo "  worktree-janitor: manual — run '~/.cc-reaper/worktree-janitor.sh' (report), add --apply to clean"
+
+# ─── 6. Uninstall hint ────────────────────────────────────────────────────────
+
+echo "[6/6] Done."
 
 echo ""
 if $IS_UPDATE; then
@@ -212,3 +242,10 @@ echo "  launchctl list | grep cc-reaper   Check if monitor is running"
 echo "  cat ~/.cc-reaper/logs/monitor.log View cleanup log"
 echo "  launchctl unload ~/Library/LaunchAgents/com.cc-reaper.orphan-monitor.plist  Stop"
 fi
+echo ""
+echo "Resource & disk janitor:"
+echo "  cat ~/.cc-reaper/logs/resource-watch.log       System snapshots (10-min cadence)"
+echo "  ~/.cc-reaper/disk-janitor.sh --check           Read-only disk + snapshot-pin check"
+echo "  ~/.cc-reaper/disk-janitor.sh --clean           Clean rebuildable caches now"
+echo "  ~/.cc-reaper/worktree-janitor.sh               Worktree report (dry-run)"
+echo "  ~/.cc-reaper/worktree-janitor.sh --apply       Remove clean idle worktrees"

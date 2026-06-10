@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- **Resource & disk janitor suite** — three system-level janitors beyond process hygiene (`shell/resource-watch.sh`, `shell/disk-janitor.sh`, `shell/worktree-janitor.sh` + three LaunchAgents, all `Nice 10` / `LowPriorityIO`):
+  - `resource-watch` — 10-min single-pass load/CPU/memory/disk snapshot with threshold-gated macOS notifications (`CC_RW_*` env config, per-metric 60-min cooldown).
+  - `disk-janitor` — hourly **read-only** `--check` (disk free % + Time Machine local-snapshot pin detection) and Sunday-04:00 `--clean` of rebuildable-only caches (go/yarn/pip/brew/bun/Spotify/ShipIt/CoreSimulator + `docker system prune -af`, never `--volumes`) plus gated TM snapshot thinning.
+  - `worktree-janitor` — manual multi-repo git worktree inventory with dual safety gate (dirty or active-process-cwd ⇒ KEEP), dry-run by default, `--apply` to remove; branches/commits never deleted.
+  - `install.sh` now installs the three scripts to `~/.cc-reaper/` and loads the three LaunchAgents.
 - **Stop hook safety layers** — `hooks/stop-cleanup-orphans.sh` now defaults to **PPID=1 orphan-only** cleanup (replacing fragile TTY filtering that broke under SSH/Docker/tmux), walks the process tree from `$$` upward and protects every ancestor PID, and exposes two new env vars:
   - `CC_STOP_HOOK_DISABLE=1` — skip all cleanup (no-op).
   - `CC_STOP_HOOK_AGGRESSIVE=1` — skip the PPID=1 check and fall back to PGID-member cleanup (ancestors + MCP whitelist still protected).

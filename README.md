@@ -388,6 +388,21 @@ Safe cleanup candidates:
   PID 37915   agent-browser  avg   0.00% max   0.00% - stale or orphaned browser automation matches cc-reaper cleanup criteria
 ```
 
+## Resource & Disk Janitor
+
+Beyond process hygiene, cc-reaper ships three system-level janitors (added after a real incident: Load 31 on 12 cores / 95% disk, resolved manually then scripted). All background agents run with `Nice 10` + `LowPriorityIO` — near-zero foreground impact.
+
+| Script | Schedule | What it does |
+|---|---|---|
+| `resource-watch.sh` | every 10 min (launchd) | Single-pass snapshot (load / CPU idle / memory / disk) to `~/.cc-reaper/logs/resource-watch.log`; macOS notification when load > 2× cores, disk free < 15%, or memory is critically tight. Per-metric 60-min cooldown. |
+| `disk-janitor.sh --check` | hourly (launchd) | **Read-only**: disk free % + Time Machine local-snapshot pin detection (snapshots holding freed space hostage after big deletes). Alerts, never deletes. |
+| `disk-janitor.sh --clean` | Sunday 04:00 (launchd) | Cleans **rebuildable-only** targets: go-build / yarn / pip / brew / bun caches, Spotify / ShipIt / CoreSimulator caches, `docker system prune -af` (never `--volumes`), TM snapshot thinning (dated `com.apple.TimeMachine.*` only, only when disk is below threshold). |
+| `worktree-janitor.sh` | manual | Inventories git worktrees under `~/Documents/GitHub` (or `--repo <path>`); classifies KEEP/REMOVABLE with a **dual safety gate** (uncommitted changes OR an active process cwd inside ⇒ KEEP). **Dry-run by default** — only `--apply` removes; branches/commits are never deleted. |
+
+Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`, `~/Desktop`), never `docker prune --volumes`, never kills processes, scheduled runs never delete worktrees.
+
+Config via env: `CC_RW_LOAD_FACTOR` / `CC_RW_DISK_MIN_PCT` / `CC_RW_MEM_MIN_PCT` / `CC_RW_COOLDOWN_SECS` (watch), `CC_DJ_DISK_MIN_PCT` / `CC_DJ_COOLDOWN_SECS` (disk), `CC_WJ_ROOT` / `CC_WJ_NOTIFY_MIN_GB` (worktree).
+
 ## Dependencies
 
 | Tool | Required | Install |
@@ -406,17 +421,26 @@ cc-reaper/
 │   └── stop-cleanup-orphans.sh     # Claude Code Stop hook (PPID=1 orphan filtering + pattern fallback)
 ├── launchd/
 │   ├── cc-reaper-monitor.sh        # LaunchAgent monitor script (PGID + PPID=1 fallback)
-│   └── com.cc-reaper.orphan-monitor.plist  # LaunchAgent config (10-min interval)
+│   ├── com.cc-reaper.orphan-monitor.plist  # LaunchAgent config (10-min interval)
+│   ├── com.cc-reaper.resource-watch.plist  # System snapshot agent (10-min interval)
+│   ├── com.cc-reaper.disk-check.plist      # Read-only disk check agent (hourly)
+│   └── com.cc-reaper.weekly-clean.plist    # Rebuildable-cache clean agent (Sun 04:00)
 ├── proc-janitor/
 │   └── config.toml                 # proc-janitor daemon config (alternative to LaunchAgent)
 ├── shell/
 │   ├── cc-monitor.sh               # Read-only heat attribution monitor
-│   └── claude-cleanup.sh           # Shell functions (claude-ram, claude-fd, claude-cleanup, claude-sessions, claude-guard)
+│   ├── claude-cleanup.sh           # Shell functions (claude-ram, claude-fd, claude-cleanup, claude-sessions, claude-guard)
+│   ├── resource-watch.sh           # System snapshot + threshold alerting
+│   ├── disk-janitor.sh             # Disk check (--check) / rebuildable-cache clean (--clean)
+│   └── worktree-janitor.sh         # Git worktree inventory + gated removal (dry-run default)
 ├── tests/
 │   ├── agent-process-patterns.sh   # Cleanup-candidate matcher validation
 │   ├── cc-monitor-optimize.sh      # cc-monitor optimization menu tests
 │   ├── cc-monitor-runaway.sh       # Runaway protected process detection tests
-│   └── ppid-fallback.sh            # PPID=1 fallback kill + whitelist validation
+│   ├── ppid-fallback.sh            # PPID=1 fallback kill + whitelist validation
+│   ├── resource-watch.sh           # Snapshot / threshold / cooldown tests (stubbed)
+│   ├── disk-janitor.sh             # Read-only check / forbidden-flag / thinning tests (stubbed)
+│   └── worktree-janitor.sh         # Fixture-repo gate + apply tests
 └── README.md
 ```
 

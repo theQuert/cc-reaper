@@ -1,0 +1,6 @@
+{"file": "openspec/changes/resource-disk-janitor/specs/resource-watch/spec.md", "reason": "resource-watch behavioral contract (snapshot cost, thresholds, cooldown)"}
+{"file": "openspec/changes/resource-disk-janitor/specs/disk-janitor/spec.md", "reason": "disk-janitor behavioral contract (rebuildable-only, no --volumes, TM snapshot rules, check=read-only)"}
+{"file": "openspec/changes/resource-disk-janitor/specs/worktree-janitor/spec.md", "reason": "worktree-janitor behavioral contract (dual safety gate, dry-run default, scheduled=report-only)"}
+{"file": "openspec/changes/resource-disk-janitor/design.md", "reason": "conventions: self-contained scripts, CC_* env config, osascript+cooldown, test stubbing pattern"}
+{"file": "shell/cc-monitor.sh", "reason": "existing style reference: usage block, env-var defaults, function naming (_cc_*) — match it"}
+{"file": "launchd/com.cc-reaper.orphan-monitor.plist", "reason": "existing plist conventions to mirror (labels, logging paths, intervals)"}

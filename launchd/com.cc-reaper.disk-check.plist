@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cc-reaper.disk-check</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/.cc-reaper/disk-janitor.sh</string>
+        <string>--check</string>
+    </array>
+
+    <!-- Run every 3600 seconds (1 hour) -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.cc-reaper/logs/launchd-disk-check-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.cc-reaper/logs/launchd-disk-check-stderr.log</string>
+</dict>
+</plist>
