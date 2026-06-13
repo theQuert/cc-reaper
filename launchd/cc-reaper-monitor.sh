@@ -188,6 +188,39 @@ while IFS= read -r line; do
   fi
 done < <(ps -eo pid=,ppid=,tty=,%cpu=,%mem=,etime=,command= 2>/dev/null)
 
+# ─── Runaway-CPU override (kills regardless of the protected whitelist) ───────
+# is_cleanup_candidate() above protects shared MCP servers (cloudflare, supabase,
+# codex, ...) by name — correct while they are idle (~0% CPU). But a *whitelisted*
+# server stuck pegging a full core is exactly what must die: on 2026-06-13 an
+# orphaned Cloudflare MCP burned one core for 9h because both this reaper and
+# proc-janitor whitelisted it by name. This pass reaps a PPID=1 orphan that is OLD
+# and sustaining high CPU no matter what its name is. Four gates make a false kill
+# near-impossible: parent already dead (PPID=1), CPU over threshold, old enough to
+# not be real startup work, and still hot on a re-sample 3s later (not a spike).
+RUNAWAY_CPU="${CC_RUNAWAY_CPU:-80}"                       # shared with cc-monitor/claude-guard
+RUNAWAY_ORPHAN_MIN_SEC="${CC_RUNAWAY_ORPHAN_MIN_SEC:-180}" # orphan age floor in SECONDS (not CC_RUNAWAY_MIN, which is minutes for live protected procs)
+
+while read -r rpid _ rcpu retime rcmd; do   # default IFS: split the 5 ps columns
+  [ -z "$rpid" ] && continue
+  # Gate: orphan old enough to not be legitimate startup work
+  [ "$(etime_to_seconds "$retime")" -lt "$RUNAWAY_ORPHAN_MIN_SEC" ] && continue
+  # Skip anything a section above already reaped
+  already_killed=false
+  for kp in "${kill_pids[@]}"; do [ "$kp" = "$rpid" ] && already_killed=true && break; done
+  $already_killed && continue
+  # Gate: confirm the burn is sustained, not a momentary spike
+  sleep 3
+  rcpu2=$(ps -o %cpu= -p "$rpid" 2>/dev/null | tr -d ' ')
+  [ -z "$rcpu2" ] && continue   # exited on its own
+  awk -v a="$rcpu2" -v th="$RUNAWAY_CPU" 'BEGIN { exit !((a + 0) >= (th + 0)) }' || continue
+  log "KILL runaway (whitelist-override) PID=$rpid CPU=${rcpu}%->${rcpu2}% ELAPSED=$retime CMD=$(echo "$rcmd" | head -c 100)"
+  kill "$rpid" 2>/dev/null
+  kill_pids+=("$rpid")
+  count=$((count + 1))
+done < <(ps -eo pid=,ppid=,%cpu=,etime=,command= 2>/dev/null \
+  | awk -v th="$RUNAWAY_CPU" '$2 == 1 && ($3 + 0) >= (th + 0) { print }' \
+  | grep -E "[n]ode|[n]px|_npx|[m]cp|[b]un|[c]odex|[c]laude")
+
 if [ "$count" -eq 0 ]; then
   exit 0
 fi

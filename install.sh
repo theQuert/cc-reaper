@@ -4,6 +4,18 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOME_DIR="$HOME"
 
+# Guard: an empty HOME (e.g. run under sudo or a stripped env) makes every
+# `sed s|__HOME__|$HOME_DIR|` below produce a broken "/.cc-reaper/..." path,
+# silently installing LaunchAgents that can never find their script (exit 78).
+# Fall back to the account's real home, then fail-fast rather than mis-install.
+if [ -z "$HOME_DIR" ]; then
+  HOME_DIR=$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+fi
+if [ -z "$HOME_DIR" ] || [ ! -d "$HOME_DIR" ]; then
+  echo "FATAL: cannot resolve home directory (HOME unset); aborting to avoid installing broken LaunchAgent paths." >&2
+  exit 1
+fi
+
 # ─── Detect install vs update ────────────────────────────────────────────────
 IS_UPDATE=false
 if grep -q "claude-cleanup.sh" "$HOME_DIR/.zshrc" 2>/dev/null || \

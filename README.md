@@ -147,7 +147,9 @@ Add to `~/.claude/settings.json` in the `"Stop"` hooks array:
 
 #### Option A: LaunchAgent (zero-dependency, macOS only)
 
-Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1.
+Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1. As a final pass it also reaps a PPID=1 orphan that is **sustaining high CPU** (`CC_RUNAWAY_CPU`, default 80%) past `CC_RUNAWAY_ORPHAN_MIN_SEC` (default 180s) **even if its name is whitelisted** — a stuck shared MCP pegging a core is exactly what the name-based whitelist must not protect.
+
+> **Install gotcha:** the `sed` below must resolve `$HOME` to a real path. If it expands empty (e.g. under `sudo`), the plist gets a broken `/.cc-reaper/...` `ProgramArguments` and the agent silently fails every run with `last exit code = 78` — verify with `launchctl print gui/$(id -u)/com.cc-reaper.orphan-monitor | grep program`. `install.sh` now fails fast rather than installing a broken path.
 
 ```bash
 mkdir -p ~/.cc-reaper/logs
@@ -225,6 +227,7 @@ claude-guard --dry-run  # preview without killing
 | `CC_RUNAWAY_MIN` | 60 | Minutes of elapsed time required before a hot protected process is treated as runaway |
 | `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds `claude-guard` waits (Ctrl+C to abort) before SIGTERM-ing runaway protected processes |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip `claude-guard`'s runaway phase entirely |
+| `CC_RUNAWAY_ORPHAN_MIN_SEC` | 180 | LaunchAgent monitor only: minimum **seconds** a PPID=1 orphan must have lived before its sustained-CPU burn (`CC_RUNAWAY_CPU`) can trigger the whitelist-override reap. Distinct from `CC_RUNAWAY_MIN` (minutes, for live protected processes). |
 
 Example: lower the thresholds for constrained machines:
 
