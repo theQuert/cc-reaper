@@ -21,7 +21,7 @@ expect_eq() {
 #######################################################
 out=$(bash -c '
   source "$1"
-  # Hot cloudflare MCP — protected and over both thresholds.
+  # Hot supabase MCP — protected and over both thresholds.
   _cc_monitor_is_runaway 102.0 09:07:51 && echo "is_runaway:yes" || echo "is_runaway:no"
   # Same MCP but only 30 minutes elapsed — below default 60-minute threshold.
   _cc_monitor_is_runaway 102.0 00:30:00 && echo "etime_short:yes" || echo "etime_short:no"
@@ -41,8 +41,8 @@ echo "$out" | grep -q "^min_override:yes$" && ok "is_runaway: CC_RUNAWAY_MIN hon
 # Report section: stuck/runaway present in human report when fixture has hot cloudflare MCP
 #######################################################
 fixture=$(mktemp)
-# Hot cloudflare MCP — high avg CPU, long etime, parent != 1, no stale criteria.
-printf "9594\t9370\t9594\tttys001\t09:07:51\t102.7\t348160\tnode /Users/quert/.npm/_npx/0a3d156e77e8dd08/node_modules/.bin/mcp-server-cloudflare run abc123\n" > "$fixture"
+# Hot supabase MCP — high avg CPU, long etime, parent != 1, no stale criteria.
+printf "9594\t9370\t9594\tttys001\t09:07:51\t102.7\t348160\tnode /Users/quert/.npm/_npx/0a3d156e77e8dd08/node_modules/.bin/mcp-server-supabase run abc123\n" > "$fixture"
 # Cool cmux — protected but cool, should stay DO_NOT_KILL.
 printf "62199\t1\t62199\t??\t02:00:00\t1.0\t51200\t/Applications/cmux.app/Contents/MacOS/cmux\n" >> "$fixture"
 
@@ -100,7 +100,7 @@ rm "$fixture"
 # But threshold envs do affect monitor. Verify CC_RUNAWAY_CPU=99 gates out a 90% process.
 #######################################################
 fixture_borderline=$(mktemp)
-printf "9594\t9370\t9594\tttys001\t09:07:51\t90.0\t348160\tnode /usr/local/bin/mcp-server-cloudflare run\n" > "$fixture_borderline"
+printf "9594\t9370\t9594\tttys001\t09:07:51\t90.0\t348160\tnode /usr/local/bin/mcp-server-supabase run\n" > "$fixture_borderline"
 out=$(CC_RUNAWAY_CPU=99 CC_MONITOR_SNAPSHOT_FILE="$fixture_borderline" bash "$ROOT_DIR/shell/cc-monitor.sh" --once 2>/dev/null)
 echo "$out" | grep -q "Stuck/runaway protected processes:" \
   && fail "CC_RUNAWAY_CPU=99 still flagged 90% process" \
@@ -120,7 +120,7 @@ cat > "$stub_dir/ps" <<'STUB'
 # Real ps invocations from elsewhere fall through to /bin/ps.
 case " $* " in
   *" -axo pid=,etime=,%cpu=,command= "*)
-    echo "  9594 09:07:51 102.7 node /usr/local/bin/mcp-server-cloudflare run abc"
+    echo "  9594 09:07:51 102.7 node /usr/local/bin/mcp-server-supabase run abc"
     return 0
     ;;
   *)
@@ -162,7 +162,7 @@ cat > "$stub_dir/ps" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in
   *" -axo pid=,etime=,%cpu=,command= "*)
-    echo "  9594 09:07:51 102.7 node /usr/local/bin/mcp-server-cloudflare run abc"
+    echo "  9594 09:07:51 102.7 node /usr/local/bin/mcp-server-supabase run abc"
     return 0
     ;;
   *)

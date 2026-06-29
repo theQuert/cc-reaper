@@ -25,7 +25,7 @@ cc-reaper is a shell-based utility that cleans up orphan Claude Code processes (
 **Safety layers in the Stop hook**:
 1. **Ancestor protection**: Walks the process tree from `$$` upward and never kills any ancestor PID (prevents SIGTERM-ing the Claude CLI when an intermediate shell sits between hook and CLI).
 2. **Orphan-parent filter** (default): Only kills processes whose parent has already exited — those reparented to PID 1, or (on Linux) to the invoking user's `systemd --user` manager. Active processes with a living parent are skipped. The `systemd --user` manager PID is itself a reparent target, never a kill candidate.
-3. **MCP whitelist**: Shared long-running MCP servers (Supabase, Stripe, context7, claude-mem, chroma-mcp, Cloudflare, sequential-thinking) are always excluded.
+3. **MCP whitelist**: Shared long-running MCP servers (Supabase, Stripe, context7, claude-mem, chroma-mcp, sequential-thinking) are always excluded. **Cloudflare's MCP server (`@cloudflare/mcp-server-cloudflare`) is deliberately NOT whitelisted** — it is prone to orphaning and pinning ~100% CPU for hours, so it is treated as a normal reap target.
 4. **`CC_STOP_HOOK_AGGRESSIVE=1`**: Skips the orphan-parent check but still preserves ancestors and the MCP whitelist.
 
 **proc-janitor** is an external Rust daemon (installed via Homebrew or Cargo). The config.toml here only configures its behavior — the daemon code lives at github.com/jhlee0409/proc-janitor.

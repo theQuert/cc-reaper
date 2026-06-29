@@ -210,12 +210,15 @@ mkdir -p "$REAPER_DIR/logs" "$REAPER_DIR/state"
 PLIST_DIR="$HOME_DIR/Library/LaunchAgents"
 mkdir -p "$PLIST_DIR"
 
-for SCRIPT in resource-watch disk-janitor worktree-janitor; do
+# claude-cleanup + guard-runner ship too: the guard agent sources the DEPLOYED
+# claude-cleanup.sh (a launchd agent has no TCC access to a ~/Documents checkout),
+# with guard-runner.sh next to it.
+for SCRIPT in resource-watch disk-janitor worktree-janitor claude-cleanup guard-runner; do
   cp "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/"
   chmod +x "$REAPER_DIR/$SCRIPT.sh"
 done
 
-for AGENT in resource-watch disk-check weekly-clean; do
+for AGENT in resource-watch disk-check weekly-clean guard; do
   AGENT_PLIST="$PLIST_DIR/com.cc-reaper.$AGENT.plist"
   sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/com.cc-reaper.$AGENT.plist" > "$AGENT_PLIST"
   launchctl unload "$AGENT_PLIST" 2>/dev/null || true
@@ -226,6 +229,7 @@ echo "  resource-watch: snapshot every 10 min (alerts on load/disk/memory thresh
 echo "  disk-check:     read-only disk + TM-snapshot check every hour"
 echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
 echo "  worktree-janitor: manual — run '~/.cc-reaper/worktree-janitor.sh' (report), add --apply to clean"
+echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs whitelisted MCP pinned >80% CPU for >60 min)"
 
 # ─── 6. Uninstall hint ────────────────────────────────────────────────────────
 

@@ -19,7 +19,7 @@ log() {
 }
 
 protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|cloudflare/mcp-server|mcp-server-cloudflare|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
 }
 
 is_protected_cmd() {
@@ -92,7 +92,7 @@ is_agent_mcp_cmd() {
 
 is_existing_orphan_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "claude.*stream-json|node.*mcp-server|npx.*mcp-server|worker-service\.cjs|bun.*worker-service|node.*claude.*subagent"
+  echo "$cmd" | grep -qE "claude.*stream-json|node.*mcp-server|npx.*mcp-server|npm exec.*mcp-server|worker-service\.cjs|bun.*worker-service|node.*claude.*subagent"
 }
 
 is_cleanup_candidate() {
@@ -189,11 +189,16 @@ while IFS= read -r line; do
 done < <(ps -eo pid=,ppid=,tty=,%cpu=,%mem=,etime=,command= 2>/dev/null)
 
 # ─── Runaway-CPU override (kills regardless of the protected whitelist) ───────
-# is_cleanup_candidate() above protects shared MCP servers (cloudflare, supabase,
+# is_cleanup_candidate() above protects shared MCP servers (supabase, claude-mem,
 # codex, ...) by name — correct while they are idle (~0% CPU). But a *whitelisted*
 # server stuck pegging a full core is exactly what must die: on 2026-06-13 an
-# orphaned Cloudflare MCP burned one core for 9h because both this reaper and
-# proc-janitor whitelisted it by name. This pass reaps a PPID=1 orphan that is OLD
+# orphaned Cloudflare MCP burned one core for 9h. (Cloudflare is no longer
+# whitelisted — the main sweep reaps it now that is_existing_orphan_cmd also
+# matches the "npm exec @scope/mcp-server-*" form.) CAVEAT: this override only
+# fires on a PPID=1 orphan that ITSELF burns CPU; a two-layer "orphan npm exec
+# wrapper (PPID=1, ~0% CPU) + hot node child (PPID!=1)" evades it, so it leans on
+# the main sweep killing the orphaned wrapper's whole PGID.
+# This pass reaps a PPID=1 orphan that is OLD
 # and sustaining high CPU no matter what its name is. Four gates make a false kill
 # near-impossible: parent already dead (PPID=1), CPU over threshold, old enough to
 # not be real startup work, and still hot on a re-sample 3s later (not a spike).

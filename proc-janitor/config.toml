@@ -53,8 +53,6 @@ whitelist = [
     "chroma-mcp",
     "chrome-devtools-mcp",
     "mcp-remote",
-    "cloudflare/mcp-server",
-    "mcp-server-cloudflare",
     "sequentialthinking",
     "sequential-thinking",
     "codex.*mcp",

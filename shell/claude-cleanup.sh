@@ -3,7 +3,7 @@
 
 # Shared-service and user-process protections for agent cleanup.
 _cc_reaper_protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|cloudflare/mcp-server|mcp-server-cloudflare|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
 }
 
 _cc_reaper_is_protected_cmd() {
@@ -473,7 +473,7 @@ claude-sessions() {
 # Usage: _claude_pgid_kill <pid>
 _claude_pgid_kill() {
   local target_pid=$1
-  local MCP_WHITELIST="supabase|@stripe/mcp|context7|context7-mcp|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|sequential-thinking|codex.*mcp"
+  local MCP_WHITELIST="supabase|@stripe/mcp|context7|context7-mcp|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp"
   local pgid=$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ')
   if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
     while IFS= read -r pid; do
@@ -538,7 +538,7 @@ _cc_guard_runaway_protected_pids() {
 
 claude-guard() {
   local dry_run=false
-  [ "$1" = "--dry-run" ] && dry_run=true
+  [ "${1:-}" = "--dry-run" ] && dry_run=true
 
   # ─── Configuration ─────────────────────────────────────────────────────
   local max_sessions=${CC_MAX_SESSIONS:-3}

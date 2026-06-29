@@ -74,7 +74,10 @@ expect_no "ChatGPT app is protected" \
   _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
   "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
 
-expect_no "mcp-server-cloudflare is protected" \
+expect_no "cloudflare MCP is no longer whitelisted (deliberately reapable)" \
+  _cc_reaper_is_protected_cmd "node /usr/local/bin/mcp-server-cloudflare run abc"
+
+expect_no "bare node mcp-server-cloudflare is not a manual-cleanup candidate (no node-form branch here)" \
   _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
   "node /usr/local/bin/mcp-server-cloudflare run abc"
 

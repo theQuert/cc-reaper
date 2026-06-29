@@ -21,7 +21,7 @@ This is a [widely reported issue](https://github.com/anthropics/claude-code/issu
 
 | File descriptors | VM processes, settings.json, MCP stdio pipes | ~6,200 FDs/hr leak rate |
 
-> **Not killed**: User apps and system services such as ChatGPT.app, cmux.app, Bitdefender, Spotlight (`mdworker`/`mds_stores`), normal Chrome browsing, and web dev servers are protected. Long-running MCP servers shared across sessions (Supabase, Stripe, claude-mem, chroma-mcp, Cloudflare/sequential-thinking variants) are also protected. Stale browser/Codex cleanup only targets orphaned or old automation processes.
+> **Not killed**: User apps and system services such as ChatGPT.app, cmux.app, Bitdefender, Spotlight (`mdworker`/`mds_stores`), normal Chrome browsing, and web dev servers are protected. Long-running MCP servers shared across sessions (Supabase, Stripe, claude-mem, chroma-mcp, sequential-thinking variants) are also protected. (Cloudflare's MCP server is **not** protected — it tends to orphan and pin ~100% CPU, so it is reaped like any other orphan.) Stale browser/Codex cleanup only targets orphaned or old automation processes.
 
 ## Solution: Three-Layer Defense
 

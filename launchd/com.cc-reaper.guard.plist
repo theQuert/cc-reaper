@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cc-reaper.guard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/.cc-reaper/guard-runner.sh</string>
+    </array>
+
+    <!-- Run every 600 seconds (10 minutes) -->
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Run at reduced scheduling priority -->
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <!-- Reduce I/O priority so process sampling does not compete with foreground work -->
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.cc-reaper/logs/launchd-guard-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.cc-reaper/logs/launchd-guard-stderr.log</string>
+</dict>
+</plist>
