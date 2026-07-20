@@ -43,6 +43,8 @@ The initial app is a local SwiftPM macOS application. It is a development and so
 
 10. **Keep engine and log roots distinct.** The configurable script root locates executable policy scripts. Logs continue to live under `~/.cc-reaper/logs`, matching the existing shell and LaunchAgent contract; opening a missing log directory reports an in-app error rather than silently asking Finder to open an invalid path.
 
+11. **Bound dense dashboard regions instead of allowing report volume to drive window layout.** The dashboard keeps its cleanup controls in a stable footer, places the main report surface in an outer scroll region, gives findings a bounded list height, and limits the visible suggestion stack with an explicit expansion control. Long process labels and actions truncate or wrap within their assigned columns rather than widening or vertically displacing the window.
+
 ## Risks / Trade-offs
 
 - [The monitor JSON contract changes] → Decode required top-level evidence strictly, tolerate additive fields, and cover a representative fixture in tests.
@@ -51,6 +53,7 @@ The initial app is a local SwiftPM macOS application. It is a development and so
 - [Cleanup runs longer than expected] → Keep process execution asynchronous, disable overlapping actions, apply operation-specific timeouts, terminate a timed-out child, and display the timeout without retrying.
 - [Dry-run and cleanup drift] → Implement both modes in the same `claude-cleanup` function and route all process signals through one dry-run-aware helper covered by shell tests.
 - [A busy real Mac produces many protected findings] → Default the dashboard to cleanup-relevant evidence, preserve explicit Review/Protected/All filters, and keep all decoded evidence available without treating it as cleanup urgency.
+- [A busy report overflows the default window] → Keep the footer stable, bound nested finding/action regions, and verify the default and minimum window sizes against real report volume.
 - [SwiftPM app bundling differs from a release build] → Keep the bundle staging script deterministic; defer signing/notarization to a separate distribution change.
 
 ## Migration Plan

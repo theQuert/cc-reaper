@@ -9,6 +9,7 @@
 - Keep refresh and preview read-only; route destructive cleanup through the existing `claude-cleanup` engine only after explicit confirmation.
 - Make cleanup preview exercise the same `claude-cleanup` policy as confirmation, bound command execution, and require a successful preview before destructive confirmation.
 - Separate cleanup availability from general resource-review findings, reduce monitor self-noise, and provide filtered actionable views with the backend's suggested actions.
+- Keep dense findings and suggested actions usable at the default and minimum dashboard sizes without clipping the header, metrics, or cleanup controls.
 - Surface unavailable scripts, malformed output, and command failures as visible unknown/error states rather than reporting the system healthy.
 - Add a reproducible SwiftPM build/test/run path and install the existing monitor script alongside the other deployed cc-reaper scripts.
 

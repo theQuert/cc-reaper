@@ -119,6 +119,10 @@ The dashboard SHALL separate cleanup availability from general resource-review e
 - **WHEN** the report contains suggested actions or a finding-specific suggested action
 - **THEN** the dashboard SHALL display those suggestions near the relevant review surface
 
+#### Scenario: Busy report is shown in a bounded dashboard window
+- **WHEN** the selected filter or suggested actions contain more content than fits in the current dashboard window
+- **THEN** the dashboard SHALL preserve access to the status header, summary, findings, suggestions, and cleanup controls through bounded regions or scrolling without clipping content outside the window
+
 ### Requirement: Reproducible local app workflow
 The repository SHALL provide a SwiftPM build and test workflow plus a single project-local script that stages and launches a valid macOS app bundle.
 

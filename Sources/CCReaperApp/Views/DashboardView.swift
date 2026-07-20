@@ -6,23 +6,36 @@ struct DashboardView: View {
     @Bindable var store: MonitorStore
     @State private var findingFilter: FindingFilter = .cleanup
     @State private var logsError: String?
+    @State private var showsAllSuggestedActions = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            header
-            summary
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    header
+                    summary
 
-            if let error = store.errorMessage {
-                errorBanner(error)
+                    if let error = store.errorMessage {
+                        errorBanner(error)
+                    }
+
+                    findings
+
+                    if store.actionTitle != nil {
+                        actionResult
+                    }
+                }
+                .padding(.horizontal, 22)
+                .padding(.top, 22)
+                .padding(.bottom, 16)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            findings
-
-            if store.actionTitle != nil {
-                actionResult
-            }
+            Divider()
+            cleanupActions
+                .padding(.horizontal, 22)
+                .padding(.vertical, 12)
         }
-        .padding(22)
         .toolbar {
             ToolbarItemGroup {
                 Button {
@@ -78,7 +91,13 @@ struct DashboardView: View {
     @ViewBuilder
     private var summary: some View {
         if let report = store.report {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 135), alignment: .leading)], spacing: 12) {
+            LazyVGrid(
+                columns: Array(
+                    repeating: GridItem(.flexible(minimum: 150), spacing: 12, alignment: .leading),
+                    count: 3
+                ),
+                spacing: 12
+            ) {
                 StatusCard(
                     title: "Cleanup candidates",
                     value: "\(report.safeCleanupCandidates.count)",
@@ -144,6 +163,9 @@ struct DashboardView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .onChange(of: findingFilter) {
+                        showsAllSuggestedActions = false
+                    }
 
                     let filteredFindings = findingFilter.apply(to: report.findings)
                     if filteredFindings.isEmpty {
@@ -158,22 +180,15 @@ struct DashboardView: View {
                             FindingRow(finding: finding)
                         }
                         .listStyle(.inset)
-                        .frame(minHeight: 190)
+                        .frame(minHeight: 190, idealHeight: 240, maxHeight: 300)
                     }
                 }
                 .padding(.vertical, 4)
             }
 
-            if !report.suggestedActions.isEmpty {
-                GroupBox("Suggested next actions") {
-                    VStack(alignment: .leading, spacing: 5) {
-                        ForEach(report.suggestedActions, id: \.self) { action in
-                            Label(action, systemImage: "arrow.turn.down.right")
-                                .font(.callout)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
+            let actions = suggestedActions(for: report)
+            if !actions.isEmpty {
+                suggestedActions(actions)
             }
         } else if store.report != nil {
             ContentUnavailableView(
@@ -183,7 +198,9 @@ struct DashboardView: View {
             )
             .frame(maxWidth: .infinity, minHeight: 190)
         }
+    }
 
+    private var cleanupActions: some View {
         HStack {
             Button("Preview Cleanup") {
                 Task { await store.previewCleanup() }
@@ -201,6 +218,56 @@ struct DashboardView: View {
             Text("Cleanup always requires confirmation")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    private func suggestedActions(_ actions: [String]) -> some View {
+        let visibleActions = showsAllSuggestedActions ? actions : Array(actions.prefix(3))
+
+        return GroupBox("Suggested next actions") {
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(visibleActions, id: \.self) { action in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: "arrow.turn.down.right")
+                            .foregroundStyle(.secondary)
+                            .frame(width: 14)
+                        Text(action)
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                if actions.count > 3 {
+                    Button(showsAllSuggestedActions ? "Show fewer" : "Show \(actions.count - 3) more") {
+                        withAnimation(.snappy) {
+                            showsAllSuggestedActions.toggle()
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tint)
+                    .accessibilityLabel(
+                        showsAllSuggestedActions
+                            ? "Show fewer suggested actions"
+                            : "Show all \(actions.count) suggested actions"
+                    )
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func suggestedActions(for report: MonitorReport) -> [String] {
+        let filteredFindings = findingFilter.apply(to: report.findings)
+        guard !filteredFindings.isEmpty else { return [] }
+
+        let contextual = filteredFindings.map(\.suggestedAction)
+        let candidates = findingFilter == .all
+            ? contextual + report.suggestedActions
+            : contextual
+        var seen = Set<String>()
+        return candidates.filter { action in
+            let normalized = action.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !normalized.isEmpty && seen.insert(normalized).inserted
         }
     }
 
@@ -359,6 +426,8 @@ private struct StatusCard: View {
             Label(title, systemImage: systemImage)
                 .foregroundStyle(tint)
                 .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
             Text(value)
                 .font(.title2.weight(.semibold).monospacedDigit())
         }
@@ -378,24 +447,31 @@ private struct FindingRow: View {
                 .foregroundStyle(finding.classification.tint)
                 .padding(.top, 5)
             VStack(alignment: .leading, spacing: 4) {
-                HStack {
+                HStack(spacing: 8) {
                     Text(finding.label)
                         .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .layoutPriority(1)
                     Text("PID \(finding.pid)")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
-                    Spacer()
+                        .fixedSize()
+                    Spacer(minLength: 8)
                     Text(finding.classification.title)
                         .font(.caption.weight(.medium))
                         .foregroundStyle(finding.classification.tint)
+                        .fixedSize()
                 }
                 Text(finding.reason)
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 if !finding.suggestedAction.isEmpty {
                     Text("Suggested: \(finding.suggestedAction)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Text("\(finding.averageCPU.formatted(.number.precision(.fractionLength(1))))% CPU · \(finding.rssMB) MB · \(finding.elapsed)")
                     .font(.caption.monospacedDigit())

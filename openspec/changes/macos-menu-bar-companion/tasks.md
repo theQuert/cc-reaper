@@ -21,3 +21,4 @@
 - [x] 4.3 Separate cleanup health from manual-review/protected evidence, add filters and suggested actions, and show candidate details before confirmation.
 - [x] 4.4 Exclude the companion/sampler process tree and protect known UI automation helpers without broadening cleanup eligibility.
 - [x] 4.5 Use the stable log root with visible missing-directory errors, then rerun full tests and a background real UI canary.
+- [x] 4.6 Bound the dashboard's findings and suggested-action regions, keep cleanup controls stable, and verify default/minimum-window overflow behavior with a real UI canary.
