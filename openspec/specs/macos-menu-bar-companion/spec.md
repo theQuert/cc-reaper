@@ -76,6 +76,29 @@ The companion SHALL keep preview non-destructive and SHALL require explicit conf
 - **WHEN** monitor, preview, or cleanup does not exit before its operation-specific timeout
 - **THEN** the companion SHALL terminate the child process, show a timeout error, and SHALL NOT retry automatically
 
+### Requirement: User-managed process rules preserve safety boundaries
+The companion SHALL let users manage case-insensitive literal command-substring rules through Settings and eligible finding rows, persist those rules atomically in `~/.cc-reaper/process-rules.tsv` with owner-only permissions, and share the resulting policy with the monitor and cleanup engines.
+
+#### Scenario: User adds an Always Protect rule
+- **WHEN** the user adds an `Always Protect` rule for a valid literal command substring
+- **THEN** the companion SHALL persist the rule, refresh the report, classify matching commands as protected, and the cleanup engines SHALL reject those commands at candidate and signal boundaries
+
+#### Scenario: User allows stale cleanup
+- **WHEN** the user adds an `Allow Stale Cleanup` rule for an eligible non-immutable process
+- **THEN** the matching process SHALL become a cleanup candidate only after it is stale and detached or orphaned, and cleanup SHALL still require same-engine preview and explicit confirmation
+
+#### Scenario: Rule file contains conflicts or malformed entries
+- **WHEN** externally edited rules contain malformed rows or both policies for the same case-insensitive literal
+- **THEN** malformed rows SHALL be ignored and `Always Protect` SHALL win the conflict
+
+#### Scenario: User targets an immutable process
+- **WHEN** a cleanup rule matches a system, security, UI, normal Chrome, cc-reaper, or Codex Computer Use process
+- **THEN** the companion SHALL withhold the cleanup-rule action and the cleanup engines SHALL preserve the immutable protection
+
+#### Scenario: Rules are saved or removed
+- **WHEN** a valid rule between 3 and 128 characters without tabs or line breaks is saved
+- **THEN** the store SHALL write it atomically with mode `0600`, replace an existing case-insensitive match, and remove the rules file when the final rule is deleted
+
 ### Requirement: Configurable local integration
 The companion SHALL automatically resolve a complete local script root and SHALL provide persistent native settings for an explicit script-root override, monitor reporting threshold, and automatic refresh interval.
 
