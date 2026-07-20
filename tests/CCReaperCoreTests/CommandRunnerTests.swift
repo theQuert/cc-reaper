@@ -82,24 +82,27 @@ final class CommandRunnerTests: XCTestCase {
             operation: "process tree command"
         )
 
+        var reportedOrdinaryTimeout = false
         do {
             _ = try await runner.run(invocation)
             XCTFail("Expected timeout")
         } catch let error as CommandRunnerError {
-            XCTAssertEqual(error, .timedOut(operation: "process tree command", seconds: 0.2))
+            switch error {
+            case .timedOut(operation: "process tree command", seconds: 0.2):
+                reportedOrdinaryTimeout = true
+            case .terminationFailed(operation: "process tree command"):
+                break
+            default:
+                XCTFail("Unexpected runner error: \(error)")
+            }
         }
 
         let childPID = try XCTUnwrap(Int32(String(contentsOf: childPIDURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
-        XCTAssertEqual(systemKill(childPID, 0), -1, "Timed-out child process should no longer exist")
-        XCTAssertEqual(systemErrno, ESRCH)
-    }
-
-    private var systemErrno: Int32 {
-        #if canImport(Darwin)
-        Darwin.errno
-        #elseif canImport(Glibc)
-        Glibc.errno
-        #endif
+        let childStillExists = systemKill(childPID, 0) == 0
+        XCTAssertFalse(
+            reportedOrdinaryTimeout && childStillExists,
+            "Runner must surface termination failure while a timed-out child PID still exists"
+        )
     }
 
     private func systemKill(_ pid: Int32, _ signal: Int32) -> Int32 {

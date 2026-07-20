@@ -66,6 +66,8 @@ public struct CLIService: CLIServiceProviding, Sendable {
                 throw CLIServiceError.invalidMonitorOutput("sample_count must be positive")
             }
             return report
+        } catch let error as CLIServiceError {
+            throw error
         } catch {
             throw CLIServiceError.invalidMonitorOutput(error.localizedDescription)
         }

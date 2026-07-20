@@ -69,7 +69,8 @@ final class CLIServiceTests: XCTestCase {
             _ = try await service.scan(scriptRoot: root, minimumCPU: 1)
             XCTFail("Expected non-read-only payload error")
         } catch let error as CLIServiceError {
-            XCTAssertEqual(error, .invalidMonitorOutput("cc-monitor returned invalid JSON: monitor payload is not read-only"))
+            XCTAssertEqual(error, .invalidMonitorOutput("monitor payload is not read-only"))
+            XCTAssertEqual(error.localizedDescription, "cc-monitor returned invalid JSON: monitor payload is not read-only")
         }
     }
 
@@ -90,7 +91,8 @@ final class CLIServiceTests: XCTestCase {
                 _ = try await service.scan(scriptRoot: root, minimumCPU: 1)
                 XCTFail("Expected monitor contract error")
             } catch let error as CLIServiceError {
-                XCTAssertEqual(error, .invalidMonitorOutput("cc-monitor returned invalid JSON: \(testCase.message)"))
+                XCTAssertEqual(error, .invalidMonitorOutput(testCase.message))
+                XCTAssertEqual(error.localizedDescription, "cc-monitor returned invalid JSON: \(testCase.message)")
             }
         }
     }

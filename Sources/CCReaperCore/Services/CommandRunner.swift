@@ -46,11 +46,14 @@ public protocol CommandRunning: Sendable {
 
 public enum CommandRunnerError: Error, Equatable, LocalizedError, Sendable {
     case timedOut(operation: String, seconds: TimeInterval)
+    case terminationFailed(operation: String)
 
     public var errorDescription: String? {
         switch self {
         case .timedOut(let operation, let seconds):
             return "cc-reaper \(operation) timed out after \(seconds.formatted(.number.precision(.fractionLength(1)))) seconds."
+        case .terminationFailed(let operation):
+            return "cc-reaper \(operation) timed out, but its helper process group did not exit after forced termination."
         }
     }
 }
@@ -94,9 +97,13 @@ public struct ProcessCommandRunner: CommandRunning {
                         break
                     }
                     if Date() >= deadline {
-                        await Self.stop(processGroup: processID)
+                        let didStop = await Self.stop(processGroup: processID)
+                        didSpawn = false
                         try? stdoutHandle.close()
                         try? stderrHandle.close()
+                        guard didStop else {
+                            throw CommandRunnerError.terminationFailed(operation: invocation.operation)
+                        }
                         throw CommandRunnerError.timedOut(
                             operation: invocation.operation,
                             seconds: invocation.timeout
@@ -108,7 +115,12 @@ public struct ProcessCommandRunner: CommandRunning {
                 try stderrHandle.close()
             } catch {
                 if didSpawn, exitCode == nil {
-                    await Self.stop(processGroup: processID)
+                    let didStop = await Self.stop(processGroup: processID)
+                    if !didStop {
+                        try? stdoutHandle.close()
+                        try? stderrHandle.close()
+                        throw CommandRunnerError.terminationFailed(operation: invocation.operation)
+                    }
                 }
                 try? stdoutHandle.close()
                 try? stderrHandle.close()
@@ -180,23 +192,26 @@ public struct ProcessCommandRunner: CommandRunning {
         return nil
     }
 
-    private static func stop(processGroup: pid_t) async {
+    private static func stop(processGroup: pid_t) async -> Bool {
         _ = ccr_signal_process_group(processGroup, SIGTERM)
-        await waitForExit(processGroup, timeout: terminationGrace)
-
-        if ccr_process_group_exists(processGroup) != 0 {
-            _ = ccr_signal_process_group(processGroup, SIGKILL)
-            await waitForExit(processGroup, timeout: killGrace)
+        if await waitForExit(processGroup, timeout: terminationGrace) {
+            return true
         }
+
+        _ = ccr_signal_process_group(processGroup, SIGKILL)
+        return await waitForExit(processGroup, timeout: killGrace)
     }
 
-    private static func waitForExit(_ processGroup: pid_t, timeout: TimeInterval) async {
+    private static func waitForExit(_ processGroup: pid_t, timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         var exitCode: Int32 = 0
-        while Date() < deadline {
+        while true {
             _ = ccr_poll_process(processGroup, &exitCode)
             if ccr_process_group_exists(processGroup) == 0 {
-                return
+                return true
+            }
+            if Date() >= deadline {
+                return false
             }
             try? await Task.sleep(for: .milliseconds(10))
         }
