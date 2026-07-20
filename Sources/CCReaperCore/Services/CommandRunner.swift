@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 public struct CommandInvocation: Equatable, Sendable {
     public let executable: URL
@@ -50,6 +55,9 @@ public enum CommandRunnerError: Error, Equatable, LocalizedError, Sendable {
 }
 
 public struct ProcessCommandRunner: CommandRunning {
+    private static let terminationGrace: TimeInterval = 0.25
+    private static let killGrace: TimeInterval = 1
+
     public init() {}
 
     public func run(_ invocation: CommandInvocation) async throws -> CommandResult {
@@ -81,8 +89,7 @@ public struct ProcessCommandRunner: CommandRunning {
                 let deadline = Date().addingTimeInterval(invocation.timeout)
                 while process.isRunning {
                     if Date() >= deadline {
-                        process.terminate()
-                        process.waitUntilExit()
+                        await Self.stop(process)
                         try? stdoutHandle.close()
                         try? stderrHandle.close()
                         throw CommandRunnerError.timedOut(
@@ -96,8 +103,7 @@ public struct ProcessCommandRunner: CommandRunning {
                 try stderrHandle.close()
             } catch {
                 if process.isRunning {
-                    process.terminate()
-                    process.waitUntilExit()
+                    await Self.stop(process)
                 }
                 try? stdoutHandle.close()
                 try? stderrHandle.close()
@@ -108,5 +114,35 @@ public struct ProcessCommandRunner: CommandRunning {
             let stderr = String(decoding: try Data(contentsOf: stderrURL), as: UTF8.self)
             return CommandResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
         }.value
+    }
+
+    private static func stop(_ process: Process) async {
+        guard process.isRunning else { return }
+        process.terminate()
+        await waitForExit(process, timeout: terminationGrace)
+
+        if process.isRunning {
+            forceKill(process.processIdentifier)
+            await waitForExit(process, timeout: killGrace)
+        }
+
+        if !process.isRunning {
+            process.waitUntilExit()
+        }
+    }
+
+    private static func waitForExit(_ process: Process, timeout: TimeInterval) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    private static func forceKill(_ pid: Int32) {
+        #if canImport(Darwin)
+        _ = Darwin.kill(pid, SIGKILL)
+        #elseif canImport(Glibc)
+        _ = Glibc.kill(pid, SIGKILL)
+        #endif
     }
 }
