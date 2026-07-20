@@ -214,13 +214,15 @@ if command -v zsh >/dev/null 2>&1; then
     printf "ok - zsh source mode does not leak local variables\n"
   fi
 
-  zsh_json="$tmp_dir/zsh.json"
-  CC_MONITOR_SNAPSHOT_FILE="$snapshot_file" zsh -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --once --json" > "$zsh_json" 2> "$zsh_stderr"
-  if python3 -m json.tool "$zsh_json" >/dev/null; then
-    printf "ok - zsh JSON preserves literal ps backslash escapes\n"
-  else
-    printf "not ok - zsh JSON preserves literal ps backslash escapes\n"
-    failures=$((failures + 1))
+  if command -v python3 >/dev/null 2>&1; then
+    zsh_json="$tmp_dir/zsh.json"
+    CC_MONITOR_SNAPSHOT_FILE="$snapshot_file" zsh -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --once --json" > "$zsh_json" 2> "$zsh_stderr"
+    if python3 -m json.tool "$zsh_json" >/dev/null; then
+      printf "ok - zsh JSON preserves literal ps backslash escapes\n"
+    else
+      printf "not ok - zsh JSON preserves literal ps backslash escapes\n"
+      failures=$((failures + 1))
+    fi
   fi
 fi
 
