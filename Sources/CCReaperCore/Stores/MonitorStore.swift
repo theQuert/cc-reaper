@@ -90,6 +90,7 @@ public final class MonitorStore {
         } catch {
             let message = Self.message(for: error)
             self.report = nil
+            self.lastUpdated = nil
             self.state = .unavailable(message)
             self.errorMessage = message
         }

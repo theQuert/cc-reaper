@@ -22,18 +22,27 @@ final class MonitorStoreTests: XCTestCase {
         XCTAssertNil(store.errorMessage)
     }
 
-    func testRefreshFailureClearsHealthyEvidenceAndShowsUnavailable() async {
-        await Self.verifyRefreshFailureClearsHealthyEvidenceAndShowsUnavailable()
+    func testRefreshFailureClearsHealthyEvidenceAndShowsUnavailable() async throws {
+        try await Self.verifyRefreshFailureClearsHealthyEvidenceAndShowsUnavailable()
     }
 
     @MainActor
-    private static func verifyRefreshFailureClearsHealthyEvidenceAndShowsUnavailable() async {
-        let service = StubCLIService(scans: [.failure(CLIServiceError.missingScript("cc-monitor.sh"))])
+    private static func verifyRefreshFailureClearsHealthyEvidenceAndShowsUnavailable() async throws {
+        let report = try decodeFixture()
+        let service = StubCLIService(scans: [
+            .success(report),
+            .failure(CLIServiceError.missingScript("cc-monitor.sh"))
+        ])
         let store = MonitorStore(service: service, defaults: makeDefaults())
+
+        await store.refresh()
+        XCTAssertEqual(store.report, report)
+        XCTAssertNotNil(store.lastUpdated)
 
         await store.refresh()
 
         XCTAssertNil(store.report)
+        XCTAssertNil(store.lastUpdated)
         guard case .unavailable = store.state else {
             return XCTFail("Expected unavailable state")
         }
