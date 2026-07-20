@@ -2,9 +2,13 @@ import Foundation
 import XCTest
 @testable import CCReaperCore
 
-@MainActor
 final class MonitorStoreTests: XCTestCase {
     func testRefreshPublishesReportAndFreshness() async throws {
+        try await Self.verifyRefreshPublishesReportAndFreshness()
+    }
+
+    @MainActor
+    private static func verifyRefreshPublishesReportAndFreshness() async throws {
         let report = try decodeFixture()
         let service = StubCLIService(scans: [.success(report)])
         let defaults = makeDefaults()
@@ -19,6 +23,11 @@ final class MonitorStoreTests: XCTestCase {
     }
 
     func testRefreshFailureClearsHealthyEvidenceAndShowsUnavailable() async {
+        await Self.verifyRefreshFailureClearsHealthyEvidenceAndShowsUnavailable()
+    }
+
+    @MainActor
+    private static func verifyRefreshFailureClearsHealthyEvidenceAndShowsUnavailable() async {
         let service = StubCLIService(scans: [.failure(CLIServiceError.missingScript("cc-monitor.sh"))])
         let store = MonitorStore(service: service, defaults: makeDefaults())
 
@@ -32,6 +41,11 @@ final class MonitorStoreTests: XCTestCase {
     }
 
     func testCleanupReviewPreviewsBeforeConfirmationAndCancelNeverInvokesCleanup() async throws {
+        try await Self.verifyCleanupReviewPreviewsBeforeConfirmationAndCancelNeverInvokesCleanup()
+    }
+
+    @MainActor
+    private static func verifyCleanupReviewPreviewsBeforeConfirmationAndCancelNeverInvokesCleanup() async throws {
         let report = try decodeFixture()
         let service = StubCLIService(
             scans: [.success(report)],
@@ -52,6 +66,11 @@ final class MonitorStoreTests: XCTestCase {
     }
 
     func testConfirmedCleanupInvokesExistingEngineOnceAndRefreshes() async throws {
+        try await Self.verifyConfirmedCleanupInvokesExistingEngineOnceAndRefreshes()
+    }
+
+    @MainActor
+    private static func verifyConfirmedCleanupInvokesExistingEngineOnceAndRefreshes() async throws {
         let report = try decodeFixture()
         let service = StubCLIService(
             scans: [.success(report), .success(report)],
@@ -78,6 +97,11 @@ final class MonitorStoreTests: XCTestCase {
     }
 
     func testPreviewUsesDryRunServiceAndPublishesOutput() async {
+        await Self.verifyPreviewUsesDryRunServiceAndPublishesOutput()
+    }
+
+    @MainActor
+    private static func verifyPreviewUsesDryRunServiceAndPublishesOutput() async {
         let service = StubCLIService(
             scans: [],
             previewResults: [.success("dry-run")]
@@ -94,6 +118,11 @@ final class MonitorStoreTests: XCTestCase {
     }
 
     func testFailedCleanupPreviewDoesNotPresentConfirmation() async throws {
+        try await Self.verifyFailedCleanupPreviewDoesNotPresentConfirmation()
+    }
+
+    @MainActor
+    private static func verifyFailedCleanupPreviewDoesNotPresentConfirmation() async throws {
         let report = try decodeFixture()
         let service = StubCLIService(
             scans: [.success(report)],
@@ -108,11 +137,11 @@ final class MonitorStoreTests: XCTestCase {
         XCTAssertTrue(store.actionError?.contains("denied") == true)
     }
 
-    private func decodeFixture() throws -> MonitorReport {
+    private static func decodeFixture() throws -> MonitorReport {
         try JSONDecoder().decode(MonitorReport.self, from: Data(MonitorReportTests.fixture.utf8))
     }
 
-    private func makeDefaults() -> UserDefaults {
+    private static func makeDefaults() -> UserDefaults {
         let suite = "CCReaperCoreTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)

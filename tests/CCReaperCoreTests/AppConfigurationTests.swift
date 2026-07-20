@@ -2,9 +2,13 @@ import Foundation
 import XCTest
 @testable import CCReaperCore
 
-@MainActor
 final class AppConfigurationTests: XCTestCase {
-    func testAutomaticResolutionUsesSourceShellWhenInstallationIsIncomplete() throws {
+    func testAutomaticResolutionUsesSourceShellWhenInstallationIsIncomplete() async throws {
+        try await Self.verifyAutomaticResolutionUsesSourceShellWhenInstallationIsIncomplete()
+    }
+
+    @MainActor
+    private static func verifyAutomaticResolutionUsesSourceShellWhenInstallationIsIncomplete() throws {
         let layout = try makeLayout()
         defer { try? FileManager.default.removeItem(at: layout.root) }
         try addScripts(to: layout.sourceShell)
@@ -23,7 +27,12 @@ final class AppConfigurationTests: XCTestCase {
         )
     }
 
-    func testAutomaticResolutionPrefersCompleteInstallation() throws {
+    func testAutomaticResolutionPrefersCompleteInstallation() async throws {
+        try await Self.verifyAutomaticResolutionPrefersCompleteInstallation()
+    }
+
+    @MainActor
+    private static func verifyAutomaticResolutionPrefersCompleteInstallation() throws {
         let layout = try makeLayout()
         defer { try? FileManager.default.removeItem(at: layout.root) }
         try addScripts(to: layout.sourceShell)
@@ -38,7 +47,12 @@ final class AppConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.scriptRoot, layout.installedRoot.standardizedFileURL)
     }
 
-    func testExplicitOverrideWinsEvenWhenAutomaticRootsAreComplete() throws {
+    func testExplicitOverrideWinsEvenWhenAutomaticRootsAreComplete() async throws {
+        try await Self.verifyExplicitOverrideWinsEvenWhenAutomaticRootsAreComplete()
+    }
+
+    @MainActor
+    private static func verifyExplicitOverrideWinsEvenWhenAutomaticRootsAreComplete() throws {
         let layout = try makeLayout()
         defer { try? FileManager.default.removeItem(at: layout.root) }
         try addScripts(to: layout.sourceShell)
@@ -55,7 +69,12 @@ final class AppConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.scriptRoot, override.standardizedFileURL)
     }
 
-    func testEmptyOverrideRestoresAutomaticResolution() throws {
+    func testEmptyOverrideRestoresAutomaticResolution() async throws {
+        try await Self.verifyEmptyOverrideRestoresAutomaticResolution()
+    }
+
+    @MainActor
+    private static func verifyEmptyOverrideRestoresAutomaticResolution() throws {
         let layout = try makeLayout()
         defer { try? FileManager.default.removeItem(at: layout.root) }
         try addScripts(to: layout.sourceShell)
@@ -70,7 +89,7 @@ final class AppConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.scriptRoot, layout.sourceShell.standardizedFileURL)
     }
 
-    private func makeLayout() throws -> Layout {
+    private static func makeLayout() throws -> Layout {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("cc-reaper-configuration-\(UUID().uuidString)", isDirectory: true)
         let home = root.appendingPathComponent("home", isDirectory: true)
@@ -96,7 +115,7 @@ final class AppConfigurationTests: XCTestCase {
         )
     }
 
-    private func addScripts(
+    private static func addScripts(
         to root: URL,
         names: [String] = ["cc-monitor.sh", "claude-cleanup.sh"]
     ) throws {
