@@ -99,14 +99,14 @@ final class CLIServiceTests: XCTestCase {
         let root = try makeScriptRoot(files: ["claude-cleanup.sh"])
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = RecordingRunner(results: [
-            CommandResult(exitCode: 0, stdout: "preview", stderr: ""),
+            CommandResult(exitCode: 0, stdout: "preview", stderr: "[DRY-RUN] Would kill PID 42"),
             CommandResult(exitCode: 0, stdout: "cleaned", stderr: "")
         ])
         let service = CLIService(runner: runner)
 
         let preview = try await service.previewCleanup(scriptRoot: root)
         let cleanup = try await service.runCleanup(scriptRoot: root)
-        XCTAssertEqual(preview, "preview")
+        XCTAssertEqual(preview, "preview\n[DRY-RUN] Would kill PID 42")
         XCTAssertEqual(cleanup, "cleaned")
 
         let invocations = await runner.invocations

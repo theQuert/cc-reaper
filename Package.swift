@@ -23,7 +23,7 @@ let package = Package(
         .testTarget(
             name: "CCReaperCoreTests",
             dependencies: ["CCReaperCore"],
-            path: "Tests/CCReaperCoreTests"
+            path: "tests/CCReaperCoreTests"
         )
     ]
 )

@@ -104,7 +104,10 @@ public struct CLIService: CLIServiceProviding, Sendable {
             operation: operation
         ))
         try requireSuccess(result)
-        let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let output = [result.stdout, result.stderr]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
         return output.isEmpty ? "Command completed successfully." : output
     }
 

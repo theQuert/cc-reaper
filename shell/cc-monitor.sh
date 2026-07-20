@@ -114,10 +114,35 @@ _cc_monitor_is_stale_etime() {
   [ "$seconds" -ge "$(_cc_monitor_agent_stale_seconds)" ]
 }
 
+_CC_MONITOR_ORPHAN_PPIDS=""
+_cc_monitor_orphan_ppids() {
+  if [ -z "$_CC_MONITOR_ORPHAN_PPIDS" ]; then
+    local uid="" systemd_user_pids=""
+    uid=$(id -u 2>/dev/null)
+    systemd_user_pids=$(ps -eo pid=,uid=,command= 2>/dev/null \
+      | awk -v uid="$uid" '$2 == uid && /systemd --user/ {print $1}' \
+      | tr '\n' ' ')
+    systemd_user_pids=${systemd_user_pids% }
+    if [ -n "$systemd_user_pids" ]; then
+      _CC_MONITOR_ORPHAN_PPIDS="1 $systemd_user_pids"
+    else
+      _CC_MONITOR_ORPHAN_PPIDS="1"
+    fi
+  fi
+  echo "$_CC_MONITOR_ORPHAN_PPIDS"
+}
+
+_cc_monitor_is_orphan_ppid() {
+  case " $(_cc_monitor_orphan_ppids) " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 _cc_monitor_is_detached_or_orphan() {
   local ppid=$1
   local tty=$2
-  [ "$ppid" = "1" ] || [ "$tty" = "??" ] || [ "$tty" = "?" ]
+  _cc_monitor_is_orphan_ppid "$ppid" || [ "$tty" = "??" ] || [ "$tty" = "?" ]
 }
 
 _cc_monitor_runaway_cpu_threshold() {
@@ -229,17 +254,17 @@ _cc_monitor_is_safe_candidate() {
   _cc_monitor_is_normal_chrome_cmd "$cmd" && return 1
 
   if _cc_monitor_is_claude_agent_cmd "$cmd"; then
-    [ "$ppid" = "1" ] || { _cc_monitor_is_detached_or_orphan "$ppid" "$tty" && _cc_monitor_is_stale_etime "$etime"; }
+    _cc_monitor_is_orphan_ppid "$ppid" || { _cc_monitor_is_detached_or_orphan "$ppid" "$tty" && _cc_monitor_is_stale_etime "$etime"; }
     return
   fi
 
   if _cc_monitor_is_agent_browser_cmd "$cmd" || _cc_monitor_is_puppeteer_chrome_cmd "$cmd"; then
-    [ "$ppid" = "1" ] || _cc_monitor_is_stale_etime "$etime"
+    _cc_monitor_is_orphan_ppid "$ppid" || _cc_monitor_is_stale_etime "$etime"
     return
   fi
 
   if _cc_monitor_is_codex_agent_cmd "$cmd" || _cc_monitor_is_agent_mcp_cmd "$cmd"; then
-    [ "$ppid" = "1" ] || { _cc_monitor_is_detached_or_orphan "$ppid" "$tty" && _cc_monitor_is_stale_etime "$etime"; }
+    _cc_monitor_is_orphan_ppid "$ppid" || { _cc_monitor_is_detached_or_orphan "$ppid" "$tty" && _cc_monitor_is_stale_etime "$etime"; }
     return
   fi
 
@@ -1076,6 +1101,11 @@ cc-monitor() {
   _cc_monitor_is_positive_int "$interval" || { echo "cc-monitor: interval must be a positive integer" >&2; return 2; }
   _cc_monitor_is_positive_int "$top" || { echo "cc-monitor: top must be a positive integer" >&2; return 2; }
   _cc_monitor_is_positive_number "$min_cpu" || { echo "cc-monitor: min-cpu must be numeric" >&2; return 2; }
+
+  # Resolve once per monitor run so every classification uses the same
+  # cross-platform orphan-parent set without rescanning the process table.
+  _CC_MONITOR_ORPHAN_PPIDS=""
+  _CC_MONITOR_ORPHAN_PPIDS=$(_cc_monitor_orphan_ppids)
 
   if [ "$once" = "true" ]; then
     duration=0

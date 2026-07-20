@@ -99,6 +99,25 @@ expect_eq "recent user cleanup match remains review-first" \
   "$(classify_cmd 123 "??" 00:10:00 "/opt/custom-worker --serve")" \
   "other/ASK_BEFORE_KILL"
 
+systemd_user_pid=4242
+current_uid=$(id -u)
+ps() {
+  if [ "${1:-}" = "-eo" ] && [ "${2:-}" = "pid=,uid=,command=" ]; then
+    printf "%s %s /usr/lib/systemd/systemd --user\n" "$systemd_user_pid" "$current_uid"
+  else
+    command ps "$@"
+  fi
+}
+_CC_MONITOR_ORPHAN_PPIDS=""
+expect_eq "monitor includes this user's systemd --user in orphan-parent set" \
+  "$(_cc_monitor_orphan_ppids)" \
+  "1 $systemd_user_pid"
+expect_eq "stale cleanup match reparented to systemd --user is safe with a retained TTY" \
+  "$(classify_cmd "$systemd_user_pid" ttys004 03:00:00 "/opt/custom-worker --serve")" \
+  "other/SAFE_TO_REAP"
+unset -f ps
+_CC_MONITOR_ORPHAN_PPIDS="1"
+
 low_cpu_snapshot="$rules_dir/low-cpu.tsv"
 low_cpu_report="$rules_dir/low-cpu.json"
 printf "109\t123\t109\t??\t03:00:00\t0.1\t10000\t/opt/custom-worker --serve\n" > "$low_cpu_snapshot"
