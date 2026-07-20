@@ -11,6 +11,69 @@ _cc_reaper_is_protected_cmd() {
   echo "$cmd" | grep -qE "$(_cc_reaper_protected_pattern)"
 }
 
+_cc_reaper_rules_file() {
+  if [ -n "${CC_REAPER_RULES_FILE:-}" ]; then
+    echo "$CC_REAPER_RULES_FILE"
+  elif [ -n "${HOME:-}" ]; then
+    echo "$HOME/.cc-reaper/process-rules.tsv"
+  else
+    return 1
+  fi
+}
+
+# User rules are case-insensitive literal command substrings, never regexes.
+_cc_reaper_has_user_rule() {
+  local policy=$1
+  local cmd=$2
+  local rules_file=""
+  rules_file=$(_cc_reaper_rules_file) || return 1
+  [ -r "$rules_file" ] || return 1
+  awk -F '\t' -v policy="$policy" -v cmd="$cmd" '
+    NF == 2 && ($1 == "protect" || $1 == "cleanup") && length($2) >= 3 && length($2) <= 128 {
+      if ($1 == policy && index(tolower(cmd), tolower($2)) > 0) found=1
+    }
+    END { exit !found }
+  ' "$rules_file"
+}
+
+_cc_reaper_is_system_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "WindowServer|kernel_task|coreaudiod|syspolicyd|mdworker|mds_stores|Spotlight|Bitdefender|com\\.apple\\.|/System/Library/|PerfPowerServices|BTLEServer|bluetoothd|UniversalControl|UserNotificationCenter|BiomeAgent|accountsd|locationd|logd|opendirectoryd|replayd|BetterSnapTool|netdisk_service"
+}
+
+_cc_reaper_is_codex_ui_helper_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "Codex Computer Use\\.app|SkyComputerUseService"
+}
+
+_cc_reaper_is_self_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "cc-monitor\\.sh( |$)|claude-cleanup\\.sh( |$)|CCReaper\\.app/Contents/MacOS/CCReaper( |$)|/CCReaper( |$)"
+}
+
+_cc_reaper_is_normal_chrome_cmd() {
+  local cmd=$1
+  if _cc_reaper_is_agent_browser_cmd "$cmd" || _cc_reaper_is_puppeteer_chrome_cmd "$cmd"; then
+    return 1
+  fi
+  echo "$cmd" | grep -qE "Google Chrome\\.app|Google Chrome Helper|/Google Chrome( |$)|Chromium\\.app"
+}
+
+_cc_reaper_is_immutable_cmd() {
+  local cmd=$1
+  _cc_reaper_is_system_cmd "$cmd" \
+    || _cc_reaper_is_self_cmd "$cmd" \
+    || _cc_reaper_is_normal_chrome_cmd "$cmd" \
+    || _cc_reaper_is_codex_ui_helper_cmd "$cmd"
+}
+
+_cc_reaper_is_direct_cleanup_protected() {
+  local cmd=$1
+  _cc_reaper_is_immutable_cmd "$cmd" \
+    || _cc_reaper_has_user_rule protect "$cmd" \
+    || _cc_reaper_is_protected_cmd "$cmd"
+}
+
 # Orphan-parent set: the PPIDs that mark a process as a true orphan (its
 # session exited and the process was reparented).
 #   - PID 1 is always included: the kernel reparent target on macOS (launchd)
@@ -26,7 +89,7 @@ _cc_reaper_is_protected_cmd() {
 _CC_REAPER_ORPHAN_PPIDS=""
 _cc_reaper_orphan_ppids() {
   if [ -z "$_CC_REAPER_ORPHAN_PPIDS" ]; then
-    local uid systemd_user_pids
+    local uid="" systemd_user_pids=""
     uid=$(id -u 2>/dev/null)
     systemd_user_pids=$(ps -eo pid=,uid=,command= 2>/dev/null \
       | awk -v uid="$uid" '$2 == uid && /systemd --user/ {print $1}' \
@@ -118,6 +181,13 @@ _cc_reaper_is_agent_cleanup_candidate() {
   local etime=$3
   local cmd=$4
 
+  _cc_reaper_is_immutable_cmd "$cmd" && return 1
+  _cc_reaper_has_user_rule protect "$cmd" && return 1
+  if _cc_reaper_has_user_rule cleanup "$cmd"; then
+    _cc_reaper_is_detached_or_orphan "$ppid" "$tty" && _cc_reaper_is_stale_etime "$etime"
+    return
+  fi
+
   _cc_reaper_is_protected_cmd "$cmd" && return 1
 
   if _cc_reaper_is_agent_browser_cmd "$cmd" || _cc_reaper_is_puppeteer_chrome_cmd "$cmd"; then
@@ -133,15 +203,26 @@ _cc_reaper_is_agent_cleanup_candidate() {
   return 1
 }
 
+# Route every cleanup signal through one helper so --dry-run exercises the same
+# candidate and protection paths as normal cleanup without sending a signal.
+_cc_reaper_kill_pid() {
+  local pid=$1
+  if [ "${_CC_REAPER_DRY_RUN:-0}" = "1" ]; then
+    echo "  [DRY-RUN] Would kill PID $pid" >&2
+    return 0
+  fi
+  kill "$pid" 2>/dev/null
+}
+
 _cc_reaper_kill_group_filtered() {
   local pgid=$1
   local killed=0
   while IFS= read -r pid; do
     [ -z "$pid" ] && continue
-    local pid_cmd
+    local pid_cmd=""
     pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
-    _cc_reaper_is_protected_cmd "$pid_cmd" && continue
-    kill "$pid" 2>/dev/null && killed=$((killed + 1))
+    _cc_reaper_is_direct_cleanup_protected "$pid_cmd" && continue
+    _cc_reaper_kill_pid "$pid" && killed=$((killed + 1))
   done < <(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
   echo "$killed"
 }
@@ -153,22 +234,28 @@ _cc_reaper_kill_group_filtered() {
 _cc_reaper_ppid_fallback() {
   local ppid_set=" $(_cc_reaper_orphan_ppids) "
   ps -eo pid=,ppid=,command= 2>/dev/null | awk -v set="$ppid_set" 'index(set, " " $2 " ")' | while IFS= read -r line; do
-    local _pid _cmd
+    local _pid="" _cmd=""
     _pid=$(echo "$line" | awk '{print $1}')
     _cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
     # Never kill an orphan parent itself (e.g. the `systemd --user` manager) —
     # it is a reparent target, not an orphan.
     case "$ppid_set" in *" $_pid "*) continue ;; esac
     if echo "$_cmd" | grep -qE "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"; then
-      _cc_reaper_is_protected_cmd "$_cmd" && continue
-      kill "$_pid" 2>/dev/null
+      _cc_reaper_is_direct_cleanup_protected "$_cmd" && continue
+      _cc_reaper_kill_pid "$_pid"
     fi
   done
 }
 
 # Immediately kill orphan Claude Code processes
 claude-cleanup() {
-  echo "=== Claude Code Orphan Process Cleanup ==="
+  local _CC_REAPER_DRY_RUN=0
+  if [ "${1:-}" = "--dry-run" ]; then
+    _CC_REAPER_DRY_RUN=1
+    echo "=== Claude Code Orphan Process Cleanup (DRY-RUN) ==="
+  else
+    echo "=== Claude Code Orphan Process Cleanup ==="
+  fi
 
   # ─── PGID-based cleanup (primary) ────────────────────────────────────────
   # Find orphaned process groups: the PGID leader has been reparented to an
@@ -176,7 +263,7 @@ claude-cleanup() {
   # manager on Linux) and the group contains Claude-related processes. Kill
   # entire group at once.
   local pgid_kills=0
-  local orphan_pgids
+  local orphan_pgids=""
   local ppid_set=" $(_cc_reaper_orphan_ppids) "
   orphan_pgids=$(ps -eo pid,ppid,pgid 2>/dev/null | awk -v set="$ppid_set" '$1 == $3 && index(set, " " $2 " ") {print $3}' | sort -u)
   for pgid in $orphan_pgids; do
@@ -184,21 +271,25 @@ claude-cleanup() {
     case "$ppid_set" in *" $pgid "*) continue ;; esac
     # Only kill groups whose leader is a Claude session (stream-json subagent)
     # Skip intentional daemons (worker-service --daemon) and non-Claude leaders
-    local leader_cmd
+    local leader_cmd=""
     leader_cmd=$(ps -o command= -p "$pgid" 2>/dev/null)
     if ! echo "$leader_cmd" | grep -qE "claude.*stream-json|claude.*--session-id|node /usr/local/bin/codex( --yolo| resume|$)|@openai/codex.*/codex/codex( --yolo| resume|$)|/codex/codex( --yolo| resume|$)"; then
       continue
     fi
     # Verify group contains Claude/MCP processes
-    local match_count
+    local match_count=""
     match_count=$(ps -eo pgid,command 2>/dev/null | awk -v pgid="$pgid" '$1 == pgid' | grep -cE "claude|codex|mcp|chroma|worker-service|agent-browser|Chrome for Testing|puppeteer_dev_chrome_profile" 2>/dev/null || echo 0)
     if [ "$match_count" -gt 0 ]; then
-      local group_pids
+      local group_pids=""
       group_pids=$(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
-      local group_size
+      local group_size=""
       group_size=$(echo "$group_pids" | wc -l | tr -d ' ')
-      echo "  Killing orphaned process group PGID=$pgid ($group_size processes)"
-      local killed_in_group
+      if [ "$_CC_REAPER_DRY_RUN" = "1" ]; then
+        echo "  Inspecting orphaned process group PGID=$pgid ($group_size processes)"
+      else
+        echo "  Killing orphaned process group PGID=$pgid ($group_size processes)"
+      fi
+      local killed_in_group=""
       killed_in_group=$(_cc_reaper_kill_group_filtered "$pgid")
       pgid_kills=$((pgid_kills + killed_in_group))
     fi
@@ -212,7 +303,7 @@ claude-cleanup() {
 
   while IFS= read -r line; do
     [ -z "$line" ] && continue
-    local pid ppid tty etime cmd
+    local pid="" ppid="" tty="" etime="" cmd=""
     pid=$(echo "$line" | awk '{print $1}')
     ppid=$(echo "$line" | awk '{print $2}')
     tty=$(echo "$line" | awk '{print $3}')
@@ -220,8 +311,12 @@ claude-cleanup() {
     cmd=$(echo "$line" | awk '{for(i=5;i<=NF;i++) printf "%s ", $i; print ""}')
 
     if _cc_reaper_is_agent_cleanup_candidate "$ppid" "$tty" "$etime" "$cmd"; then
-      echo "  Killing stale agent process PID=$pid ELAPSED=$etime CMD=$(echo "$cmd" | head -c 100)"
-      kill "$pid" 2>/dev/null && agent_count=$((agent_count + 1))
+      if [ "$_CC_REAPER_DRY_RUN" = "1" ]; then
+        echo "  Inspecting stale agent process PID=$pid ELAPSED=$etime CMD=$(echo "$cmd" | head -c 100)"
+      else
+        echo "  Killing stale agent process PID=$pid ELAPSED=$etime CMD=$(echo "$cmd" | head -c 100)"
+      fi
+      _cc_reaper_kill_pid "$pid" && agent_count=$((agent_count + 1))
     fi
   done < <(ps -eo pid=,ppid=,tty=,etime=,command= 2>/dev/null)
 
@@ -230,13 +325,25 @@ claude-cleanup() {
     return 0
   fi
 
-  [ "$pgid_kills" -gt 0 ] && echo "  PGID-based: killed $pgid_kills processes"
+  if [ "$pgid_kills" -gt 0 ]; then
+    if [ "$_CC_REAPER_DRY_RUN" = "1" ]; then
+      echo "  PGID-based: would reap $pgid_kills processes"
+    else
+      echo "  PGID-based: killed $pgid_kills processes"
+    fi
+  fi
   [ "$orphan_count" -gt 0 ] || [ "$mcp_count" -gt 0 ] && echo "  Pattern fallback: $orphan_count subagents, $mcp_count MCP processes"
-  [ "$agent_count" -gt 0 ] && echo "  Agent fallback: killed $agent_count stale browser/Codex processes"
+  if [ "$agent_count" -gt 0 ]; then
+    if [ "$_CC_REAPER_DRY_RUN" = "1" ]; then
+      echo "  Agent fallback: would reap $agent_count stale browser/Codex processes"
+    else
+      echo "  Agent fallback: killed $agent_count stale browser/Codex processes"
+    fi
+  fi
 
   _cc_reaper_ppid_fallback
 
-  sleep 1
+  [ "$_CC_REAPER_DRY_RUN" = "1" ] || sleep 1
   local remaining=$(ps aux | grep -E "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[a]gent-browser-darwin-arm64|puppeteer_dev_chrome_profile|agent-browser-chrome-|[c]odex --yolo" | grep -v grep | wc -l | tr -d ' ')
   echo "Cleaned. Remaining: $remaining processes"
 }
@@ -474,18 +581,22 @@ claude-sessions() {
 _claude_pgid_kill() {
   local target_pid=$1
   local MCP_WHITELIST="supabase|@stripe/mcp|context7|context7-mcp|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp"
+  local target_cmd=""
+  target_cmd=$(ps -o command= -p "$target_pid" 2>/dev/null)
+  _cc_reaper_has_user_rule protect "$target_cmd" && return 1
   local pgid=$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ')
   if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
     while IFS= read -r pid; do
       [ -z "$pid" ] && continue
       local pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+      _cc_reaper_has_user_rule protect "$pid_cmd" && continue
       if echo "$pid_cmd" | grep -qE "$MCP_WHITELIST"; then
         continue
       fi
-      kill "$pid" 2>/dev/null
+      _cc_reaper_kill_pid "$pid"
     done < <(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
   else
-    kill "$target_pid" 2>/dev/null
+    _cc_reaper_kill_pid "$target_pid"
   fi
 }
 
@@ -522,14 +633,15 @@ _cc_guard_etime_to_seconds() {
 _cc_guard_runaway_protected_pids() {
   local cpu_threshold=$1
   local min_minutes=$2
-  local protected_pattern
+  local protected_pattern=""
   protected_pattern=$(_cc_reaper_protected_pattern)
   local min_seconds=$((min_minutes * 60))
   ps -axo pid=,etime=,%cpu=,command= 2>/dev/null | while read -r pid etime cpu rest; do
     [ -z "$pid" ] && continue
     echo "$rest" | grep -qE "$protected_pattern" || continue
+    _cc_reaper_has_user_rule protect "$rest" && continue
     awk -v a="$cpu" -v b="$cpu_threshold" 'BEGIN { exit !(a+0 >= b+0) }' || continue
-    local secs
+    local secs=""
     secs=$(_cc_guard_etime_to_seconds "$etime")
     [ "$secs" -ge "$min_seconds" ] || continue
     printf "%s\t%s\t%s\t%s\n" "$pid" "$cpu" "$etime" "$rest"
@@ -569,7 +681,7 @@ claude-guard() {
 
   # ─── Phase 0.5: Runaway protected processes ───────────────────────────
   if [ "$runaway_disable" != "1" ]; then
-    local runaway_lines
+    local runaway_lines=""
     runaway_lines=$(_cc_guard_runaway_protected_pids "$runaway_cpu" "$runaway_min")
     if [ -n "$runaway_lines" ]; then
       echo "  --- Runaway protected processes (CPU >= ${runaway_cpu}% for >= ${runaway_min} min) ---"
@@ -584,7 +696,7 @@ claude-guard() {
         local rkilled=0 rfreed=0
         while IFS=$'\t' read -r rpid rcpu retime rrest; do
           [ -z "$rpid" ] && continue
-          local rrss
+          local rrss=""
           rrss=$(_claude_tree_rss "$rpid" 2>/dev/null || echo 0)
           _claude_pgid_kill "$rpid" >/dev/null 2>&1
           rkilled=$((rkilled + 1))
@@ -622,6 +734,8 @@ claude-guard() {
   printf "  %-7s %8s %6s %6s %-14s %s\n" "-------" "--------" "------" "------" "--------------" "--------"
 
   for pid in "${session_pids[@]}"; do
+    local session_cmd=""
+    session_cmd=$(ps -p "$pid" -o command= 2>/dev/null)
     local info=$(ps -p "$pid" -o rss=,%cpu=,etime= 2>/dev/null)
     [ -z "$info" ] && continue
 
@@ -634,7 +748,10 @@ claude-guard() {
 
     # Determine status: fd-leak > bloated > idle
     local status="LIVE"
-    if [ "$fds" -ge "$max_fd" ]; then
+    if _cc_reaper_has_user_rule protect "$session_cmd"; then
+      status="[USER-PROTECTED]"
+      live_count=$((live_count + 1))
+    elif [ "$fds" -ge "$max_fd" ]; then
       status="[FD-LEAK]"
       fdleak_pids+=("$pid")
       fdleak_fds+=("$fds")

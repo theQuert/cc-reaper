@@ -8,6 +8,10 @@ export CC_AGENT_STALE_MINUTES=60
 
 failures=0
 
+rules_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor-rules-test.XXXXXX")
+rules_file="$rules_dir/process-rules.tsv"
+export CC_REAPER_RULES_FILE="$rules_file"
+
 expect_eq() {
   local name=$1
   local actual=$2
@@ -78,8 +82,62 @@ expect_eq "shared Supabase MCP is do-not-kill" \
   "$(classify_cmd 123 "??" 03:00:00 "node /Users/me/.npm/_npx/53c4795544aaa350/node_modules/.bin/mcp-server-supabase --access-token sbp_secret")" \
   "mcp/DO_NOT_KILL"
 
+expect_eq "Codex Computer Use helper is protected" \
+  "$(classify_cmd 23693 "??" 01:00:00 "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService")" \
+  "other/DO_NOT_KILL"
+
+printf "cleanup\tSkyComputerUseService\n" > "$rules_file"
+expect_eq "Codex Computer Use helper remains immutable under a cleanup rule" \
+  "$(classify_cmd 23693 "??" 03:00:00 "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService")" \
+  "other/DO_NOT_KILL"
+
+printf "protect\tcustom-worker\n" > "$rules_file"
+expect_eq "user protect rule appears as do-not-kill" \
+  "$(classify_cmd 123 "??" 03:00:00 "/opt/custom-worker --serve")" \
+  "other/DO_NOT_KILL"
+
+printf "cleanup\tcustom-worker\n" > "$rules_file"
+expect_eq "user cleanup rule appears safe only when stale and detached" \
+  "$(classify_cmd 123 "??" 03:00:00 "/opt/custom-worker --serve")" \
+  "other/SAFE_TO_REAP"
+expect_eq "recent user cleanup match remains review-first" \
+  "$(classify_cmd 123 "??" 00:10:00 "/opt/custom-worker --serve")" \
+  "other/ASK_BEFORE_KILL"
+
+systemd_user_pid=4242
+current_uid=$(id -u)
+ps() {
+  if [ "${1:-}" = "-eo" ] && [ "${2:-}" = "pid=,uid=,command=" ]; then
+    printf "%s %s /usr/lib/systemd/systemd --user\n" "$systemd_user_pid" "$current_uid"
+  else
+    command ps "$@"
+  fi
+}
+_CC_MONITOR_ORPHAN_PPIDS=""
+expect_eq "monitor includes this user's systemd --user in orphan-parent set" \
+  "$(_cc_monitor_orphan_ppids)" \
+  "1 $systemd_user_pid"
+expect_eq "stale cleanup match reparented to systemd --user is safe with a retained TTY" \
+  "$(classify_cmd "$systemd_user_pid" ttys004 03:00:00 "/opt/custom-worker --serve")" \
+  "other/SAFE_TO_REAP"
+unset -f ps
+_CC_MONITOR_ORPHAN_PPIDS="1"
+
+low_cpu_snapshot="$rules_dir/low-cpu.tsv"
+low_cpu_report="$rules_dir/low-cpu.json"
+printf "109\t123\t109\t??\t03:00:00\t0.1\t10000\t/opt/custom-worker --serve\n" > "$low_cpu_snapshot"
+CC_MONITOR_SNAPSHOT_FILE="$low_cpu_snapshot" bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json --min-cpu 5 > "$low_cpu_report"
+expect_contains "low-CPU user cleanup match remains visible" "$low_cpu_report" '"pid": 109'
+
+printf "cleanup\tWindowServer\n" > "$rules_file"
+expect_eq "immutable system classification ignores cleanup rule" \
+  "$(classify_cmd 1 "??" 18-00:00:00 "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon")" \
+  "system/DO_NOT_KILL"
+
+: > "$rules_file"
+
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor-test.XXXXXX")
-trap 'rm -rf "$tmp_dir"' EXIT
+trap 'rm -rf "$tmp_dir" "$rules_dir"' EXIT
 
 raw_file="$tmp_dir/raw.tsv"
 agg_file="$tmp_dir/agg.tsv"
@@ -108,6 +166,8 @@ expect_eq "aggregation RSS MB rounds max" "$agg_rss" "20"
   printf "104\t555\t555\tttys002\t00:05:00\t18.0\t150000\tnode /repo/web/default/node_modules/react-scripts/scripts/start.js\n"
   printf "105\t689\t689\t??\t01:00:00\t15.0\t300000\t/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --profile-directory=Default\n"
   printf "106\t123\t123\t??\t03:00:00\t2.0\t30000\tnode /Users/me/.npm/_npx/53c4795544aaa350/node_modules/.bin/mcp-server-supabase --access-token sbp_secret\n"
+  printf "107\t23693\t23693\t??\t00:01:00\t90.0\t30000\t/bin/zsh -lc cc-monitor.sh --once --json\n"
+  printf "108\t1\t108\t??\t00:01:00\t90.0\t30000\t/Users/me/dist/CCReaper.app/Contents/MacOS/CCReaper\n"
 } > "$snapshot_file"
 
 CC_MONITOR_SNAPSHOT_FILE="$snapshot_file" bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json > "$json_file"
@@ -127,6 +187,12 @@ expect_contains "json includes safe-to-reap" "$json_file" '"classification": "SA
 expect_contains "json includes do-not-kill" "$json_file" '"classification": "DO_NOT_KILL"'
 expect_contains "json includes family totals" "$json_file" '"family_totals"'
 expect_contains "json redacts access tokens" "$json_file" '--access-token \[redacted\]'
+if grep -qE '"pid": (107|108)' "$json_file"; then
+  printf "not ok - monitor omits its own sampler and companion process\n"
+  failures=$((failures + 1))
+else
+  printf "ok - monitor omits its own sampler and companion process\n"
+fi
 
 human_stdout="$tmp_dir/human.out"
 human_stderr="$tmp_dir/human.err"

@@ -4,3 +4,5 @@
 .env.*
 .claude/
 2026-03-07_x-claude-*.json
+.build/
+dist/

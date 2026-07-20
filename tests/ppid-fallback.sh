@@ -92,6 +92,19 @@ expect_no "PPID=2 claude NOT killed" \
 expect_no "protected mcp-server-cloudflare NOT killed" \
   grep -q "^900$" "$kill_log"
 
+# The same fallback path must be inspectable without sending any signal.
+: > "$kill_log"
+_CC_REAPER_DRY_RUN=1 _cc_reaper_ppid_fallback 2>"${kill_log}.dry-run"
+if [ -s "$kill_log" ]; then
+  printf "not ok - dry-run fallback sent a signal\n"
+  failures=$((failures + 1))
+else
+  printf "ok - dry-run fallback sent no signal\n"
+fi
+grep -q "DRY-RUN.*Would kill PID 100" "${kill_log}.dry-run" \
+  && printf "ok - dry-run fallback reports would-reap PID\n" \
+  || { printf "not ok - dry-run fallback reports would-reap PID\n"; failures=$((failures + 1)); }
+
 if [ "$failures" -gt 0 ]; then
   printf "%s validation failure(s)\n" "$failures"
   exit 1

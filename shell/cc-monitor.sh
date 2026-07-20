@@ -30,7 +30,43 @@ Environment:
   CC_MONITOR_TOP           Default top contributor count
   CC_MONITOR_MIN_CPU       Default CPU reporting floor
   CC_MONITOR_SNAPSHOT_FILE Test hook: read tab-separated snapshots from a file
+  CC_REAPER_RULES_FILE     User process-rule file (default: ~/.cc-reaper/process-rules.tsv)
 EOF
+}
+
+_cc_monitor_rules_file() {
+  if [ -n "${CC_REAPER_RULES_FILE:-}" ]; then
+    echo "$CC_REAPER_RULES_FILE"
+  elif [ -n "${HOME:-}" ]; then
+    echo "$HOME/.cc-reaper/process-rules.tsv"
+  else
+    return 1
+  fi
+}
+
+# Rules are case-insensitive literal command substrings, never regexes.
+_cc_monitor_has_user_rule() {
+  local policy=$1
+  local cmd=$2
+  local rules_file=""
+  rules_file=$(_cc_monitor_rules_file) || return 1
+  [ -r "$rules_file" ] || return 1
+  awk -F '\t' -v policy="$policy" -v cmd="$cmd" '
+    NF == 2 && ($1 == "protect" || $1 == "cleanup") && length($2) >= 3 && length($2) <= 128 {
+      if ($1 == policy && index(tolower(cmd), tolower($2)) > 0) found=1
+    }
+    END { exit !found }
+  ' "$rules_file"
+}
+
+_cc_monitor_has_any_cleanup_rule() {
+  local rules_file=""
+  rules_file=$(_cc_monitor_rules_file) || return 1
+  [ -r "$rules_file" ] || return 1
+  awk -F '\t' '
+    $1 == "cleanup" && NF == 2 && length($2) >= 3 && length($2) <= 128 { found=1 }
+    END { exit !found }
+  ' "$rules_file"
 }
 
 _cc_monitor_is_positive_number() {
@@ -73,15 +109,40 @@ _cc_monitor_agent_stale_seconds() {
 
 _cc_monitor_is_stale_etime() {
   local etime=$1
-  local seconds
+  local seconds=""
   seconds=$(_cc_monitor_etime_to_seconds "$etime")
   [ "$seconds" -ge "$(_cc_monitor_agent_stale_seconds)" ]
+}
+
+_CC_MONITOR_ORPHAN_PPIDS=""
+_cc_monitor_orphan_ppids() {
+  if [ -z "$_CC_MONITOR_ORPHAN_PPIDS" ]; then
+    local uid="" systemd_user_pids=""
+    uid=$(id -u 2>/dev/null)
+    systemd_user_pids=$(ps -eo pid=,uid=,command= 2>/dev/null \
+      | awk -v uid="$uid" '$2 == uid && /systemd --user/ {print $1}' \
+      | tr '\n' ' ')
+    systemd_user_pids=${systemd_user_pids% }
+    if [ -n "$systemd_user_pids" ]; then
+      _CC_MONITOR_ORPHAN_PPIDS="1 $systemd_user_pids"
+    else
+      _CC_MONITOR_ORPHAN_PPIDS="1"
+    fi
+  fi
+  echo "$_CC_MONITOR_ORPHAN_PPIDS"
+}
+
+_cc_monitor_is_orphan_ppid() {
+  case " $(_cc_monitor_orphan_ppids) " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 _cc_monitor_is_detached_or_orphan() {
   local ppid=$1
   local tty=$2
-  [ "$ppid" = "1" ] || [ "$tty" = "??" ] || [ "$tty" = "?" ]
+  _cc_monitor_is_orphan_ppid "$ppid" || [ "$tty" = "??" ] || [ "$tty" = "?" ]
 }
 
 _cc_monitor_runaway_cpu_threshold() {
@@ -101,7 +162,7 @@ _cc_monitor_runaway_min_threshold() {
 _cc_monitor_is_runaway() {
   local avg_cpu=$1
   local etime=$2
-  local cpu_threshold etime_threshold elapsed_seconds
+  local cpu_threshold="" etime_threshold="" elapsed_seconds=""
   cpu_threshold=$(_cc_monitor_runaway_cpu_threshold)
   etime_threshold=$(_cc_monitor_runaway_min_threshold)
   elapsed_seconds=$(_cc_monitor_etime_to_seconds "$etime")
@@ -110,7 +171,7 @@ _cc_monitor_is_runaway() {
 }
 
 _cc_monitor_protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores|CCReaper|Codex Computer Use\\.app|SkyComputerUseService"
 }
 
 _cc_monitor_is_protected_cmd() {
@@ -153,7 +214,17 @@ _cc_monitor_is_dev_server_cmd() {
 
 _cc_monitor_is_system_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "WindowServer|kernel_task|coreaudiod|syspolicyd|mdworker|mds_stores|Spotlight|Bitdefender|com\\.apple\\.|/System/Library/"
+  echo "$cmd" | grep -qE "WindowServer|kernel_task|coreaudiod|syspolicyd|mdworker|mds_stores|Spotlight|Bitdefender|com\\.apple\\.|/System/Library/|PerfPowerServices|BTLEServer|bluetoothd|UniversalControl|UserNotificationCenter|BiomeAgent|accountsd|locationd|logd|opendirectoryd|replayd|BetterSnapTool|netdisk_service"
+}
+
+_cc_monitor_is_codex_ui_helper_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "Codex Computer Use\\.app|SkyComputerUseService"
+}
+
+_cc_monitor_is_self_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "cc-monitor\\.sh( |$)|CCReaper\\.app/Contents/MacOS/CCReaper( |$)|/CCReaper( |$)"
 }
 
 _cc_monitor_is_normal_chrome_cmd() {
@@ -164,11 +235,26 @@ _cc_monitor_is_normal_chrome_cmd() {
   echo "$cmd" | grep -qE "Google Chrome\\.app|Google Chrome Helper|/Google Chrome( |$)|Chromium\\.app"
 }
 
+_cc_monitor_is_immutable_cmd() {
+  local cmd=$1
+  _cc_monitor_is_system_cmd "$cmd" \
+    || _cc_monitor_is_self_cmd "$cmd" \
+    || _cc_monitor_is_normal_chrome_cmd "$cmd" \
+    || _cc_monitor_is_codex_ui_helper_cmd "$cmd"
+}
+
 _cc_monitor_is_safe_candidate() {
   local ppid=$1
   local tty=$2
   local etime=$3
   local cmd=$4
+
+  _cc_monitor_is_immutable_cmd "$cmd" && return 1
+  _cc_monitor_has_user_rule protect "$cmd" && return 1
+  if _cc_monitor_has_user_rule cleanup "$cmd"; then
+    _cc_monitor_is_detached_or_orphan "$ppid" "$tty" && _cc_monitor_is_stale_etime "$etime"
+    return
+  fi
 
   _cc_monitor_is_protected_cmd "$cmd" && return 1
   _cc_monitor_is_dev_server_cmd "$cmd" && return 1
@@ -176,17 +262,17 @@ _cc_monitor_is_safe_candidate() {
   _cc_monitor_is_normal_chrome_cmd "$cmd" && return 1
 
   if _cc_monitor_is_claude_agent_cmd "$cmd"; then
-    [ "$ppid" = "1" ] || { _cc_monitor_is_detached_or_orphan "$ppid" "$tty" && _cc_monitor_is_stale_etime "$etime"; }
+    _cc_monitor_is_orphan_ppid "$ppid" || { _cc_monitor_is_detached_or_orphan "$ppid" "$tty" && _cc_monitor_is_stale_etime "$etime"; }
     return
   fi
 
   if _cc_monitor_is_agent_browser_cmd "$cmd" || _cc_monitor_is_puppeteer_chrome_cmd "$cmd"; then
-    [ "$ppid" = "1" ] || _cc_monitor_is_stale_etime "$etime"
+    _cc_monitor_is_orphan_ppid "$ppid" || _cc_monitor_is_stale_etime "$etime"
     return
   fi
 
   if _cc_monitor_is_codex_agent_cmd "$cmd" || _cc_monitor_is_agent_mcp_cmd "$cmd"; then
-    [ "$ppid" = "1" ] || { _cc_monitor_is_detached_or_orphan "$ppid" "$tty" && _cc_monitor_is_stale_etime "$etime"; }
+    _cc_monitor_is_orphan_ppid "$ppid" || { _cc_monitor_is_detached_or_orphan "$ppid" "$tty" && _cc_monitor_is_stale_etime "$etime"; }
     return
   fi
 
@@ -225,7 +311,11 @@ _cc_monitor_classification() {
   local cmd=$4
   local family=$5
 
-  if _cc_monitor_is_safe_candidate "$ppid" "$tty" "$etime" "$cmd"; then
+  if _cc_monitor_is_immutable_cmd "$cmd"; then
+    echo "DO_NOT_KILL"
+  elif _cc_monitor_has_user_rule protect "$cmd"; then
+    echo "DO_NOT_KILL"
+  elif _cc_monitor_is_safe_candidate "$ppid" "$tty" "$etime" "$cmd"; then
     echo "SAFE_TO_REAP"
   elif [ "$family" = "system" ] || [ "$family" = "chrome" ]; then
     echo "DO_NOT_KILL"
@@ -240,6 +330,15 @@ _cc_monitor_reason() {
   local classification=$1
   local family=$2
   local cmd=$3
+
+  if _cc_monitor_has_user_rule protect "$cmd"; then
+    echo "protected by a user process rule"
+    return
+  fi
+  if [ "$classification" = "SAFE_TO_REAP" ] && _cc_monitor_has_user_rule cleanup "$cmd"; then
+    echo "matches a user cleanup rule and the stale detached-process safety checks"
+    return
+  fi
 
   case "$classification:$family" in
     SAFE_TO_REAP:agent-browser)
@@ -288,6 +387,16 @@ _cc_monitor_action() {
   local classification=$1
   local family=$2
   local pid=$3
+  local cmd=$4
+
+  if _cc_monitor_has_user_rule protect "$cmd"; then
+    echo "Leave this process running, or remove its Always Protect rule in Settings."
+    return
+  fi
+  if [ "$classification" = "SAFE_TO_REAP" ] && _cc_monitor_has_user_rule cleanup "$cmd"; then
+    echo "Preview cleanup, then explicitly confirm if this stale detached process is no longer needed."
+    return
+  fi
 
   case "$classification:$family" in
     SAFE_TO_REAP:*)
@@ -346,6 +455,10 @@ _cc_monitor_label() {
     echo "react-scripts start"
   elif echo "$cmd" | grep -q "chrome-devtools-mcp"; then
     echo "chrome-devtools-mcp"
+  elif echo "$cmd" | grep -q "SkyComputerUseService\|Codex Computer Use\\.app"; then
+    echo "Codex Computer Use"
+  elif echo "$cmd" | grep -qE "CCReaper\\.app/Contents/MacOS/CCReaper|(^|/)CCReaper( |$)"; then
+    echo "cc-reaper"
   elif echo "$cmd" | grep -qE "(^|/)cmux( |$)|cmux\\.app"; then
     echo "cmux"
   elif [ "$family" = "chrome" ]; then
@@ -462,19 +575,30 @@ _cc_monitor_enrich_findings() {
   local filtered_file="${out_file}.prefilter"
 
   : > "$out_file"
-  awk -F '\t' -v min_cpu="$min_cpu" '
-    ($1+0) >= (min_cpu+0) || $10 ~ /agent-browser|puppeteer_dev_chrome_profile|Chrome for Testing|codex|claude|mcp|stream-json/ {
-      print
-    }
-  ' "$agg_file" > "$filtered_file"
+  if _cc_monitor_has_any_cleanup_rule; then
+    # A user cleanup rule may intentionally target a low-CPU stale process;
+    # classify every aggregate row so that candidate is not hidden by the
+    # reporting floor. Non-candidates still fall through the normal floor.
+    cp "$agg_file" "$filtered_file"
+  else
+    awk -F '\t' -v min_cpu="$min_cpu" '
+      ($1+0) >= (min_cpu+0) || $10 ~ /agent-browser|puppeteer_dev_chrome_profile|Chrome for Testing|codex|claude|mcp|stream-json/ {
+        print
+      }
+    ' "$agg_file" > "$filtered_file"
+  fi
 
   while IFS="$(printf '\t')" read -r avg_cpu max_cpu row_samples pid ppid pgid tty etime rss_mb cmd; do
     [ -z "$pid" ] && continue
+    _cc_monitor_is_self_cmd "$cmd" && continue
     local family="" classification="" label="" reason="" action=""
     family=$(_cc_monitor_family "$cmd")
     classification=$(_cc_monitor_classification "$ppid" "$tty" "$etime" "$cmd" "$family")
 
-    if _cc_monitor_is_protected_cmd "$cmd" && _cc_monitor_is_runaway "$avg_cpu" "$etime"; then
+    if _cc_monitor_is_protected_cmd "$cmd" \
+      && ! _cc_monitor_is_immutable_cmd "$cmd" \
+      && ! _cc_monitor_has_user_rule protect "$cmd" \
+      && _cc_monitor_is_runaway "$avg_cpu" "$etime"; then
       family="runaway"
       classification="ASK_BEFORE_KILL"
     fi
@@ -485,7 +609,7 @@ _cc_monitor_enrich_findings() {
 
     label=$(_cc_monitor_label "$family" "$cmd")
     reason=$(_cc_monitor_reason "$classification" "$family" "$cmd")
-    action=$(_cc_monitor_action "$classification" "$family" "$pid")
+    action=$(_cc_monitor_action "$classification" "$family" "$pid" "$cmd")
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
       "$avg_cpu" "$max_cpu" "$row_samples" "$pid" "$ppid" "$pgid" "$tty" "$etime" \
       "$rss_mb" "$family" "$classification" "$label" "$reason" "$action" "$cmd" >> "$out_file"
@@ -557,7 +681,7 @@ _cc_monitor_human_report() {
 
   echo ""
   echo "Family totals:"
-  local family_totals
+  local family_totals=""
   family_totals=$(_cc_monitor_family_totals "$findings_file")
   if [ -z "$family_totals" ]; then
     echo "  none"
@@ -569,7 +693,7 @@ _cc_monitor_human_report() {
 
   echo ""
   echo "Safe cleanup candidates:"
-  local safe_count
+  local safe_count=""
   safe_count=$(awk -F '\t' '$11 == "SAFE_TO_REAP" { count++ } END { print count+0 }' "$findings_file")
   if [ "$safe_count" -eq 0 ]; then
     echo "  none"
@@ -581,7 +705,7 @@ _cc_monitor_human_report() {
     ' "$findings_file"
   fi
 
-  local runaway_count
+  local runaway_count=""
   runaway_count=$(awk -F '\t' '$10 == "runaway" && $11 == "ASK_BEFORE_KILL" { count++ } END { print count+0 }' "$findings_file")
   if [ "$runaway_count" -gt 0 ]; then
     echo ""
@@ -748,7 +872,7 @@ _cc_monitor_module_binary() {
 }
 
 _cc_monitor_module_available() {
-  local binary
+  local binary=""
   binary=$(_cc_monitor_module_binary "$1") || return 1
   command -v "$binary" >/dev/null 2>&1
 }
@@ -797,7 +921,7 @@ _cc_monitor_prompt_apply() {
   fi
 
   local all_modules=()
-  local m
+  local m=""
   while IFS= read -r m; do
     all_modules+=("$m")
   done < <(_cc_monitor_all_modules)
@@ -879,14 +1003,14 @@ _cc_monitor_dispatch_module() {
   local skip_confirm=$2
 
   if ! _cc_monitor_module_available "$module"; then
-    local binary
+    local binary=""
     binary=$(_cc_monitor_module_binary "$module")
     echo "cc-monitor: module '$module' not available on PATH (binary: $binary)" >&2
     return 127
   fi
 
   if [ "$skip_confirm" != "true" ] && _cc_monitor_module_destructive "$module"; then
-    local label
+    local label=""
     label=$(_cc_monitor_module_label "$module")
     printf "Run %s? [y/N] " "$label" >&2
     local answer=""
@@ -985,6 +1109,11 @@ cc-monitor() {
   _cc_monitor_is_positive_int "$interval" || { echo "cc-monitor: interval must be a positive integer" >&2; return 2; }
   _cc_monitor_is_positive_int "$top" || { echo "cc-monitor: top must be a positive integer" >&2; return 2; }
   _cc_monitor_is_positive_number "$min_cpu" || { echo "cc-monitor: min-cpu must be numeric" >&2; return 2; }
+
+  # Resolve once per monitor run so every classification uses the same
+  # cross-platform orphan-parent set without rescanning the process table.
+  _CC_MONITOR_ORPHAN_PPIDS=""
+  _CC_MONITOR_ORPHAN_PPIDS=$(_cc_monitor_orphan_ppids)
 
   if [ "$once" = "true" ]; then
     duration=0

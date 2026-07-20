@@ -18,13 +18,53 @@ log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
 }
 
+rules_file() {
+  if [ -n "${CC_REAPER_RULES_FILE:-}" ]; then
+    echo "$CC_REAPER_RULES_FILE"
+  elif [ -n "${HOME:-}" ]; then
+    echo "$HOME/.cc-reaper/process-rules.tsv"
+  else
+    return 1
+  fi
+}
+
+# User rules are case-insensitive literal command substrings, never regexes.
+has_user_rule() {
+  local policy=$1
+  local cmd=$2
+  local file=""
+  file=$(rules_file) || return 1
+  [ -r "$file" ] || return 1
+  awk -F '\t' -v policy="$policy" -v cmd="$cmd" '
+    NF == 2 && ($1 == "protect" || $1 == "cleanup") && length($2) >= 3 && length($2) <= 128 {
+      if ($1 == policy && index(tolower(cmd), tolower($2)) > 0) found=1
+    }
+    END { exit !found }
+  ' "$file"
+}
+
 protected_pattern() {
   echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
 }
 
 is_protected_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "$(protected_pattern)"
+  echo "$cmd" | grep -qE "$(protected_pattern)" || has_user_rule protect "$cmd"
+}
+
+# Re-check user policy at the signal boundary so scheduled cleanup cannot race
+# a rule edit or bypass protection through a later fallback/SIGKILL path.
+terminate_unless_user_protected() {
+  local pid=$1
+  local signal=${2:-}
+  local cmd=""
+  cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+  has_user_rule protect "$cmd" && return 1
+  if [ -n "$signal" ]; then
+    kill "$signal" "$pid" 2>/dev/null
+  else
+    kill "$pid" 2>/dev/null
+  fi
 }
 
 agent_stale_seconds() {
@@ -128,10 +168,14 @@ kill_group_filtered() {
     local pid_cmd
     pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
     is_protected_cmd "$pid_cmd" && continue
-    kill "$pid" 2>/dev/null && killed=$((killed + 1))
+    terminate_unless_user_protected "$pid" && killed=$((killed + 1))
   done < <(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
   echo "$killed"
 }
+
+if [ "${CC_REAPER_MONITOR_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 # ─── PGID-based cleanup (primary) ────────────────────────────────────────────
 # Find orphaned process groups whose leader has PPID=1 and contain Claude/Codex processes.
@@ -147,9 +191,9 @@ for pgid in $orphan_pgids; do
     continue
   fi
   group_info=$(ps -eo pid,pgid,%cpu,%mem,command 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {printf "PID=%s CPU=%s%% MEM=%s%% ", $1, $3, $4}')
-  log "KILL group PGID=$pgid ($group_info)"
   killed_in_group=$(kill_group_filtered "$pgid")
   if [ "$killed_in_group" -gt 0 ]; then
+    log "KILL group PGID=$pgid ($group_info)"
     killed_pgids+=("$pgid")
   fi
 done
@@ -180,11 +224,12 @@ while IFS= read -r line; do
     fi
     $already_killed && continue
 
-    short_cmd=$(echo "$cmd" | head -c 100)
-    log "KILL agent/orphan PID=$pid CPU=${cpu}% MEM=${mem}% ELAPSED=$etime CMD=$short_cmd"
-    kill "$pid" 2>/dev/null
-    kill_pids+=("$pid")
-    count=$((count + 1))
+    if terminate_unless_user_protected "$pid"; then
+      short_cmd=$(echo "$cmd" | head -c 100)
+      log "KILL agent/orphan PID=$pid CPU=${cpu}% MEM=${mem}% ELAPSED=$etime CMD=$short_cmd"
+      kill_pids+=("$pid")
+      count=$((count + 1))
+    fi
   fi
 done < <(ps -eo pid=,ppid=,tty=,%cpu=,%mem=,etime=,command= 2>/dev/null)
 
@@ -207,6 +252,9 @@ RUNAWAY_ORPHAN_MIN_SEC="${CC_RUNAWAY_ORPHAN_MIN_SEC:-180}" # orphan age floor in
 
 while read -r rpid _ rcpu retime rcmd; do   # default IFS: split the 5 ps columns
   [ -z "$rpid" ] && continue
+  # Explicit user protection remains an absolute boundary even though this
+  # pass deliberately overrides the built-in shared-service whitelist.
+  has_user_rule protect "$rcmd" && continue
   # Gate: orphan old enough to not be legitimate startup work
   [ "$(etime_to_seconds "$retime")" -lt "$RUNAWAY_ORPHAN_MIN_SEC" ] && continue
   # Skip anything a section above already reaped
@@ -218,10 +266,11 @@ while read -r rpid _ rcpu retime rcmd; do   # default IFS: split the 5 ps column
   rcpu2=$(ps -o %cpu= -p "$rpid" 2>/dev/null | tr -d ' ')
   [ -z "$rcpu2" ] && continue   # exited on its own
   awk -v a="$rcpu2" -v th="$RUNAWAY_CPU" 'BEGIN { exit !((a + 0) >= (th + 0)) }' || continue
-  log "KILL runaway (whitelist-override) PID=$rpid CPU=${rcpu}%->${rcpu2}% ELAPSED=$retime CMD=$(echo "$rcmd" | head -c 100)"
-  kill "$rpid" 2>/dev/null
-  kill_pids+=("$rpid")
-  count=$((count + 1))
+  if terminate_unless_user_protected "$rpid"; then
+    log "KILL runaway (whitelist-override) PID=$rpid CPU=${rcpu}%->${rcpu2}% ELAPSED=$retime CMD=$(echo "$rcmd" | head -c 100)"
+    kill_pids+=("$rpid")
+    count=$((count + 1))
+  fi
 done < <(ps -eo pid=,ppid=,%cpu=,etime=,command= 2>/dev/null \
   | awk -v th="$RUNAWAY_CPU" '$2 == 1 && ($3 + 0) >= (th + 0) { print }' \
   | grep -E "[n]ode|[n]px|_npx|[m]cp|[b]un|[c]odex|[c]laude")
@@ -236,14 +285,20 @@ for pgid in "${killed_pgids[@]}"; do
   # Check if any process in the group survived
   survivors=$(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
   for pid in $survivors; do
-    kill -9 "$pid" 2>/dev/null
-    log "SIGKILL PID=$pid from group PGID=$pgid"
+    pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+    is_protected_cmd "$pid_cmd" && continue
+    if terminate_unless_user_protected "$pid" -9; then
+      log "SIGKILL PID=$pid from group PGID=$pgid"
+    fi
   done
 done
 for pid in "${kill_pids[@]}"; do
   if kill -0 "$pid" 2>/dev/null; then
-    kill -9 "$pid" 2>/dev/null
-    log "SIGKILL PID=$pid (did not respond to SIGTERM)"
+    pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+    is_protected_cmd "$pid_cmd" && continue
+    if terminate_unless_user_protected "$pid" -9; then
+      log "SIGKILL PID=$pid (did not respond to SIGTERM)"
+    fi
   fi
 done
 

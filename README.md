@@ -406,6 +406,36 @@ Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`,
 
 Config via env: `CC_RW_LOAD_FACTOR` / `CC_RW_DISK_MIN_PCT` / `CC_RW_MEM_MIN_PCT` / `CC_RW_COOLDOWN_SECS` (watch), `CC_DJ_DISK_MIN_PCT` / `CC_DJ_COOLDOWN_SECS` (disk), `CC_WJ_ROOT` / `CC_WJ_NOTIFY_MIN_GB` (worktree).
 
+## macOS Companion (source preview)
+
+cc-reaper includes a native SwiftUI menu bar companion for status visibility and safe manual actions. It reads the existing `cc-monitor --once --json` contract, shows current findings in a dashboard, and keeps settings in the standard macOS Settings window. The app does not reimplement process classification or cleanup policy.
+
+Install/update the shell tools first so `~/.cc-reaper/cc-monitor.sh` and `claude-cleanup.sh` are available, then build and launch the app:
+
+```bash
+./install.sh
+swift test
+./script/build_and_run.sh
+```
+
+The menu bar can refresh status, run the same-engine `claude-cleanup --dry-run` preview, and open the dashboard. Process cleanup is available only from the dashboard after a successful preview and explicit destructive confirmation, then delegates once to the existing `claude-cleanup` function. Missing scripts, invalid JSON, stale monitor contracts, timeouts, and command failures display an unavailable/error state instead of a healthy result.
+
+Source-built bundles staged under `dist/` automatically use the checkout's `shell/` directory when `~/.cc-reaper` is incomplete. A complete installed root remains preferred, and an explicit Settings override takes precedence over both.
+
+### Custom process rules
+
+The companion's **Settings → Process Rules** pane and each finding row's action menu can add a case-insensitive literal command match as either:
+
+- **Always Protect** — matching processes are excluded from cleanup and guard termination paths.
+- **Allow Stale Cleanup** — a matching ordinary process may become a cleanup candidate only when it is both stale and detached/orphaned. System/security processes, normal Chrome, and cc-reaper itself remain immutable; preview and explicit cleanup confirmation are still required.
+
+Rules are stored in `~/.cc-reaper/process-rules.tsv` with owner-only permissions. `protect` wins conflicts, invalid externally edited rows are ignored, and removing the final rule removes the file. The match is literal text, not a regular expression or wildcard.
+Always Protect rules are re-read by manual cleanup, guard paths, and the scheduled LaunchAgent before both TERM and SIGKILL, so changing a rule does not require reloading the agent.
+
+For automated launch checks while continuing other work, run `./script/build_and_run.sh --verify`. Verification launches with background activation, confirms a new app process, stops only that verification process, and leaves both the foreground application and any pre-existing cc-reaper instance alone.
+
+Requirements: macOS 14 or later and the Swift toolchain included with current Xcode or Xcode Command Line Tools. This iteration stages an unsigned local bundle at `dist/CCReaper.app`; signing, notarization, and automatic updates are not included yet.
+
 ## Dependencies
 
 | Tool | Required | Install |
