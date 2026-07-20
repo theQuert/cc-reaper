@@ -15,3 +15,4 @@
 - [x] 3.3 Make `--verify` background-only and process-scoped so automated GUI checks do not steal focus or terminate a pre-existing cc-reaper instance; prove launch-mode parsing, process cleanup, and unchanged foreground identity.
 - [x] 3.4 Run a background-only UI/UX canary against the real monitor contract, inspect the dashboard accessibility tree and screenshot, confirm the foreground application remains unchanged, and remove the isolated canary bundle/settings/process.
 - [x] 3.5 Reject unsupported run modes before any process or build mutation, and verify the failure is side-effect-free.
+- [x] 3.6 Make source-built canaries automatically resolve the checkout's complete `shell/` directory when `~/.cc-reaper` is incomplete, preserve installed and explicit-override precedence, show the active root in Settings, and rerun the user-visible canary.

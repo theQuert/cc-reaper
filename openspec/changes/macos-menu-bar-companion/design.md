@@ -29,7 +29,7 @@ The initial app is a local SwiftPM macOS application. It is a development and so
 
 3. **Treat existing shell commands as the policy boundary.** A scan executes `/bin/bash <root>/cc-monitor.sh --once --json --min-cpu <value>`. Preview and cleanup source `<root>/claude-cleanup.sh` through a fixed Bash program with the script path passed as a positional argument, then call `claude-guard --dry-run` or `claude-cleanup`. User-controlled paths are never interpolated into shell source text.
 
-4. **Default the engine root to `~/.cc-reaper` and make it configurable.** `install.sh` will deploy `cc-monitor.sh` beside the existing cleanup script. A settings override supports source checkouts or non-default installs. Missing files produce an unavailable state with an install hint.
+4. **Resolve the engine root automatically and keep an explicit override.** A saved settings override wins. Otherwise the app prefers a complete `~/.cc-reaper` installation and, for a bundle staged under the repository's `dist/` directory, falls back to that checkout's complete `shell/` directory. `install.sh` deploys `cc-monitor.sh` beside the existing cleanup script. Missing files in every eligible root produce an unavailable state with an install hint.
 
 5. **Keep destructive intent in the dashboard.** The menu bar can refresh, preview, and open the dashboard, but it does not terminate processes directly. The dashboard presents a destructive confirmation that names the action; cancel sends no command. After confirmed cleanup the app refreshes its read-only report.
 

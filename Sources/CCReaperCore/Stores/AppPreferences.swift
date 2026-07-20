@@ -20,23 +20,62 @@ public struct AppConfiguration: Equatable, Sendable {
     public let refreshInterval: Double
 
     @MainActor
-    public init(defaults: UserDefaults = .standard) {
-        let storedRoot = defaults.string(forKey: AppPreferenceKeys.scriptRoot) ?? AppDefaults.scriptRoot
-        let rootPath: String
-        if storedRoot == "~" {
-            rootPath = FileManager.default.homeDirectoryForCurrentUser.path
-        } else if storedRoot.hasPrefix("~/") {
-            rootPath = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(String(storedRoot.dropFirst(2)), isDirectory: true)
-                .path
+    public init(
+        defaults: UserDefaults = .standard,
+        homeDirectory: URL? = nil,
+        bundleURL: URL? = nil
+    ) {
+        let homeDirectory = homeDirectory ?? FileManager.default.homeDirectoryForCurrentUser
+        let bundleURL = bundleURL ?? Bundle.main.bundleURL
+        let storedRoot = defaults.string(forKey: AppPreferenceKeys.scriptRoot)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedRoot: URL
+
+        if let storedRoot, !storedRoot.isEmpty {
+            resolvedRoot = Self.expand(path: storedRoot, homeDirectory: homeDirectory)
         } else {
-            rootPath = storedRoot
+            let installedRoot = homeDirectory.appendingPathComponent(".cc-reaper", isDirectory: true)
+            if Self.containsRequiredScripts(installedRoot) {
+                resolvedRoot = installedRoot
+            } else if let sourceRoot = Self.sourceRoot(for: bundleURL),
+                      Self.containsRequiredScripts(sourceRoot) {
+                resolvedRoot = sourceRoot
+            } else {
+                resolvedRoot = installedRoot
+            }
         }
 
         let storedMinimumCPU = defaults.double(forKey: AppPreferenceKeys.minimumCPU)
         let storedRefreshInterval = defaults.double(forKey: AppPreferenceKeys.refreshInterval)
-        self.scriptRoot = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+        self.scriptRoot = resolvedRoot.standardizedFileURL
         self.minimumCPU = storedMinimumCPU > 0 ? storedMinimumCPU : AppDefaults.minimumCPU
         self.refreshInterval = storedRefreshInterval > 0 ? storedRefreshInterval : AppDefaults.refreshInterval
+    }
+
+    private static func expand(path: String, homeDirectory: URL) -> URL {
+        if path == "~" {
+            return homeDirectory
+        }
+        if path.hasPrefix("~/") {
+            return homeDirectory.appendingPathComponent(String(path.dropFirst(2)), isDirectory: true)
+        }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    private static func sourceRoot(for bundleURL: URL) -> URL? {
+        guard bundleURL.pathExtension == "app" else { return nil }
+        let distDirectory = bundleURL.deletingLastPathComponent()
+        guard distDirectory.lastPathComponent == "dist" else { return nil }
+        return distDirectory
+            .deletingLastPathComponent()
+            .appendingPathComponent("shell", isDirectory: true)
+    }
+
+    private static func containsRequiredScripts(_ root: URL) -> Bool {
+        ["cc-monitor.sh", "claude-cleanup.sh"].allSatisfy { name in
+            let candidate = root.appendingPathComponent(name, isDirectory: false)
+            let values = try? candidate.resourceValues(forKeys: [.isRegularFileKey])
+            return values?.isRegularFile == true
+        }
     }
 }

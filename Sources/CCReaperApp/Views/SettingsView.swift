@@ -2,16 +2,20 @@ import CCReaperCore
 import SwiftUI
 
 struct SettingsView: View {
-    @AppStorage(AppPreferenceKeys.scriptRoot) private var scriptRoot = AppDefaults.scriptRoot
+    @AppStorage(AppPreferenceKeys.scriptRoot) private var scriptRootOverride = ""
     @AppStorage(AppPreferenceKeys.minimumCPU) private var minimumCPU = AppDefaults.minimumCPU
     @AppStorage(AppPreferenceKeys.refreshInterval) private var refreshInterval = AppDefaults.refreshInterval
 
     var body: some View {
         Form {
             Section("Integration") {
-                TextField("Script root", text: $scriptRoot)
+                TextField("Script root override", text: $scriptRootOverride, prompt: Text("Automatic"))
                     .textFieldStyle(.roundedBorder)
-                Text("Expected files: cc-monitor.sh and claude-cleanup.sh")
+                Text("Active root: \(AppConfiguration().scriptRoot.path)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Text("Automatic prefers ~/.cc-reaper, then a staged source checkout. Expected files: cc-monitor.sh and claude-cleanup.sh")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -36,7 +40,7 @@ struct SettingsView: View {
             HStack {
                 Spacer()
                 Button("Restore Defaults") {
-                    scriptRoot = AppDefaults.scriptRoot
+                    scriptRootOverride = ""
                     minimumCPU = AppDefaults.minimumCPU
                     refreshInterval = AppDefaults.refreshInterval
                 }

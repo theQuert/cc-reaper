@@ -58,15 +58,27 @@ The companion SHALL keep preview non-destructive and SHALL require explicit conf
 - **THEN** the companion SHALL surface the failure and captured error without claiming cleanup succeeded or retrying automatically
 
 ### Requirement: Configurable local integration
-The companion SHALL default to the installed `~/.cc-reaper` script root and SHALL provide persistent native settings for the script root, monitor reporting threshold, and automatic refresh interval.
+The companion SHALL automatically resolve a complete local script root and SHALL provide persistent native settings for an explicit script-root override, monitor reporting threshold, and automatic refresh interval.
 
 #### Scenario: Default installation is present
 - **WHEN** the expected monitor and cleanup scripts exist under the default script root
 - **THEN** the companion SHALL use those files without additional configuration
 
+#### Scenario: Source canary has no complete default installation
+- **WHEN** no script-root override is saved, the default installation is incomplete, and the app bundle is staged under a source checkout whose `shell` directory contains the expected monitor and cleanup scripts
+- **THEN** the companion SHALL use that source `shell` directory without requiring the user to edit settings
+
+#### Scenario: Both installed and source roots are complete
+- **WHEN** no script-root override is saved and both the default installation and staged source roots contain the expected scripts
+- **THEN** the companion SHALL prefer the default installation
+
 #### Scenario: User supplies a different script root
 - **WHEN** the user saves a non-default script root
 - **THEN** subsequent commands SHALL resolve only the expected script filenames under that root and SHALL pass the resolved path as a process argument rather than interpolating it into shell source
+
+#### Scenario: User clears the script-root override
+- **WHEN** the user restores automatic script-root selection
+- **THEN** the companion SHALL resume installed-then-source automatic resolution and SHALL show the active resolved path in Settings
 
 #### Scenario: Script root is incomplete
 - **WHEN** a required script is not a regular file under the configured root
