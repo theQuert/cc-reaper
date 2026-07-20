@@ -27,7 +27,7 @@
 
 ## Impact
 
-- Adds a SwiftPM macOS executable and testable core module under `Sources/` and `Tests/`.
+- Adds a SwiftPM macOS executable and testable core module under `Sources/` and `tests/`.
 - Adds a project-local app bundle build/run script and Codex Run action.
 - Updates `install.sh` so `cc-monitor.sh` is available at the stable deployed script root used by the app.
 - Extends `claude-cleanup` with a non-destructive dry-run mode while preserving the existing cleanup policy and normal invocation.
