@@ -86,6 +86,11 @@ expect_eq "Codex Computer Use helper is protected" \
   "$(classify_cmd 23693 "??" 01:00:00 "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService")" \
   "other/DO_NOT_KILL"
 
+printf "cleanup\tSkyComputerUseService\n" > "$rules_file"
+expect_eq "Codex Computer Use helper remains immutable under a cleanup rule" \
+  "$(classify_cmd 23693 "??" 03:00:00 "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService")" \
+  "other/DO_NOT_KILL"
+
 printf "protect\tcustom-worker\n" > "$rules_file"
 expect_eq "user protect rule appears as do-not-kill" \
   "$(classify_cmd 123 "??" 03:00:00 "/opt/custom-worker --serve")" \
