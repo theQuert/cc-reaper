@@ -7,8 +7,12 @@ The monitor SHALL exclude the process tree used to invoke `cc-monitor` and the c
 - **WHEN** a sampled command contains the current `cc-monitor.sh` invocation or its shell wrapper
 - **THEN** the monitor SHALL omit that process from findings and family totals
 
-#### Scenario: Companion or known UI automation helper is sampled
-- **WHEN** a sampled command belongs to CCReaper or the Codex Computer Use helper
+#### Scenario: Companion process is sampled
+- **WHEN** a sampled command belongs to CCReaper
+- **THEN** the monitor SHALL omit it from findings and family totals
+
+#### Scenario: Known UI automation helper is sampled
+- **WHEN** a sampled command belongs to the Codex Computer Use helper
 - **THEN** the monitor SHALL classify it as protected and SHALL NOT recommend direct termination
 
 ### Requirement: Cleanup dry-run shares cleanup policy
