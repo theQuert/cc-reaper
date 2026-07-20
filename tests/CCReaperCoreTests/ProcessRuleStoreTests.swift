@@ -59,6 +59,32 @@ final class ProcessRuleStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: layout.file.path))
     }
 
+    func testFindingSuggestedRuleUsesBoundedCommandLiteralRatherThanDisplayLabel() throws {
+        let command = "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing --user-data-dir=/tmp/puppeteer_dev_chrome_profile-123456789 --remote-debugging-port=0"
+        let finding = Finding(
+            pid: 42,
+            ppid: 1,
+            pgid: 42,
+            family: "agent-browser",
+            classification: .safeToReap,
+            label: "Puppeteer Chrome",
+            averageCPU: 1,
+            maximumCPU: 2,
+            rssMB: 50,
+            samples: 1,
+            elapsed: "03:00:00",
+            reason: "fixture",
+            suggestedAction: "fixture",
+            command: command
+        )
+
+        let match = try XCTUnwrap(finding.suggestedRuleMatch)
+        XCTAssertEqual(match, String(command.prefix(128)))
+        XCTAssertEqual(match.count, 128)
+        XCTAssertNotEqual(match, finding.label)
+        XCTAssertTrue(command.lowercased().contains(match.lowercased()))
+    }
+
     private func makeLayout() throws -> (root: URL, file: URL) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("cc-reaper-rules-\(UUID().uuidString)", isDirectory: true)

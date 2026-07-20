@@ -48,7 +48,8 @@ public extension Finding {
     }
 
     var suggestedRuleMatch: String? {
-        let candidate = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let command = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidate = String(command.prefix(128))
         return ProcessRuleStore.normalizedMatch(candidate)
     }
 }
