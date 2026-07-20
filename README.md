@@ -422,6 +422,15 @@ The menu bar can refresh status, run the same-engine `claude-cleanup --dry-run` 
 
 Source-built bundles staged under `dist/` automatically use the checkout's `shell/` directory when `~/.cc-reaper` is incomplete. A complete installed root remains preferred, and an explicit Settings override takes precedence over both.
 
+### Custom process rules
+
+The companion's **Settings → Process Rules** pane and each finding row's action menu can add a case-insensitive literal command match as either:
+
+- **Always Protect** — matching processes are excluded from cleanup and guard termination paths.
+- **Allow Stale Cleanup** — a matching ordinary process may become a cleanup candidate only when it is both stale and detached/orphaned. System/security processes, normal Chrome, and cc-reaper itself remain immutable; preview and explicit cleanup confirmation are still required.
+
+Rules are stored in `~/.cc-reaper/process-rules.tsv` with owner-only permissions. `protect` wins conflicts, invalid externally edited rows are ignored, and removing the final rule removes the file. The match is literal text, not a regular expression or wildcard.
+
 For automated launch checks while continuing other work, run `./script/build_and_run.sh --verify`. Verification launches with background activation, confirms a new app process, stops only that verification process, and leaves both the foreground application and any pre-existing cc-reaper instance alone.
 
 Requirements: macOS 14 or later and the Swift toolchain included with current Xcode or Xcode Command Line Tools. This iteration stages an unsigned local bundle at `dist/CCReaper.app`; signing, notarization, and automatic updates are not included yet.

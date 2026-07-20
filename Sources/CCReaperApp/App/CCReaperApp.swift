@@ -19,10 +19,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct CCReaperApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var store = MonitorStore()
+    @State private var ruleStore = ProcessRuleStore()
 
     var body: some Scene {
         WindowGroup("cc-reaper", id: "dashboard") {
-            DashboardView(store: store)
+            DashboardView(store: store, ruleStore: ruleStore)
                 .frame(minWidth: 760, minHeight: 560)
                 .task { store.start() }
         }
@@ -43,7 +44,9 @@ struct CCReaperApp: App {
         .menuBarExtraStyle(.window)
 
         Settings {
-            SettingsView()
+            SettingsView(ruleStore: ruleStore) {
+                Task { await store.refresh() }
+            }
         }
     }
 }

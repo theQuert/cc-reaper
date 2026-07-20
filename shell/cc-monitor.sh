@@ -30,7 +30,43 @@ Environment:
   CC_MONITOR_TOP           Default top contributor count
   CC_MONITOR_MIN_CPU       Default CPU reporting floor
   CC_MONITOR_SNAPSHOT_FILE Test hook: read tab-separated snapshots from a file
+  CC_REAPER_RULES_FILE     User process-rule file (default: ~/.cc-reaper/process-rules.tsv)
 EOF
+}
+
+_cc_monitor_rules_file() {
+  if [ -n "${CC_REAPER_RULES_FILE:-}" ]; then
+    echo "$CC_REAPER_RULES_FILE"
+  elif [ -n "${HOME:-}" ]; then
+    echo "$HOME/.cc-reaper/process-rules.tsv"
+  else
+    return 1
+  fi
+}
+
+# Rules are case-insensitive literal command substrings, never regexes.
+_cc_monitor_has_user_rule() {
+  local policy=$1
+  local cmd=$2
+  local rules_file=""
+  rules_file=$(_cc_monitor_rules_file) || return 1
+  [ -r "$rules_file" ] || return 1
+  awk -F '\t' -v policy="$policy" -v cmd="$cmd" '
+    NF == 2 && ($1 == "protect" || $1 == "cleanup") && length($2) >= 3 && length($2) <= 128 {
+      if ($1 == policy && index(tolower(cmd), tolower($2)) > 0) found=1
+    }
+    END { exit !found }
+  ' "$rules_file"
+}
+
+_cc_monitor_has_any_cleanup_rule() {
+  local rules_file=""
+  rules_file=$(_cc_monitor_rules_file) || return 1
+  [ -r "$rules_file" ] || return 1
+  awk -F '\t' '
+    $1 == "cleanup" && NF == 2 && length($2) >= 3 && length($2) <= 128 { found=1 }
+    END { exit !found }
+  ' "$rules_file"
 }
 
 _cc_monitor_is_positive_number() {
@@ -169,11 +205,23 @@ _cc_monitor_is_normal_chrome_cmd() {
   echo "$cmd" | grep -qE "Google Chrome\\.app|Google Chrome Helper|/Google Chrome( |$)|Chromium\\.app"
 }
 
+_cc_monitor_is_immutable_cmd() {
+  local cmd=$1
+  _cc_monitor_is_system_cmd "$cmd" || _cc_monitor_is_self_cmd "$cmd" || _cc_monitor_is_normal_chrome_cmd "$cmd"
+}
+
 _cc_monitor_is_safe_candidate() {
   local ppid=$1
   local tty=$2
   local etime=$3
   local cmd=$4
+
+  _cc_monitor_is_immutable_cmd "$cmd" && return 1
+  _cc_monitor_has_user_rule protect "$cmd" && return 1
+  if _cc_monitor_has_user_rule cleanup "$cmd"; then
+    _cc_monitor_is_detached_or_orphan "$ppid" "$tty" && _cc_monitor_is_stale_etime "$etime"
+    return
+  fi
 
   _cc_monitor_is_protected_cmd "$cmd" && return 1
   _cc_monitor_is_dev_server_cmd "$cmd" && return 1
@@ -230,7 +278,11 @@ _cc_monitor_classification() {
   local cmd=$4
   local family=$5
 
-  if _cc_monitor_is_safe_candidate "$ppid" "$tty" "$etime" "$cmd"; then
+  if _cc_monitor_is_immutable_cmd "$cmd"; then
+    echo "DO_NOT_KILL"
+  elif _cc_monitor_has_user_rule protect "$cmd"; then
+    echo "DO_NOT_KILL"
+  elif _cc_monitor_is_safe_candidate "$ppid" "$tty" "$etime" "$cmd"; then
     echo "SAFE_TO_REAP"
   elif [ "$family" = "system" ] || [ "$family" = "chrome" ]; then
     echo "DO_NOT_KILL"
@@ -245,6 +297,15 @@ _cc_monitor_reason() {
   local classification=$1
   local family=$2
   local cmd=$3
+
+  if _cc_monitor_has_user_rule protect "$cmd"; then
+    echo "protected by a user process rule"
+    return
+  fi
+  if [ "$classification" = "SAFE_TO_REAP" ] && _cc_monitor_has_user_rule cleanup "$cmd"; then
+    echo "matches a user cleanup rule and the stale detached-process safety checks"
+    return
+  fi
 
   case "$classification:$family" in
     SAFE_TO_REAP:agent-browser)
@@ -293,6 +354,16 @@ _cc_monitor_action() {
   local classification=$1
   local family=$2
   local pid=$3
+  local cmd=$4
+
+  if _cc_monitor_has_user_rule protect "$cmd"; then
+    echo "Leave this process running, or remove its Always Protect rule in Settings."
+    return
+  fi
+  if [ "$classification" = "SAFE_TO_REAP" ] && _cc_monitor_has_user_rule cleanup "$cmd"; then
+    echo "Preview cleanup, then explicitly confirm if this stale detached process is no longer needed."
+    return
+  fi
 
   case "$classification:$family" in
     SAFE_TO_REAP:*)
@@ -471,11 +542,18 @@ _cc_monitor_enrich_findings() {
   local filtered_file="${out_file}.prefilter"
 
   : > "$out_file"
-  awk -F '\t' -v min_cpu="$min_cpu" '
-    ($1+0) >= (min_cpu+0) || $10 ~ /agent-browser|puppeteer_dev_chrome_profile|Chrome for Testing|codex|claude|mcp|stream-json/ {
-      print
-    }
-  ' "$agg_file" > "$filtered_file"
+  if _cc_monitor_has_any_cleanup_rule; then
+    # A user cleanup rule may intentionally target a low-CPU stale process;
+    # classify every aggregate row so that candidate is not hidden by the
+    # reporting floor. Non-candidates still fall through the normal floor.
+    cp "$agg_file" "$filtered_file"
+  else
+    awk -F '\t' -v min_cpu="$min_cpu" '
+      ($1+0) >= (min_cpu+0) || $10 ~ /agent-browser|puppeteer_dev_chrome_profile|Chrome for Testing|codex|claude|mcp|stream-json/ {
+        print
+      }
+    ' "$agg_file" > "$filtered_file"
+  fi
 
   while IFS="$(printf '\t')" read -r avg_cpu max_cpu row_samples pid ppid pgid tty etime rss_mb cmd; do
     [ -z "$pid" ] && continue
@@ -484,7 +562,10 @@ _cc_monitor_enrich_findings() {
     family=$(_cc_monitor_family "$cmd")
     classification=$(_cc_monitor_classification "$ppid" "$tty" "$etime" "$cmd" "$family")
 
-    if _cc_monitor_is_protected_cmd "$cmd" && _cc_monitor_is_runaway "$avg_cpu" "$etime"; then
+    if _cc_monitor_is_protected_cmd "$cmd" \
+      && ! _cc_monitor_is_immutable_cmd "$cmd" \
+      && ! _cc_monitor_has_user_rule protect "$cmd" \
+      && _cc_monitor_is_runaway "$avg_cpu" "$etime"; then
       family="runaway"
       classification="ASK_BEFORE_KILL"
     fi
@@ -495,7 +576,7 @@ _cc_monitor_enrich_findings() {
 
     label=$(_cc_monitor_label "$family" "$cmd")
     reason=$(_cc_monitor_reason "$classification" "$family" "$cmd")
-    action=$(_cc_monitor_action "$classification" "$family" "$pid")
+    action=$(_cc_monitor_action "$classification" "$family" "$pid" "$cmd")
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
       "$avg_cpu" "$max_cpu" "$row_samples" "$pid" "$ppid" "$pgid" "$tty" "$etime" \
       "$rss_mb" "$family" "$classification" "$label" "$reason" "$action" "$cmd" >> "$out_file"

@@ -8,6 +8,11 @@ export CC_AGENT_STALE_MINUTES=60
 
 failures=0
 
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-reaper-rules-test.XXXXXX")
+trap 'rm -rf "$tmp_dir"' EXIT
+rules_file="$tmp_dir/process-rules.tsv"
+export CC_REAPER_RULES_FILE="$rules_file"
+
 expect_yes() {
   local name=$1
   shift
@@ -88,6 +93,76 @@ expect_no "@stripe/mcp is protected" \
 expect_no "sequential-thinking is protected" \
   _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
   "node sequential-thinking"
+
+printf "protect\tcustom-worker\n" > "$rules_file"
+expect_no "user protect rule blocks otherwise eligible process" \
+  _cc_reaper_is_agent_cleanup_candidate 123 "??" "03:00:00" \
+  "/opt/custom-worker --serve"
+
+printf "cleanup\tcustom-worker\n" > "$rules_file"
+expect_yes "user cleanup rule admits stale detached ordinary process" \
+  _cc_reaper_is_agent_cleanup_candidate 123 "??" "03:00:00" \
+  "/opt/custom-worker --serve"
+expect_no "user cleanup rule does not admit recent process" \
+  _cc_reaper_is_agent_cleanup_candidate 123 "??" "00:10:00" \
+  "/opt/custom-worker --serve"
+expect_no "user cleanup rule does not admit terminal-attached process" \
+  _cc_reaper_is_agent_cleanup_candidate 123 "ttys003" "03:00:00" \
+  "/opt/custom-worker --serve"
+
+printf "cleanup\tchrome-devtools-mcp\n" > "$rules_file"
+expect_yes "user cleanup rule can override ordinary built-in protection after safety checks" \
+  _cc_reaper_is_agent_cleanup_candidate 123 "??" "03:00:00" \
+  "chrome-devtools-mcp npm_config_legacy_peer_deps=true"
+
+printf "cleanup\tWindowServer\ncleanup\tCCReaper\n" > "$rules_file"
+expect_no "system safety floor rejects user cleanup rule" \
+  _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
+  "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon"
+expect_no "cc-reaper self safety floor rejects user cleanup rule" \
+  _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
+  "/Applications/CCReaper.app/Contents/MacOS/CCReaper"
+
+printf "cleanup\tconflicted-worker\nprotect\tCONFLICTED-WORKER\n" > "$rules_file"
+expect_no "protect wins an externally edited policy conflict" \
+  _cc_reaper_is_agent_cleanup_candidate 123 "??" "03:00:00" \
+  "/opt/conflicted-worker --serve"
+
+printf "cleanup\tworker.*\n" > "$rules_file"
+expect_no "rule syntax is literal rather than regular expression" \
+  _cc_reaper_is_agent_cleanup_candidate 123 "??" "03:00:00" \
+  "/opt/worker-123 --serve"
+
+protected_group_sends_no_signal() (
+  local signal_file="$tmp_dir/signal-sent"
+  printf "protect\tcustom-worker\n" > "$rules_file"
+  ps() {
+    case "$*" in
+      "-eo pid,pgid") printf "900 700\n" ;;
+      "-o command= -p 900") printf "/opt/custom-worker --serve\n" ;;
+      *) command ps "$@" ;;
+    esac
+  }
+  kill() { : > "$signal_file"; }
+  _cc_reaper_kill_group_filtered 700 >/dev/null
+  [ ! -e "$signal_file" ]
+)
+
+expect_yes "user protect rule blocks the group signal path" protected_group_sends_no_signal
+
+protected_runaway_is_not_returned() (
+  printf "protect\tchrome-devtools-mcp\n" > "$rules_file"
+  ps() {
+    if [ "$*" = "-axo pid=,etime=,%cpu=,command=" ]; then
+      printf "901 03:00:00 99.0 node chrome-devtools-mcp\n"
+    else
+      command ps "$@"
+    fi
+  }
+  [ -z "$(_cc_guard_runaway_protected_pids 80 60)" ]
+)
+
+expect_yes "user protect rule blocks the runaway guard path" protected_runaway_is_not_returned
 
 if [ "$failures" -gt 0 ]; then
   printf "%s validation failure(s)\n" "$failures"

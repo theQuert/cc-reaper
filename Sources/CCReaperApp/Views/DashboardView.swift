@@ -4,8 +4,10 @@ import SwiftUI
 
 struct DashboardView: View {
     @Bindable var store: MonitorStore
+    @Bindable var ruleStore: ProcessRuleStore
     @State private var findingFilter: FindingFilter = .cleanup
     @State private var logsError: String?
+    @State private var ruleError: String?
     @State private var showsAllSuggestedActions = false
 
     var body: some View {
@@ -66,6 +68,11 @@ struct DashboardView: View {
             Button("OK", role: .cancel) { logsError = nil }
         } message: {
             Text(logsError ?? "The cc-reaper log directory is unavailable.")
+        }
+        .alert("Could not update process rule", isPresented: ruleErrorBinding) {
+            Button("OK", role: .cancel) { ruleError = nil }
+        } message: {
+            Text(ruleError ?? "The process rule could not be saved.")
         }
     }
 
@@ -177,7 +184,12 @@ struct DashboardView: View {
                         .frame(maxWidth: .infinity, minHeight: 120)
                     } else {
                         List(filteredFindings) { finding in
-                            FindingRow(finding: finding)
+                            FindingRow(
+                                finding: finding,
+                                rule: ruleStore.rule(forCommand: finding.command),
+                                onSetPolicy: { policy in setRule(policy, for: finding) },
+                                onRemoveRule: { rule in removeRule(rule) }
+                            )
                         }
                         .listStyle(.inset)
                         .frame(minHeight: 190, idealHeight: 240, maxHeight: 300)
@@ -287,6 +299,13 @@ struct DashboardView: View {
         )
     }
 
+    private var ruleErrorBinding: Binding<Bool> {
+        Binding(
+            get: { ruleError != nil },
+            set: { visible in if !visible { ruleError = nil } }
+        )
+    }
+
     private var actionResult: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
@@ -357,6 +376,32 @@ struct DashboardView: View {
         guard NSWorkspace.shared.open(logs) else {
             logsError = "macOS could not open the log directory: \(logs.path)"
             return
+        }
+    }
+
+    private func setRule(_ policy: ProcessRulePolicy, for finding: Finding) {
+        guard let match = finding.suggestedRuleMatch else {
+            ruleError = "This process name is too short for a safe literal rule. Add a longer command fragment in Settings."
+            return
+        }
+        guard policy != .cleanup || finding.allowsCustomCleanupRule else {
+            ruleError = "System, normal-browser, and cc-reaper processes cannot be added to cleanup."
+            return
+        }
+        do {
+            try ruleStore.setRule(policy: policy, match: match)
+            Task { await store.refresh() }
+        } catch {
+            ruleError = error.localizedDescription
+        }
+    }
+
+    private func removeRule(_ rule: ProcessRule) {
+        do {
+            try ruleStore.removeRule(match: rule.match)
+            Task { await store.refresh() }
+        } catch {
+            ruleError = error.localizedDescription
         }
     }
 }
@@ -439,6 +484,9 @@ private struct StatusCard: View {
 
 private struct FindingRow: View {
     let finding: Finding
+    let rule: ProcessRule?
+    let onSetPolicy: (ProcessRulePolicy) -> Void
+    let onRemoveRule: (ProcessRule) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -462,6 +510,7 @@ private struct FindingRow: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(finding.classification.tint)
                         .fixedSize()
+                    processRuleMenu
                 }
                 Text(finding.reason)
                     .font(.callout)
@@ -479,5 +528,43 @@ private struct FindingRow: View {
             }
         }
         .padding(.vertical, 5)
+    }
+
+    private var processRuleMenu: some View {
+        Menu {
+            Button {
+                onSetPolicy(.protect)
+            } label: {
+                Label(
+                    rule?.policy == .protect ? "Always Protect (Current)" : "Always Protect",
+                    systemImage: "shield.fill"
+                )
+            }
+            .disabled(finding.suggestedRuleMatch == nil)
+
+            Button {
+                onSetPolicy(.cleanup)
+            } label: {
+                Label(
+                    rule?.policy == .cleanup ? "Allow Stale Cleanup (Current)" : "Allow Stale Cleanup",
+                    systemImage: "clock.badge.checkmark"
+                )
+            }
+            .disabled(!finding.allowsCustomCleanupRule || finding.suggestedRuleMatch == nil)
+
+            if let rule {
+                Divider()
+                Button("Remove Custom Rule", role: .destructive) {
+                    onRemoveRule(rule)
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .foregroundStyle(rule == nil ? Color.secondary : Color.accentColor)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .accessibilityLabel("Process rule for \(finding.label)")
+        .help("Manage protection or stale-cleanup policy")
     }
 }

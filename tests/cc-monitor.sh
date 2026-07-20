@@ -8,6 +8,10 @@ export CC_AGENT_STALE_MINUTES=60
 
 failures=0
 
+rules_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor-rules-test.XXXXXX")
+rules_file="$rules_dir/process-rules.tsv"
+export CC_REAPER_RULES_FILE="$rules_file"
+
 expect_eq() {
   local name=$1
   local actual=$2
@@ -82,8 +86,34 @@ expect_eq "Codex Computer Use helper is protected" \
   "$(classify_cmd 23693 "??" 01:00:00 "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService")" \
   "other/DO_NOT_KILL"
 
+printf "protect\tcustom-worker\n" > "$rules_file"
+expect_eq "user protect rule appears as do-not-kill" \
+  "$(classify_cmd 123 "??" 03:00:00 "/opt/custom-worker --serve")" \
+  "other/DO_NOT_KILL"
+
+printf "cleanup\tcustom-worker\n" > "$rules_file"
+expect_eq "user cleanup rule appears safe only when stale and detached" \
+  "$(classify_cmd 123 "??" 03:00:00 "/opt/custom-worker --serve")" \
+  "other/SAFE_TO_REAP"
+expect_eq "recent user cleanup match remains review-first" \
+  "$(classify_cmd 123 "??" 00:10:00 "/opt/custom-worker --serve")" \
+  "other/ASK_BEFORE_KILL"
+
+low_cpu_snapshot="$rules_dir/low-cpu.tsv"
+low_cpu_report="$rules_dir/low-cpu.json"
+printf "109\t123\t109\t??\t03:00:00\t0.1\t10000\t/opt/custom-worker --serve\n" > "$low_cpu_snapshot"
+CC_MONITOR_SNAPSHOT_FILE="$low_cpu_snapshot" bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json --min-cpu 5 > "$low_cpu_report"
+expect_contains "low-CPU user cleanup match remains visible" "$low_cpu_report" '"pid": 109'
+
+printf "cleanup\tWindowServer\n" > "$rules_file"
+expect_eq "immutable system classification ignores cleanup rule" \
+  "$(classify_cmd 1 "??" 18-00:00:00 "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon")" \
+  "system/DO_NOT_KILL"
+
+: > "$rules_file"
+
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor-test.XXXXXX")
-trap 'rm -rf "$tmp_dir"' EXIT
+trap 'rm -rf "$tmp_dir" "$rules_dir"' EXIT
 
 raw_file="$tmp_dir/raw.tsv"
 agg_file="$tmp_dir/agg.tsv"

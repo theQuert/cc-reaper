@@ -22,3 +22,10 @@
 - [x] 4.4 Exclude the companion/sampler process tree and protect known UI automation helpers without broadening cleanup eligibility.
 - [x] 4.5 Use the stable log root with visible missing-directory errors, then rerun full tests and a background real UI canary.
 - [x] 4.6 Bound the dashboard's findings and suggested-action regions, keep cleanup controls stable, and verify default/minimum-window overflow behavior with a real UI canary.
+
+## 5. Add user-managed process policy
+
+- [x] 5.1 Add red Core and shell tests for persistent literal protect/cleanup rules, protect precedence, malformed-file handling, and immutable cleanup denial.
+- [x] 5.2 Implement the atomic mode-0600 rule store plus shared monitor/cleanup rule evaluation, preserving stale/detached requirements and same-engine preview/confirmation.
+- [x] 5.3 Add native Settings rule management and finding-row actions, refresh the monitor after changes, and prevent immutable findings from being added to cleanup.
+- [x] 5.4 Run strict OpenSpec validation, full Swift/shell regression tests, destructive denial proof, diff review, and a background-only default/minimum-window UI/UX canary without changing the user's foreground app.
