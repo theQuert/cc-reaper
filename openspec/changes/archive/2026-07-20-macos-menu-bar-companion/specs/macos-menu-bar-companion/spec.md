@@ -88,9 +88,13 @@ The companion SHALL let users manage case-insensitive literal command-substring 
 - **WHEN** externally edited rules contain malformed rows or both policies for the same case-insensitive literal
 - **THEN** malformed rows SHALL be ignored and `Always Protect` SHALL win the conflict
 
-#### Scenario: User targets an immutable process
-- **WHEN** a cleanup rule matches a system, security, UI, normal Chrome, cc-reaper, or Codex Computer Use process
-- **THEN** the companion SHALL withhold the cleanup-rule action and the cleanup engines SHALL preserve the immutable protection
+#### Scenario: Finding row represents an immutable process
+- **WHEN** a finding row represents a system, security, UI, normal Chrome, cc-reaper, or Codex Computer Use process
+- **THEN** the companion SHALL withhold the finding-row cleanup-rule action
+
+#### Scenario: Persisted cleanup literal matches an immutable process
+- **WHEN** a cleanup rule saved through Settings matches an immutable process
+- **THEN** the monitor and cleanup engines SHALL ignore its cleanup effect and preserve the immutable classification and signal denial
 
 #### Scenario: Rules are saved or removed
 - **WHEN** a valid rule between 3 and 128 characters without tabs or line breaks is saved
