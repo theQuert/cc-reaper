@@ -213,7 +213,7 @@ mkdir -p "$PLIST_DIR"
 # claude-cleanup + guard-runner ship too: the guard agent sources the DEPLOYED
 # claude-cleanup.sh (a launchd agent has no TCC access to a ~/Documents checkout),
 # with guard-runner.sh next to it.
-for SCRIPT in resource-watch disk-janitor worktree-janitor claude-cleanup guard-runner; do
+for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cleanup guard-runner; do
   cp "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/"
   chmod +x "$REAPER_DIR/$SCRIPT.sh"
 done

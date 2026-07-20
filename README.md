@@ -406,6 +406,24 @@ Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`,
 
 Config via env: `CC_RW_LOAD_FACTOR` / `CC_RW_DISK_MIN_PCT` / `CC_RW_MEM_MIN_PCT` / `CC_RW_COOLDOWN_SECS` (watch), `CC_DJ_DISK_MIN_PCT` / `CC_DJ_COOLDOWN_SECS` (disk), `CC_WJ_ROOT` / `CC_WJ_NOTIFY_MIN_GB` (worktree).
 
+## macOS Companion (source preview)
+
+cc-reaper includes a native SwiftUI menu bar companion for status visibility and safe manual actions. It reads the existing `cc-monitor --once --json` contract, shows current findings in a dashboard, and keeps settings in the standard macOS Settings window. The app does not reimplement process classification or cleanup policy.
+
+Install/update the shell tools first so `~/.cc-reaper/cc-monitor.sh` and `claude-cleanup.sh` are available, then build and launch the app:
+
+```bash
+./install.sh
+swift test
+./script/build_and_run.sh
+```
+
+The menu bar can refresh status, run `claude-guard --dry-run`, and open the dashboard. Process cleanup is available only from the dashboard after an explicit destructive confirmation, then delegates once to the existing `claude-cleanup` function. Missing scripts, invalid JSON, and command failures display an unavailable/error state instead of a healthy result.
+
+For automated launch checks while continuing other work, run `./script/build_and_run.sh --verify`. Verification launches with background activation, confirms a new app process, stops only that verification process, and leaves both the foreground application and any pre-existing cc-reaper instance alone.
+
+Requirements: macOS 14 or later and the Swift toolchain included with current Xcode or Xcode Command Line Tools. This iteration stages an unsigned local bundle at `dist/CCReaper.app`; signing, notarization, and automatic updates are not included yet.
+
 ## Dependencies
 
 | Tool | Required | Install |
