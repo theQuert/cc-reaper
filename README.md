@@ -430,6 +430,7 @@ The companion's **Settings → Process Rules** pane and each finding row's actio
 - **Allow Stale Cleanup** — a matching ordinary process may become a cleanup candidate only when it is both stale and detached/orphaned. System/security processes, normal Chrome, and cc-reaper itself remain immutable; preview and explicit cleanup confirmation are still required.
 
 Rules are stored in `~/.cc-reaper/process-rules.tsv` with owner-only permissions. `protect` wins conflicts, invalid externally edited rows are ignored, and removing the final rule removes the file. The match is literal text, not a regular expression or wildcard.
+Always Protect rules are re-read by manual cleanup, guard paths, and the scheduled LaunchAgent before both TERM and SIGKILL, so changing a rule does not require reloading the agent.
 
 For automated launch checks while continuing other work, run `./script/build_and_run.sh --verify`. Verification launches with background activation, confirms a new app process, stops only that verification process, and leaves both the foreground application and any pre-existing cc-reaper instance alone.
 
