@@ -41,6 +41,11 @@ _cc_reaper_is_system_cmd() {
   echo "$cmd" | grep -qE "WindowServer|kernel_task|coreaudiod|syspolicyd|mdworker|mds_stores|Spotlight|Bitdefender|com\\.apple\\.|/System/Library/|PerfPowerServices|BTLEServer|bluetoothd|UniversalControl|UserNotificationCenter|BiomeAgent|accountsd|locationd|logd|opendirectoryd|replayd|BetterSnapTool|netdisk_service"
 }
 
+_cc_reaper_is_codex_ui_helper_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "Codex Computer Use\\.app|SkyComputerUseService"
+}
+
 _cc_reaper_is_self_cmd() {
   local cmd=$1
   echo "$cmd" | grep -qE "cc-monitor\\.sh( |$)|claude-cleanup\\.sh( |$)|CCReaper\\.app/Contents/MacOS/CCReaper( |$)|/CCReaper( |$)"
@@ -56,7 +61,10 @@ _cc_reaper_is_normal_chrome_cmd() {
 
 _cc_reaper_is_immutable_cmd() {
   local cmd=$1
-  _cc_reaper_is_system_cmd "$cmd" || _cc_reaper_is_self_cmd "$cmd" || _cc_reaper_is_normal_chrome_cmd "$cmd"
+  _cc_reaper_is_system_cmd "$cmd" \
+    || _cc_reaper_is_self_cmd "$cmd" \
+    || _cc_reaper_is_normal_chrome_cmd "$cmd" \
+    || _cc_reaper_is_codex_ui_helper_cmd "$cmd"
 }
 
 _cc_reaper_is_direct_cleanup_protected() {

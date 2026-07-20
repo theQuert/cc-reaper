@@ -56,10 +56,8 @@ struct MenuBarView: View {
             .disabled(store.isBusy)
 
             Button("Review Cleanup…") {
-                Task {
-                    await store.prepareCleanupReview()
-                    openDashboard()
-                }
+                openDashboard()
+                Task { await store.prepareCleanupReview() }
             }
             .disabled(store.isBusy || (store.report?.safeCleanupCandidates.isEmpty ?? true))
 

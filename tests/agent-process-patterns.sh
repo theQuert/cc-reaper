@@ -115,13 +115,16 @@ expect_yes "user cleanup rule can override ordinary built-in protection after sa
   _cc_reaper_is_agent_cleanup_candidate 123 "??" "03:00:00" \
   "chrome-devtools-mcp npm_config_legacy_peer_deps=true"
 
-printf "cleanup\tWindowServer\ncleanup\tCCReaper\n" > "$rules_file"
+printf "cleanup\tWindowServer\ncleanup\tCCReaper\ncleanup\tSkyComputerUseService\n" > "$rules_file"
 expect_no "system safety floor rejects user cleanup rule" \
   _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
   "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon"
 expect_no "cc-reaper self safety floor rejects user cleanup rule" \
   _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
   "/Applications/CCReaper.app/Contents/MacOS/CCReaper"
+expect_no "Codex Computer Use UI helper rejects user cleanup rule" \
+  _cc_reaper_is_agent_cleanup_candidate 1 "??" "03:00:00" \
+  "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService"
 
 printf "cleanup\tconflicted-worker\nprotect\tCONFLICTED-WORKER\n" > "$rules_file"
 expect_no "protect wins an externally edited policy conflict" \
