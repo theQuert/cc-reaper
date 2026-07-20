@@ -1,4 +1,5 @@
 import Foundation
+import CCReaperSpawn
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -62,13 +63,6 @@ public struct ProcessCommandRunner: CommandRunning {
 
     public func run(_ invocation: CommandInvocation) async throws -> CommandResult {
         try await Task.detached(priority: .userInitiated) { () async throws -> CommandResult in
-            let process = Process()
-            process.executableURL = invocation.executable
-            process.arguments = invocation.arguments
-            if let environment = invocation.environment {
-                process.environment = environment
-            }
-
             let captureRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("cc-reaper-command-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: captureRoot, withIntermediateDirectories: true)
@@ -81,15 +75,26 @@ public struct ProcessCommandRunner: CommandRunning {
 
             let stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
             let stderrHandle = try FileHandle(forWritingTo: stderrURL)
-            process.standardOutput = stdoutHandle
-            process.standardError = stderrHandle
+            var processID: pid_t = 0
+            var didSpawn = false
+            var exitCode: Int32?
 
             do {
-                try process.run()
+                try Self.spawn(
+                    invocation,
+                    stdoutDescriptor: stdoutHandle.fileDescriptor,
+                    stderrDescriptor: stderrHandle.fileDescriptor,
+                    processID: &processID
+                )
+                didSpawn = true
                 let deadline = Date().addingTimeInterval(invocation.timeout)
-                while process.isRunning {
+                while exitCode == nil {
+                    exitCode = try Self.poll(processID)
+                    if exitCode != nil {
+                        break
+                    }
                     if Date() >= deadline {
-                        await Self.stop(process)
+                        await Self.stop(processGroup: processID)
                         try? stdoutHandle.close()
                         try? stderrHandle.close()
                         throw CommandRunnerError.timedOut(
@@ -102,8 +107,8 @@ public struct ProcessCommandRunner: CommandRunning {
                 try stdoutHandle.close()
                 try stderrHandle.close()
             } catch {
-                if process.isRunning {
-                    await Self.stop(process)
+                if didSpawn, exitCode == nil {
+                    await Self.stop(processGroup: processID)
                 }
                 try? stdoutHandle.close()
                 try? stderrHandle.close()
@@ -112,37 +117,88 @@ public struct ProcessCommandRunner: CommandRunning {
 
             let stdout = String(decoding: try Data(contentsOf: stdoutURL), as: UTF8.self)
             let stderr = String(decoding: try Data(contentsOf: stderrURL), as: UTF8.self)
-            return CommandResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
+            return CommandResult(exitCode: exitCode ?? -1, stdout: stdout, stderr: stderr)
         }.value
     }
 
-    private static func stop(_ process: Process) async {
-        guard process.isRunning else { return }
-        process.terminate()
-        await waitForExit(process, timeout: terminationGrace)
+    private static func spawn(
+        _ invocation: CommandInvocation,
+        stdoutDescriptor: Int32,
+        stderrDescriptor: Int32,
+        processID: inout pid_t
+    ) throws {
+        let arguments = [invocation.executable.path] + invocation.arguments
+        let environment = (invocation.environment ?? ProcessInfo.processInfo.environment)
+            .map { "\($0.key)=\($0.value)" }
+            .sorted()
 
-        if process.isRunning {
-            forceKill(process.processIdentifier)
-            await waitForExit(process, timeout: killGrace)
+        let result = invocation.executable.path.withCString { executable in
+            withCStringArray(arguments) { argumentPointers in
+                withCStringArray(environment) { environmentPointers in
+                    ccr_spawn_process(
+                        executable,
+                        argumentPointers,
+                        environmentPointers,
+                        stdoutDescriptor,
+                        stderrDescriptor,
+                        &processID
+                    )
+                }
+            }
         }
-
-        if !process.isRunning {
-            process.waitUntilExit()
+        guard result == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EIO)
         }
     }
 
-    private static func waitForExit(_ process: Process, timeout: TimeInterval) async {
+    private static func withCStringArray<Result>(
+        _ strings: [String],
+        _ body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Result
+    ) -> Result {
+        var pointers: [UnsafeMutablePointer<CChar>?] = strings.map { strdup($0) }
+        pointers.append(nil)
+        defer {
+            for pointer in pointers where pointer != nil {
+                free(pointer)
+            }
+        }
+        return pointers.withUnsafeMutableBufferPointer { buffer in
+            body(buffer.baseAddress!)
+        }
+    }
+
+    private static func poll(_ processID: pid_t) throws -> Int32? {
+        var exitCode: Int32 = 0
+        let result = ccr_poll_process(processID, &exitCode)
+        if result == 1 {
+            return exitCode
+        }
+        if result < 0 {
+            let errorNumber = -result
+            throw POSIXError(POSIXErrorCode(rawValue: errorNumber) ?? .EIO)
+        }
+        return nil
+    }
+
+    private static func stop(processGroup: pid_t) async {
+        _ = ccr_signal_process_group(processGroup, SIGTERM)
+        await waitForExit(processGroup, timeout: terminationGrace)
+
+        if ccr_process_group_exists(processGroup) != 0 {
+            _ = ccr_signal_process_group(processGroup, SIGKILL)
+            await waitForExit(processGroup, timeout: killGrace)
+        }
+    }
+
+    private static func waitForExit(_ processGroup: pid_t, timeout: TimeInterval) async {
         let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning, Date() < deadline {
+        var exitCode: Int32 = 0
+        while Date() < deadline {
+            _ = ccr_poll_process(processGroup, &exitCode)
+            if ccr_process_group_exists(processGroup) == 0 {
+                return
+            }
             try? await Task.sleep(for: .milliseconds(10))
         }
-    }
-
-    private static func forceKill(_ pid: Int32) {
-        #if canImport(Darwin)
-        _ = Darwin.kill(pid, SIGKILL)
-        #elseif canImport(Glibc)
-        _ = Glibc.kill(pid, SIGKILL)
-        #endif
     }
 }

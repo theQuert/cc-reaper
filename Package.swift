@@ -7,7 +7,13 @@ var products: [Product] = [
 
 var targets: [Target] = [
     .target(
+        name: "CCReaperSpawn",
+        path: "Sources/CCReaperSpawn",
+        publicHeadersPath: "include"
+    ),
+    .target(
         name: "CCReaperCore",
+        dependencies: ["CCReaperSpawn"],
         path: "Sources/CCReaperCore"
     ),
     .testTarget(
