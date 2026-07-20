@@ -85,6 +85,32 @@ final class ProcessRuleStoreTests: XCTestCase {
         XCTAssertTrue(command.lowercased().contains(match.lowercased()))
     }
 
+    func testFindingSuggestedRuleStopsBeforeRedactedValueAndMatchesLiveCommand() throws {
+        let visibleCommand = "node /opt/custom-worker.js --api-key [redacted] --serve"
+        let liveCommand = "node /opt/custom-worker.js --api-key super-secret-value --serve"
+        let finding = Finding(
+            pid: 43,
+            ppid: 1,
+            pgid: 43,
+            family: "other",
+            classification: .askBeforeKill,
+            label: "node",
+            averageCPU: 1,
+            maximumCPU: 2,
+            rssMB: 50,
+            samples: 1,
+            elapsed: "03:00:00",
+            reason: "fixture",
+            suggestedAction: "fixture",
+            command: visibleCommand
+        )
+
+        let match = try XCTUnwrap(finding.suggestedRuleMatch)
+        XCTAssertEqual(match, "node /opt/custom-worker.js --api-key")
+        XCTAssertFalse(match.contains("[redacted]"))
+        XCTAssertTrue(liveCommand.lowercased().contains(match.lowercased()))
+    }
+
     private func makeLayout() throws -> (root: URL, file: URL) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("cc-reaper-rules-\(UUID().uuidString)", isDirectory: true)

@@ -49,7 +49,14 @@ public extension Finding {
 
     var suggestedRuleMatch: String? {
         let command = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        let candidate = String(command.prefix(128))
+        let stablePrefix: Substring
+        if let redacted = command.range(of: "[redacted]", options: .caseInsensitive) {
+            stablePrefix = command[..<redacted.lowerBound]
+        } else {
+            stablePrefix = command[...]
+        }
+        let candidate = String(stablePrefix.prefix(128))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return ProcessRuleStore.normalizedMatch(candidate)
     }
 }
