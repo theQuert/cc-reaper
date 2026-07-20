@@ -168,6 +168,7 @@ expect_eq "aggregation RSS MB rounds max" "$agg_rss" "20"
   printf "106\t123\t123\t??\t03:00:00\t2.0\t30000\tnode /Users/me/.npm/_npx/53c4795544aaa350/node_modules/.bin/mcp-server-supabase --access-token sbp_secret\n"
   printf "107\t23693\t23693\t??\t00:01:00\t90.0\t30000\t/bin/zsh -lc cc-monitor.sh --once --json\n"
   printf "108\t1\t108\t??\t00:01:00\t90.0\t30000\t/Users/me/dist/CCReaper.app/Contents/MacOS/CCReaper\n"
+  printf "109\t123\t109\t??\t00:05:00\t8.0\t12000\t%s\n" '/bin/zsh -lc printf first\012printf second'
 } > "$snapshot_file"
 
 CC_MONITOR_SNAPSHOT_FILE="$snapshot_file" bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json > "$json_file"
@@ -211,6 +212,17 @@ if command -v zsh >/dev/null 2>&1; then
     failures=$((failures + 1))
   else
     printf "ok - zsh source mode does not leak local variables\n"
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    zsh_json="$tmp_dir/zsh.json"
+    CC_MONITOR_SNAPSHOT_FILE="$snapshot_file" zsh -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --once --json" > "$zsh_json" 2> "$zsh_stderr"
+    if python3 -m json.tool "$zsh_json" >/dev/null; then
+      printf "ok - zsh JSON preserves literal ps backslash escapes\n"
+    else
+      printf "not ok - zsh JSON preserves literal ps backslash escapes\n"
+      failures=$((failures + 1))
+    fi
   fi
 fi
 

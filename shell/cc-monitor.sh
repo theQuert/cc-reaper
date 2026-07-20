@@ -176,55 +176,55 @@ _cc_monitor_protected_pattern() {
 
 _cc_monitor_is_protected_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "$(_cc_monitor_protected_pattern)"
+  printf '%s\n' "$cmd" | grep -qE "$(_cc_monitor_protected_pattern)"
 }
 
 _cc_monitor_is_agent_browser_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "agent-browser-darwin-arm64|Google Chrome for Testing.*agent-browser-chrome-|agent-browser-chrome-"
+  printf '%s\n' "$cmd" | grep -qE "agent-browser-darwin-arm64|Google Chrome for Testing.*agent-browser-chrome-|agent-browser-chrome-"
 }
 
 _cc_monitor_is_puppeteer_chrome_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "puppeteer_dev_chrome_profile-"
+  printf '%s\n' "$cmd" | grep -qE "puppeteer_dev_chrome_profile-"
 }
 
 _cc_monitor_is_codex_agent_cmd() {
   local cmd=$1
-  if echo "$cmd" | grep -qE "codex app-server|app-server-broker"; then
+  if printf '%s\n' "$cmd" | grep -qE "codex app-server|app-server-broker"; then
     return 1
   fi
-  echo "$cmd" | grep -qE "node /usr/local/bin/codex( --yolo| resume|$)|@openai/codex.*/codex/codex( --yolo| resume|$)|/codex/codex( --yolo| resume|$)|(^|/)codex( --yolo| resume|$)"
+  printf '%s\n' "$cmd" | grep -qE "node /usr/local/bin/codex( --yolo| resume|$)|@openai/codex.*/codex/codex( --yolo| resume|$)|/codex/codex( --yolo| resume|$)|(^|/)codex( --yolo| resume|$)"
 }
 
 _cc_monitor_is_claude_agent_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "claude.*stream-json|claude.*--session-id|claude --dangerously"
+  printf '%s\n' "$cmd" | grep -qE "claude.*stream-json|claude.*--session-id|claude --dangerously"
 }
 
 _cc_monitor_is_agent_mcp_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "npm exec @upstash/context7-mcp|context7-mcp|chrome-devtools-mcp|npm exec mcp-remote|mcp-remote|npm exec mcp-|npx.*mcp-server"
+  printf '%s\n' "$cmd" | grep -qE "npm exec @upstash/context7-mcp|context7-mcp|chrome-devtools-mcp|npm exec mcp-remote|mcp-remote|npm exec mcp-|npx.*mcp-server"
 }
 
 _cc_monitor_is_dev_server_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "react-scripts/scripts/start|react-scripts start|next dev|vite( --host| --port|$)|webpack-dev-server|astro dev|node.*(dev-server|http-server|next.*server)|npm run dev|pnpm dev|yarn dev"
+  printf '%s\n' "$cmd" | grep -qE "react-scripts/scripts/start|react-scripts start|next dev|vite( --host| --port|$)|webpack-dev-server|astro dev|node.*(dev-server|http-server|next.*server)|npm run dev|pnpm dev|yarn dev"
 }
 
 _cc_monitor_is_system_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "WindowServer|kernel_task|coreaudiod|syspolicyd|mdworker|mds_stores|Spotlight|Bitdefender|com\\.apple\\.|/System/Library/|PerfPowerServices|BTLEServer|bluetoothd|UniversalControl|UserNotificationCenter|BiomeAgent|accountsd|locationd|logd|opendirectoryd|replayd|BetterSnapTool|netdisk_service"
+  printf '%s\n' "$cmd" | grep -qE "WindowServer|kernel_task|coreaudiod|syspolicyd|mdworker|mds_stores|Spotlight|Bitdefender|com\\.apple\\.|/System/Library/|PerfPowerServices|BTLEServer|bluetoothd|UniversalControl|UserNotificationCenter|BiomeAgent|accountsd|locationd|logd|opendirectoryd|replayd|BetterSnapTool|netdisk_service"
 }
 
 _cc_monitor_is_codex_ui_helper_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "Codex Computer Use\\.app|SkyComputerUseService"
+  printf '%s\n' "$cmd" | grep -qE "Codex Computer Use\\.app|SkyComputerUseService"
 }
 
 _cc_monitor_is_self_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "cc-monitor\\.sh( |$)|CCReaper\\.app/Contents/MacOS/CCReaper( |$)|/CCReaper( |$)"
+  printf '%s\n' "$cmd" | grep -qE "cc-monitor\\.sh( |$)|CCReaper\\.app/Contents/MacOS/CCReaper( |$)|/CCReaper( |$)"
 }
 
 _cc_monitor_is_normal_chrome_cmd() {
@@ -232,7 +232,7 @@ _cc_monitor_is_normal_chrome_cmd() {
   if _cc_monitor_is_agent_browser_cmd "$cmd" || _cc_monitor_is_puppeteer_chrome_cmd "$cmd"; then
     return 1
   fi
-  echo "$cmd" | grep -qE "Google Chrome\\.app|Google Chrome Helper|/Google Chrome( |$)|Chromium\\.app"
+  printf '%s\n' "$cmd" | grep -qE "Google Chrome\\.app|Google Chrome Helper|/Google Chrome( |$)|Chromium\\.app"
 }
 
 _cc_monitor_is_immutable_cmd() {
@@ -293,9 +293,9 @@ _cc_monitor_family() {
     echo "codex"
   elif _cc_monitor_is_claude_agent_cmd "$cmd"; then
     echo "claude"
-  elif echo "$cmd" | grep -qE "Cursor Helper|Cursor\\.app|Visual Studio Code|Code Helper|/Code\\.app|/Cursor\\.app"; then
+  elif printf '%s\n' "$cmd" | grep -qE "Cursor Helper|Cursor\\.app|Visual Studio Code|Code Helper|/Code\\.app|/Cursor\\.app"; then
     echo "editor"
-  elif echo "$cmd" | grep -qE "(^|/)cmux( |$)|cmux\\.app"; then
+  elif printf '%s\n' "$cmd" | grep -qE "(^|/)cmux( |$)|cmux\\.app"; then
     echo "cmux"
   elif _cc_monitor_is_normal_chrome_cmd "$cmd"; then
     echo "chrome"
@@ -374,7 +374,7 @@ _cc_monitor_reason() {
     DO_NOT_KILL:*)
       echo "protected process matched cc-reaper safety boundaries" ;;
     *)
-      if echo "$cmd" | grep -qE "ChatGPT\\.app"; then
+      if printf '%s\n' "$cmd" | grep -qE "ChatGPT\\.app"; then
         echo "ChatGPT.app is protected user software"
       else
         echo "unknown process family; inspect manually before killing"
@@ -439,32 +439,32 @@ _cc_monitor_label() {
   local family=$1
   local cmd=$2
 
-  if echo "$cmd" | grep -q "Cursor Helper"; then
+  if printf '%s\n' "$cmd" | grep -q "Cursor Helper"; then
     echo "Cursor Helper"
-  elif echo "$cmd" | grep -q "Visual Studio Code"; then
+  elif printf '%s\n' "$cmd" | grep -q "Visual Studio Code"; then
     echo "VS Code"
-  elif echo "$cmd" | grep -q "WindowServer"; then
+  elif printf '%s\n' "$cmd" | grep -q "WindowServer"; then
     echo "WindowServer"
-  elif echo "$cmd" | grep -q "agent-browser-darwin-arm64"; then
+  elif printf '%s\n' "$cmd" | grep -q "agent-browser-darwin-arm64"; then
     echo "agent-browser"
-  elif echo "$cmd" | grep -q "puppeteer_dev_chrome_profile"; then
+  elif printf '%s\n' "$cmd" | grep -q "puppeteer_dev_chrome_profile"; then
     echo "Puppeteer Chrome"
-  elif echo "$cmd" | grep -q "Google Chrome for Testing"; then
+  elif printf '%s\n' "$cmd" | grep -q "Google Chrome for Testing"; then
     echo "Chrome for Testing"
-  elif echo "$cmd" | grep -q "react-scripts"; then
+  elif printf '%s\n' "$cmd" | grep -q "react-scripts"; then
     echo "react-scripts start"
-  elif echo "$cmd" | grep -q "chrome-devtools-mcp"; then
+  elif printf '%s\n' "$cmd" | grep -q "chrome-devtools-mcp"; then
     echo "chrome-devtools-mcp"
-  elif echo "$cmd" | grep -q "SkyComputerUseService\|Codex Computer Use\\.app"; then
+  elif printf '%s\n' "$cmd" | grep -q "SkyComputerUseService\|Codex Computer Use\\.app"; then
     echo "Codex Computer Use"
-  elif echo "$cmd" | grep -qE "CCReaper\\.app/Contents/MacOS/CCReaper|(^|/)CCReaper( |$)"; then
+  elif printf '%s\n' "$cmd" | grep -qE "CCReaper\\.app/Contents/MacOS/CCReaper|(^|/)CCReaper( |$)"; then
     echo "cc-reaper"
-  elif echo "$cmd" | grep -qE "(^|/)cmux( |$)|cmux\\.app"; then
+  elif printf '%s\n' "$cmd" | grep -qE "(^|/)cmux( |$)|cmux\\.app"; then
     echo "cmux"
   elif [ "$family" = "chrome" ]; then
     echo "Google Chrome"
   else
-    echo "$cmd" | awk '{name=$1; sub(/^.*\//, "", name); if (name == "") name="process"; print name}'
+    printf '%s\n' "$cmd" | awk '{name=$1; sub(/^.*\//, "", name); if (name == "") name="process"; print name}'
   fi
 }
 
