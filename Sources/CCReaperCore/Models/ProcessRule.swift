@@ -44,6 +44,8 @@ public extension Finding {
         let lowercasedCommand = command.lowercased()
         return !lowercasedCommand.contains("cc-monitor.sh")
             && !lowercasedCommand.contains("ccreaper.app/contents/macos/ccreaper")
+            && !lowercasedCommand.contains("codex computer use.app")
+            && !lowercasedCommand.contains("skycomputeruseservice")
             && label.lowercased() != "cc-reaper"
     }
 

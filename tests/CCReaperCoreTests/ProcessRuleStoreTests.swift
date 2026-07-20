@@ -113,6 +113,28 @@ final class ProcessRuleStoreTests: XCTestCase {
         try await Self.verifyFindingSuggestedRuleStopsBeforeRedactedValueAndMatchesLiveCommand()
     }
 
+    func testFindingDisallowsCleanupRuleForCodexUIHelper() {
+        let finding = Finding(
+            pid: 44,
+            ppid: 1,
+            pgid: 44,
+            family: "other",
+            classification: .doNotKill,
+            label: "Codex Computer Use",
+            averageCPU: 1,
+            maximumCPU: 2,
+            rssMB: 50,
+            samples: 1,
+            elapsed: "03:00:00",
+            reason: "protected UI helper",
+            suggestedAction: "Do not terminate directly",
+            command: "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService"
+        )
+
+        XCTAssertFalse(finding.allowsCustomCleanupRule)
+        XCTAssertNotNil(finding.suggestedRuleMatch, "Always Protect can remain available")
+    }
+
     @MainActor
     private static func verifyFindingSuggestedRuleStopsBeforeRedactedValueAndMatchesLiveCommand() throws {
         let visibleCommand = "node /opt/custom-worker.js --api-key [redacted] --serve"
