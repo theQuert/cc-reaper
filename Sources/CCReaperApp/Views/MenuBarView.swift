@@ -28,11 +28,11 @@ struct MenuBarView: View {
 
             if let report = store.report {
                 HStack {
-                    metric("Candidates", value: "\(report.safeCleanupCandidates.count)")
+                    metric("Cleanup", value: "\(report.safeCleanupCandidates.count)")
                     Divider()
-                    metric("CPU", value: report.totalCPU.formatted(.number.precision(.fractionLength(1))) + "%")
+                    metric("Review", value: "\(report.reviewFindings.count)")
                     Divider()
-                    metric("Memory", value: "\(report.totalRSSMB) MB")
+                    metric("Runaway", value: "\(report.runawayCandidates.count)")
                 }
             } else if let error = store.errorMessage {
                 Text(error)
@@ -56,8 +56,10 @@ struct MenuBarView: View {
             .disabled(store.isBusy)
 
             Button("Review Cleanup…") {
-                store.requestCleanupReview()
-                openDashboard()
+                Task {
+                    await store.prepareCleanupReview()
+                    openDashboard()
+                }
             }
             .disabled(store.isBusy || (store.report?.safeCleanupCandidates.isEmpty ?? true))
 

@@ -20,7 +20,11 @@ The companion SHALL obtain health evidence from the installed `cc-monitor --once
 
 #### Scenario: Initial scan succeeds
 - **WHEN** the companion receives valid monitor JSON
-- **THEN** it SHALL display the decoded findings and family totals, record the refresh time, and derive health from the reported classifications
+- **THEN** it SHALL display the decoded findings and family totals, record the refresh time, derive cleanup health from safe/runaway classifications, and expose manual-review/protected counts separately
+
+#### Scenario: Monitor payload is not a read-only once sample
+- **WHEN** the monitor exits successfully but the JSON has a mode other than `once`, `read_only` is false, or `sample_count` is not positive
+- **THEN** the companion SHALL reject the payload as unavailable and SHALL NOT display it as a read-only sample
 
 #### Scenario: User refreshes status
 - **WHEN** the user selects refresh
@@ -39,7 +43,11 @@ The companion SHALL keep preview non-destructive and SHALL require explicit conf
 
 #### Scenario: User requests a preview
 - **WHEN** the user selects preview cleanup
-- **THEN** the companion SHALL invoke `claude-guard --dry-run`, display its output, and SHALL NOT send cleanup signals
+- **THEN** the companion SHALL invoke the existing `claude-cleanup --dry-run` policy, display its output, and SHALL NOT send cleanup signals
+
+#### Scenario: Cleanup review previews before confirmation
+- **WHEN** the user selects cleanup review while safe candidates exist
+- **THEN** the companion SHALL complete a successful same-engine dry-run first, display its output, and only then present confirmation with the sampled candidate count and PIDs
 
 #### Scenario: User starts cleanup review from the menu bar
 - **WHEN** the user selects the cleanup review action in the menu bar
@@ -56,6 +64,14 @@ The companion SHALL keep preview non-destructive and SHALL require explicit conf
 #### Scenario: Cleanup command fails
 - **WHEN** the delegated cleanup command exits non-zero
 - **THEN** the companion SHALL surface the failure and captured error without claiming cleanup succeeded or retrying automatically
+
+#### Scenario: Cleanup review preview fails
+- **WHEN** the same-engine dry-run exits non-zero
+- **THEN** the companion SHALL show the preview failure and SHALL NOT present destructive confirmation
+
+#### Scenario: Command exceeds its operation timeout
+- **WHEN** monitor, preview, or cleanup does not exit before its operation-specific timeout
+- **THEN** the companion SHALL terminate the child process, show a timeout error, and SHALL NOT retry automatically
 
 ### Requirement: Configurable local integration
 The companion SHALL automatically resolve a complete local script root and SHALL provide persistent native settings for an explicit script-root override, monitor reporting threshold, and automatic refresh interval.
@@ -83,6 +99,25 @@ The companion SHALL automatically resolve a complete local script root and SHALL
 #### Scenario: Script root is incomplete
 - **WHEN** a required script is not a regular file under the configured root
 - **THEN** the companion SHALL deny the affected action and show an installation or path correction hint
+
+#### Scenario: Logs use the stable installed log root
+- **WHEN** the user opens logs while the script root is an automatic source checkout or an explicit custom root
+- **THEN** the companion SHALL open `~/.cc-reaper/logs` and SHALL show an in-app error when that directory is unavailable
+
+### Requirement: Actionable finding review
+The dashboard SHALL separate cleanup availability from general resource-review evidence and SHALL expose filtered findings and backend suggestions without changing cleanup policy.
+
+#### Scenario: Busy machine has only manual-review or protected findings
+- **WHEN** a report has no safe cleanup or runaway candidates but has manual-review or protected findings
+- **THEN** the companion SHALL show a no-cleanup-needed status, display the separate review/protected counts, and SHALL NOT make the global cleanup status orange solely because of those findings
+
+#### Scenario: User selects a finding filter
+- **WHEN** the user chooses Cleanup, Review, Protected, or All findings
+- **THEN** the dashboard SHALL show only findings matching that classification and preserve the decoded report counts
+
+#### Scenario: Monitor provides suggested actions
+- **WHEN** the report contains suggested actions or a finding-specific suggested action
+- **THEN** the dashboard SHALL display those suggestions near the relevant review surface
 
 ### Requirement: Reproducible local app workflow
 The repository SHALL provide a SwiftPM build and test workflow plus a single project-local script that stages and launches a valid macOS app bundle.

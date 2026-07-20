@@ -16,3 +16,8 @@
 - [x] 3.4 Run a background-only UI/UX canary against the real monitor contract, inspect the dashboard accessibility tree and screenshot, confirm the foreground application remains unchanged, and remove the isolated canary bundle/settings/process.
 - [x] 3.5 Reject unsupported run modes before any process or build mutation, and verify the failure is side-effect-free.
 - [x] 3.6 Make source-built canaries automatically resolve the checkout's complete `shell/` directory when `~/.cc-reaper` is incomplete, preserve installed and explicit-override precedence, show the active root in Settings, and rerun the user-visible canary.
+- [x] 4.1 Make cleanup preview and confirmed cleanup use the same `claude-cleanup` policy, add dry-run denial tests, and gate confirmation on a successful preview.
+- [x] 4.2 Bound monitor/preview/cleanup subprocesses, terminate timed-out children, and reject monitor payloads that are not `once` + read-only with positive samples.
+- [x] 4.3 Separate cleanup health from manual-review/protected evidence, add filters and suggested actions, and show candidate details before confirmation.
+- [x] 4.4 Exclude the companion/sampler process tree and protect known UI automation helpers without broadening cleanup eligibility.
+- [x] 4.5 Use the stable log root with visible missing-directory errors, then rerun full tests and a background real UI canary.

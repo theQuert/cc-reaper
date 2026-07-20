@@ -4,11 +4,21 @@ public struct CommandInvocation: Equatable, Sendable {
     public let executable: URL
     public let arguments: [String]
     public let environment: [String: String]?
+    public let timeout: TimeInterval
+    public let operation: String
 
-    public init(executable: URL, arguments: [String], environment: [String: String]? = nil) {
+    public init(
+        executable: URL,
+        arguments: [String],
+        environment: [String: String]? = nil,
+        timeout: TimeInterval = 30,
+        operation: String = "command"
+    ) {
         self.executable = executable
         self.arguments = arguments
         self.environment = environment
+        self.timeout = max(0.1, timeout)
+        self.operation = operation
     }
 }
 
@@ -28,11 +38,22 @@ public protocol CommandRunning: Sendable {
     func run(_ invocation: CommandInvocation) async throws -> CommandResult
 }
 
+public enum CommandRunnerError: Error, Equatable, LocalizedError, Sendable {
+    case timedOut(operation: String, seconds: TimeInterval)
+
+    public var errorDescription: String? {
+        switch self {
+        case .timedOut(let operation, let seconds):
+            return "cc-reaper \(operation) timed out after \(seconds.formatted(.number.precision(.fractionLength(1)))) seconds."
+        }
+    }
+}
+
 public struct ProcessCommandRunner: CommandRunning {
     public init() {}
 
     public func run(_ invocation: CommandInvocation) async throws -> CommandResult {
-        try await Task.detached(priority: .userInitiated) {
+        try await Task.detached(priority: .userInitiated) { () async throws -> CommandResult in
             let process = Process()
             process.executableURL = invocation.executable
             process.arguments = invocation.arguments
@@ -57,10 +78,27 @@ public struct ProcessCommandRunner: CommandRunning {
 
             do {
                 try process.run()
-                process.waitUntilExit()
+                let deadline = Date().addingTimeInterval(invocation.timeout)
+                while process.isRunning {
+                    if Date() >= deadline {
+                        process.terminate()
+                        process.waitUntilExit()
+                        try? stdoutHandle.close()
+                        try? stderrHandle.close()
+                        throw CommandRunnerError.timedOut(
+                            operation: invocation.operation,
+                            seconds: invocation.timeout
+                        )
+                    }
+                    try await Task.sleep(for: .milliseconds(20))
+                }
                 try stdoutHandle.close()
                 try stderrHandle.close()
             } catch {
+                if process.isRunning {
+                    process.terminate()
+                    process.waitUntilExit()
+                }
                 try? stdoutHandle.close()
                 try? stderrHandle.close()
                 throw error

@@ -16,6 +16,7 @@ public enum AppDefaults {
 
 public struct AppConfiguration: Equatable, Sendable {
     public let scriptRoot: URL
+    public let logsRoot: URL
     public let minimumCPU: Double
     public let refreshInterval: Double
 
@@ -48,6 +49,10 @@ public struct AppConfiguration: Equatable, Sendable {
         let storedMinimumCPU = defaults.double(forKey: AppPreferenceKeys.minimumCPU)
         let storedRefreshInterval = defaults.double(forKey: AppPreferenceKeys.refreshInterval)
         self.scriptRoot = resolvedRoot.standardizedFileURL
+        self.logsRoot = homeDirectory
+            .appendingPathComponent(".cc-reaper", isDirectory: true)
+            .appendingPathComponent("logs", isDirectory: true)
+            .standardizedFileURL
         self.minimumCPU = storedMinimumCPU > 0 ? storedMinimumCPU : AppDefaults.minimumCPU
         self.refreshInterval = storedRefreshInterval > 0 ? storedRefreshInterval : AppDefaults.refreshInterval
     }

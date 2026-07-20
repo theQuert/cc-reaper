@@ -24,6 +24,20 @@ final class MonitorReportTests: XCTestCase {
         XCTAssertEqual(report.health, .critical)
     }
 
+    func testManualReviewFindingsDoNotMakeCleanupHealthAttention() throws {
+        let json = Self.fixture
+            .replacingOccurrences(of: "SAFE_TO_REAP", with: "ASK_BEFORE_KILL")
+            .replacingOccurrences(
+                of: #"{"pid": 37915, "family": "agent-browser", "avg_cpu": 1.5, "reason": "stale browser automation"}"#,
+                with: ""
+            )
+
+        let report = try JSONDecoder().decode(MonitorReport.self, from: Data(json.utf8))
+        XCTAssertEqual(report.health, .healthy)
+        XCTAssertEqual(report.reviewFindings.count, 1)
+        XCTAssertEqual(report.protectedFindings.count, 0)
+    }
+
     static let fixture = #"""
     {
       "sample_seconds": 0,

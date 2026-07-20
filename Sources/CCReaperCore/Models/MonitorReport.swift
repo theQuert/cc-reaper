@@ -24,10 +24,18 @@ public struct MonitorReport: Decodable, Equatable, Sendable {
         if !runawayCandidates.isEmpty {
             return .critical
         }
-        if !safeCleanupCandidates.isEmpty || findings.contains(where: { $0.classification == .askBeforeKill }) {
+        if !safeCleanupCandidates.isEmpty {
             return .attention
         }
         return .healthy
+    }
+
+    public var reviewFindings: [Finding] {
+        findings.filter { $0.classification == .askBeforeKill }
+    }
+
+    public var protectedFindings: [Finding] {
+        findings.filter { $0.classification == .doNotKill }
     }
 
     enum CodingKeys: String, CodingKey {

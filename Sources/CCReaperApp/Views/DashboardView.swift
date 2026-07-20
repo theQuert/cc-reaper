@@ -4,6 +4,8 @@ import SwiftUI
 
 struct DashboardView: View {
     @Bindable var store: MonitorStore
+    @State private var findingFilter: FindingFilter = .cleanup
+    @State private var logsError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -45,7 +47,12 @@ struct DashboardView: View {
                 Task { await store.confirmCleanup() }
             }
         } message: {
-            Text("cc-reaper will delegate once to the existing claude-cleanup engine, then refresh status. Active and protected processes remain governed by the existing safety rules.")
+            Text(cleanupConfirmationMessage)
+        }
+        .alert("Logs unavailable", isPresented: logsErrorBinding) {
+            Button("OK", role: .cancel) { logsError = nil }
+        } message: {
+            Text(logsError ?? "The cc-reaper log directory is unavailable.")
         }
     }
 
@@ -71,12 +78,24 @@ struct DashboardView: View {
     @ViewBuilder
     private var summary: some View {
         if let report = store.report {
-            HStack(spacing: 12) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 135), alignment: .leading)], spacing: 12) {
                 StatusCard(
-                    title: "Safe candidates",
+                    title: "Cleanup candidates",
                     value: "\(report.safeCleanupCandidates.count)",
                     systemImage: "checkmark.shield",
                     tint: report.safeCleanupCandidates.isEmpty ? .green : .orange
+                )
+                StatusCard(
+                    title: "Needs review",
+                    value: "\(report.reviewFindings.count)",
+                    systemImage: "exclamationmark.magnifyingglass",
+                    tint: report.reviewFindings.isEmpty ? .secondary : .orange
+                )
+                StatusCard(
+                    title: "Protected",
+                    value: "\(report.protectedFindings.count)",
+                    systemImage: "shield",
+                    tint: .secondary
                 )
                 StatusCard(
                     title: "Reported CPU",
@@ -118,11 +137,43 @@ struct DashboardView: View {
     private var findings: some View {
         if let report = store.report, !report.findings.isEmpty {
             GroupBox("Current findings") {
-                List(report.findings) { finding in
-                    FindingRow(finding: finding)
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Finding filter", selection: $findingFilter) {
+                        ForEach(FindingFilter.allCases) { filter in
+                            Text(filter.title).tag(filter)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    let filteredFindings = findingFilter.apply(to: report.findings)
+                    if filteredFindings.isEmpty {
+                        ContentUnavailableView(
+                            findingFilter.emptyTitle,
+                            systemImage: findingFilter.systemImage,
+                            description: Text(findingFilter.emptyDescription)
+                        )
+                        .frame(maxWidth: .infinity, minHeight: 120)
+                    } else {
+                        List(filteredFindings) { finding in
+                            FindingRow(finding: finding)
+                        }
+                        .listStyle(.inset)
+                        .frame(minHeight: 190)
+                    }
                 }
-                .listStyle(.inset)
-                .frame(minHeight: 190)
+                .padding(.vertical, 4)
+            }
+
+            if !report.suggestedActions.isEmpty {
+                GroupBox("Suggested next actions") {
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(report.suggestedActions, id: \.self) { action in
+                            Label(action, systemImage: "arrow.turn.down.right")
+                                .font(.callout)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
         } else if store.report != nil {
             ContentUnavailableView(
@@ -139,8 +190,8 @@ struct DashboardView: View {
             }
             .disabled(store.isBusy)
 
-            Button("Review Cleanup…") {
-                store.requestCleanupReview()
+            Button("Review & Confirm Cleanup…") {
+                Task { await store.prepareCleanupReview() }
             }
             .buttonStyle(.borderedProminent)
             .disabled(store.isBusy || (store.report?.safeCleanupCandidates.isEmpty ?? true))
@@ -151,6 +202,22 @@ struct DashboardView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var cleanupConfirmationMessage: String {
+        let candidates = store.report?.safeCleanupCandidates ?? []
+        let pids = candidates.prefix(8).map { String($0.pid) }.joined(separator: ", ")
+        let suffix = candidates.count > 8 ? "…" : ""
+        return "The latest read-only sample identified \(candidates.count) cleanup candidate(s) (PID \(pids)\(suffix)). cc-reaper will delegate once to the existing claude-cleanup engine, then refresh status. Active and protected processes remain governed by the existing safety rules."
+    }
+
+    private var logsErrorBinding: Binding<Bool> {
+        Binding(
+            get: { logsError != nil },
+            set: { visible in
+                if !visible { logsError = nil }
+            }
+        )
     }
 
     private var actionResult: some View {
@@ -214,8 +281,70 @@ struct DashboardView: View {
     }
 
     private func openLogs() {
-        let logs = store.configuration.scriptRoot.appendingPathComponent("logs", isDirectory: true)
-        NSWorkspace.shared.open(logs)
+        let logs = store.configuration.logsRoot
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: logs.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            logsError = "The log directory is missing: \(logs.path)"
+            return
+        }
+        guard NSWorkspace.shared.open(logs) else {
+            logsError = "macOS could not open the log directory: \(logs.path)"
+            return
+        }
+    }
+}
+
+private enum FindingFilter: String, CaseIterable, Identifiable {
+    case cleanup
+    case review
+    case protected
+    case all
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .cleanup: "Cleanup"
+        case .review: "Review"
+        case .protected: "Protected"
+        case .all: "All"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .cleanup: "checkmark.shield"
+        case .review: "exclamationmark.magnifyingglass"
+        case .protected: "shield"
+        case .all: "list.bullet"
+        }
+    }
+
+    var emptyTitle: String {
+        switch self {
+        case .cleanup: "No cleanup candidates"
+        case .review: "No manual-review findings"
+        case .protected: "No protected findings"
+        case .all: "No reportable findings"
+        }
+    }
+
+    var emptyDescription: String {
+        switch self {
+        case .cleanup: "The latest sample found nothing safe for the existing cleanup engine to reap."
+        case .review: "No findings currently require manual inspection."
+        case .protected: "The latest sample found no protected processes above the reporting threshold."
+        case .all: "The latest read-only sample found nothing above the reporting threshold."
+        }
+    }
+
+    func apply(to findings: [Finding]) -> [Finding] {
+        switch self {
+        case .cleanup: findings.filter { $0.classification == .safeToReap }
+        case .review: findings.filter { $0.classification == .askBeforeKill }
+        case .protected: findings.filter { $0.classification == .doNotKill }
+        case .all: findings
+        }
     }
 }
 
@@ -263,6 +392,11 @@ private struct FindingRow: View {
                 Text(finding.reason)
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                if !finding.suggestedAction.isEmpty {
+                    Text("Suggested: \(finding.suggestedAction)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Text("\(finding.averageCPU.formatted(.number.precision(.fractionLength(1))))% CPU · \(finding.rssMB) MB · \(finding.elapsed)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.tertiary)

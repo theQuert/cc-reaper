@@ -78,6 +78,10 @@ expect_eq "shared Supabase MCP is do-not-kill" \
   "$(classify_cmd 123 "??" 03:00:00 "node /Users/me/.npm/_npx/53c4795544aaa350/node_modules/.bin/mcp-server-supabase --access-token sbp_secret")" \
   "mcp/DO_NOT_KILL"
 
+expect_eq "Codex Computer Use helper is protected" \
+  "$(classify_cmd 23693 "??" 01:00:00 "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService")" \
+  "other/DO_NOT_KILL"
+
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor-test.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -108,6 +112,8 @@ expect_eq "aggregation RSS MB rounds max" "$agg_rss" "20"
   printf "104\t555\t555\tttys002\t00:05:00\t18.0\t150000\tnode /repo/web/default/node_modules/react-scripts/scripts/start.js\n"
   printf "105\t689\t689\t??\t01:00:00\t15.0\t300000\t/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --profile-directory=Default\n"
   printf "106\t123\t123\t??\t03:00:00\t2.0\t30000\tnode /Users/me/.npm/_npx/53c4795544aaa350/node_modules/.bin/mcp-server-supabase --access-token sbp_secret\n"
+  printf "107\t23693\t23693\t??\t00:01:00\t90.0\t30000\t/bin/zsh -lc cc-monitor.sh --once --json\n"
+  printf "108\t1\t108\t??\t00:01:00\t90.0\t30000\t/Users/me/dist/CCReaper.app/Contents/MacOS/CCReaper\n"
 } > "$snapshot_file"
 
 CC_MONITOR_SNAPSHOT_FILE="$snapshot_file" bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json > "$json_file"
@@ -127,6 +133,12 @@ expect_contains "json includes safe-to-reap" "$json_file" '"classification": "SA
 expect_contains "json includes do-not-kill" "$json_file" '"classification": "DO_NOT_KILL"'
 expect_contains "json includes family totals" "$json_file" '"family_totals"'
 expect_contains "json redacts access tokens" "$json_file" '--access-token \[redacted\]'
+if grep -qE '"pid": (107|108)' "$json_file"; then
+  printf "not ok - monitor omits its own sampler and companion process\n"
+  failures=$((failures + 1))
+else
+  printf "ok - monitor omits its own sampler and companion process\n"
+fi
 
 human_stdout="$tmp_dir/human.out"
 human_stderr="$tmp_dir/human.err"

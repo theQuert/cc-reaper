@@ -24,6 +24,12 @@ public enum CLIServiceError: Error, Equatable, LocalizedError, Sendable {
 }
 
 public struct CLIService: CLIServiceProviding, Sendable {
+    private enum Timeout {
+        static let scan: TimeInterval = 30
+        static let preview: TimeInterval = 45
+        static let cleanup: TimeInterval = 120
+    }
+
     private let runner: any CommandRunning
     private let decoder: JSONDecoder
 
@@ -42,12 +48,24 @@ public struct CLIService: CLIServiceProviding, Sendable {
                 "--json",
                 "--min-cpu",
                 String(minimumCPU)
-            ]
+            ],
+            timeout: Timeout.scan,
+            operation: "monitor scan"
         )
         let result = try await runner.run(invocation)
         try requireSuccess(result)
         do {
-            return try decoder.decode(MonitorReport.self, from: Data(result.stdout.utf8))
+            let report = try decoder.decode(MonitorReport.self, from: Data(result.stdout.utf8))
+            guard report.mode == "once" else {
+                throw CLIServiceError.invalidMonitorOutput("expected mode=once")
+            }
+            guard report.readOnly else {
+                throw CLIServiceError.invalidMonitorOutput("monitor payload is not read-only")
+            }
+            guard report.sampleCount > 0 else {
+                throw CLIServiceError.invalidMonitorOutput("sample_count must be positive")
+            }
+            return report
         } catch {
             throw CLIServiceError.invalidMonitorOutput(error.localizedDescription)
         }
@@ -56,8 +74,10 @@ public struct CLIService: CLIServiceProviding, Sendable {
     public func previewCleanup(scriptRoot: URL) async throws -> String {
         let cleanup = try requiredScript(named: "claude-cleanup.sh", under: scriptRoot)
         return try await runShellFunction(
-            program: #"source "$1"; claude-guard --dry-run"#,
-            script: cleanup
+            program: #"source "$1"; claude-cleanup --dry-run"#,
+            script: cleanup,
+            timeout: Timeout.preview,
+            operation: "cleanup preview"
         )
     }
 
@@ -65,14 +85,23 @@ public struct CLIService: CLIServiceProviding, Sendable {
         let cleanup = try requiredScript(named: "claude-cleanup.sh", under: scriptRoot)
         return try await runShellFunction(
             program: #"source "$1"; claude-cleanup"#,
-            script: cleanup
+            script: cleanup,
+            timeout: Timeout.cleanup,
+            operation: "cleanup"
         )
     }
 
-    private func runShellFunction(program: String, script: URL) async throws -> String {
+    private func runShellFunction(
+        program: String,
+        script: URL,
+        timeout: TimeInterval,
+        operation: String
+    ) async throws -> String {
         let result = try await runner.run(CommandInvocation(
             executable: URL(fileURLWithPath: "/bin/bash"),
-            arguments: ["-c", program, "_", script.path]
+            arguments: ["-c", program, "_", script.path],
+            timeout: timeout,
+            operation: operation
         ))
         try requireSuccess(result)
         let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)

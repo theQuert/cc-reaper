@@ -7,6 +7,8 @@
 - Add a native macOS menu bar companion with an on-demand dashboard and dedicated settings window.
 - Read current process health through `cc-monitor --once --json` and show candidate, CPU, memory, and freshness evidence.
 - Keep refresh and preview read-only; route destructive cleanup through the existing `claude-cleanup` engine only after explicit confirmation.
+- Make cleanup preview exercise the same `claude-cleanup` policy as confirmation, bound command execution, and require a successful preview before destructive confirmation.
+- Separate cleanup availability from general resource-review findings, reduce monitor self-noise, and provide filtered actionable views with the backend's suggested actions.
 - Surface unavailable scripts, malformed output, and command failures as visible unknown/error states rather than reporting the system healthy.
 - Add a reproducible SwiftPM build/test/run path and install the existing monitor script alongside the other deployed cc-reaper scripts.
 
@@ -18,11 +20,12 @@
 
 ### Modified Capabilities
 
-<!-- none -->
+- `cc-monitor`: Exclude the monitor/app sampling process tree and protect known companion/UI automation services from misleading manual-kill classification.
 
 ## Impact
 
 - Adds a SwiftPM macOS executable and testable core module under `Sources/` and `Tests/`.
 - Adds a project-local app bundle build/run script and Codex Run action.
 - Updates `install.sh` so `cc-monitor.sh` is available at the stable deployed script root used by the app.
-- Reuses the existing JSON and cleanup command contracts; it does not change process classification or deletion policy.
+- Extends `claude-cleanup` with a non-destructive dry-run mode while preserving the existing cleanup policy and normal invocation.
+- Refines monitor presentation classification only for task-owned sampler/app processes; it does not broaden deletion eligibility.

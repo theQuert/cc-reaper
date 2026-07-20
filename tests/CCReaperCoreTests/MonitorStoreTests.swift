@@ -31,35 +31,48 @@ final class MonitorStoreTests: XCTestCase {
         XCTAssertTrue(store.errorMessage?.contains("cc-monitor.sh") == true)
     }
 
-    func testCleanupReviewAndCancelNeverInvokeCleanup() async {
-        let service = StubCLIService(scans: [])
+    func testCleanupReviewPreviewsBeforeConfirmationAndCancelNeverInvokesCleanup() async throws {
+        let report = try decodeFixture()
+        let service = StubCLIService(
+            scans: [.success(report)],
+            previewResults: [.success("dry-run")]
+        )
         let store = MonitorStore(service: service, defaults: makeDefaults())
 
-        store.requestCleanupReview()
+        await store.refresh()
+        await store.prepareCleanupReview()
         XCTAssertTrue(store.isCleanupConfirmationRequested)
         store.cancelCleanupReview()
 
         XCTAssertFalse(store.isCleanupConfirmationRequested)
+        let previewCallCount = await service.previewCallCount
         let cleanupCallCount = await service.cleanupCallCount
+        XCTAssertEqual(previewCallCount, 1)
         XCTAssertEqual(cleanupCallCount, 0)
     }
 
     func testConfirmedCleanupInvokesExistingEngineOnceAndRefreshes() async throws {
         let report = try decodeFixture()
         let service = StubCLIService(
-            scans: [.success(report)],
+            scans: [.success(report), .success(report)],
+            previewResults: [.success("dry-run")],
             cleanupResults: [.success("cleaned")]
         )
         let store = MonitorStore(service: service, defaults: makeDefaults())
 
-        store.requestCleanupReview()
+        await store.refresh()
+        let servicePreview = await service.previewCallCount
+        XCTAssertEqual(servicePreview, 0)
+        await store.prepareCleanupReview()
         await store.confirmCleanup()
 
         XCTAssertFalse(store.isCleanupConfirmationRequested)
+        let previewCallCount = await service.previewCallCount
         let cleanupCallCount = await service.cleanupCallCount
         let scanCallCount = await service.scanCallCount
+        XCTAssertEqual(previewCallCount, 1)
         XCTAssertEqual(cleanupCallCount, 1)
-        XCTAssertEqual(scanCallCount, 1)
+        XCTAssertEqual(scanCallCount, 2)
         XCTAssertEqual(store.actionOutput, "cleaned")
         XCTAssertEqual(store.report, report)
     }
@@ -78,6 +91,21 @@ final class MonitorStoreTests: XCTestCase {
         XCTAssertEqual(previewCallCount, 1)
         XCTAssertEqual(cleanupCallCount, 0)
         XCTAssertEqual(store.actionOutput, "dry-run")
+    }
+
+    func testFailedCleanupPreviewDoesNotPresentConfirmation() async throws {
+        let report = try decodeFixture()
+        let service = StubCLIService(
+            scans: [.success(report)],
+            previewResults: [.failure(CLIServiceError.commandFailed(exitCode: 9, message: "denied"))]
+        )
+        let store = MonitorStore(service: service, defaults: makeDefaults())
+
+        await store.refresh()
+        await store.prepareCleanupReview()
+
+        XCTAssertFalse(store.isCleanupConfirmationRequested)
+        XCTAssertTrue(store.actionError?.contains("denied") == true)
     }
 
     private func decodeFixture() throws -> MonitorReport {

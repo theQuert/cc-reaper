@@ -110,7 +110,17 @@ public final class MonitorStore {
         }
     }
 
-    public func requestCleanupReview() {
+    public func prepareCleanupReview() async {
+        guard activity == .idle else { return }
+        guard let report, !report.safeCleanupCandidates.isEmpty else {
+            actionTitle = "Cleanup Preview"
+            actionOutput = nil
+            actionError = "No safe cleanup candidates are present in the latest monitor report."
+            return
+        }
+
+        await previewCleanup()
+        guard actionError == nil else { return }
         isCleanupConfirmationRequested = true
     }
 

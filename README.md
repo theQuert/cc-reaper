@@ -418,7 +418,7 @@ swift test
 ./script/build_and_run.sh
 ```
 
-The menu bar can refresh status, run `claude-guard --dry-run`, and open the dashboard. Process cleanup is available only from the dashboard after an explicit destructive confirmation, then delegates once to the existing `claude-cleanup` function. Missing scripts, invalid JSON, and command failures display an unavailable/error state instead of a healthy result.
+The menu bar can refresh status, run the same-engine `claude-cleanup --dry-run` preview, and open the dashboard. Process cleanup is available only from the dashboard after a successful preview and explicit destructive confirmation, then delegates once to the existing `claude-cleanup` function. Missing scripts, invalid JSON, stale monitor contracts, timeouts, and command failures display an unavailable/error state instead of a healthy result.
 
 Source-built bundles staged under `dist/` automatically use the checkout's `shell/` directory when `~/.cc-reaper` is incomplete. A complete installed root remains preferred, and an explicit Settings override takes precedence over both.
 

@@ -57,6 +57,44 @@ final class CLIServiceTests: XCTestCase {
         }
     }
 
+    func testNonReadOnlyMonitorPayloadIsRejected() async throws {
+        let root = try makeScriptRoot(files: ["cc-monitor.sh"])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = RecordingRunner(results: [
+            CommandResult(exitCode: 0, stdout: MonitorReportTests.fixture.replacingOccurrences(of: #""read_only": true"#, with: #""read_only": false"#), stderr: "")
+        ])
+        let service = CLIService(runner: runner)
+
+        do {
+            _ = try await service.scan(scriptRoot: root, minimumCPU: 1)
+            XCTFail("Expected non-read-only payload error")
+        } catch let error as CLIServiceError {
+            XCTAssertEqual(error, .invalidMonitorOutput("cc-monitor returned invalid JSON: monitor payload is not read-only"))
+        }
+    }
+
+    func testMonitorPayloadRequiresOnceModeAndPositiveSampleCount() async throws {
+        let root = try makeScriptRoot(files: ["cc-monitor.sh"])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let cases: [(from: String, to: String, message: String)] = [
+            (#""mode": "once""#, #""mode": "sample""#, "expected mode=once"),
+            (#""sample_count": 1"#, #""sample_count": 0"#, "sample_count must be positive")
+        ]
+        for testCase in cases {
+            let runner = RecordingRunner(results: [
+                CommandResult(exitCode: 0, stdout: MonitorReportTests.fixture.replacingOccurrences(of: testCase.from, with: testCase.to), stderr: "")
+            ])
+            let service = CLIService(runner: runner)
+            do {
+                _ = try await service.scan(scriptRoot: root, minimumCPU: 1)
+                XCTFail("Expected monitor contract error")
+            } catch let error as CLIServiceError {
+                XCTAssertEqual(error, .invalidMonitorOutput("cc-monitor returned invalid JSON: \(testCase.message)"))
+            }
+        }
+    }
+
     func testPreviewAndCleanupUseFixedShellProgramsWithPathArgument() async throws {
         let root = try makeScriptRoot(files: ["claude-cleanup.sh"])
         defer { try? FileManager.default.removeItem(at: root) }
@@ -74,7 +112,7 @@ final class CLIServiceTests: XCTestCase {
         let invocations = await runner.invocations
         let scriptPath = root.appendingPathComponent("claude-cleanup.sh").path
         XCTAssertEqual(invocations[0].arguments, [
-            "-c", #"source "$1"; claude-guard --dry-run"#, "_", scriptPath
+            "-c", #"source "$1"; claude-cleanup --dry-run"#, "_", scriptPath
         ])
         XCTAssertEqual(invocations[1].arguments, [
             "-c", #"source "$1"; claude-cleanup"#, "_", scriptPath

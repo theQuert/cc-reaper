@@ -17,8 +17,8 @@ extension MonitorStore {
         if state == .loading { return "Refreshing" }
         guard let report else { return "Status unavailable" }
         return switch report.health {
-        case .healthy: "Healthy"
-        case .attention: "Review recommended"
+        case .healthy: "No cleanup needed"
+        case .attention: "Cleanup available"
         case .critical: "Runaway process detected"
         }
     }

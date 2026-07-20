@@ -17,6 +17,10 @@ final class AppConfigurationTests: XCTestCase {
         )
 
         XCTAssertEqual(configuration.scriptRoot, layout.sourceShell.standardizedFileURL)
+        XCTAssertEqual(
+            configuration.logsRoot,
+            layout.home.appendingPathComponent(".cc-reaper/logs", isDirectory: true).standardizedFileURL
+        )
     }
 
     func testAutomaticResolutionPrefersCompleteInstallation() throws {

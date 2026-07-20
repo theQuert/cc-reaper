@@ -73,7 +73,7 @@ _cc_monitor_agent_stale_seconds() {
 
 _cc_monitor_is_stale_etime() {
   local etime=$1
-  local seconds
+  local seconds=""
   seconds=$(_cc_monitor_etime_to_seconds "$etime")
   [ "$seconds" -ge "$(_cc_monitor_agent_stale_seconds)" ]
 }
@@ -101,7 +101,7 @@ _cc_monitor_runaway_min_threshold() {
 _cc_monitor_is_runaway() {
   local avg_cpu=$1
   local etime=$2
-  local cpu_threshold etime_threshold elapsed_seconds
+  local cpu_threshold="" etime_threshold="" elapsed_seconds=""
   cpu_threshold=$(_cc_monitor_runaway_cpu_threshold)
   etime_threshold=$(_cc_monitor_runaway_min_threshold)
   elapsed_seconds=$(_cc_monitor_etime_to_seconds "$etime")
@@ -110,7 +110,7 @@ _cc_monitor_is_runaway() {
 }
 
 _cc_monitor_protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
+  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores|CCReaper|Codex Computer Use\\.app|SkyComputerUseService"
 }
 
 _cc_monitor_is_protected_cmd() {
@@ -153,7 +153,12 @@ _cc_monitor_is_dev_server_cmd() {
 
 _cc_monitor_is_system_cmd() {
   local cmd=$1
-  echo "$cmd" | grep -qE "WindowServer|kernel_task|coreaudiod|syspolicyd|mdworker|mds_stores|Spotlight|Bitdefender|com\\.apple\\.|/System/Library/"
+  echo "$cmd" | grep -qE "WindowServer|kernel_task|coreaudiod|syspolicyd|mdworker|mds_stores|Spotlight|Bitdefender|com\\.apple\\.|/System/Library/|PerfPowerServices|BTLEServer|bluetoothd|UniversalControl|UserNotificationCenter|BiomeAgent|accountsd|locationd|logd|opendirectoryd|replayd|BetterSnapTool|netdisk_service"
+}
+
+_cc_monitor_is_self_cmd() {
+  local cmd=$1
+  echo "$cmd" | grep -qE "cc-monitor\\.sh( |$)|CCReaper\\.app/Contents/MacOS/CCReaper( |$)|/CCReaper( |$)"
 }
 
 _cc_monitor_is_normal_chrome_cmd() {
@@ -346,6 +351,10 @@ _cc_monitor_label() {
     echo "react-scripts start"
   elif echo "$cmd" | grep -q "chrome-devtools-mcp"; then
     echo "chrome-devtools-mcp"
+  elif echo "$cmd" | grep -q "SkyComputerUseService\|Codex Computer Use\\.app"; then
+    echo "Codex Computer Use"
+  elif echo "$cmd" | grep -qE "CCReaper\\.app/Contents/MacOS/CCReaper|(^|/)CCReaper( |$)"; then
+    echo "cc-reaper"
   elif echo "$cmd" | grep -qE "(^|/)cmux( |$)|cmux\\.app"; then
     echo "cmux"
   elif [ "$family" = "chrome" ]; then
@@ -470,6 +479,7 @@ _cc_monitor_enrich_findings() {
 
   while IFS="$(printf '\t')" read -r avg_cpu max_cpu row_samples pid ppid pgid tty etime rss_mb cmd; do
     [ -z "$pid" ] && continue
+    _cc_monitor_is_self_cmd "$cmd" && continue
     local family="" classification="" label="" reason="" action=""
     family=$(_cc_monitor_family "$cmd")
     classification=$(_cc_monitor_classification "$ppid" "$tty" "$etime" "$cmd" "$family")
@@ -557,7 +567,7 @@ _cc_monitor_human_report() {
 
   echo ""
   echo "Family totals:"
-  local family_totals
+  local family_totals=""
   family_totals=$(_cc_monitor_family_totals "$findings_file")
   if [ -z "$family_totals" ]; then
     echo "  none"
@@ -569,7 +579,7 @@ _cc_monitor_human_report() {
 
   echo ""
   echo "Safe cleanup candidates:"
-  local safe_count
+  local safe_count=""
   safe_count=$(awk -F '\t' '$11 == "SAFE_TO_REAP" { count++ } END { print count+0 }' "$findings_file")
   if [ "$safe_count" -eq 0 ]; then
     echo "  none"
@@ -581,7 +591,7 @@ _cc_monitor_human_report() {
     ' "$findings_file"
   fi
 
-  local runaway_count
+  local runaway_count=""
   runaway_count=$(awk -F '\t' '$10 == "runaway" && $11 == "ASK_BEFORE_KILL" { count++ } END { print count+0 }' "$findings_file")
   if [ "$runaway_count" -gt 0 ]; then
     echo ""
@@ -748,7 +758,7 @@ _cc_monitor_module_binary() {
 }
 
 _cc_monitor_module_available() {
-  local binary
+  local binary=""
   binary=$(_cc_monitor_module_binary "$1") || return 1
   command -v "$binary" >/dev/null 2>&1
 }
@@ -797,7 +807,7 @@ _cc_monitor_prompt_apply() {
   fi
 
   local all_modules=()
-  local m
+  local m=""
   while IFS= read -r m; do
     all_modules+=("$m")
   done < <(_cc_monitor_all_modules)
@@ -879,14 +889,14 @@ _cc_monitor_dispatch_module() {
   local skip_confirm=$2
 
   if ! _cc_monitor_module_available "$module"; then
-    local binary
+    local binary=""
     binary=$(_cc_monitor_module_binary "$module")
     echo "cc-monitor: module '$module' not available on PATH (binary: $binary)" >&2
     return 127
   fi
 
   if [ "$skip_confirm" != "true" ] && _cc_monitor_module_destructive "$module"; then
-    local label
+    local label=""
     label=$(_cc_monitor_module_label "$module")
     printf "Run %s? [y/N] " "$label" >&2
     local answer=""
