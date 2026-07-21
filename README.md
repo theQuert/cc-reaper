@@ -37,6 +37,7 @@ Session crashes / terminal force-closed
 
 Manual intervention needed
   └── cc-monitor — explain current CPU heat by process family before cleanup
+  └── macOS companion app — menu bar status, dashboard, process rules, and confirmed cleanup
   └── claude-cleanup — finds orphaned PGIDs and stale agent-browser/Puppeteer/Codex stragglers
   └── claude-ram — check RAM/CPU usage breakdown with orphan visibility
 ```
@@ -62,6 +63,14 @@ chmod +x install.sh
 git pull
 ./install.sh
 ```
+
+On macOS 14 or later, build and open the optional local companion after installation:
+
+```bash
+./script/build_and_run.sh
+```
+
+See [macOS Companion App (local)](#macos-companion-app-local) for its dashboard, process rules, safety behavior, and background verification mode.
 
 The installer auto-updates hook and shell functions. For proc-janitor users, manually sync the config:
 
@@ -406,35 +415,69 @@ Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`,
 
 Config via env: `CC_RW_LOAD_FACTOR` / `CC_RW_DISK_MIN_PCT` / `CC_RW_MEM_MIN_PCT` / `CC_RW_COOLDOWN_SECS` (watch), `CC_DJ_DISK_MIN_PCT` / `CC_DJ_COOLDOWN_SECS` (disk), `CC_WJ_ROOT` / `CC_WJ_NOTIFY_MIN_GB` (worktree).
 
-## macOS Companion (source preview)
+## macOS Companion App (local)
 
-cc-reaper includes a native SwiftUI menu bar companion for status visibility and safe manual actions. It reads the existing `cc-monitor --once --json` contract, shows current findings in a dashboard, and keeps settings in the standard macOS Settings window. The app does not reimplement process classification or cleanup policy.
+cc-reaper includes a native SwiftUI menu bar app for status visibility and safe manual actions. It reads the existing `cc-monitor --once --json` contract and delegates cleanup to the existing shell engine; process discovery, classification, and termination policy remain in the tested shell scripts.
 
-Install/update the shell tools first so `~/.cc-reaper/cc-monitor.sh` and `claude-cleanup.sh` are available, then build and launch the app:
+Requirements: macOS 14 or later and the Swift toolchain from current Xcode or Xcode Command Line Tools.
+
+### Install the runtime scripts
+
+Run the interactive installer once, or rerun it after updating cc-reaper:
 
 ```bash
+cd /path/to/cc-reaper
 ./install.sh
+```
+
+The installer deploys `cc-monitor.sh`, `claude-cleanup.sh`, and the supporting scripts under `~/.cc-reaper/`, then installs or refreshes the selected background daemon and LaunchAgents. It does **not** copy the GUI into `/Applications`.
+
+### Build and open the app
+
+From the repository root:
+
+```bash
 swift test
 ./script/build_and_run.sh
 ```
 
-The menu bar can refresh status, run the same-engine `claude-cleanup --dry-run` preview, and open the dashboard. Process cleanup is available only from the dashboard after a successful preview and explicit destructive confirmation, then delegates once to the existing `claude-cleanup` function. Missing scripts, invalid JSON, stale monitor contracts, timeouts, and command failures display an unavailable/error state instead of a healthy result.
+`build_and_run.sh` builds the current checkout, stages an unsigned bundle at `dist/CCReaper.app`, stops only a previous app process from that staged bundle, and opens the current build. Once it has been built, it can also be opened directly:
 
-Source-built bundles staged under `dist/` automatically use the checkout's `shell/` directory when `~/.cc-reaper` is incomplete. A complete installed root remains preferred, and an explicit Settings override takes precedence over both.
+```bash
+open /path/to/cc-reaper/dist/CCReaper.app
+```
+
+The normal launch opens the dashboard and adds **cc-reaper** to the macOS menu bar.
+
+### App surfaces
+
+| Surface | Available actions |
+|---|---|
+| Menu bar | View current cleanup/review/runaway counts, refresh status, preview cleanup, start cleanup review, open the dashboard or Settings, and quit the app. |
+| Dashboard | View CPU/memory and process findings, filter by Cleanup/Review/Protected/All, inspect suggested actions, open logs, preview cleanup, and explicitly confirm eligible cleanup. |
+| Settings | Inspect or override the active script root, configure monitor/refresh preferences, and add or remove custom process rules. |
+
+Refresh is read-only. **Preview Cleanup** runs the same `claude-cleanup --dry-run` policy without sending signals. Actual cleanup is available only from the dashboard after a successful preview and an explicit destructive confirmation, then delegates once to the existing `claude-cleanup` function.
+
+The app prefers a complete installed root at `~/.cc-reaper/`. A bundle staged under `dist/` falls back to the checkout's `shell/` directory when the installation is incomplete, and an explicit Settings override takes precedence over both. Missing scripts, invalid JSON, incompatible monitor output, timeouts, and command failures display an unavailable/error state instead of reporting the system healthy.
 
 ### Custom process rules
 
 The companion's **Settings → Process Rules** pane and each finding row's action menu can add a case-insensitive literal command match as either:
 
 - **Always Protect** — matching processes are excluded from cleanup and guard termination paths.
-- **Allow Stale Cleanup** — a matching ordinary process may become a cleanup candidate only when it is both stale and detached/orphaned. System/security processes, normal Chrome, and cc-reaper itself remain immutable; preview and explicit cleanup confirmation are still required.
+- **Allow Stale Cleanup** — a matching ordinary process may become a cleanup candidate only when it is both stale and detached/orphaned. System/security/UI processes, normal Chrome, cc-reaper, and the Codex Computer Use helper remain immutable; preview and explicit cleanup confirmation are still required.
 
 Rules are stored in `~/.cc-reaper/process-rules.tsv` with owner-only permissions. `protect` wins conflicts, invalid externally edited rows are ignored, and removing the final rule removes the file. The match is literal text, not a regular expression or wildcard.
 Always Protect rules are re-read by manual cleanup, guard paths, and the scheduled LaunchAgent before both TERM and SIGKILL, so changing a rule does not require reloading the agent.
 
+Immutable findings do not offer **Allow Stale Cleanup** in their finding-row menu. Settings can persist any otherwise valid literal, but the monitor and cleanup engines still ignore cleanup effects that match an immutable process.
+
+### Background verification
+
 For automated launch checks while continuing other work, run `./script/build_and_run.sh --verify`. Verification launches with background activation, confirms a new app process, stops only that verification process, and leaves both the foreground application and any pre-existing cc-reaper instance alone.
 
-Requirements: macOS 14 or later and the Swift toolchain included with current Xcode or Xcode Command Line Tools. This iteration stages an unsigned local bundle at `dist/CCReaper.app`; signing, notarization, and automatic updates are not included yet.
+This local app is currently unsigned and repository-staged. Packaging into `/Applications`, code signing, notarization, and automatic updates are not included yet.
 
 ## Dependencies
 
