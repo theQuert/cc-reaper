@@ -28,6 +28,16 @@ cc-reaper is a shell-based utility that cleans up orphan Claude Code processes (
 3. **MCP whitelist**: Shared long-running MCP servers (Supabase, Stripe, context7, claude-mem, chroma-mcp, sequential-thinking) are always excluded. **Cloudflare's MCP server (`@cloudflare/mcp-server-cloudflare`) is deliberately NOT whitelisted** — it is prone to orphaning and pinning ~100% CPU for hours, so it is treated as a normal reap target.
 4. **`CC_STOP_HOOK_AGGRESSIVE=1`**: Skips the orphan-parent check but still preserves ancestors and the MCP whitelist.
 
+**What counts as a session**: `claude-guard`, `claude-sessions`, and `claude-fd` all resolve sessions through `_cc_reaper_session_pids`, which reports only **top-level `claude` CLI processes attached to a real terminal**. Three families are deliberately excluded, because `claude-guard` reaps whole process groups:
+
+- **Desktop-hosted claude-code and `stream-json` subagents** — both run the same binary with the same `--output-format stream-json --input-format stream-json` flags, and only the parent chain separates them. Neither holds a terminal, so requiring one drops both. `cc-monitor` still reports them.
+- **Headless `-p` / `--output-format` runs** — a batch job below the idle CPU threshold is indistinguishable from an abandoned session, and killing one destroys work with no visible tab.
+- **Helper modes** such as `claude mcp-server`.
+
+The matcher keys on the `claude` executable plus any known session flag (`--session-id` or the legacy `--dangerously…`) rather than a single flag, which is how the previous matcher went silently blind when Claude Code stopped putting `--dangerously…` on the command line. `--settings` JSON can contain newlines, so `ps` renders one process across several lines; continuation lines are dropped by validating the PID and TTY field shapes, the same guard `_cc_monitor_snapshot` uses. Tests inject a fixed process table via `CC_REAPER_PS_SNAPSHOT_FILE`.
+
+**zsh portability**: this project is installed into zsh, so `claude-guard`'s reaping paths must avoid two zsh traps that bash hides — `status` is a read-only variable (use `proc_status`), and arrays cannot be walked by numeric index (`${!arr[@]}` is `bad substitution`, `${arr[0]}` is empty). Kill candidates are carried as `pid<TAB>detail` records iterated by value. `zsh -n` belongs in the syntax check alongside `bash -n`.
+
 **proc-janitor** is an external Rust daemon (installed via Homebrew or Cargo). The config.toml here only configures its behavior — the daemon code lives at github.com/jhlee0409/proc-janitor.
 
 **Installer idempotency**: `install.sh` checks for existing installations before modifying shell configs, copying hooks, or installing dependencies. It uses `sed` to replace `~` with the actual home path in the proc-janitor config.
@@ -65,9 +75,11 @@ bash tests/ppid-fallback.sh            # Validate _cc_reaper_ppid_fallback (PPID
 bash tests/stop-hook-env.sh            # Validate CC_STOP_HOOK_DISABLE / CC_STOP_HOOK_AGGRESSIVE
 bash tests/cc-monitor-optimize.sh      # Validate cc-monitor optimization menu logic
 bash tests/cc-monitor-runaway.sh       # Validate runaway protected process detection
+bash tests/guard-session-detect.sh     # Validate session detection + guard phases under bash and zsh
 bash -n shell/claude-cleanup.sh        # Syntax check
 bash -n shell/cc-monitor.sh            # Syntax check
 bash -n hooks/stop-cleanup-orphans.sh  # Syntax check
+zsh -n shell/claude-cleanup.sh         # zsh reaches code paths bash-only checks miss
 ```
 
 ## Environment Variables
