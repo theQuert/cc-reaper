@@ -23,11 +23,11 @@ runaway phase added in `agent-process-reapers` still worked because it scans pro
 processes directly instead of going through session detection.
 
 A second defect sits in the same line. The `--settings` argument carries JSON that can
-contain newlines, so `ps` emits a session as several lines. `awk '{print $1}'` reads the
-first token of every continuation line, which can yield a non-PID token or a PID belonging
-to an unrelated process. `cc-monitor` already solved this in `_cc_monitor_snapshot` by
-validating field shapes and dropping rows that do not parse; session detection never got
-the same guard.
+contain newlines, so `ps` emits a session as several lines and `awk '{print $1}'` reads the
+first token of every continuation line. Parsing PIDs out of any table that also carries
+argument text is unsafe in principle: a payload line shaped like a process record becomes a
+record. Since `claude-guard` reaps whole process groups, a forged PID that happens to be
+live and over a threshold would take its group with it.
 
 ## What Changes
 
@@ -36,9 +36,14 @@ the same guard.
 - Define a session as a **top-level `claude` CLI process attached to a real terminal**.
   Desktop-hosted claude-code, headless `-p`/`--output-format` runs, and `stream-json`
   subagents are deliberately excluded.
-- Drop `ps` continuation lines by validating the PID and TTY field shapes, reusing the
-  approach already proven in `_cc_monitor_snapshot`.
-- Add a mocked-`ps` regression test that pins each inclusion and exclusion case.
+- Split detection into two seams so no argument value can influence which PIDs exist:
+  candidate PID and TTY come from `ps -eo pid=,tty=,comm=`, which carries the executable
+  name and no arguments; the command line is then fetched per PID and judged by
+  `_cc_reaper_is_session_cmd`.
+- Judge only the CLI's own arguments. Everything from the first `{` is the `--settings`
+  payload and neither qualifies nor disqualifies a session.
+- Add a regression test that pins each inclusion and exclusion case, driving the predicate
+  and the table walker as separate seams.
 
 Not in scope: threshold defaults, `_claude_pgid_kill`, the MCP whitelist, and the
 `ChatGPT.app` protected-pattern behavior are all unchanged.

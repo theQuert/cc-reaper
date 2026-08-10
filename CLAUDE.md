@@ -34,7 +34,14 @@ cc-reaper is a shell-based utility that cleans up orphan Claude Code processes (
 - **Headless `-p` / `--output-format` runs** — a batch job below the idle CPU threshold is indistinguishable from an abandoned session, and killing one destroys work with no visible tab.
 - **Helper modes** such as `claude mcp-server`.
 
-The matcher keys on the `claude` executable plus any known session flag (`--session-id` or the legacy `--dangerously…`) rather than a single flag, which is how the previous matcher went silently blind when Claude Code stopped putting `--dangerously…` on the command line. `--settings` JSON can contain newlines, so `ps` renders one process across several lines; continuation lines are dropped by validating the PID and TTY field shapes, the same guard `_cc_monitor_snapshot` uses. Tests inject a fixed process table via `CC_REAPER_PS_SNAPSHOT_FILE`.
+The matcher keys on the `claude` executable plus any known session flag (`--session-id` or the legacy `--dangerously…`) rather than a single flag, which is how the previous matcher went silently blind when Claude Code stopped putting `--dangerously…` on the command line.
+
+Detection is split across two seams so that **no argument value can influence which PIDs exist**:
+
+- `_cc_reaper_ps_pid_tty_comm` lists PID, TTY, and `comm` — the executable name, never the arguments. Candidate PIDs come only from here, so a `--settings` payload containing a line like `12345 ttys999 /path/claude --session-id injected` cannot forge a record. Parsing PIDs out of a `ps …,command=` table is unsafe for exactly this reason: `claude-guard` reaps whole process groups, so a forged PID that happens to be live and over a threshold would take its group with it.
+- `_cc_reaper_is_session_cmd` judges one command line, fetched per PID. It first drops everything from the first `{` — the `--settings` payload — because a hook command in there may legitimately mention `--output-format` or `mcp-server`, and matching the whole line would hide the very session that owns it. The payload equally cannot *qualify* a session.
+
+Tests drive the two seams separately via `CC_REAPER_PS_SNAPSHOT_FILE` (`pid tty comm`) and `CC_REAPER_PS_CMD_SNAPSHOT_FILE` (`pid<TAB>command`).
 
 **zsh portability**: this project is installed into zsh, so `claude-guard`'s reaping paths must avoid two zsh traps that bash hides — `status` is a read-only variable (use `proc_status`), and arrays cannot be walked by numeric index (`${!arr[@]}` is `bad substitution`, `${arr[0]}` is empty). Kill candidates are carried as `pid<TAB>detail` records iterated by value. `zsh -n` belongs in the syntax check alongside `bash -n`.
 

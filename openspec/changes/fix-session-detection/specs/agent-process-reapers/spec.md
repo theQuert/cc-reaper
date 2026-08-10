@@ -51,19 +51,47 @@ single flag remaining in future Claude Code releases.
 - **WHEN** `vim shell/claude-cleanup.sh` or `grep claude --session-id log.txt` runs on a terminal
 - **THEN** its PID SHALL NOT be reported as a session, because neither runs the `claude` executable
 
-### Requirement: Session detection tolerates multi-line process arguments
-The system SHALL discard `ps` output lines that are argument continuations rather than
-process records. A session started with a `--settings` JSON argument containing newlines
-SHALL be reported exactly once, and no token from a continuation line SHALL ever be emitted
-as a PID.
+### Requirement: Record boundaries never derive from process arguments
+The system SHALL obtain the candidate PID and TTY from a process listing that carries the
+executable name only and no argument text, so that no value a session was launched with can
+forge a process record. The full command line SHALL be fetched per PID, never parsed out of
+a concatenated table.
+
+A session started with a `--settings` JSON argument containing newlines SHALL be reported
+exactly once, and no token from that argument SHALL ever be emitted as a PID.
+
+#### Scenario: Session arguments carry a forged process record
+- **WHEN** a session's `--settings` payload contains the text `12345 ttys999 /path/claude --session-id injected` on its own line
+- **THEN** the helper SHALL emit only the real session's PID, and SHALL NOT emit `12345`
+
+#### Scenario: Forged PID belongs to a live process
+- **WHEN** the forged PID names a live, unrelated process that exceeds an FD, RSS, or idle threshold
+- **THEN** that process SHALL NOT be classified as a session, so `claude-guard` cannot reap its process group
 
 #### Scenario: Session carries multi-line JSON settings
-- **WHEN** a session's `--settings` argument contains embedded newlines, so `ps` renders the process across four lines
-- **THEN** the helper SHALL emit that session's PID exactly once and emit nothing for the three continuation lines
+- **WHEN** a session's `--settings` argument contains embedded newlines
+- **THEN** the helper SHALL emit that session's PID exactly once
 
-#### Scenario: Continuation line resembles a process record
-- **WHEN** a continuation line begins with a bare number followed by text
-- **THEN** the helper SHALL reject it, because the line's TTY field does not have the shape of a TTY
+### Requirement: Only the CLI's own arguments decide session status
+The system SHALL ignore the `--settings` payload when testing for session and exclusion
+flags. Everything from the first `{` of the command line is user-supplied data and SHALL NOT
+qualify or disqualify a session.
+
+#### Scenario: Hook command inside settings names an exclusion flag
+- **WHEN** an interactive session's `--settings` JSON contains a hook such as `claude -p x --output-format json`
+- **THEN** the session SHALL still be reported, because `--output-format` there belongs to the payload rather than to the CLI's own arguments
+
+#### Scenario: Payload cannot qualify a non-session
+- **WHEN** a non-session command such as `claude doctor --settings {"x":"--session-id fake"}` runs on a terminal
+- **THEN** it SHALL NOT be reported, because the session flag appears only inside the payload
+
+#### Scenario: Equals form of the settings flag
+- **WHEN** the payload is passed as `--settings={…}` rather than `--settings {…}`
+- **THEN** the payload SHALL be excluded from matching just the same
+
+#### Scenario: Genuine headless run is still excluded
+- **WHEN** `claude -p "summarize" --session-id ghi` runs on a terminal with the flags in its own arguments
+- **THEN** it SHALL NOT be reported as a session
 
 ### Requirement: claude-guard runs identically under bash and zsh
 `claude-guard` SHALL classify and report the same sessions whether sourced into bash or zsh.

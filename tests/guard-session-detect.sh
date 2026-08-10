@@ -2,8 +2,12 @@
 # Pins the session-detection contract shared by claude-guard, claude-sessions,
 # and claude-fd. See openspec/specs/agent-process-reapers/spec.md.
 #
-# A fixed process table is fed through CC_REAPER_PS_SNAPSHOT_FILE, which has the
-# format of `ps -eo pid=,tty=,command=`, so no real process is inspected.
+# Two seams are covered separately:
+#   _cc_reaper_is_session_cmd  — pure predicate over one command line
+#   _cc_reaper_session_pids    — walks the process table, fed by
+#                                CC_REAPER_PS_SNAPSHOT_FILE (pid tty comm) and
+#                                CC_REAPER_PS_CMD_SNAPSHOT_FILE (pid<TAB>command)
+# so no real process is inspected and nothing is ever signalled.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,113 +17,113 @@ failures=0
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-reaper-session-test.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT
-snapshot="$tmp_dir/ps-snapshot.txt"
-export CC_REAPER_PS_SNAPSHOT_FILE="$snapshot"
+tty_snapshot="$tmp_dir/ps-tty.txt"
+cmd_snapshot="$tmp_dir/ps-cmd.txt"
 
-# Emit a single-process table and assert whether its PID is reported.
-expect_session() {
-  local name=$1 want=$2 line=$3
-  printf '%s\n' "$line" > "$snapshot"
-  local got
-  got=$(_cc_reaper_session_pids)
-  if [ "$got" = "$want" ]; then
-    printf "ok - %s\n" "$name"
+pass() { printf "ok - %s\n" "$1"; }
+fail() { printf "not ok - %s\n" "$1"; failures=$((failures + 1)); }
+
+expect_cmd() {
+  local name=$1 want=$2 cmd=$3
+  if _cc_reaper_is_session_cmd "$cmd"; then
+    [ "$want" = yes ] && pass "$name" || fail "$name (matched, expected no match)"
   else
-    printf "not ok - %s (want '%s', got '%s')\n" "$name" "$want" "$got"
-    failures=$((failures + 1))
+    [ "$want" = no ] && pass "$name" || fail "$name (no match, expected match)"
   fi
 }
 
-# ─── Included: terminal-attached top-level CLI sessions ─────────────────────
+# ─── Command predicate: included ───────────────────────────────────────────
 
-expect_session "interactive session with --session-id is found" "59516" \
-  '59516 ttys006 /Users/me/.local/bin/claude --session-id 3ded1c38-baa6-4602-b83d-3329e634c676 --settings {"preferredNotifChannel":"terminal_bell"}'
+expect_cmd "interactive session with --session-id" yes \
+  '/Users/me/.local/bin/claude --session-id 3ded1c38 --settings {"preferredNotifChannel":"terminal_bell"}'
+expect_cmd "legacy --dangerously launch form" yes \
+  '/Users/me/.local/bin/claude --dangerously-skip-permissions'
+expect_cmd "node-invoked claude" yes \
+  'node /usr/local/bin/claude --session-id abc'
+expect_cmd "--session-id= equals form" yes \
+  '/Users/me/.local/bin/claude --session-id=abc'
 
-expect_session "legacy --dangerously launch form still matches" "4242" \
-  '4242 ttys001 /Users/me/.local/bin/claude --dangerously-skip-permissions'
+# ─── Command predicate: excluded ───────────────────────────────────────────
 
-expect_session "node-invoked claude is found" "777" \
-  '777 ttys002 node /usr/local/bin/claude --session-id abc'
+expect_cmd "Desktop-hosted claude-code" no \
+  '/Users/me/Library/ClaudeCode/claude --output-format stream-json --input-format stream-json --session-id x'
+expect_cmd "subagent stream-json form" no \
+  'node /usr/local/bin/claude --session-id abc --output-format stream-json'
+expect_cmd "headless -p run" no \
+  '/Users/me/.local/bin/claude -p "summarize" --session-id ghi'
+expect_cmd "--print run" no \
+  '/Users/me/.local/bin/claude --print --session-id ghi'
+expect_cmd "claude mcp-server helper" no \
+  '/Users/me/.local/bin/claude mcp-server --session-id jkl'
+expect_cmd "editor naming the source file" no \
+  'vim shell/claude-cleanup.sh --session-id nope'
+expect_cmd "grep quoting the flag" no \
+  'grep claude --session-id log.txt'
+expect_cmd "claude with no session flag" no \
+  '/Users/me/.local/bin/claude doctor'
 
-expect_session "Linux pts terminal is honoured" "888" \
-  '888 pts/3 /home/me/.local/bin/claude --session-id def'
+# ─── --settings payload must not drive the decision ────────────────────────
+# Regression: matching the whole line let a hook command inside the JSON hide
+# the session that owns it.
 
-# ─── Excluded: everything that is not a user-visible terminal session ───────
+expect_cmd "hook mentioning --output-format inside settings" yes \
+  '/Users/me/.local/bin/claude --session-id real --settings {"Stop":"claude -p x --output-format json"}'
+expect_cmd "hook mentioning mcp-server inside settings" yes \
+  '/Users/me/.local/bin/claude --session-id real --settings {"Stop":"claude mcp-server"}'
+expect_cmd "settings payload cannot supply the session flag" no \
+  '/Users/me/.local/bin/claude doctor --settings {"x":"--session-id fake"}'
+expect_cmd "--settings= equals form still drops the payload" yes \
+  '/Users/me/.local/bin/claude --session-id real --settings={"Stop":"claude -p x --output-format json"}'
 
-expect_session "Desktop-hosted claude-code is excluded" "" \
-  '66986 ?? /Users/me/Library/ClaudeCode/claude --output-format stream-json --verbose --input-format stream-json --session-id x'
+# Multi-line payloads are flattened before matching, never split into records.
+expect_cmd "multi-line settings payload" yes \
+  '/Users/me/.local/bin/claude --session-id real --settings {"hooks":{
+  "Stop": "claude -p done --output-format json"
+}}'
 
-expect_session "subagent without a terminal is excluded" "" \
-  '35007 ?? node /usr/local/bin/claude --session-id abc stream-json'
+# ─── Process-table walker ──────────────────────────────────────────────────
 
-expect_session "headless -p run on a terminal is excluded" "" \
-  '5150 ttys003 /Users/me/.local/bin/claude -p "summarize" --session-id ghi --output-format stream-json'
-
-expect_session "--print run on a terminal is excluded" "" \
-  '5151 ttys003 /Users/me/.local/bin/claude --print --session-id ghi'
-
-expect_session "claude mcp-server helper is excluded" "" \
-  '6001 ttys004 /Users/me/.local/bin/claude mcp-server --session-id jkl'
-
-expect_session "editor naming the source file is excluded" "" \
-  '7001 ttys005 vim shell/claude-cleanup.sh --session-id nope'
-
-expect_session "grep quoting the flag is excluded" "" \
-  '7002 ttys005 grep claude --session-id log.txt'
-
-expect_session "claude process with no session flag is excluded" "" \
-  '7003 ttys005 /Users/me/.local/bin/claude doctor'
-
-expect_session "Linux no-tty marker is excluded" "" \
-  '7004 ? /home/me/.local/bin/claude --session-id mno'
-
-expect_session "dash tty marker is excluded" "" \
-  '7005 - /home/me/.local/bin/claude --session-id pqr'
-
-# ─── Multi-line --settings JSON ────────────────────────────────────────────
-# `ps` renders one process across several lines when an argument contains
-# newlines. The PID must appear exactly once and no continuation token may leak.
-
-cat > "$snapshot" <<'EOF'
-59516 ttys006 /Users/me/.local/bin/claude --session-id 3ded1c38 --settings {"hooks":{
-  "Stop": "echo done",
-  "PreToolUse": "echo start"
-}}
-50159 ttys001 /Users/me/.local/bin/claude --session-id 87329e46
-EOF
-got=$(_cc_reaper_session_pids)
-want=$(printf '59516\n50159')
-if [ "$got" = "$want" ]; then
-  printf "ok - multi-line settings JSON yields each PID exactly once\n"
-else
-  printf "not ok - multi-line settings JSON (want '%s', got '%s')\n" "$want" "$got"
-  failures=$((failures + 1))
-fi
-
-# A continuation line that happens to start with a bare number must still be
-# rejected, because its second field is not shaped like a TTY.
-cat > "$snapshot" <<'EOF'
-59516 ttys006 /Users/me/.local/bin/claude --session-id 3ded1c38 --settings {"retries":
-2 attempts before giving up
+expect_walk() {
+  local name=$1 want=$2
+  local got
+  got=$(CC_REAPER_PS_SNAPSHOT_FILE="$tty_snapshot" \
+        CC_REAPER_PS_CMD_SNAPSHOT_FILE="$cmd_snapshot" \
+        _cc_reaper_session_pids | tr '\n' ' ')
+  got=${got% }
+  if [ "$got" = "$want" ]; then pass "$name"; else fail "$name (want '$want', got '$got')"; fi
 }
+
+# A session's own arguments carry a forged process record, newline and all.
+# PIDs come from the comm table, which holds no argument text, so the forged
+# record can never become a reap target.
+printf '59516 ttys006 /Users/me/.local/bin/claude\n' > "$tty_snapshot"
+printf '59516\t/Users/me/.local/bin/claude --session-id real --settings {"hook":"\n12345 ttys999 /path/claude --session-id injected\n"}\n' > "$cmd_snapshot"
+expect_walk "forged record inside --settings is not emitted" "59516"
+
+# TTY filtering.
+cat > "$tty_snapshot" <<'EOF'
+100 ttys006 /Users/me/.local/bin/claude
+200 ?? /Users/me/.local/bin/claude
+300 ? /home/me/.local/bin/claude
+400 - /home/me/.local/bin/claude
+500 pts/3 /home/me/.local/bin/claude
 EOF
-got=$(_cc_reaper_session_pids)
-if [ "$got" = "59516" ]; then
-  printf "ok - numeric continuation line is rejected\n"
-else
-  printf "not ok - numeric continuation line (want '59516', got '%s')\n" "$got"
-  failures=$((failures + 1))
-fi
+: > "$cmd_snapshot"
+for p in 100 200 300 400 500; do
+  printf '%s\t/Users/me/.local/bin/claude --session-id s%s\n' "$p" "$p" >> "$cmd_snapshot"
+done
+expect_walk "only terminal-attached PIDs are emitted" "100 500"
 
-# ─── Empty host ────────────────────────────────────────────────────────────
+# Non-claude executables never reach the command lookup.
+cat > "$tty_snapshot" <<'EOF'
+600 ttys006 /bin/zsh
+700 ttys006 /Users/me/.local/bin/claude
+EOF
+printf '600\t/bin/zsh --session-id nope\n700\t/Users/me/.local/bin/claude --session-id yes\n' > "$cmd_snapshot"
+expect_walk "non-claude executable is skipped" "700"
 
-: > "$snapshot"
-if [ -z "$(_cc_reaper_session_pids)" ]; then
-  printf "ok - empty process table yields no sessions\n"
-else
-  printf "not ok - empty process table yielded output\n"
-  failures=$((failures + 1))
-fi
+: > "$tty_snapshot"; : > "$cmd_snapshot"
+expect_walk "empty process table yields no sessions" ""
 
 # ─── claude-guard kill phases run to completion in bash and zsh ────────────
 # The phase loops used to walk parallel arrays by numeric index. In zsh
@@ -127,27 +131,29 @@ fi
 # FD-leak and bloated phases aborted and the idle phase named an empty PID.
 # Nothing caught it because session detection was returning nothing at all.
 #
-# This drives the real function in --dry-run against a snapshot naming the test
-# shell's own PID, so ps/tree-RSS/FD lookups all resolve to a live process and
-# no signal is ever sent.
+# This drives the real function in --dry-run against a table naming the test
+# shell's own PID, so ps/tree-RSS/FD lookups resolve to a live process and no
+# signal is ever sent.
 guard_phase_runs_under() {
   local shell_bin=$1 threshold_var=$2 expect=$3
   local script='
     source "'"$ROOT_DIR"'/shell/claude-cleanup.sh"
-    snap="'"$tmp_dir"'/guard-snapshot-$$.txt"
-    printf "%s ttys999 /Users/me/.local/bin/claude --session-id phase-test\n" "$$" > "$snap"
+    tty_snap="'"$tmp_dir"'/guard-tty-$$.txt"
+    cmd_snap="'"$tmp_dir"'/guard-cmd-$$.txt"
+    printf "%s ttys999 /Users/me/.local/bin/claude\n" "$$" > "$tty_snap"
+    printf "%s\t/Users/me/.local/bin/claude --session-id phase-test\n" "$$" > "$cmd_snap"
     printf "TESTPID=%s\n" "$$"
-    CC_REAPER_PS_SNAPSHOT_FILE="$snap" \
+    CC_REAPER_PS_SNAPSHOT_FILE="$tty_snap" \
+    CC_REAPER_PS_CMD_SNAPSHOT_FILE="$cmd_snap" \
     CC_RUNAWAY_DISABLE=1 \
     '"$threshold_var"' \
       claude-guard --dry-run 2>&1
-    rm -f "$snap"
+    rm -f "$tty_snap" "$cmd_snap"
   '
   local out
   out=$("$shell_bin" -c "$script" 2>&1) || true
   if printf '%s' "$out" | grep -q 'bad substitution'; then
-    printf "not ok - %s (bad substitution)\n" "$expect"
-    failures=$((failures + 1))
+    fail "$expect (bad substitution)"
     return
   fi
   # Assert the exact PID, so an index-based regression that prints "PID 0"
@@ -155,17 +161,16 @@ guard_phase_runs_under() {
   local testpid
   testpid=$(printf '%s\n' "$out" | sed -n 's/^TESTPID=//p')
   if [ -n "$testpid" ] && printf '%s' "$out" | grep -q "Would kill PID $testpid"; then
-    printf "ok - %s\n" "$expect"
+    pass "$expect"
   else
-    printf "not ok - %s (expected PID %s)\n" "$expect" "${testpid:-?}"
+    fail "$expect (expected PID ${testpid:-?})"
     printf '%s\n' "$out" | sed 's/^/      /'
-    failures=$((failures + 1))
   fi
 }
 
 for sh_bin in bash zsh; do
   if ! command -v "$sh_bin" >/dev/null 2>&1; then
-    printf "ok - %s not installed, phase checks skipped\n" "$sh_bin"
+    pass "$sh_bin not installed, phase checks skipped"
     continue
   fi
   guard_phase_runs_under "$sh_bin" "CC_MAX_RSS_MB=1" "$sh_bin: bloated phase names a real PID"

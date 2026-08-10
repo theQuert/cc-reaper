@@ -416,56 +416,87 @@ _claude_tree_rss() {
   echo "$tree_mb"
 }
 
-# Emit one PID per line for every Claude Code session.
+# Process table carrying PID, TTY, and executable name only. `comm` holds the
+# executable, never the arguments, so nothing a session was launched with can
+# forge a record boundary here. Overridable for tests.
+_cc_reaper_ps_pid_tty_comm() {
+  if [ -n "${CC_REAPER_PS_SNAPSHOT_FILE:-}" ]; then
+    cat "$CC_REAPER_PS_SNAPSHOT_FILE" 2>/dev/null
+  else
+    ps -eo pid=,tty=,comm= 2>/dev/null
+  fi
+}
+
+# Full command line for one PID. Asked for a single process, so a multi-line
+# argument cannot be mistaken for another process's record.
+_cc_reaper_ps_command() {
+  local pid=$1
+  if [ -n "${CC_REAPER_PS_CMD_SNAPSHOT_FILE:-}" ]; then
+    awk -F '\t' -v want="$pid" '$1 == want { print $2 }' \
+      "$CC_REAPER_PS_CMD_SNAPSHOT_FILE" 2>/dev/null
+  else
+    ps -o command= -p "$pid" 2>/dev/null
+  fi
+}
+
+# Decide whether one command line belongs to a Claude Code session.
 #
-# A session is a top-level `claude` CLI process attached to a real terminal.
-# Three families are deliberately excluded, because `claude-guard` reaps whole
-# process groups and a wrong call here terminates live work:
+# A session is a top-level `claude` CLI process. Three families are deliberately
+# excluded, because `claude-guard` reaps whole process groups and a wrong call
+# here terminates live work:
 #
 #   - Desktop-hosted claude-code and stream-json subagents. Both run the same
 #     binary with the same `--output-format stream-json --input-format
 #     stream-json` flags; only the parent chain separates them. Neither holds a
-#     terminal, so requiring one drops both.
+#     terminal, so the caller's terminal requirement drops both.
 #   - Headless `-p` / `--output-format` runs. A batch job sitting below the idle
 #     CPU threshold looks exactly like an abandoned session, and killing one
 #     destroys work with no visible tab to explain it.
 #   - Helper modes such as `claude mcp-server`.
 #
-# `--settings` carries JSON that may contain newlines, so `ps` renders one
-# process across several lines. Continuation lines are dropped by validating the
-# PID and TTY field shapes — the same guard `_cc_monitor_snapshot` uses.
+# Only the CLI's own arguments are inspected. Everything from the first `{` is a
+# `--settings` payload holding arbitrary user text: a hook command in there may
+# legitimately mention `--output-format`, and matching the whole line would hide
+# the very session that owns it.
+_cc_reaper_is_session_cmd() {
+  local cmd
+  cmd=$(printf '%s' "$1" | tr '\n' ' ')
+  cmd=${cmd%%\{*}
+
+  local tok1 tok2 rest
+  read -r tok1 tok2 rest <<< "$cmd"
+  case "${tok1##*/}" in
+    claude) ;;
+    node|bun|deno) [ "${tok2##*/}" = "claude" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+
+  case " $cmd " in
+    *" mcp-server "*) return 1 ;;
+    *" -p "*|*" --print "*|*" --print="*) return 1 ;;
+    *" --output-format "*|*" --output-format="*) return 1 ;;
+  esac
+
+  # Match on any known launch flag rather than one a future release may drop,
+  # which is how the previous matcher went silently blind.
+  case " $cmd " in
+    *" --session-id "*|*" --session-id="*|*" --dangerously"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Emit one PID per line for every Claude Code session attached to a terminal.
 _cc_reaper_session_pids() {
-  if [ -n "${CC_REAPER_PS_SNAPSHOT_FILE:-}" ]; then
-    cat "$CC_REAPER_PS_SNAPSHOT_FILE" 2>/dev/null
-  else
-    ps -eo pid=,tty=,command= 2>/dev/null
-  fi | awk '
-    function base(path,   n, parts) {
-      n = split(path, parts, "/")
-      return parts[n]
-    }
-    # A record starts with a numeric PID and a TTY name. macOS renders "??" and
-    # Linux "?" or "-" for no terminal; a continuation line matches neither.
-    $1 !~ /^[0-9]+$/ { next }
-    $2 !~ /^(tty|pts|console)/ { next }
-    {
-      # The executable is either claude itself or a runtime invoking it.
-      exe = base($3)
-      argv1 = (NF >= 4 ? base($4) : "")
-      if (exe != "claude" && \
-          !((exe == "node" || exe == "bun" || exe == "deno") && argv1 == "claude")) next
-
-      if ($0 ~ /(^| )mcp-server( |$)/) next
-      if ($0 ~ /--output-format/) next
-      if ($0 ~ /(^| )-p( |$)/ || $0 ~ /--print( |$)/) next
-
-      # Match the session by any known launch flag rather than one that a future
-      # release may drop, which is how the previous matcher went silently blind.
-      if ($0 !~ /--session-id/ && $0 !~ /--dangerously/) next
-
-      print $1
-    }
-  '
+  local pid tty comm
+  while read -r pid tty comm; do
+    [ -n "$pid" ] || continue
+    # macOS renders "??" for no terminal, Linux "?" or "-"; none match these.
+    case "$tty" in tty*|pts*|console*) ;; *) continue ;; esac
+    case "${comm##*/}" in claude|node|bun|deno) ;; *) continue ;; esac
+    if _cc_reaper_is_session_cmd "$(_cc_reaper_ps_command "$pid")"; then
+      printf '%s\n' "$pid"
+    fi
+  done < <(_cc_reaper_ps_pid_tty_comm)
 }
 
 # Show file descriptor usage for Claude Code processes
