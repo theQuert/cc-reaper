@@ -74,8 +74,29 @@ exactly once, and no token from that argument SHALL ever be emitted as a PID.
 
 ### Requirement: Only the CLI's own arguments decide session status
 The system SHALL ignore the `--settings` payload when testing for session and exclusion
-flags. Everything from the first `{` of the command line is user-supplied data and SHALL NOT
+flags. Every balanced `{…}` region of the command line is user-supplied data and SHALL NOT
 qualify or disqualify a session.
+
+The payload SHALL be cut out rather than truncated at, so top-level arguments written after
+it still count. Braces inside JSON strings SHALL NOT affect the pairing. When the braces
+never balance, the command SHALL be rejected: a missed session leaves the reaper inert,
+while trusting a half-parsed line could hand `claude-guard` the wrong process group.
+
+#### Scenario: Exclusion flag written after the payload
+- **WHEN** `claude --session-id real --settings={} --output-format json` runs on a terminal
+- **THEN** it SHALL NOT be reported, because `--output-format` is a top-level argument even though it follows the payload
+
+#### Scenario: Session flag written after the payload
+- **WHEN** `claude --settings={} --session-id real` runs on a terminal
+- **THEN** it SHALL be reported
+
+#### Scenario: Braces inside a JSON string
+- **WHEN** the payload is `{"a":"}{"}`
+- **THEN** the region SHALL still be treated as balanced and the session reported
+
+#### Scenario: Braces never balance
+- **WHEN** the command line ends mid-payload, as in `--settings {"truncated":`
+- **THEN** the command SHALL NOT be reported as a session
 
 #### Scenario: Hook command inside settings names an exclusion flag
 - **WHEN** an interactive session's `--settings` JSON contains a hook such as `claude -p x --output-format json`

@@ -6,7 +6,7 @@
 #   _cc_reaper_is_session_cmd  — pure predicate over one command line
 #   _cc_reaper_session_pids    — walks the process table, fed by
 #                                CC_REAPER_PS_SNAPSHOT_FILE (pid tty comm) and
-#                                CC_REAPER_PS_CMD_SNAPSHOT_FILE (pid<TAB>command)
+#                                CC_REAPER_PS_CMD_SNAPSHOT_DIR (one file per PID)
 # so no real process is inspected and nothing is ever signalled.
 set -euo pipefail
 
@@ -18,7 +18,8 @@ failures=0
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-reaper-session-test.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT
 tty_snapshot="$tmp_dir/ps-tty.txt"
-cmd_snapshot="$tmp_dir/ps-cmd.txt"
+cmd_dir="$tmp_dir/ps-cmd"
+mkdir -p "$cmd_dir"
 
 pass() { printf "ok - %s\n" "$1"; }
 fail() { printf "not ok - %s\n" "$1"; failures=$((failures + 1)); }
@@ -81,26 +82,60 @@ expect_cmd "multi-line settings payload" yes \
   "Stop": "claude -p done --output-format json"
 }}'
 
+# ─── Top-level flags after the payload still count ─────────────────────────
+# Regression: truncating at the first `{` discarded every later argument, so a
+# headless run reading `--settings={} --output-format json` was classified as a
+# session and became reapable, while `--settings={} --session-id x` went unseen.
+
+expect_cmd "exclusion flag after an inline payload" no \
+  '/Users/me/.local/bin/claude --session-id real --settings={} --output-format json'
+expect_cmd "session flag after an inline payload" yes \
+  '/Users/me/.local/bin/claude --settings={} --session-id real'
+expect_cmd "flag after a nested payload" yes \
+  '/Users/me/.local/bin/claude --session-id real --settings {"hooks":{"Stop":"x"}} --verbose'
+expect_cmd "exclusion flag after a nested payload" no \
+  '/Users/me/.local/bin/claude --session-id real --settings {"hooks":{"Stop":"x"}} --print'
+
+# Braces inside JSON strings must not unbalance the scan.
+expect_cmd "braces inside a JSON string" yes \
+  '/Users/me/.local/bin/claude --session-id real --settings {"a":"}{"}'
+expect_cmd "escaped quote inside a JSON string" yes \
+  '/Users/me/.local/bin/claude --session-id real --settings {"a":"say \"hi\" }"} --verbose'
+
+# Unbalanced braces mean the line cannot be parsed with confidence. Fail closed:
+# a missed session leaves the reaper inert, a false one hands claude-guard the
+# wrong process group.
+expect_cmd "unbalanced braces are rejected" no \
+  '/Users/me/.local/bin/claude --session-id real --settings {"truncated":'
+
 # ─── Process-table walker ──────────────────────────────────────────────────
 
 expect_walk() {
   local name=$1 want=$2
   local got
   got=$(CC_REAPER_PS_SNAPSHOT_FILE="$tty_snapshot" \
-        CC_REAPER_PS_CMD_SNAPSHOT_FILE="$cmd_snapshot" \
+        CC_REAPER_PS_CMD_SNAPSHOT_DIR="$cmd_dir" \
         _cc_reaper_session_pids | tr '\n' ' ')
   got=${got% }
   if [ "$got" = "$want" ]; then pass "$name"; else fail "$name (want '$want', got '$got')"; fi
 }
 
-# A session's own arguments carry a forged process record, newline and all.
-# PIDs come from the comm table, which holds no argument text, so the forged
-# record can never become a reap target.
+reset_fixtures() { : > "$tty_snapshot"; rm -rf "$cmd_dir"; mkdir -p "$cmd_dir"; }
+
+# A session's own arguments carry a forged process record, newline and all, as
+# `ps -o command=` would render it. PIDs come from the comm table, which holds
+# no argument text, so the forged record can never become a reap target.
+reset_fixtures
 printf '59516 ttys006 /Users/me/.local/bin/claude\n' > "$tty_snapshot"
-printf '59516\t/Users/me/.local/bin/claude --session-id real --settings {"hook":"\n12345 ttys999 /path/claude --session-id injected\n"}\n' > "$cmd_snapshot"
+cat > "$cmd_dir/59516" <<'EOF'
+/Users/me/.local/bin/claude --session-id real --settings {"hook":"
+12345 ttys999 /path/claude --session-id injected
+"}
+EOF
 expect_walk "forged record inside --settings is not emitted" "59516"
 
 # TTY filtering.
+reset_fixtures
 cat > "$tty_snapshot" <<'EOF'
 100 ttys006 /Users/me/.local/bin/claude
 200 ?? /Users/me/.local/bin/claude
@@ -108,21 +143,22 @@ cat > "$tty_snapshot" <<'EOF'
 400 - /home/me/.local/bin/claude
 500 pts/3 /home/me/.local/bin/claude
 EOF
-: > "$cmd_snapshot"
 for p in 100 200 300 400 500; do
-  printf '%s\t/Users/me/.local/bin/claude --session-id s%s\n' "$p" "$p" >> "$cmd_snapshot"
+  printf '/Users/me/.local/bin/claude --session-id s%s\n' "$p" > "$cmd_dir/$p"
 done
 expect_walk "only terminal-attached PIDs are emitted" "100 500"
 
 # Non-claude executables never reach the command lookup.
+reset_fixtures
 cat > "$tty_snapshot" <<'EOF'
 600 ttys006 /bin/zsh
 700 ttys006 /Users/me/.local/bin/claude
 EOF
-printf '600\t/bin/zsh --session-id nope\n700\t/Users/me/.local/bin/claude --session-id yes\n' > "$cmd_snapshot"
+printf '/bin/zsh --session-id nope\n' > "$cmd_dir/600"
+printf '/Users/me/.local/bin/claude --session-id yes\n' > "$cmd_dir/700"
 expect_walk "non-claude executable is skipped" "700"
 
-: > "$tty_snapshot"; : > "$cmd_snapshot"
+reset_fixtures
 expect_walk "empty process table yields no sessions" ""
 
 # ─── claude-guard kill phases run to completion in bash and zsh ────────────
@@ -139,16 +175,16 @@ guard_phase_runs_under() {
   local script='
     source "'"$ROOT_DIR"'/shell/claude-cleanup.sh"
     tty_snap="'"$tmp_dir"'/guard-tty-$$.txt"
-    cmd_snap="'"$tmp_dir"'/guard-cmd-$$.txt"
+    cmd_dir="'"$tmp_dir"'/guard-cmd-$$"; mkdir -p "$cmd_dir"
     printf "%s ttys999 /Users/me/.local/bin/claude\n" "$$" > "$tty_snap"
-    printf "%s\t/Users/me/.local/bin/claude --session-id phase-test\n" "$$" > "$cmd_snap"
+    printf "/Users/me/.local/bin/claude --session-id phase-test\n" > "$cmd_dir/$$"
     printf "TESTPID=%s\n" "$$"
     CC_REAPER_PS_SNAPSHOT_FILE="$tty_snap" \
-    CC_REAPER_PS_CMD_SNAPSHOT_FILE="$cmd_snap" \
+    CC_REAPER_PS_CMD_SNAPSHOT_DIR="$cmd_dir" \
     CC_RUNAWAY_DISABLE=1 \
     '"$threshold_var"' \
       claude-guard --dry-run 2>&1
-    rm -f "$tty_snap" "$cmd_snap"
+    rm -rf "$tty_snap" "$cmd_dir"
   '
   local out
   out=$("$shell_bin" -c "$script" 2>&1) || true

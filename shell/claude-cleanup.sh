@@ -429,14 +429,50 @@ _cc_reaper_ps_pid_tty_comm() {
 
 # Full command line for one PID. Asked for a single process, so a multi-line
 # argument cannot be mistaken for another process's record.
+# One file per PID, so a fixture can hold the embedded newlines a real
+# `--settings` argument produces.
 _cc_reaper_ps_command() {
   local pid=$1
-  if [ -n "${CC_REAPER_PS_CMD_SNAPSHOT_FILE:-}" ]; then
-    awk -F '\t' -v want="$pid" '$1 == want { print $2 }' \
-      "$CC_REAPER_PS_CMD_SNAPSHOT_FILE" 2>/dev/null
+  if [ -n "${CC_REAPER_PS_CMD_SNAPSHOT_DIR:-}" ]; then
+    cat "$CC_REAPER_PS_CMD_SNAPSHOT_DIR/$pid" 2>/dev/null
   else
     ps -o command= -p "$pid" 2>/dev/null
   fi
+}
+
+# Remove every balanced `{…}` region from a command line, leaving the CLI's own
+# arguments on both sides of it intact. `ps` joins argv with spaces, so the
+# boundaries of a `--settings` value cannot be recovered exactly; brace depth is
+# the one structural marker JSON always provides. Braces inside JSON strings are
+# not counted, so a payload like {"a":"}{"} stays balanced.
+#
+# Fails (non-zero, no output) when the braces never balance — a truncated or
+# hand-crafted argument. Callers treat that as "not a session": missing a session
+# leaves the reaper inert, while trusting a half-parsed line could hand
+# claude-guard the wrong process group.
+_cc_reaper_strip_brace_args() {
+  printf '%s' "$1" | awk '
+    {
+      out = ""; depth = 0; instr = 0; esc = 0
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        ch = substr($0, i, 1)
+        if (instr) {
+          if (esc) { esc = 0 }
+          else if (ch == "\\") { esc = 1 }
+          else if (ch == "\"") { instr = 0 }
+          if (depth == 0) out = out ch
+          continue
+        }
+        if (ch == "\"") { instr = 1; if (depth == 0) out = out ch; continue }
+        if (ch == "{") { depth++; continue }
+        if (ch == "}") { if (depth > 0) depth--; continue }
+        if (depth == 0) out = out ch
+      }
+      if (depth != 0) exit 1
+      print out
+    }
+  '
 }
 
 # Decide whether one command line belongs to a Claude Code session.
@@ -454,14 +490,15 @@ _cc_reaper_ps_command() {
 #     destroys work with no visible tab to explain it.
 #   - Helper modes such as `claude mcp-server`.
 #
-# Only the CLI's own arguments are inspected. Everything from the first `{` is a
-# `--settings` payload holding arbitrary user text: a hook command in there may
-# legitimately mention `--output-format`, and matching the whole line would hide
-# the very session that owns it.
+# Only the CLI's own arguments are inspected. A `--settings` payload holds
+# arbitrary user text: a hook command in there may legitimately mention
+# `--output-format`, and matching the whole line would hide the very session that
+# owns it. The payload is cut out rather than truncated at, so top-level flags
+# written after `--settings` still count.
 _cc_reaper_is_session_cmd() {
   local cmd
   cmd=$(printf '%s' "$1" | tr '\n' ' ')
-  cmd=${cmd%%\{*}
+  cmd=$(_cc_reaper_strip_brace_args "$cmd") || return 1
 
   local tok1 tok2 rest
   read -r tok1 tok2 rest <<< "$cmd"

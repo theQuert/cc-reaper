@@ -40,8 +40,10 @@ live and over a threshold would take its group with it.
   candidate PID and TTY come from `ps -eo pid=,tty=,comm=`, which carries the executable
   name and no arguments; the command line is then fetched per PID and judged by
   `_cc_reaper_is_session_cmd`.
-- Judge only the CLI's own arguments. Everything from the first `{` is the `--settings`
-  payload and neither qualifies nor disqualifies a session.
+- Judge only the CLI's own arguments. Balanced `{…}` regions are the `--settings` payload and
+  neither qualify nor disqualify a session. The payload is cut out rather than truncated at,
+  so top-level flags written after `--settings` still count; braces inside JSON strings do not
+  affect the pairing, and an unbalanced line is rejected rather than half-trusted.
 - Add a regression test that pins each inclusion and exclusion case, driving the predicate
   and the table walker as separate seams.
 

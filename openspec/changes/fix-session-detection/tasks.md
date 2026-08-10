@@ -26,18 +26,20 @@ which is the shell this project installs into.
 Both reproduced against `8466a1e` before fixing.
 
 - [x] 4.1 P2 — a `--settings` payload containing `12345 ttys999 /path/claude --session-id injected` passed every shape check and emitted `12345`; a live process with that PID over a threshold would have had its whole group reaped. Split detection so candidate PIDs come from `ps -eo pid=,tty=,comm=`, which carries no argument text, and fetch the command line per PID.
-- [x] 4.2 P2 — a session whose `--settings` JSON held a hook mentioning `--output-format` was excluded, blinding all three commands to it. `_cc_reaper_is_session_cmd` now drops everything from the first `{` before testing any flag.
+- [x] 4.2 P2 — a session whose `--settings` JSON held a hook mentioning `--output-format` was excluded, blinding all three commands to it. `_cc_reaper_is_session_cmd` now removes the payload before testing any flag (first cut at the brace, then corrected in 4.4).
 - [x] 4.3 Confirm genuine headless runs, `mcp-server`, and Desktop-hosted sessions are still excluded after the payload change
-- [x] 4.4 Confirm the payload guard has teeth: removing the truncation fails 3 tests
+- [x] 4.4 P2 (second round) — cutting at the first `{` discarded every argument after `--settings`, so `--settings={} --output-format json` was misclassified as a session and became reapable, while `--settings={} --session-id x` went unseen. `_cc_reaper_strip_brace_args` now removes balanced `{…}` regions instead, keeping later top-level flags, ignoring braces inside JSON strings, and rejecting unbalanced lines outright
+- [x] 4.5 Confirm the payload guard has teeth: restoring the truncation fails 4 tests
 
 ## 5. Regression proof
 
-- [x] 5.1 `tests/guard-session-detect.sh` covers every scenario in the spec delta, driving the command predicate and the table walker as separate seams
+- [x] 5.1 `tests/guard-session-detect.sh` covers every scenario in the spec delta (34 checks), driving the command predicate and the table walker as separate seams
 - [x] 5.2 Assert a forged process record inside `--settings` never becomes a PID
-- [x] 5.3 Assert a payload flag neither disqualifies a real session nor qualifies a non-session
+- [x] 5.3 Assert a payload flag neither disqualifies a real session nor qualifies a non-session, and that top-level flags after the payload still count in both directions
 - [x] 5.4 Drive all three kill phases end-to-end in `--dry-run` under both bash and zsh, asserting the exact PID so an index regression printing `PID 0` cannot pass
 - [x] 5.5 Confirm the phase checks fail when the index-based loops are restored (6/6 fail; zsh reports `bad substitution`)
-- [x] 5.6 Full suite green: 13 test scripts, plus `bash -n` and `zsh -n` on all three shell entry points
+- [x] 5.6 Fixture fidelity: the command override is a directory of per-PID files, since TSV cannot hold the newlines a real `--settings` argument produces
+- [x] 5.7 Full suite green: 13 test scripts, plus `bash -n` and `zsh -n` on all three shell entry points
 
 ## 6. Live verification
 
