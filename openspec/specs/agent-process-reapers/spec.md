@@ -129,9 +129,15 @@ Three cleanup paths exist and they do not share one rule. They differ both in wh
 |---|---|---|
 | Pattern-based candidacy | full precedence chain below, including the user `cleanup` override | per-branch predicate, see below |
 | Process-group cleanup | immutable, user `protect`, or built-in protected pattern | group membership alone |
-| Runaway phase | built-in protected pattern selects processes *into* it; only a user `protect` rule exempts | CPU ≥ `CC_RUNAWAY_CPU` and etime ≥ `CC_RUNAWAY_MIN` |
+| Runaway phase | built-in protected pattern selects processes *into* it; a user `protect` rule exempts at selection, and the group-kill MCP whitelist exempts again at the signal stage | CPU ≥ `CC_RUNAWAY_CPU` and etime ≥ `CC_RUNAWAY_MIN` |
 
-Two consequences are easy to miss. Process-group cleanup signals every member that is not directly protected on membership alone, so a recent, still-attached member of an orphaned group is reaped without its own staleness being consulted, and a user `cleanup` rule has no effect there. The runaway phase consults only the built-in protected pattern, so immutability does not reach it: a system scanner that appears in both sets is a runaway candidate once it is hot and old enough.
+Three consequences are easy to miss.
+
+Process-group cleanup signals every member that is not directly protected on membership alone, so a recent, still-attached member of an orphaned group is reaped without its own staleness being consulted, and a user `cleanup` rule has no effect there.
+
+The runaway phase consults only the built-in protected pattern at selection, so immutability does not reach it: a system scanner that appears in both sets is a runaway candidate once it is hot and old enough.
+
+Selection and signalling are separate stages, and they apply different lists. The runaway phase selects on the protected pattern but signals through the group-kill path, which skips members matching its own MCP whitelist. A shared MCP server that goes runaway — `chrome-devtools-mcp`, `context7-mcp`, `sequential-thinking` — is therefore selected, waited on through the grace window, and then not signalled. The counters do not model this: the phase reports the candidate as reaped and adds its tree RSS to the freed total either way.
 
 Candidacy for **pattern-based** cleanup is decided first-match against the process's own command line:
 
@@ -211,12 +217,18 @@ An orphaned parent is therefore sufficient on its own for the two family rungs, 
 - **THEN** that member SHALL still be spared, because the `cleanup` override applies to pattern-based candidacy only
 
 #### Scenario: Protected application is stuck hot
-- **WHEN** a whitelisted application meets the runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` over etime ≥ `CC_RUNAWAY_MIN`)
+- **WHEN** a whitelisted application such as `ChatGPT.app` or `cmux.app` meets the runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` over etime ≥ `CC_RUNAWAY_MIN`)
 - **THEN** the runaway phase SHALL signal it after the grace window, because the whitelist protects an application that is working, not one that is stuck
+- **AND** this holds because applications are absent from the group-kill MCP whitelist; a runaway MCP server in that list reaches the opposite outcome, below
 
 #### Scenario: User protect rule during the runaway phase
 - **WHEN** a process covered by a user `protect` rule meets the runaway thresholds
-- **THEN** it SHALL NOT be signalled, because a user rule outranks the built-in exception
+- **THEN** it SHALL NOT be selected, because a user rule outranks the built-in exception
+
+#### Scenario: Runaway candidate is a whitelisted MCP server
+- **WHEN** a shared MCP server such as `chrome-devtools-mcp` meets the runaway thresholds
+- **THEN** it SHALL be selected and listed, and SHALL NOT be signalled, because the group-kill path skips members matching its MCP whitelist
+- **AND** the reported reaped count and freed total SHALL still include it, since the phase does not observe whether a signal was delivered
 
 ### Requirement: Stale threshold is configurable
 The system SHALL expose configurable stale-age thresholds for browser automation and agent background cleanup with conservative defaults.
