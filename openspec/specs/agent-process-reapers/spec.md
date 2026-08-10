@@ -1,7 +1,8 @@
 # agent-process-reapers Specification
 
 ## Purpose
-TBD - created by archiving change agent-process-reapers. Update Purpose after archive.
+Reaping of leaked agent automation: orphan-parent detection shared across the Stop hook, `claude-cleanup`, and the orphan report; stale browser/Puppeteer/Codex process families; the runaway-protected-process phase; and the definition of a Claude Code session that `claude-guard`, `claude-sessions`, and `claude-fd` reap against. Safety boundaries here decide what cc-reaper may never signal.
+
 ## Requirements
 ### Requirement: Cross-platform orphan parent detection
 
@@ -111,6 +112,29 @@ The system SHALL keep explicit safety boundaries for processes that are not part
 #### Scenario: Headless batch run is active during guard
 - **WHEN** `claude-guard` runs while a headless `claude -p` batch job sits at 0% CPU
 - **THEN** the batch job SHALL NOT be counted toward `CC_MAX_SESSIONS` and SHALL NOT be signalled
+
+### Requirement: Protection covers the matched process, not its descendants
+The protected-pattern whitelist SHALL apply to a process whose own command line matches a protected pattern. A descendant SHALL be judged on its own command line and its own detached/stale state, not on its ancestry.
+
+This is deliberate. A protected application's leaked helpers are exactly what cc-reaper exists to reclaim: they carry no marker of their parent, and once detached and past `CC_AGENT_STALE_MINUTES` they are indistinguishable from any other orphaned MCP server. Extending protection along the parent chain would place a leaking app's garbage permanently out of reach, leaving no recovery short of quitting the app.
+
+The converse also holds: a live descendant that has not met the stale and detached criteria SHALL NOT be reaped, so protecting the application in practice protects the work it is currently doing.
+
+#### Scenario: Protected application itself
+- **WHEN** cleanup runs while `ChatGPT.app`, `cmux.app`, or another whitelisted application is running
+- **THEN** that process SHALL NOT be signalled
+
+#### Scenario: Live descendant of a protected application
+- **WHEN** a whitelisted application has spawned MCP servers that are still attached to it and below the stale threshold
+- **THEN** they SHALL NOT be signalled, because they fail the detached and stale criteria on their own merits
+
+#### Scenario: Leaked descendant of a protected application
+- **WHEN** a whitelisted application has leaked `npx`-spawned MCP servers that are detached and older than `CC_AGENT_STALE_MINUTES`
+- **THEN** they SHALL be reaped, because a leaked helper carries no marker of its parent and is indistinguishable from any other orphan
+
+#### Scenario: Reaping a leaked descendant does not disturb the application
+- **WHEN** those leaked helpers are reaped
+- **THEN** the whitelisted application itself SHALL remain running
 
 ### Requirement: Stale threshold is configurable
 The system SHALL expose configurable stale-age thresholds for browser automation and agent background cleanup with conservative defaults.
