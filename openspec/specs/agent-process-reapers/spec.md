@@ -118,6 +118,8 @@ The protected-pattern whitelist SHALL apply to a process whose own command line 
 
 This is deliberate. A protected application's leaked helpers are exactly what cc-reaper exists to reclaim: they carry no marker of their parent, and once detached and past `CC_AGENT_STALE_MINUTES` they are indistinguishable from any other orphaned MCP server. Extending protection along the parent chain would place a leaking app's garbage permanently out of reach, leaving no recovery short of quitting the app.
 
+The rule cuts both ways, and that is the point: a descendant whose own command line matches a protected pattern is exempt no matter who spawned it, exactly as a descendant that matches nothing is reapable no matter who spawned it. Ancestry is not consulted in either direction.
+
 The converse also holds: a live descendant that has not met the stale and detached criteria SHALL NOT be reaped, so protecting the application in practice protects the work it is currently doing.
 
 This requirement governs stale/orphan cleanup only. The runaway phase below is a deliberate exception: it selects its candidates *from* the protected set, so a whitelisted application that is stuck hot SHALL still be signalled after its grace window. A user `protect` rule is honoured in both paths and has no such exception.
@@ -139,8 +141,12 @@ This requirement governs stale/orphan cleanup only. The runaway phase below is a
 - **THEN** they SHALL NOT be signalled, because they fail the detached and stale criteria on their own merits
 
 #### Scenario: Leaked descendant of a protected application
-- **WHEN** a whitelisted application has leaked `npx`-spawned MCP servers that are detached and older than `CC_AGENT_STALE_MINUTES`
+- **WHEN** a whitelisted application has leaked `npx`-spawned MCP servers that are detached, older than `CC_AGENT_STALE_MINUTES`, and whose **own** command lines match no protected pattern
 - **THEN** they SHALL be reaped, because a leaked helper carries no marker of its parent and is indistinguishable from any other orphan
+
+#### Scenario: Leaked descendant is itself a whitelisted service
+- **WHEN** the leaked descendant's own command line matches a protected pattern — `chrome-devtools-mcp`, `context7-mcp`, `sequential-thinking`, or another shared service
+- **THEN** it SHALL be exempt and survive, because the same rule that judges a descendant on its own command line protects it here; ancestry neither condemns nor saves it
 
 #### Scenario: Reaping a leaked descendant does not disturb the application
 - **WHEN** those leaked helpers are reaped
