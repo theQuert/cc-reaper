@@ -2,7 +2,7 @@
 
 ## Purpose
 
-A hard memory ceiling for Claude Code sessions. `claude-guard` terminates any session whose tree RSS (session plus descendants) exceeds `CC_MAX_RSS_MB`, regardless of whether the session is idle or active, because a leaking session can balloon to multiple GB while still busy.
+A hard memory ceiling for Claude Code sessions. `claude-guard` terminates any session whose tree RSS meets or exceeds `CC_MAX_RSS_MB`, regardless of whether the session is idle or active, because a leaking session can balloon to multiple GB while still busy. Tree RSS covers the session process, its children, and its grandchildren.
 
 ## Requirements
 
@@ -22,19 +22,39 @@ The system SHALL support a configurable RSS threshold via the `CC_MAX_RSS_MB` en
 - **THEN** the system SHALL fall back to the default 4096 MB and print a warning
 
 ### Requirement: Tree RSS calculation
-The system SHALL calculate tree RSS as the sum of RSS of the session process and all its descendant processes (children + grandchildren), matching the existing `claude-sessions` logic.
+The system SHALL calculate tree RSS as the sum of RSS of the session process, its direct children, and its grandchildren — two generations, matching the existing `claude-sessions` logic. It SHALL NOT recurse further.
+
+Anything deeper is therefore not counted, so a session behind a long wrapper chain (CLI → `npm` → shell → server) is undercounted. On ordinary sessions the shortfall is around 1% (measured: 3–4 MB on trees of 6–10 processes), which is why the bound is accepted rather than paid for with a full recursive walk on every sampled session. Widening it is a behavior change, not a wording change.
 
 #### Scenario: Session with MCP server children
 - **WHEN** a Claude session (PID 1000) has 3 child MCP servers each using 200 MB, and the session itself uses 500 MB
 - **THEN** tree RSS SHALL be calculated as 1100 MB
 
 ### Requirement: Bloated session detection
-The system SHALL mark sessions as `[BLOATED]` when their tree RSS **meets or exceeds** the configured threshold. Tree RSS is carried as whole megabytes, so equality is a reachable boundary and is treated as bloated.
+The system SHALL mark a session as `[BLOATED]` when its tree RSS **meets or exceeds** the configured threshold **and** it has not already matched a higher-priority status. Tree RSS is carried as whole megabytes, so equality is a reachable boundary and is treated as bloated.
+
+Classification is first-match in this order, so each session carries exactly one status:
+
+1. `[USER-PROTECTED]` — a user `protect` rule covers the session
+2. `[FD-LEAK]` — file descriptors meet or exceed `CC_MAX_FD`
+3. `[BLOATED]` — tree RSS meets or exceeds `CC_MAX_RSS_MB`
+4. `[IDLE]` — CPU is below `CC_IDLE_THRESHOLD`
+5. `LIVE` — none of the above
+
+An over-threshold session that is also leaking descriptors is reaped by the FD-leak phase, with that phase's notification, not this one.
 
 #### Scenario: Session exceeds threshold
 - **WHEN** `claude-guard` runs and a session's tree RSS is 5000 MB
 - **AND** `CC_MAX_RSS_MB` is 4096
 - **THEN** the session SHALL be marked as `[BLOATED]`
+
+#### Scenario: Over-threshold session is also leaking descriptors
+- **WHEN** a session's tree RSS is 5000 MB against a 4096 MB threshold **and** its descriptor count meets `CC_MAX_FD`
+- **THEN** the session SHALL be marked `[FD-LEAK]` rather than `[BLOATED]`, and SHALL be reaped by the FD-leak phase
+
+#### Scenario: Over-threshold session is covered by a user protect rule
+- **WHEN** a session's tree RSS exceeds the threshold and a user `protect` rule covers it
+- **THEN** the session SHALL be marked `[USER-PROTECTED]`, SHALL count as live, and SHALL NOT be reaped
 
 #### Scenario: Session exactly at threshold
 - **WHEN** `claude-guard` runs and a session's tree RSS is 4096 MB
