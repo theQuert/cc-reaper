@@ -2,7 +2,9 @@
 
 ## Purpose
 
-A hard memory ceiling for Claude Code sessions. `claude-guard` terminates any session whose tree RSS meets or exceeds `CC_MAX_RSS_MB`, regardless of whether the session is idle or active, because a leaking session can balloon to multiple GB while still busy. Tree RSS covers the session process, its children, and its grandchildren.
+A hard memory ceiling for Claude Code sessions. `claude-guard` terminates a session whose tree RSS meets or exceeds `CC_MAX_RSS_MB` whether it is idle or active, because a leaking session can balloon to multiple GB while still busy. A session covered by a user `protect` rule is exempt, and one that is also leaking descriptors is handled by the FD-leak phase instead.
+
+Tree RSS covers the session process, its children, and its grandchildren, each truncated to whole megabytes before summation.
 
 ## Requirements
 
@@ -22,13 +24,30 @@ The system SHALL support a configurable RSS threshold via the `CC_MAX_RSS_MB` en
 - **THEN** the system SHALL fall back to the default 4096 MB and print a warning
 
 ### Requirement: Tree RSS calculation
-The system SHALL calculate tree RSS as the sum of RSS of the session process, its direct children, and its grandchildren — two generations, matching the existing `claude-sessions` logic. It SHALL NOT recurse further.
+The system SHALL calculate tree RSS over the session process, its direct children, and its grandchildren — two generations, matching the existing `claude-sessions` logic. It SHALL NOT recurse further.
 
-Anything deeper is therefore not counted, so a session behind a long wrapper chain (CLI → `npm` → shell → server) is undercounted. On ordinary sessions the shortfall is around 1% (measured: 3–4 MB on trees of 6–10 processes), which is why the bound is accepted rather than paid for with a full recursive walk on every sampled session. Widening it is a behavior change, not a wording change.
+Each member's RSS SHALL be truncated to whole megabytes **before** summation, not summed in kilobytes and converted once. The two behaviours differ, and the shipped helper truncates per process.
+
+Both bounds make tree RSS a slight underestimate, so a session crosses the threshold marginally later than its true footprint would suggest:
+
+| Source | Measured on four live sessions (6–10 processes each) |
+|---|---|
+| Per-process truncation | 2–4 MB |
+| Generations beyond grandchildren | 0–1 MB |
+
+Truncation dominates and scales with process count — roughly 0.5 MB per member — while depth costs almost nothing on ordinary session trees; a long wrapper chain (CLI → `npm` → shell → server) would shift that balance. Both are accepted rather than paid for on every sampled session. Changing either is a behavior change, not a wording change.
 
 #### Scenario: Session with MCP server children
 - **WHEN** a Claude session (PID 1000) has 3 child MCP servers each using 200 MB, and the session itself uses 500 MB
 - **THEN** tree RSS SHALL be calculated as 1100 MB
+
+#### Scenario: Members carry fractional megabytes
+- **WHEN** a session's own RSS is 4095 MB plus 1023 KB and its single child holds 1 KB
+- **THEN** tree RSS SHALL be 4095 MB, because each member is truncated before summation — summing in kilobytes first would give 4096 MB and reach the threshold a member earlier
+
+#### Scenario: Great-grandchild process
+- **WHEN** a session's grandchild has spawned a further child of its own
+- **THEN** that process's RSS SHALL NOT be included in tree RSS
 
 ### Requirement: Bloated session detection
 The system SHALL mark a session as `[BLOATED]` when its tree RSS **meets or exceeds** the configured threshold **and** it has not already matched a higher-priority status. Tree RSS is carried as whole megabytes, so equality is a reachable boundary and is treated as bloated.
