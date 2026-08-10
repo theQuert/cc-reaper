@@ -29,10 +29,15 @@ The system SHALL calculate tree RSS as the sum of RSS of the session process and
 - **THEN** tree RSS SHALL be calculated as 1100 MB
 
 ### Requirement: Bloated session detection
-The system SHALL mark sessions as `[BLOATED]` when their tree RSS exceeds the configured threshold.
+The system SHALL mark sessions as `[BLOATED]` when their tree RSS **meets or exceeds** the configured threshold. Tree RSS is carried as whole megabytes, so equality is a reachable boundary and is treated as bloated.
 
 #### Scenario: Session exceeds threshold
 - **WHEN** `claude-guard` runs and a session's tree RSS is 5000 MB
+- **AND** `CC_MAX_RSS_MB` is 4096
+- **THEN** the session SHALL be marked as `[BLOATED]`
+
+#### Scenario: Session exactly at threshold
+- **WHEN** `claude-guard` runs and a session's tree RSS is 4096 MB
 - **AND** `CC_MAX_RSS_MB` is 4096
 - **THEN** the session SHALL be marked as `[BLOATED]`
 
@@ -42,15 +47,21 @@ The system SHALL mark sessions as `[BLOATED]` when their tree RSS exceeds the co
 - **THEN** the session SHALL NOT be marked as `[BLOATED]`
 
 ### Requirement: Bloated session termination
-The system SHALL kill bloated sessions using PGID-based process group termination (`kill -- -$PGID`), regardless of whether the session is idle or active.
+The system SHALL terminate bloated sessions PGID-aware, regardless of whether the session is idle or active: it SHALL enumerate the members of the session's process group and signal each one individually, skipping any member that matches the shared-service whitelist or a user `protect` rule.
 
-#### Scenario: Active session exceeds threshold
-- **WHEN** a session is active (CPU > 1%) but tree RSS exceeds the threshold
-- **THEN** the system SHALL kill the entire process group via PGID
+It SHALL NOT signal the group as a whole (`kill -- -$PGID`), because that would take shared MCP services down with it and contradict the safety boundaries in the `agent-process-reapers` capability.
 
-#### Scenario: Idle session exceeds threshold
-- **WHEN** a session is idle (CPU < 1%) and tree RSS exceeds the threshold
-- **THEN** the system SHALL kill the entire process group via PGID (bloated takes priority over idle)
+#### Scenario: Active session meets threshold
+- **WHEN** a session is active (CPU > 1%) but tree RSS meets or exceeds the threshold
+- **THEN** the system SHALL signal each member of its process group individually
+
+#### Scenario: Idle session meets threshold
+- **WHEN** a session is idle (CPU < 1%) and tree RSS meets or exceeds the threshold
+- **THEN** the system SHALL signal each member of its process group individually (bloated takes priority over idle)
+
+#### Scenario: Bloated session shares its group with a shared MCP service
+- **WHEN** a bloated session's process group also contains a whitelisted MCP server, or a process covered by a user `protect` rule
+- **THEN** that member SHALL be skipped and SHALL survive the reap, while the remaining members are signalled
 
 ### Requirement: Bloated session prioritization
 The system SHALL kill bloated sessions before idle sessions. Bloated sessions SHALL be killed regardless of the `CC_MAX_SESSIONS` limit.

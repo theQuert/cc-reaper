@@ -120,9 +120,19 @@ This is deliberate. A protected application's leaked helpers are exactly what cc
 
 The converse also holds: a live descendant that has not met the stale and detached criteria SHALL NOT be reaped, so protecting the application in practice protects the work it is currently doing.
 
+This requirement governs stale/orphan cleanup only. The runaway phase below is a deliberate exception: it selects its candidates *from* the protected set, so a whitelisted application that is stuck hot SHALL still be signalled after its grace window. A user `protect` rule is honoured in both paths and has no such exception.
+
 #### Scenario: Protected application itself
-- **WHEN** cleanup runs while `ChatGPT.app`, `cmux.app`, or another whitelisted application is running
+- **WHEN** stale/orphan cleanup runs while `ChatGPT.app`, `cmux.app`, or another whitelisted application is running
 - **THEN** that process SHALL NOT be signalled
+
+#### Scenario: Protected application is stuck hot
+- **WHEN** a whitelisted application meets the runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` over etime ≥ `CC_RUNAWAY_MIN`)
+- **THEN** the runaway phase SHALL signal it after the grace window, because the whitelist protects an application that is working, not one that is stuck
+
+#### Scenario: User protect rule during the runaway phase
+- **WHEN** a process covered by a user `protect` rule meets the runaway thresholds
+- **THEN** it SHALL NOT be signalled, because a user rule outranks the built-in exception
 
 #### Scenario: Live descendant of a protected application
 - **WHEN** a whitelisted application has spawned MCP servers that are still attached to it and below the stale threshold
