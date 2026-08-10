@@ -119,7 +119,9 @@ The system SHALL keep explicit safety boundaries for processes that are not part
 - **THEN** the batch job SHALL NOT be counted toward `CC_MAX_SESSIONS` and SHALL NOT be signalled
 
 ### Requirement: Protection covers the matched process, not its descendants
-Every protection test SHALL be applied to a process's own command line. Ancestry SHALL NOT be consulted in either direction: a process whose command matches a protected pattern is exempt no matter who spawned it, and one that matches nothing is reapable no matter who spawned it.
+Every protection test SHALL be applied to a process's own command line. Ancestry SHALL NOT be consulted: it neither protects a process nor exposes one. A process whose command matches a protected pattern is exempt no matter who spawned it, and a process spawned by a protected application gains no protection from that parent.
+
+Losing a parent's protection is not the same as becoming reapable. A process is reaped only when it also satisfies a path's own eligibility test — a family predicate, a user `cleanup` rule, or membership in an orphaned group. A helper matching none of those is left alone however detached and stale it is.
 
 This is deliberate. A protected application's leaked helpers are exactly what cc-reaper exists to reclaim: they carry no marker of their parent, and once detached and past `CC_AGENT_STALE_MINUTES` they are indistinguishable from any other orphaned MCP server. Extending protection along the parent chain would place a leaking app's garbage permanently out of reach, leaving no recovery short of quitting the app.
 
@@ -158,6 +160,10 @@ The eligibility test is **not** shared across those rungs. Once a rung claims a 
 | Codex, agent MCP | orphan parent **or** (detached **and** stale) |
 
 An orphaned parent is therefore sufficient on its own for the two family rungs, however young the process: a ten-second-old agent-browser reparented to PID 1 is already a candidate. It is not sufficient for a user `cleanup` rule, which always requires age as well.
+
+#### Scenario: Unmatched helper spawned by a protected application
+- **WHEN** a protected application has spawned a helper that matches no protected pattern, no agent family, and no user `cleanup` rule, and no orphaned group covers it
+- **THEN** it SHALL NOT be reaped even when detached and long-running, because losing the parent's protection does not by itself make a process eligible
 
 #### Scenario: Freshly orphaned agent browser
 - **WHEN** an agent-browser process has been reparented to an orphan parent ten seconds ago
