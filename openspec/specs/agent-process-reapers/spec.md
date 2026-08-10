@@ -123,13 +123,13 @@ Every protection test SHALL be applied to a process's own command line. Ancestry
 
 This is deliberate. A protected application's leaked helpers are exactly what cc-reaper exists to reclaim: they carry no marker of their parent, and once detached and past `CC_AGENT_STALE_MINUTES` they are indistinguishable from any other orphaned MCP server. Extending protection along the parent chain would place a leaking app's garbage permanently out of reach, leaving no recovery short of quitting the app.
 
-Three cleanup paths exist and they do not share one rule. They differ in what protects a process and in whether it must also be detached and stale:
+Three cleanup paths exist and they do not share one rule. They differ both in what protects a process and in what makes it eligible in the first place:
 
-| Path | Protection applied | Must be detached and stale |
+| Path | Protection applied | What makes a process eligible |
 |---|---|---|
-| Pattern-based candidacy | full precedence chain below, including the user `cleanup` override | yes |
-| Process-group cleanup | immutable, user `protect`, or built-in protected pattern | **no** — group membership is the criterion |
-| Runaway phase | built-in protected pattern selects processes *into* it; only a user `protect` rule exempts | no — CPU and elapsed time are the criteria |
+| Pattern-based candidacy | full precedence chain below, including the user `cleanup` override | per-branch predicate, see below |
+| Process-group cleanup | immutable, user `protect`, or built-in protected pattern | group membership alone |
+| Runaway phase | built-in protected pattern selects processes *into* it; only a user `protect` rule exempts | CPU ≥ `CC_RUNAWAY_CPU` and etime ≥ `CC_RUNAWAY_MIN` |
 
 Two consequences are easy to miss. Process-group cleanup signals every member that is not directly protected on membership alone, so a recent, still-attached member of an orphaned group is reaped without its own staleness being consulted, and a user `cleanup` rule has no effect there. The runaway phase consults only the built-in protected pattern, so immutability does not reach it: a system scanner that appears in both sets is a runaway candidate once it is hot and old enough.
 
@@ -139,13 +139,39 @@ Candidacy for **pattern-based** cleanup is decided first-match against the proce
 2. **User `protect` rule** — exempt. Outranks a `cleanup` rule for the same process.
 3. **User `cleanup` rule** — reapable once detached and stale, **overriding built-in protection**. This is how a user reclaims a shared service the built-in whitelist would otherwise spare.
 4. **Built-in protected pattern** — exempt.
-5. **Family matchers** — agent browser, Puppeteer Chrome, Codex, and agent MCP, each with its own detached/stale test.
+5. **Family matchers** — agent browser, Puppeteer Chrome, Codex, and agent MCP.
 
 "cc-reaper's own scripts and app binary" means processes whose command matches `claude-cleanup.sh`, `cc-monitor.sh`, or the `CCReaper` binary — not everything cc-reaper spawned, since this rung matches commands rather than walking the tree.
 
+The eligibility test is **not** shared across those rungs. Once a rung claims a process, that rung's own predicate decides:
+
+| Rung | Eligible when |
+|---|---|
+| User `cleanup` rule | detached **and** stale — an orphan parent alone is not enough |
+| Agent browser, Puppeteer Chrome | orphan parent **or** stale — an old process still attached to a terminal qualifies |
+| Codex, agent MCP | orphan parent **or** (detached **and** stale) |
+
+An orphaned parent is therefore sufficient on its own for the two family rungs, however young the process: a ten-second-old agent-browser reparented to PID 1 is already a candidate. It is not sufficient for a user `cleanup` rule, which always requires age as well.
+
+#### Scenario: Freshly orphaned agent browser
+- **WHEN** an agent-browser process has been reparented to an orphan parent ten seconds ago
+- **THEN** it SHALL be a candidate, because the orphan parent alone satisfies that family's predicate
+
+#### Scenario: Old agent browser still attached to a terminal
+- **WHEN** an agent-browser process has a living parent, holds a terminal, and is older than `CC_AGENT_STALE_MINUTES`
+- **THEN** it SHALL be a candidate, because that family's predicate accepts staleness without requiring detachment
+
+#### Scenario: Old agent MCP still attached to a terminal
+- **WHEN** an agent-MCP process has a living parent, holds a terminal, and is older than `CC_AGENT_STALE_MINUTES`
+- **THEN** it SHALL NOT be a candidate, because that family requires detachment alongside staleness
+
+#### Scenario: Freshly orphaned process under a user cleanup rule
+- **WHEN** a user `cleanup` rule covers a process that was reparented to an orphan parent ten seconds ago
+- **THEN** it SHALL NOT be a candidate, because a user rule requires staleness as well
+
 #### Scenario: Live descendant of a protected application
 - **WHEN** a whitelisted application has spawned MCP servers that are still attached to it and below the stale threshold, and no orphaned group covers them
-- **THEN** they SHALL NOT be signalled, because they fail the detached and stale criteria on their own merits
+- **THEN** they SHALL NOT be signalled, because they satisfy no family predicate on their own merits
 
 #### Scenario: Leaked descendant of a protected application
 - **WHEN** a whitelisted application has leaked `npx`-spawned MCP servers that are detached, older than `CC_AGENT_STALE_MINUTES`, and whose **own** command lines match no protected pattern
