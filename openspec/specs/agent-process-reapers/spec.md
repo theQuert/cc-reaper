@@ -102,8 +102,13 @@ The proc-janitor configuration SHALL include target patterns for stale/orphan ag
 The system SHALL keep explicit safety boundaries for processes that are not part of stale agent automation cleanup. `claude-guard` SHALL additionally never treat a process as a reapable session unless it satisfies the terminal-attached top-level Claude CLI definition, so that Desktop-hosted sessions, headless batch runs, and subagents are out of reach of RSS, FD, and idle reaping.
 
 #### Scenario: User apps and system scanners are running
-- **WHEN** ChatGPT.app, cmux.app, Bitdefender, Spotlight, normal Chrome browsing, or a frontend/backend dev server is running
+- **WHEN** stale/orphan cleanup or process-group cleanup runs while ChatGPT.app, cmux.app, Bitdefender, Spotlight, normal Chrome browsing, or a frontend/backend dev server is running
 - **THEN** cc-reaper SHALL NOT target those processes through this capability.
+
+#### Scenario: Scanner is stuck hot during the runaway phase
+- **WHEN** a scanner in the built-in protected pattern — `Bitdefender`, `mdworker`, `mds_stores` — sustains CPU ≥ `CC_RUNAWAY_CPU` for etime ≥ `CC_RUNAWAY_MIN`
+- **THEN** the runaway phase SHALL select it, which is the single exception to the scenario above
+- **AND** a user `protect` rule covering it SHALL still exempt it
 
 #### Scenario: Active session is running
 - **WHEN** a Codex or Claude process is still attached to an active terminal/session and does not exceed stale/orphan criteria
@@ -114,13 +119,21 @@ The system SHALL keep explicit safety boundaries for processes that are not part
 - **THEN** the batch job SHALL NOT be counted toward `CC_MAX_SESSIONS` and SHALL NOT be signalled
 
 ### Requirement: Protection covers the matched process, not its descendants
-The protected-pattern whitelist SHALL apply to a process whose own command line matches a protected pattern. A descendant SHALL be judged on its own command line and its own detached/stale state, not on its ancestry.
+Every protection test SHALL be applied to a process's own command line. Ancestry SHALL NOT be consulted in either direction: a process whose command matches a protected pattern is exempt no matter who spawned it, and one that matches nothing is reapable no matter who spawned it.
 
 This is deliberate. A protected application's leaked helpers are exactly what cc-reaper exists to reclaim: they carry no marker of their parent, and once detached and past `CC_AGENT_STALE_MINUTES` they are indistinguishable from any other orphaned MCP server. Extending protection along the parent chain would place a leaking app's garbage permanently out of reach, leaving no recovery short of quitting the app.
 
-The rule cuts both ways, and that is the point: a descendant whose own command line matches a protected pattern is exempt no matter who spawned it, exactly as a descendant that matches nothing is reapable no matter who spawned it. Ancestry is not consulted in either direction.
+Three cleanup paths exist and they do not share one rule. They differ in what protects a process and in whether it must also be detached and stale:
 
-Candidacy for **stale/orphan cleanup** is decided first-match against the process's own command line, in this order:
+| Path | Protection applied | Must be detached and stale |
+|---|---|---|
+| Pattern-based candidacy | full precedence chain below, including the user `cleanup` override | yes |
+| Process-group cleanup | immutable, user `protect`, or built-in protected pattern | **no** — group membership is the criterion |
+| Runaway phase | built-in protected pattern selects processes *into* it; only a user `protect` rule exempts | no — CPU and elapsed time are the criteria |
+
+Two consequences are easy to miss. Process-group cleanup signals every member that is not directly protected on membership alone, so a recent, still-attached member of an orphaned group is reaped without its own staleness being consulted, and a user `cleanup` rule has no effect there. The runaway phase consults only the built-in protected pattern, so immutability does not reach it: a system scanner that appears in both sets is a runaway candidate once it is hot and old enough.
+
+Candidacy for **pattern-based** cleanup is decided first-match against the process's own command line:
 
 1. **Immutable** — system processes, cc-reaper's own scripts and app binary, ordinary Chrome, and Codex UI helpers. No user rule can override this rung.
 2. **User `protect` rule** — exempt. Outranks a `cleanup` rule for the same process.
@@ -128,41 +141,10 @@ Candidacy for **stale/orphan cleanup** is decided first-match against the proces
 4. **Built-in protected pattern** — exempt.
 5. **Family matchers** — agent browser, Puppeteer Chrome, Codex, and agent MCP, each with its own detached/stale test.
 
-Every rung tests the supplied command line only. "cc-reaper's own scripts and app binary" means processes whose command matches `claude-cleanup.sh`, `cc-monitor.sh`, or the `CCReaper` binary — not everything cc-reaper spawned. A child it started whose own command matches a cleanup rule or an agent family is reapable like any other process, consistent with ancestry never being consulted.
-
-This chain governs stale/orphan cleanup. The runaway phase runs a separate selection that consults only the built-in protected pattern, so immutability does **not** extend to it: a system scanner that appears in both sets — `mdworker`, `mds_stores`, `Bitdefender` — is a runaway candidate once it is hot and old enough, and only a user `protect` rule keeps it out.
-
-#### Scenario: Immutable process during stale/orphan cleanup
-- **WHEN** stale/orphan cleanup evaluates a system scanner such as `mdworker`
-- **THEN** it SHALL be exempt, and a user `cleanup` rule naming it SHALL NOT change that
-
-#### Scenario: Immutable process meets the runaway thresholds
-- **WHEN** `mdworker`, `mds_stores`, or `Bitdefender` sustains CPU ≥ `CC_RUNAWAY_CPU` for etime ≥ `CC_RUNAWAY_MIN`
-- **THEN** the runaway phase SHALL select it, because that phase consults the protected pattern rather than the immutable set
-- **AND** a user `protect` rule covering it SHALL still exempt it
-
-#### Scenario: Child spawned by cc-reaper with an unrelated command
-- **WHEN** a process cc-reaper started is detached and stale, and its own command line matches an agent family or a user `cleanup` rule
-- **THEN** it SHALL be reapable, because self-immutability matches commands rather than walking the tree
-
-The converse also holds: a live descendant that has not met the stale and detached criteria SHALL NOT be reaped, so protecting the application in practice protects the work it is currently doing.
-
-This requirement governs stale/orphan cleanup only. The runaway phase below is a deliberate exception: it selects its candidates *from* the protected set, so a whitelisted application that is stuck hot SHALL still be signalled after its grace window. A user `protect` rule is honoured in both paths and has no such exception.
-
-#### Scenario: Protected application itself
-- **WHEN** stale/orphan cleanup runs while `ChatGPT.app`, `cmux.app`, or another whitelisted application is running
-- **THEN** that process SHALL NOT be signalled
-
-#### Scenario: Protected application is stuck hot
-- **WHEN** a whitelisted application meets the runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` over etime ≥ `CC_RUNAWAY_MIN`)
-- **THEN** the runaway phase SHALL signal it after the grace window, because the whitelist protects an application that is working, not one that is stuck
-
-#### Scenario: User protect rule during the runaway phase
-- **WHEN** a process covered by a user `protect` rule meets the runaway thresholds
-- **THEN** it SHALL NOT be signalled, because a user rule outranks the built-in exception
+"cc-reaper's own scripts and app binary" means processes whose command matches `claude-cleanup.sh`, `cc-monitor.sh`, or the `CCReaper` binary — not everything cc-reaper spawned, since this rung matches commands rather than walking the tree.
 
 #### Scenario: Live descendant of a protected application
-- **WHEN** a whitelisted application has spawned MCP servers that are still attached to it and below the stale threshold
+- **WHEN** a whitelisted application has spawned MCP servers that are still attached to it and below the stale threshold, and no orphaned group covers them
 - **THEN** they SHALL NOT be signalled, because they fail the detached and stale criteria on their own merits
 
 #### Scenario: Leaked descendant of a protected application
@@ -172,11 +154,15 @@ This requirement governs stale/orphan cleanup only. The runaway phase below is a
 #### Scenario: Leaked descendant is itself a whitelisted service
 - **WHEN** the leaked descendant's own command line matches a protected pattern — `chrome-devtools-mcp`, `context7-mcp`, `sequential-thinking`, or another shared service
 - **AND** no user rule covers it
-- **THEN** it SHALL be exempt and survive, because the same rule that judges a descendant on its own command line protects it here; ancestry neither condemns nor saves it
+- **THEN** it SHALL be exempt and survive; ancestry neither condemns nor saves it
+
+#### Scenario: Reaping a leaked descendant does not disturb the application
+- **WHEN** those leaked helpers are reaped
+- **THEN** the whitelisted application itself SHALL remain running
 
 #### Scenario: User cleanup rule overrides built-in protection
 - **WHEN** a user `cleanup` rule covers a built-in protected service such as `chrome-devtools-mcp`, and the process is detached and stale
-- **THEN** it SHALL be reaped, because a user rule is evaluated before the built-in whitelist
+- **THEN** pattern-based cleanup SHALL reap it, because a user rule is evaluated before the built-in whitelist
 
 #### Scenario: User protect rule outranks a user cleanup rule
 - **WHEN** both a `protect` and a `cleanup` rule match the same process
@@ -184,11 +170,27 @@ This requirement governs stale/orphan cleanup only. The runaway phase below is a
 
 #### Scenario: No user rule can reach an immutable process
 - **WHEN** a user `cleanup` rule matches a system process such as `WindowServer`, one of cc-reaper's own scripts, ordinary Chrome, or a Codex UI helper
-- **THEN** it SHALL still be exempt from stale/orphan cleanup, because immutability is evaluated before any user rule
+- **THEN** it SHALL still be exempt from pattern-based cleanup, because immutability is evaluated before any user rule
 
-#### Scenario: Reaping a leaked descendant does not disturb the application
-- **WHEN** those leaked helpers are reaped
-- **THEN** the whitelisted application itself SHALL remain running
+#### Scenario: Child spawned by cc-reaper with an unrelated command
+- **WHEN** a process cc-reaper started is detached and stale, and its own command line matches an agent family or a user `cleanup` rule
+- **THEN** it SHALL be reapable, because self-immutability matches commands rather than walking the tree
+
+#### Scenario: Group member that is not itself stale
+- **WHEN** an orphaned Claude or Codex process group is reaped, and one member is recent and still attached but matches no immutable pattern, no built-in protected pattern, and no user `protect` rule
+- **THEN** it SHALL be signalled on group membership alone
+
+#### Scenario: User cleanup rule during process-group cleanup
+- **WHEN** a user `cleanup` rule names a built-in protected service that is a member of an orphaned group
+- **THEN** that member SHALL still be spared, because the `cleanup` override applies to pattern-based candidacy only
+
+#### Scenario: Protected application is stuck hot
+- **WHEN** a whitelisted application meets the runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` over etime ≥ `CC_RUNAWAY_MIN`)
+- **THEN** the runaway phase SHALL signal it after the grace window, because the whitelist protects an application that is working, not one that is stuck
+
+#### Scenario: User protect rule during the runaway phase
+- **WHEN** a process covered by a user `protect` rule meets the runaway thresholds
+- **THEN** it SHALL NOT be signalled, because a user rule outranks the built-in exception
 
 ### Requirement: Stale threshold is configurable
 The system SHALL expose configurable stale-age thresholds for browser automation and agent background cleanup with conservative defaults.
