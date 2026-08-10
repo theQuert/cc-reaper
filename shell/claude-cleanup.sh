@@ -416,6 +416,126 @@ _claude_tree_rss() {
   echo "$tree_mb"
 }
 
+# Process table carrying PID, TTY, and executable name only. `comm` holds the
+# executable, never the arguments, so nothing a session was launched with can
+# forge a record boundary here. Overridable for tests.
+_cc_reaper_ps_pid_tty_comm() {
+  if [ -n "${CC_REAPER_PS_SNAPSHOT_FILE:-}" ]; then
+    cat "$CC_REAPER_PS_SNAPSHOT_FILE" 2>/dev/null
+  else
+    ps -eo pid=,tty=,comm= 2>/dev/null
+  fi
+}
+
+# Full command line for one PID. Asked for a single process, so a multi-line
+# argument cannot be mistaken for another process's record.
+# One file per PID, so a fixture can hold the embedded newlines a real
+# `--settings` argument produces.
+_cc_reaper_ps_command() {
+  local pid=$1
+  if [ -n "${CC_REAPER_PS_CMD_SNAPSHOT_DIR:-}" ]; then
+    cat "$CC_REAPER_PS_CMD_SNAPSHOT_DIR/$pid" 2>/dev/null
+  else
+    ps -o command= -p "$pid" 2>/dev/null
+  fi
+}
+
+# Remove every balanced `{…}` region from a command line, leaving the CLI's own
+# arguments on both sides of it intact. `ps` joins argv with spaces, so the
+# boundaries of a `--settings` value cannot be recovered exactly; brace depth is
+# the one structural marker JSON always provides. Braces inside JSON strings are
+# not counted, so a payload like {"a":"}{"} stays balanced.
+#
+# Fails (non-zero, no output) when the braces never balance — a truncated or
+# hand-crafted argument. Callers treat that as "not a session": missing a session
+# leaves the reaper inert, while trusting a half-parsed line could hand
+# claude-guard the wrong process group.
+_cc_reaper_strip_brace_args() {
+  printf '%s' "$1" | awk '
+    {
+      out = ""; depth = 0; instr = 0; esc = 0
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        ch = substr($0, i, 1)
+        if (instr) {
+          if (esc) { esc = 0 }
+          else if (ch == "\\") { esc = 1 }
+          else if (ch == "\"") { instr = 0 }
+          if (depth == 0) out = out ch
+          continue
+        }
+        if (ch == "\"") { instr = 1; if (depth == 0) out = out ch; continue }
+        if (ch == "{") { depth++; continue }
+        if (ch == "}") { if (depth > 0) depth--; continue }
+        if (depth == 0) out = out ch
+      }
+      if (depth != 0) exit 1
+      print out
+    }
+  '
+}
+
+# Decide whether one command line belongs to a Claude Code session.
+#
+# A session is a top-level `claude` CLI process. Three families are deliberately
+# excluded, because `claude-guard` reaps whole process groups and a wrong call
+# here terminates live work:
+#
+#   - Desktop-hosted claude-code and stream-json subagents. Both run the same
+#     binary with the same `--output-format stream-json --input-format
+#     stream-json` flags; only the parent chain separates them. Neither holds a
+#     terminal, so the caller's terminal requirement drops both.
+#   - Headless `-p` / `--output-format` runs. A batch job sitting below the idle
+#     CPU threshold looks exactly like an abandoned session, and killing one
+#     destroys work with no visible tab to explain it.
+#   - Helper modes such as `claude mcp-server`.
+#
+# Only the CLI's own arguments are inspected. A `--settings` payload holds
+# arbitrary user text: a hook command in there may legitimately mention
+# `--output-format`, and matching the whole line would hide the very session that
+# owns it. The payload is cut out rather than truncated at, so top-level flags
+# written after `--settings` still count.
+_cc_reaper_is_session_cmd() {
+  local cmd
+  cmd=$(printf '%s' "$1" | tr '\n' ' ')
+  cmd=$(_cc_reaper_strip_brace_args "$cmd") || return 1
+
+  local tok1 tok2 rest
+  read -r tok1 tok2 rest <<< "$cmd"
+  case "${tok1##*/}" in
+    claude) ;;
+    node|bun|deno) [ "${tok2##*/}" = "claude" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+
+  case " $cmd " in
+    *" mcp-server "*) return 1 ;;
+    *" -p "*|*" --print "*|*" --print="*) return 1 ;;
+    *" --output-format "*|*" --output-format="*) return 1 ;;
+  esac
+
+  # Match on any known launch flag rather than one a future release may drop,
+  # which is how the previous matcher went silently blind.
+  case " $cmd " in
+    *" --session-id "*|*" --session-id="*|*" --dangerously"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Emit one PID per line for every Claude Code session attached to a terminal.
+_cc_reaper_session_pids() {
+  local pid tty comm
+  while read -r pid tty comm; do
+    [ -n "$pid" ] || continue
+    # macOS renders "??" for no terminal, Linux "?" or "-"; none match these.
+    case "$tty" in tty*|pts*|console*) ;; *) continue ;; esac
+    case "${comm##*/}" in claude|node|bun|deno) ;; *) continue ;; esac
+    if _cc_reaper_is_session_cmd "$(_cc_reaper_ps_command "$pid")"; then
+      printf '%s\n' "$pid"
+    fi
+  done < <(_cc_reaper_ps_pid_tty_comm)
+}
+
 # Show file descriptor usage for Claude Code processes
 claude-fd() {
   echo "=== Claude Code File Descriptor Usage ==="
@@ -437,7 +557,7 @@ claude-fd() {
   local session_pids=()
   while IFS= read -r line; do
     session_pids+=("$line")
-  done < <(ps -eo pid,command | grep "[c]laude --dangerously" | awk '{print $1}')
+  done < <(_cc_reaper_session_pids)
 
   local total_fds=0
   local leak_count=0
@@ -454,13 +574,14 @@ claude-fd() {
     [ -z "$fds" ] && fds=0
     total_fds=$((total_fds + fds))
 
-    local status=""
+    # `status` is read-only in zsh, so this follows claude-sessions' proc_status naming.
+    local proc_status=""
     if [ "$fds" -ge "$max_fd" ]; then
-      status="[FD-LEAK]"
+      proc_status="[FD-LEAK]"
       leak_count=$((leak_count + 1))
     fi
 
-    printf "  %-7s %8s %7s %6s %-14s %s\n" "$pid" "$fds" "${rss_mb}" "${cpu}%" "$etime" "$status"
+    printf "  %-7s %8s %7s %6s %-14s %s\n" "$pid" "$fds" "${rss_mb}" "${cpu}%" "$etime" "$proc_status"
   done
 
   if [ ${#session_pids[@]} -eq 0 ]; then
@@ -515,7 +636,7 @@ claude-sessions() {
   local session_pids=()
   while IFS= read -r line; do
     session_pids+=("$line")
-  done < <(ps -eo pid,command | grep "[c]laude --dangerously" | awk '{print $1}')
+  done < <(_cc_reaper_session_pids)
 
   local session_count=0
   local idle_count=0
@@ -713,7 +834,7 @@ claude-guard() {
   local session_pids=()
   while IFS= read -r line; do
     session_pids+=("$line")
-  done < <(ps -eo pid,command | grep "[c]laude --dangerously" | awk '{print $1}')
+  done < <(_cc_reaper_session_pids)
 
   local session_count=${#session_pids[@]}
   if [ "$session_count" -eq 0 ]; then
@@ -722,12 +843,13 @@ claude-guard() {
   fi
 
   # ─── Classify sessions ─────────────────────────────────────────────────
-  local fdleak_pids=()
-  local fdleak_fds=()
-  local bloated_pids=()
-  local bloated_rss=()
-  local idle_pids=()
-  local idle_etimes=()
+  # Each record packs its own detail as "pid<TAB>detail" and is read back with
+  # ${r%%...}/${r#...}. Parallel arrays walked by numeric index cannot be used:
+  # `${!arr[@]}` is a hard error in zsh and `${arr[0]}` is empty there, so every
+  # kill phase below would abort or fire on an empty PID.
+  local fdleak_records=()
+  local bloated_records=()
+  local idle_records=()
   local live_count=0
 
   printf "  %-7s %8s %6s %6s %-14s %s\n" "PID" "TREE_MB" "FDs" "CPU%" "ELAPSED" "STATUS"
@@ -747,42 +869,40 @@ claude-guard() {
     [ -z "$fds" ] && fds=0
 
     # Determine status: fd-leak > bloated > idle
-    local status="LIVE"
+    # `status` is read-only in zsh, so this follows claude-sessions' proc_status naming.
+    local proc_status="LIVE"
     if _cc_reaper_has_user_rule protect "$session_cmd"; then
-      status="[USER-PROTECTED]"
+      proc_status="[USER-PROTECTED]"
       live_count=$((live_count + 1))
     elif [ "$fds" -ge "$max_fd" ]; then
-      status="[FD-LEAK]"
-      fdleak_pids+=("$pid")
-      fdleak_fds+=("$fds")
+      proc_status="[FD-LEAK]"
+      fdleak_records+=("$pid"$'\t'"$fds")
     elif [ "$tree_mb" -ge "$max_rss_mb" ]; then
-      status="[BLOATED]"
-      bloated_pids+=("$pid")
-      bloated_rss+=("$tree_mb")
+      proc_status="[BLOATED]"
+      bloated_records+=("$pid"$'\t'"$tree_mb")
     elif [ "$cpu_int" -lt "$idle_threshold" ]; then
-      status="[IDLE]"
-      idle_pids+=("$pid")
-      idle_etimes+=("$etime")
+      proc_status="[IDLE]"
+      idle_records+=("$pid"$'\t'"$etime")
     else
       live_count=$((live_count + 1))
     fi
 
-    printf "  %-7s %7s %6s %6s %-14s %s\n" "$pid" "${tree_mb}" "$fds" "${cpu}%" "$etime" "$status"
+    printf "  %-7s %7s %6s %6s %-14s %s\n" "$pid" "${tree_mb}" "$fds" "${cpu}%" "$etime" "$proc_status"
   done
 
   echo ""
-  echo "  Sessions: $session_count total, ${#fdleak_pids[@]} fd-leak, ${#bloated_pids[@]} bloated, ${#idle_pids[@]} idle, $live_count live"
+  echo "  Sessions: $session_count total, ${#fdleak_records[@]} fd-leak, ${#bloated_records[@]} bloated, ${#idle_records[@]} idle, $live_count live"
 
   # ─── Phase 0: Kill FD-leaking sessions (regardless of count) ──────────
   local killed=0
   local freed_mb=0
 
-  if [ ${#fdleak_pids[@]} -gt 0 ]; then
+  if [ ${#fdleak_records[@]} -gt 0 ]; then
     echo ""
     echo "  --- Killing FD-leaking sessions (FDs > $max_fd) ---"
-    for i in "${!fdleak_pids[@]}"; do
-      local fpid=${fdleak_pids[$i]}
-      local ffds=${fdleak_fds[$i]}
+    for record in "${fdleak_records[@]}"; do
+      local fpid=${record%%$'\t'*}
+      local ffds=${record#*$'\t'}
       local frss=$(_claude_tree_rss "$fpid")
       if $dry_run; then
         echo "  [DRY-RUN] Would kill PID $fpid (FDs: $ffds, threshold: $max_fd)"
@@ -798,12 +918,12 @@ claude-guard() {
 
   # ─── Phase 1: Kill bloated sessions (regardless of count) ──────────────
 
-  if [ ${#bloated_pids[@]} -gt 0 ]; then
+  if [ ${#bloated_records[@]} -gt 0 ]; then
     echo ""
     echo "  --- Killing bloated sessions (tree RSS > ${max_rss_mb} MB) ---"
-    for i in "${!bloated_pids[@]}"; do
-      local bpid=${bloated_pids[$i]}
-      local brss=${bloated_rss[$i]}
+    for record in "${bloated_records[@]}"; do
+      local bpid=${record%%$'\t'*}
+      local brss=${record#*$'\t'}
       if $dry_run; then
         echo "  [DRY-RUN] Would kill PID $bpid (tree RSS: ${brss} MB, threshold: ${max_rss_mb} MB)"
       else
@@ -820,15 +940,18 @@ claude-guard() {
 
   # ─── Phase 2: Kill idle sessions if over max_sessions ──────────────────
   local remaining=$((session_count - killed))
-  if [ "$remaining" -gt "$max_sessions" ] && [ ${#idle_pids[@]} -gt 0 ]; then
+  if [ "$remaining" -gt "$max_sessions" ] && [ ${#idle_records[@]} -gt 0 ]; then
     local to_kill=$((remaining - max_sessions))
-    [ "$to_kill" -gt "${#idle_pids[@]}" ] && to_kill=${#idle_pids[@]}
+    [ "$to_kill" -gt "${#idle_records[@]}" ] && to_kill=${#idle_records[@]}
 
     echo ""
     echo "  --- Killing $to_kill idle session(s) to reach limit of $max_sessions ---"
-    for i in $(seq 0 $((to_kill - 1))); do
-      local ipid=${idle_pids[$i]}
-      local ietime=${idle_etimes[$i]}
+    local taken=0
+    for record in "${idle_records[@]}"; do
+      [ "$taken" -ge "$to_kill" ] && break
+      taken=$((taken + 1))
+      local ipid=${record%%$'\t'*}
+      local ietime=${record#*$'\t'}
       local irss=$(_claude_tree_rss "$ipid")
       if $dry_run; then
         echo "  [DRY-RUN] Would kill PID $ipid (idle ${ietime}, tree RSS: ${irss} MB)"
@@ -850,7 +973,7 @@ claude-guard() {
     if ! $dry_run; then
       osascript -e "display notification \"Reaped $killed session(s), freed ~${freed_mb} MB\" with title \"Claude Guard\" subtitle \"Cleanup complete\"" 2>/dev/null &
     fi
-  elif $dry_run && [ ${#bloated_pids[@]} -eq 0 ] && [ "$remaining" -le "$max_sessions" ]; then
+  elif $dry_run && [ ${#bloated_records[@]} -eq 0 ] && [ "$remaining" -le "$max_sessions" ]; then
     echo "  All clear — no sessions to reap."
   elif ! $dry_run; then
     echo "  All clear — no sessions to reap."
