@@ -120,13 +120,30 @@ This is deliberate. A protected application's leaked helpers are exactly what cc
 
 The rule cuts both ways, and that is the point: a descendant whose own command line matches a protected pattern is exempt no matter who spawned it, exactly as a descendant that matches nothing is reapable no matter who spawned it. Ancestry is not consulted in either direction.
 
-Candidacy is decided first-match against the process's own command line, in this order:
+Candidacy for **stale/orphan cleanup** is decided first-match against the process's own command line, in this order:
 
-1. **Immutable** — system processes, cc-reaper's own tree, ordinary Chrome, and Codex UI helpers. Never reapable, and no user rule can override this.
+1. **Immutable** — system processes, cc-reaper's own scripts and app binary, ordinary Chrome, and Codex UI helpers. No user rule can override this rung.
 2. **User `protect` rule** — exempt. Outranks a `cleanup` rule for the same process.
 3. **User `cleanup` rule** — reapable once detached and stale, **overriding built-in protection**. This is how a user reclaims a shared service the built-in whitelist would otherwise spare.
 4. **Built-in protected pattern** — exempt.
 5. **Family matchers** — agent browser, Puppeteer Chrome, Codex, and agent MCP, each with its own detached/stale test.
+
+Every rung tests the supplied command line only. "cc-reaper's own scripts and app binary" means processes whose command matches `claude-cleanup.sh`, `cc-monitor.sh`, or the `CCReaper` binary — not everything cc-reaper spawned. A child it started whose own command matches a cleanup rule or an agent family is reapable like any other process, consistent with ancestry never being consulted.
+
+This chain governs stale/orphan cleanup. The runaway phase runs a separate selection that consults only the built-in protected pattern, so immutability does **not** extend to it: a system scanner that appears in both sets — `mdworker`, `mds_stores`, `Bitdefender` — is a runaway candidate once it is hot and old enough, and only a user `protect` rule keeps it out.
+
+#### Scenario: Immutable process during stale/orphan cleanup
+- **WHEN** stale/orphan cleanup evaluates a system scanner such as `mdworker`
+- **THEN** it SHALL be exempt, and a user `cleanup` rule naming it SHALL NOT change that
+
+#### Scenario: Immutable process meets the runaway thresholds
+- **WHEN** `mdworker`, `mds_stores`, or `Bitdefender` sustains CPU ≥ `CC_RUNAWAY_CPU` for etime ≥ `CC_RUNAWAY_MIN`
+- **THEN** the runaway phase SHALL select it, because that phase consults the protected pattern rather than the immutable set
+- **AND** a user `protect` rule covering it SHALL still exempt it
+
+#### Scenario: Child spawned by cc-reaper with an unrelated command
+- **WHEN** a process cc-reaper started is detached and stale, and its own command line matches an agent family or a user `cleanup` rule
+- **THEN** it SHALL be reapable, because self-immutability matches commands rather than walking the tree
 
 The converse also holds: a live descendant that has not met the stale and detached criteria SHALL NOT be reaped, so protecting the application in practice protects the work it is currently doing.
 
@@ -166,8 +183,8 @@ This requirement governs stale/orphan cleanup only. The runaway phase below is a
 - **THEN** it SHALL be exempt
 
 #### Scenario: No user rule can reach an immutable process
-- **WHEN** a user `cleanup` rule matches a system process such as `WindowServer`, cc-reaper's own tree, ordinary Chrome, or a Codex UI helper
-- **THEN** it SHALL still be exempt, because immutability is evaluated before any user rule
+- **WHEN** a user `cleanup` rule matches a system process such as `WindowServer`, one of cc-reaper's own scripts, ordinary Chrome, or a Codex UI helper
+- **THEN** it SHALL still be exempt from stale/orphan cleanup, because immutability is evaluated before any user rule
 
 #### Scenario: Reaping a leaked descendant does not disturb the application
 - **WHEN** those leaked helpers are reaped
