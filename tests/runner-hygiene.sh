@@ -135,13 +135,31 @@ for mode in normal abort; do
   fi
 done
 
-# Not covered automatically: `cc-monitor ... &` followed by `kill $!`. A worker
-# subshell inherits its parent's argv, so `pgrep -f` cannot tell the wrapper from
-# the worker, and the same code reported 0 survivors with a 2s settle and 2 with
-# a 4s one. An assertion that flips on timing is worse than none. Verified by
-# hand: the job is killed, and the sampler and its directory are gone within one
-# interval. The mechanism it relies on — recording the invoking process rather
-# than $$ — is what the checks below exercise.
+# `cc-monitor ... &` then `kill $!`: $$ keeps pointing at the interactive shell
+# inside a background job, so an owner check on $$ would never notice. This was
+# unassertable while the suite matched process names — a worker inherits its
+# parent's argv — but it cannot inherit a directory it never created, so the
+# private TMPDIR settles it.
+rm -rf "$mon_tmp"/cc-monitor.* 2>/dev/null || true
+bg_script="$tmp_dir/bg-cancel.sh"
+# Written to a file rather than inlined: the nested quoting swallowed `$!`, the
+# kill then did nothing, and the wrapper exited leaving an orphaned sampler —
+# which read as the feature being broken rather than the test.
+cat > "$bg_script" <<INNER
+source "$ROOT_DIR/shell/cc-monitor.sh"
+cc-monitor --duration 60 --interval 2 >/dev/null 2>&1 &
+job=\$!
+sleep 3
+kill -TERM "\$job" 2>/dev/null
+sleep 4
+INNER
+TMPDIR="$mon_tmp" bash "$bg_script" >/dev/null 2>&1 || true
+if [ "$(count_monitor_dirs)" = 0 ]; then
+  pass "cancelling a background job stops the sampler and cleans up"
+else
+  fail "a sampler outlived a background-job cancellation"
+  ls -ld "$mon_tmp"/cc-monitor.* 2>/dev/null | sed 's/^/      /' >&2
+fi
 
 # Cancellation must be prompt whatever interval was asked for: a single
 # `sleep "$interval"` delayed the owner check by the whole interval, so at
