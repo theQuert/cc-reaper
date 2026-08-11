@@ -53,6 +53,22 @@ _cc_wj_cooldown_secs() {
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
+# Bound a log to one live file plus one previous generation. cc-reaper reaps
+# other tools for leaking; an unbounded log of its own is the same fault.
+#
+# Copy-then-truncate rather than rename: truncating keeps the inode, so a
+# descriptor launchd already opened for StandardOutPath stays valid and keeps
+# appending to the live file. A rename would leave launchd filling the ".old"
+# copy while the live path stayed empty.
+_cc_wj_bound_log() {
+  local file=$1 max=${2:-1048576} size=""
+  [ -f "$file" ] || return 0
+  size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+  [ -n "$size" ] && [ "$size" -gt "$max" ] || return 0
+  cp -f "$file" "$file.old" 2>/dev/null && : > "$file" 2>/dev/null
+  return 0
+}
+
 _cc_wj_log_write() {
   local log
   log=$(_cc_wj_log)
@@ -546,5 +562,6 @@ _cc_wj_run() {
 
 # Run if executed directly (not sourced)
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  _cc_wj_bound_log "$(_cc_wj_log)"
   _cc_wj_run "$@"
 fi

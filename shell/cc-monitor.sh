@@ -1121,6 +1121,9 @@ cc-monitor() {
 
   local tmp_dir="" raw_file="" agg_file="" findings_file="" samples=""
   tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor.XXXXXX") || return 1
+  # Default sampling runs 60s, so an interrupted run is ordinary rather than an
+  # edge case. Without this the temp directory survives every Ctrl-C.
+  trap 'rm -rf "$tmp_dir"' EXIT INT TERM
   raw_file="$tmp_dir/raw.tsv"
   agg_file="$tmp_dir/agg.tsv"
   findings_file="$tmp_dir/findings.tsv"
@@ -1156,6 +1159,7 @@ cc-monitor() {
   fi
 
   rm -rf "$tmp_dir"
+  trap - EXIT INT TERM
   return "$dispatch_rc"
 }
 

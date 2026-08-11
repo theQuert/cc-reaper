@@ -218,12 +218,27 @@ for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cle
   chmod +x "$REAPER_DIR/$SCRIPT.sh"
 done
 
+# `launchctl load` cannot clear a `disabled` flag in the launchd database, and
+# reports nothing when the agent fails to start — an agent disabled once stays
+# dead through every later install while still looking installed. Enable,
+# bootstrap, then confirm, and name anything that did not come up.
+AGENT_UI="gui/$(id -u)"
+AGENT_FAILED=""
 for AGENT in resource-watch disk-check weekly-clean guard; do
-  AGENT_PLIST="$PLIST_DIR/com.cc-reaper.$AGENT.plist"
-  sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/com.cc-reaper.$AGENT.plist" > "$AGENT_PLIST"
-  launchctl unload "$AGENT_PLIST" 2>/dev/null || true
-  launchctl load "$AGENT_PLIST"
+  AGENT_LABEL="com.cc-reaper.$AGENT"
+  AGENT_PLIST="$PLIST_DIR/$AGENT_LABEL.plist"
+  sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/$AGENT_LABEL.plist" > "$AGENT_PLIST"
+  launchctl enable "$AGENT_UI/$AGENT_LABEL" 2>/dev/null || true
+  launchctl bootout "$AGENT_UI/$AGENT_LABEL" 2>/dev/null || true
+  launchctl bootstrap "$AGENT_UI" "$AGENT_PLIST" 2>/dev/null || true
+  if ! launchctl print "$AGENT_UI/$AGENT_LABEL" >/dev/null 2>&1; then
+    AGENT_FAILED="$AGENT_FAILED $AGENT_LABEL"
+  fi
 done
+if [ -n "$AGENT_FAILED" ]; then
+  echo "  WARNING: these agents did not load:$AGENT_FAILED"
+  echo "           inspect with: launchctl print $AGENT_UI/<label>"
+fi
 
 echo "  resource-watch: snapshot every 10 min (alerts on load/disk/memory thresholds)"
 echo "  disk-check:     read-only disk + TM-snapshot check every hour"

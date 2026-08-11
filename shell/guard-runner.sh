@@ -19,6 +19,11 @@ CLEANUP="${CC_REAPER_CLEANUP:-$HOME/.cc-reaper/claude-cleanup.sh}"
 # shellcheck source=/dev/null
 . "$CLEANUP"
 
+# This runner fires every 10 minutes; unbounded, its stdout was the largest log
+# on the host.
+_cc_reaper_bound_log "$HOME/.cc-reaper/logs/launchd-guard-stdout.log"
+_cc_reaper_bound_log "$HOME/.cc-reaper/logs/launchd-guard-stderr.log"
+
 # Suppress every non-runaway phase (idle eviction, RSS bloat, FD leak) by
 # setting thresholds out of reach. Runaway thresholds keep their defaults
 # (CC_RUNAWAY_CPU=80, CC_RUNAWAY_MIN=60). No grace wait — nobody is watching.

@@ -9,10 +9,21 @@ LOG_DIR="$HOME/.cc-reaper/logs"
 LOG_FILE="$LOG_DIR/monitor.log"
 mkdir -p "$LOG_DIR"
 
-# Rotate log if > 1MB
-if [ -f "$LOG_FILE" ] && [ "$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)" -gt 1048576 ]; then
-  mv "$LOG_FILE" "$LOG_FILE.old"
-fi
+# Bound a log to one live file plus one previous generation. Copy-then-truncate
+# rather than rename: truncating keeps the inode, so the descriptor launchd
+# opened for StandardOutPath stays valid and keeps appending to the live file.
+_cc_mon_bound_log() {
+  local file=$1 max=${2:-1048576} size=""
+  [ -f "$file" ] || return 0
+  size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+  [ -n "$size" ] && [ "$size" -gt "$max" ] || return 0
+  cp -f "$file" "$file.old" 2>/dev/null && : > "$file" 2>/dev/null
+  return 0
+}
+
+for _cc_l in "$LOG_FILE" "$LOG_DIR/launchd-stdout.log" "$LOG_DIR/launchd-stderr.log"; do
+  _cc_mon_bound_log "$_cc_l"
+done
 
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
