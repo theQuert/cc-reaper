@@ -117,6 +117,9 @@ kill_with() {
         "-o command= -p 501") echo "npm exec @upstash/context7-mcp" ;;
         "-o command= -p 502") echo "node /x/.bin/mcp-server-tauri" ;;
         "-o pgid= -p "*)      echo " 500" ;;
+        "-o rss= -p 500")     echo " 102400" ;;
+        "-o rss= -p 501")     echo " 204800" ;;
+        "-o rss= -p 502")     echo "  51200" ;;
         "-eo pid,pgid")       printf "500 500\n501 500\n502 500\n" ;;
         *) command ps "$@" ;; esac; }
     _CC_REAPER_DRY_RUN=1 _claude_pgid_kill "$target" "$force" 2>&1 || true )
@@ -141,10 +144,17 @@ printf '%s' "$out" | grep -q 'Would kill PID 500' \
 
 # ─── Delivery counting ─────────────────────────────────────────────────────
 
-count_of() { printf '%s' "$1" | tail -1; }
+count_of() { printf '%s' "$1" | tail -1 | awk '{print $1}'; }
+freed_of() { printf '%s' "$1" | tail -1 | awk '{print $2}'; }
 
 out=$(kill_with 500 1)
 [ "$(count_of "$out")" = 2 ] && pass "count reports two deliveries" || fail "count wrong: $(count_of "$out")"
+
+# 500 (100 MB) and 502 (50 MB) are signalled; the spared sibling 501 (200 MB)
+# must not appear in the freed total.
+[ "$(freed_of "$out")" = 150 ] \
+  && pass "freed total counts only signalled processes" \
+  || fail "freed total wrong: $(freed_of "$out") (want 150)"
 
 printf 'protect\tchrome-devtools-mcp\n' > "$rules_file"
 out=$(kill_with 500 1 || true)

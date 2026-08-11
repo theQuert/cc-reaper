@@ -457,6 +457,11 @@ The reaped count and freed total SHALL include only processes to which a signal 
 sent. A candidate that survives the signal stage SHALL NOT be counted, SHALL NOT contribute to
 the freed total, and SHALL NOT raise a notification claiming it was reaped.
 
+The freed total SHALL be summed from the signalled processes themselves. A candidate's pre-kill
+tree RSS SHALL NOT be used, because the tree includes members the signal stage deliberately
+spares — a runaway target with a `shared` descendant would otherwise report memory that is still
+in use.
+
 #### Scenario: Every candidate is signalled
 - **WHEN** two runaway candidates are selected and both are signalled
 - **THEN** the summary SHALL report two reaped
@@ -468,3 +473,7 @@ the freed total, and SHALL NOT raise a notification claiming it was reaped.
 #### Scenario: Nothing is delivered
 - **WHEN** every candidate is spared at the signal stage
 - **THEN** the summary SHALL report zero reaped rather than a non-zero count
+
+#### Scenario: Runaway target has a spared descendant
+- **WHEN** a runaway target is signalled but a `shared` process in its group is spared
+- **THEN** the freed total SHALL exclude that spared process's RSS

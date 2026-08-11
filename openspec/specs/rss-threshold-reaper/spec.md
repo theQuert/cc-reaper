@@ -88,7 +88,7 @@ An over-threshold session that is also leaking descriptors is reaped by the FD-l
 - **THEN** the session SHALL NOT be marked as `[BLOATED]`
 
 ### Requirement: Bloated session termination
-The system SHALL terminate bloated sessions PGID-aware, regardless of whether the session is idle or active: it SHALL enumerate the members of the session's process group and signal each one individually, skipping any member that matches the shared-service whitelist or a user `protect` rule.
+The system SHALL terminate bloated sessions PGID-aware, regardless of whether the session is idle or active: it SHALL enumerate the members of the session's process group and signal each one individually, skipping any member that classifies `immutable` or `shared`, and any member a user `protect` rule covers. Classification is defined by the `agent-process-reapers` capability.
 
 It SHALL NOT signal the group as a whole (`kill -- -$PGID`), because that would take shared MCP services down with it and contradict the safety boundaries in the `agent-process-reapers` capability.
 
@@ -101,8 +101,12 @@ It SHALL NOT signal the group as a whole (`kill -- -$PGID`), because that would 
 - **THEN** the system SHALL signal each member of its process group individually (bloated takes priority over idle)
 
 #### Scenario: Bloated session shares its group with a shared MCP service
-- **WHEN** a bloated session's process group also contains a whitelisted MCP server, or a process covered by a user `protect` rule
+- **WHEN** a bloated session's process group also contains a `shared` service, an `immutable` process, or a process covered by a user `protect` rule
 - **THEN** that member SHALL be skipped and SHALL survive the reap, while the remaining members are signalled
+
+#### Scenario: Freed total after a partial reap
+- **WHEN** some members of a bloated session's group are skipped
+- **THEN** the reported freed total SHALL sum only the members actually signalled, not the session's pre-kill tree RSS
 
 ### Requirement: Bloated session prioritization
 The system SHALL kill bloated sessions before idle sessions. Bloated sessions SHALL be killed regardless of the `CC_MAX_SESSIONS` limit.
