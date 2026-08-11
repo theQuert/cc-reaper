@@ -6,9 +6,30 @@ _cc_reaper_protected_pattern() {
   echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores"
 }
 
-_cc_reaper_is_protected_cmd() {
+# Single owner of "how protected is this process". Three cleanup paths used to
+# carry their own list and disagreed: a runaway shared MCP was selected by one
+# and skipped by another, `mcp-server-stripe` was protected where `@stripe/mcp`
+# was not, and a stuck system scanner was reachable by the runaway phase.
+#
+#   immutable — never signalled by any path
+#   shared    — a long-running service other work depends on
+#   none      — everything else
+#
+# Immutable is tested first, so a system scanner named in both sets classifies
+# immutable rather than shared.
+_cc_reaper_protection_class() {
   local cmd=$1
-  echo "$cmd" | grep -qE "$(_cc_reaper_protected_pattern)"
+  if _cc_reaper_is_immutable_cmd "$cmd"; then
+    echo immutable
+  elif echo "$cmd" | grep -qE "$(_cc_reaper_protected_pattern)"; then
+    echo shared
+  else
+    echo none
+  fi
+}
+
+_cc_reaper_is_protected_cmd() {
+  [ "$(_cc_reaper_protection_class "$1")" = shared ]
 }
 
 _cc_reaper_rules_file() {
@@ -391,29 +412,37 @@ _claude_process_fds() {
 }
 
 # Calculate tree RSS (MB) for a given PID: process + children + grandchildren
+# Total RSS of a process tree, in whole megabytes.
+#
+# Summed in kilobytes and converted once. Dividing each member first truncated
+# roughly 0.5 MB per process, which on a ten-process tree silently undercounted
+# the total by several megabytes. The walk is full-depth for the same reason:
+# stopping at grandchildren missed anything behind a wrapper chain such as
+# CLI -> npm -> shell -> server.
+#
+# One `ps` builds the whole table and awk walks it, rather than a `pgrep` per
+# node — that is cheaper than even the two-level version it replaces.
 _claude_tree_rss() {
   local pid=$1
-  local rss=$(ps -p "$pid" -o rss= 2>/dev/null | tr -d ' ')
-  [ -z "$rss" ] && echo 0 && return
-  local tree_mb=$((rss / 1024))
-
-  local children=()
-  while IFS= read -r cpid; do
-    [ -z "$cpid" ] && continue
-    children+=("$cpid")
-    local crss=$(ps -p "$cpid" -o rss= 2>/dev/null | tr -d ' ')
-    [ -n "$crss" ] && tree_mb=$((tree_mb + crss / 1024))
-  done < <(pgrep -P "$pid" 2>/dev/null)
-
-  for cpid in "${children[@]}"; do
-    while IFS= read -r gcpid; do
-      [ -z "$gcpid" ] && continue
-      local gcrss=$(ps -p "$gcpid" -o rss= 2>/dev/null | tr -d ' ')
-      [ -n "$gcrss" ] && tree_mb=$((tree_mb + gcrss / 1024))
-    done < <(pgrep -P "$cpid" 2>/dev/null)
-  done
-
-  echo "$tree_mb"
+  ps -eo pid=,ppid=,rss= 2>/dev/null | awk -v root="$pid" '
+    $1 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {
+      kids[$2] = kids[$2] " " $1
+      rss[$1] = $3
+    }
+    END {
+      if (!(root in rss)) { print 0; exit }
+      queue[1] = root; n = 1; i = 1; total = 0
+      while (i <= n) {
+        p = queue[i]; i++
+        if (p in seen) continue
+        seen[p] = 1
+        total += rss[p]
+        m = split(kids[p], ch, " ")
+        for (j = 1; j <= m; j++) { n++; queue[n] = ch[j] }
+      }
+      printf "%d\n", total / 1024
+    }
+  '
 }
 
 # Process table carrying PID, TTY, and executable name only. `comm` holds the
@@ -697,28 +726,45 @@ claude-sessions() {
   fi
 }
 
-# Kill a session's process group while preserving whitelisted MCP servers
-# Usage: _claude_pgid_kill <pid>
+# Kill a session's process group, sparing immutable processes, shared services,
+# and anything a user `protect` rule covers. Prints the number of processes
+# actually signalled, so callers can report deliveries rather than intentions.
+#
+# `force_target` makes the named PID itself bypass the `shared` exemption — the
+# runaway phase uses it to terminate a shared service that is stuck hot, which
+# is the one case where reclaiming it is the point. It never bypasses the
+# immutable class or a user `protect` rule, and never applies to the target's
+# group siblings.
+#
+# Usage: _claude_pgid_kill <pid> [force_target]
 _claude_pgid_kill() {
   local target_pid=$1
-  local MCP_WHITELIST="supabase|@stripe/mcp|context7|context7-mcp|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp"
+  local force_target=${2:-0}
+  local signalled=0
   local target_cmd=""
   target_cmd=$(ps -o command= -p "$target_pid" 2>/dev/null)
-  _cc_reaper_has_user_rule protect "$target_cmd" && return 1
+  _cc_reaper_has_user_rule protect "$target_cmd" && { echo 0; return 1; }
+  [ "$(_cc_reaper_protection_class "$target_cmd")" = immutable ] && { echo 0; return 1; }
+
   local pgid=$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ')
   if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
     while IFS= read -r pid; do
       [ -z "$pid" ] && continue
       local pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
       _cc_reaper_has_user_rule protect "$pid_cmd" && continue
-      if echo "$pid_cmd" | grep -qE "$MCP_WHITELIST"; then
-        continue
+      local class=""
+      class=$(_cc_reaper_protection_class "$pid_cmd")
+      [ "$class" = immutable ] && continue
+      if [ "$class" = shared ]; then
+        # Only the explicitly selected target crosses this exemption.
+        { [ "$force_target" = 1 ] && [ "$pid" = "$target_pid" ]; } || continue
       fi
-      _cc_reaper_kill_pid "$pid"
+      _cc_reaper_kill_pid "$pid" && signalled=$((signalled + 1))
     done < <(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
   else
-    _cc_reaper_kill_pid "$target_pid"
+    _cc_reaper_kill_pid "$target_pid" && signalled=1
   fi
+  echo "$signalled"
 }
 
 # Automatic session guard: kills bloated (RSS threshold) and idle sessions
@@ -759,7 +805,11 @@ _cc_guard_runaway_protected_pids() {
   local min_seconds=$((min_minutes * 60))
   ps -axo pid=,etime=,%cpu=,command= 2>/dev/null | while read -r pid etime cpu rest; do
     [ -z "$pid" ] && continue
-    echo "$rest" | grep -qE "$protected_pattern" || continue
+    # Only shared services are candidates. Immutable processes — system
+    # scanners, cc-reaper itself, ordinary Chrome — are never signalled, however
+    # hot they get: SIGTERM-ing security software or a Spotlight reindex costs
+    # more than the CPU it would reclaim.
+    [ "$(_cc_reaper_protection_class "$rest")" = shared ] || continue
     _cc_reaper_has_user_rule protect "$rest" && continue
     awk -v a="$cpu" -v b="$cpu_threshold" 'BEGIN { exit !(a+0 >= b+0) }' || continue
     local secs=""
@@ -819,10 +869,17 @@ claude-guard() {
           [ -z "$rpid" ] && continue
           local rrss=""
           rrss=$(_claude_tree_rss "$rpid" 2>/dev/null || echo 0)
-          _claude_pgid_kill "$rpid" >/dev/null 2>&1
-          rkilled=$((rkilled + 1))
-          rfreed=$((rfreed + ${rrss:-0}))
-          osascript -e "display notification \"Reaped runaway PID $rpid (CPU ${rcpu}%, etime ${retime})\" with title \"Claude Guard\" subtitle \"Runaway protected process\"" 2>/dev/null &
+          # force_target: a runaway shared service is exactly what this phase
+          # exists to reclaim, so the selected PID crosses the shared exemption.
+          local rsent=""
+          rsent=$(_claude_pgid_kill "$rpid" 1 2>/dev/null)
+          if [ "${rsent:-0}" -gt 0 ]; then
+            rkilled=$((rkilled + 1))
+            rfreed=$((rfreed + ${rrss:-0}))
+            osascript -e "display notification \"Reaped runaway PID $rpid (CPU ${rcpu}%, etime ${retime})\" with title \"Claude Guard\" subtitle \"Runaway protected process\"" 2>/dev/null &
+          else
+            echo "  PID $rpid was spared at the signal stage; not counted."
+          fi
         done <<< "$runaway_lines"
         echo "  Reaped $rkilled runaway protected process(es), freed ~${rfreed} MB"
       fi
@@ -907,7 +964,7 @@ claude-guard() {
       if $dry_run; then
         echo "  [DRY-RUN] Would kill PID $fpid (FDs: $ffds, threshold: $max_fd)"
       else
-        _claude_pgid_kill "$fpid"
+        _claude_pgid_kill "$fpid" >/dev/null
         echo "  Killed PID $fpid (FDs: $ffds, threshold: $max_fd)"
         killed=$((killed + 1))
         freed_mb=$((freed_mb + frss))
@@ -928,7 +985,7 @@ claude-guard() {
         echo "  [DRY-RUN] Would kill PID $bpid (tree RSS: ${brss} MB, threshold: ${max_rss_mb} MB)"
       else
         # Kill session group, preserving whitelisted MCP servers
-        _claude_pgid_kill "$bpid"
+        _claude_pgid_kill "$bpid" >/dev/null
         echo "  Killed PID $bpid (tree RSS: ${brss} MB, threshold: ${max_rss_mb} MB)"
         killed=$((killed + 1))
         freed_mb=$((freed_mb + brss))
@@ -957,7 +1014,7 @@ claude-guard() {
         echo "  [DRY-RUN] Would kill PID $ipid (idle ${ietime}, tree RSS: ${irss} MB)"
       else
         # Kill session group, preserving whitelisted MCP servers
-        _claude_pgid_kill "$ipid"
+        _claude_pgid_kill "$ipid" >/dev/null
         echo "  Killed PID $ipid (idle ${ietime}, tree RSS: ${irss} MB)"
         killed=$((killed + 1))
         freed_mb=$((freed_mb + irss))

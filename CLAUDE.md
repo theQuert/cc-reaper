@@ -45,6 +45,20 @@ Tests drive the two seams separately via `CC_REAPER_PS_SNAPSHOT_FILE` (`pid tty 
 
 **zsh portability**: this project is installed into zsh, so `claude-guard`'s reaping paths must avoid two zsh traps that bash hides — `status` is a read-only variable (use `proc_status`), and arrays cannot be walked by numeric index (`${!arr[@]}` is `bad substitution`, `${arr[0]}` is empty). Kill candidates are carried as `pid<TAB>detail` records iterated by value. `zsh -n` belongs in the syntax check alongside `bash -n`.
 
+**Protection classes**: `_cc_reaper_protection_class` is the single owner of how protected a process is, returning `immutable`, `shared`, or `none` for a command line. All three cleanup paths consult it, which is what keeps them from disagreeing:
+
+| Path | `immutable` | `shared` | `none` |
+|------|-------------|----------|--------|
+| Pattern-based cleanup | never | exempt, unless a user `cleanup` rule covers it | family predicates decide |
+| Process-group cleanup | never | skipped | signalled on membership |
+| Runaway phase | never selected | selected, and signalled | not selected |
+
+They previously carried three separate lists (`_cc_reaper_protected_pattern`, `_cc_reaper_is_direct_cleanup_protected`, and an `MCP_WHITELIST` local to `_claude_pgid_kill`) that had drifted apart: a runaway shared MCP was selected by one and skipped by another, `mcp-server-stripe` was protected where `@stripe/mcp` was not, and a stuck system scanner was reachable by the runaway phase.
+
+**Runaway phase specifics**: it never selects `immutable`, so cc-reaper does not SIGTERM security software or a Spotlight reindex however hot they get. It *does* signal the `shared` service it selected — that is the point of the phase, and `_claude_pgid_kill` takes a `force_target` argument for exactly that PID, sparing its group siblings. Reported counts are deliveries, not intentions: a candidate spared at the signal stage is not counted, adds nothing to the freed total, and raises no notification.
+
+**Tree RSS** (`_claude_tree_rss`) sums the whole descendant tree in kilobytes and converts once, from a single `ps` walked in awk. Truncating each member first cost ~0.5 MB per process, and stopping at grandchildren missed anything behind a wrapper chain; the single-pass form is also ~5x faster than the two-level version it replaced.
+
 **proc-janitor** is an external Rust daemon (installed via Homebrew or Cargo). The config.toml here only configures its behavior — the daemon code lives at github.com/jhlee0409/proc-janitor.
 
 **Installer idempotency**: `install.sh` checks for existing installations before modifying shell configs, copying hooks, or installing dependencies. It uses `sed` to replace `~` with the actual home path in the proc-janitor config.
@@ -83,6 +97,7 @@ bash tests/stop-hook-env.sh            # Validate CC_STOP_HOOK_DISABLE / CC_STOP
 bash tests/cc-monitor-optimize.sh      # Validate cc-monitor optimization menu logic
 bash tests/cc-monitor-runaway.sh       # Validate runaway protected process detection
 bash tests/guard-session-detect.sh     # Validate session detection + guard phases under bash and zsh
+bash tests/protection-classes.sh       # Validate protection classes, runaway selection/signalling, tree RSS
 bash -n shell/claude-cleanup.sh        # Syntax check
 bash -n shell/cc-monitor.sh            # Syntax check
 bash -n hooks/stop-cleanup-orphans.sh  # Syntax check
