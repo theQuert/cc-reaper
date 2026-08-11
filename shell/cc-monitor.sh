@@ -498,6 +498,22 @@ _cc_monitor_owner_alive() {
   kill -0 "$_CC_MONITOR_OWNER_PID" 2>/dev/null
 }
 
+# Sleep in short slices so cancellation is noticed promptly whatever interval the
+# caller asked for. A single `sleep "$interval"` delayed the owner check by the
+# whole interval — at --interval 30 a cancelled run kept sampling for half a
+# minute. Returns non-zero once the owner is gone.
+_cc_monitor_sleep_watching() {
+  local remaining=$1 slice=1
+  case "$remaining" in ''|*[!0-9]*) remaining=1 ;; esac
+  while [ "$remaining" -gt 0 ]; do
+    [ "$remaining" -lt "$slice" ] && slice="$remaining"
+    sleep "$slice"
+    remaining=$((remaining - slice))
+    _cc_monitor_owner_alive || return 1
+  done
+  return 0
+}
+
 _cc_monitor_collect_samples() {
   local outfile=$1
   local once=$2
@@ -524,15 +540,13 @@ _cc_monitor_collect_samples() {
     samples=$((samples + 1))
     [ "$progress" = "true" ] && printf "." >&2
     [ "$elapsed" -ge "$duration" ] && break
-    sleep "$interval"
-    elapsed=$((elapsed + interval))
-    # Whoever asked for this sample is gone. Break rather than exit: this runs
-    # inside a command substitution, so an exit here would end only that
-    # substitution and leave the worker sampling on.
-    if ! _cc_monitor_owner_alive; then
+    # Break rather than exit: this runs inside a command substitution, so an exit
+    # here would end only that substitution and leave the worker sampling on.
+    if ! _cc_monitor_sleep_watching "$interval"; then
       [ "$progress" = "true" ] && printf " cancelled\n" >&2
       break
     fi
+    elapsed=$((elapsed + interval))
   done
   [ "$progress" = "true" ] && printf " done (%s snapshots)\n" "$samples" >&2
   echo "$samples"

@@ -53,7 +53,10 @@ _cc_reaper_bound_log() {
 # left a reparented child per notification.
 _cc_reaper_notify() {
   local title=$1 subtitle=$2 message=$3
-  [ -t 1 ] || return 0
+  # Any of the three descriptors being a terminal means someone is there:
+  # `claude-guard | tee guard.log` redirects stdout while stdin and stderr stay
+  # attached. Under launchd all three point at log files, so nothing is raised.
+  [ -t 0 ] || [ -t 1 ] || [ -t 2 ] || return 0
   command -v osascript >/dev/null 2>&1 || return 0
   osascript -e "display notification \"$message\" with title \"$title\" subtitle \"$subtitle\"" \
     >/dev/null 2>&1 || true

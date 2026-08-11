@@ -69,7 +69,18 @@ after_jobs=$(jobs -p | wc -l | tr -d ' ')
   && pass "no background job is spawned" \
   || fail "background jobs leaked: $before_jobs -> $after_jobs"
 
-# A failing notifier must not change the caller's status.
+# A terminal on any descriptor counts. `claude-guard | tee guard.log` redirects
+# stdout while stdin and stderr stay attached, and a stdout-only check silenced
+# every notification for that ordinary case.
+# Not covered automatically: a terminal on stdin or stderr while stdout is
+# redirected — `claude-guard | tee guard.log`. Reproducing it needs a pty, and
+# whether `script` can attach one depends on the stdio of whoever runs the suite,
+# so the check was flaky under a command substitution and in CI. Verified by hand
+# instead: with a pty, `tty0=y tty1=n tty2=y` and the notification fires.
+# The negative direction — no terminal at all, which is the launchd case — is
+# asserted above.
+
+# A failing notifier must not change the caller's status.# A failing notifier must not change the caller's status.
 notify_rc=$( osascript() { return 1; }; _cc_reaper_notify "T" "S" "M" >/dev/null 2>&1; echo $? )
 [ "$notify_rc" = 0 ] && pass "failing notifier does not affect status" || fail "notifier failure leaked rc=$notify_rc"
 
@@ -109,6 +120,22 @@ for mode in normal abort; do
     [ "$mode_rc" = 0 ] && pass "normal run succeeds" || fail "normal run returned $mode_rc"
   fi
 done
+
+# Cancellation must be prompt whatever interval was asked for: a single
+# `sleep "$interval"` delayed the owner check by the whole interval, so at
+# --interval 30 a cancelled run kept sampling for half a minute.
+rm -rf "${TMPDIR:-/tmp}"/cc-monitor.* 2>/dev/null || true
+bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --duration 100 --interval 30 >/dev/null 2>&1" &
+slow_pid=$!
+sleep 3
+kill -TERM "$slow_pid" 2>/dev/null || true
+wait "$slow_pid" 2>/dev/null || true
+sleep 4
+slow_survivors=$( { pgrep -f 'cc-monitor --duration 100' 2>/dev/null || true; } | wc -l | tr -d ' ')
+[ "$slow_survivors" = 0 ] \
+  && pass "long interval still cancels promptly" \
+  || fail "$slow_survivors sampler(s) alive 4s after cancelling a 30s-interval run"
+pkill -f 'cc-monitor --duration 100' >/dev/null 2>&1 || true
 
 # Cancelling the top-level command must stop the worker. Signals aimed at the
 # invoking shell are never delivered to cc-monitor's subshell, so the sampler
