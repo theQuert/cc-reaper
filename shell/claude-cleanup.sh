@@ -32,6 +32,37 @@ _cc_reaper_is_protected_cmd() {
   [ "$(_cc_reaper_protection_class "$1")" = shared ]
 }
 
+# Bound a log to one live file plus one previous generation. cc-reaper reaps
+# other tools for leaking; an unbounded log of its own is the same fault.
+#
+# Copy-then-truncate rather than rename: truncating keeps the inode, so a
+# descriptor launchd already opened for StandardOutPath stays valid and keeps
+# appending to the live file. A rename would leave launchd filling the ".old"
+# copy while the live path stayed empty.
+_cc_reaper_bound_log() {
+  local file=$1 max=${2:-1048576} size=""
+  [ -f "$file" ] || return 0
+  size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+  [ -n "$size" ] && [ "$size" -gt "$max" ] || return 0
+  cp -f "$file" "$file.old" 2>/dev/null && : > "$file" 2>/dev/null
+  return 0
+}
+
+# Desktop notification, only where one can be seen. Under launchd there is no
+# terminal and nothing to display it, and the previous `osascript ... &` form
+# left a reparented child per notification.
+_cc_reaper_notify() {
+  local title=$1 subtitle=$2 message=$3
+  # Any of the three descriptors being a terminal means someone is there:
+  # `claude-guard | tee guard.log` redirects stdout while stdin and stderr stay
+  # attached. Under launchd all three point at log files, so nothing is raised.
+  [ -t 0 ] || [ -t 1 ] || [ -t 2 ] || return 0
+  command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e "display notification \"$message\" with title \"$title\" subtitle \"$subtitle\"" \
+    >/dev/null 2>&1 || true
+  return 0
+}
+
 _cc_reaper_rules_file() {
   if [ -n "${CC_REAPER_RULES_FILE:-}" ]; then
     echo "$CC_REAPER_RULES_FILE"
@@ -883,7 +914,7 @@ claude-guard() {
           if [ "${rsent:-0}" -gt 0 ]; then
             rkilled=$((rkilled + 1))
             rfreed=$((rfreed + ${rmb:-0}))
-            osascript -e "display notification \"Reaped runaway PID $rpid (CPU ${rcpu}%, etime ${retime})\" with title \"Claude Guard\" subtitle \"Runaway protected process\"" 2>/dev/null &
+            _cc_reaper_notify "Claude Guard" "Runaway protected process" "Reaped runaway PID $rpid (CPU ${rcpu}%, etime ${retime})"
           else
             echo "  PID $rpid was spared at the signal stage; not counted."
           fi
@@ -976,7 +1007,7 @@ claude-guard() {
         echo "  Killed PID $fpid (FDs: $ffds, threshold: $max_fd)"
         killed=$((killed + 1))
         freed_mb=$((freed_mb + ${fmb:-0}))
-        osascript -e "display notification \"Killed session PID $fpid — $ffds FDs (threshold: $max_fd)\" with title \"Claude Guard\" subtitle \"FD-leak session reaped\"" 2>/dev/null &
+        _cc_reaper_notify "Claude Guard" "FD-leak session reaped" "Killed session PID $fpid — $ffds FDs (threshold: $max_fd)"
       fi
     done
   fi
@@ -999,7 +1030,7 @@ claude-guard() {
         killed=$((killed + 1))
         freed_mb=$((freed_mb + ${bmb:-0}))
         # macOS desktop notification
-        osascript -e "display notification \"Killed session PID $bpid — ${brss} MB (threshold: ${max_rss_mb} MB)\" with title \"Claude Guard\" subtitle \"Bloated session reaped\"" 2>/dev/null &
+        _cc_reaper_notify "Claude Guard" "Bloated session reaped" "Killed session PID $bpid — ${brss} MB (threshold: ${max_rss_mb} MB)"
       fi
     done
   fi
@@ -1038,7 +1069,7 @@ claude-guard() {
     echo "  Reaped $killed session(s), freed ~${freed_mb} MB"
     # Summary notification
     if ! $dry_run; then
-      osascript -e "display notification \"Reaped $killed session(s), freed ~${freed_mb} MB\" with title \"Claude Guard\" subtitle \"Cleanup complete\"" 2>/dev/null &
+      _cc_reaper_notify "Claude Guard" "Cleanup complete" "Reaped $killed session(s), freed ~${freed_mb} MB"
     fi
   elif $dry_run && [ ${#bloated_records[@]} -eq 0 ] && [ "$remaining" -le "$max_sessions" ]; then
     echo "  All clear — no sessions to reap."

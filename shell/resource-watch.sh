@@ -70,12 +70,31 @@ _cc_rw_mem_min_pct() {
 # Directory bootstrap
 # ---------------------------------------------------------------------------
 
+# Bound a log to one live file plus one previous generation. cc-reaper reaps
+# other tools for leaking; an unbounded log of its own is the same fault.
+#
+# Copy-then-truncate rather than rename: truncating keeps the inode, so a
+# descriptor launchd already opened for StandardOutPath stays valid and keeps
+# appending to the live file. A rename would leave launchd filling the ".old"
+# copy while the live path stayed empty.
+_cc_rw_bound_log() {
+  local file=$1 max=${2:-1048576} size=""
+  [ -f "$file" ] || return 0
+  size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+  [ -n "$size" ] && [ "$size" -gt "$max" ] || return 0
+  cp -f "$file" "$file.old" 2>/dev/null && : > "$file" 2>/dev/null
+  return 0
+}
+
 _cc_rw_ensure_dirs() {
   local log_file state_dir
   log_file=$(_cc_rw_log_path)
   state_dir=$(_cc_rw_state_dir)
   mkdir -p "$(dirname "$log_file")" 2>/dev/null || true
   mkdir -p "$state_dir" 2>/dev/null || true
+  _cc_rw_bound_log "$log_file"
+  _cc_rw_bound_log "$HOME/.cc-reaper/logs/launchd-resource-watch-stdout.log"
+  _cc_rw_bound_log "$HOME/.cc-reaper/logs/launchd-resource-watch-stderr.log"
 }
 
 # ---------------------------------------------------------------------------

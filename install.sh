@@ -36,6 +36,30 @@ echo ""
 
 echo "[1/4] Installing shell functions..."
 
+# Activate a LaunchAgent and confirm it came up.
+#
+# `launchctl load` cannot clear a `disabled` flag in the launchd database, and
+# reports nothing when the agent fails to start — an agent disabled once stays
+# dead through every later install while still looking installed. Enable,
+# bootstrap, then confirm. Appends failures to AGENT_FAILED.
+AGENT_UI="gui/$(id -u)"
+AGENT_FAILED=""
+_cc_install_agent() {
+  local label=$1 plist=$2
+  launchctl enable "$AGENT_UI/$label" 2>/dev/null || true
+  launchctl bootout "$AGENT_UI/$label" 2>/dev/null || true
+  launchctl bootstrap "$AGENT_UI" "$plist" 2>/dev/null || true
+  launchctl print "$AGENT_UI/$label" >/dev/null 2>&1 && return 0
+  AGENT_FAILED="$AGENT_FAILED $label"
+  return 1
+}
+
+_cc_report_failed_agents() {
+  [ -n "$AGENT_FAILED" ] || return 0
+  echo "  WARNING: these agents did not load:$AGENT_FAILED"
+  echo "           inspect with: launchctl print $AGENT_UI/<label>"
+}
+
 SHELL_SOURCE="source \"$SCRIPT_DIR/shell/claude-cleanup.sh\""
 MONITOR_SOURCE="source \"$SCRIPT_DIR/shell/cc-monitor.sh\""
 
@@ -187,9 +211,7 @@ else
 
   sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/com.cc-reaper.orphan-monitor.plist" > "$PLIST_FILE"
 
-  # Load the LaunchAgent
-  launchctl unload "$PLIST_FILE" 2>/dev/null || true
-  launchctl load "$PLIST_FILE"
+  _cc_install_agent "com.cc-reaper.orphan-monitor" "$PLIST_FILE" || true
 
   echo "  LaunchAgent installed and started."
   echo "  Monitor runs every 10 minutes, logs at $REAPER_DIR/logs/"
@@ -219,11 +241,12 @@ for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cle
 done
 
 for AGENT in resource-watch disk-check weekly-clean guard; do
-  AGENT_PLIST="$PLIST_DIR/com.cc-reaper.$AGENT.plist"
-  sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/com.cc-reaper.$AGENT.plist" > "$AGENT_PLIST"
-  launchctl unload "$AGENT_PLIST" 2>/dev/null || true
-  launchctl load "$AGENT_PLIST"
+  AGENT_LABEL="com.cc-reaper.$AGENT"
+  AGENT_PLIST="$PLIST_DIR/$AGENT_LABEL.plist"
+  sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/$AGENT_LABEL.plist" > "$AGENT_PLIST"
+  _cc_install_agent "$AGENT_LABEL" "$AGENT_PLIST" || true
 done
+_cc_report_failed_agents
 
 echo "  resource-watch: snapshot every 10 min (alerts on load/disk/memory thresholds)"
 echo "  disk-check:     read-only disk + TM-snapshot check every hour"

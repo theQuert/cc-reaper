@@ -42,7 +42,29 @@ CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
 
 _cc_dj_init_dirs() {
   mkdir -p "$(dirname "$CC_DJ_LOG")" || { echo "disk-janitor: cannot create log dir" >&2; return 1; }
+  _cc_dj_bound_log "$CC_DJ_LOG"
+  local agent
+  for agent in disk-check weekly-clean; do
+    _cc_dj_bound_log "$HOME/.cc-reaper/logs/launchd-$agent-stdout.log"
+    _cc_dj_bound_log "$HOME/.cc-reaper/logs/launchd-$agent-stderr.log"
+  done
   mkdir -p "$CC_DJ_STATE_DIR" || { echo "disk-janitor: cannot create log dir" >&2; return 1; }
+}
+
+# Bound a log to one live file plus one previous generation. cc-reaper reaps
+# other tools for leaking; an unbounded log of its own is the same fault.
+#
+# Copy-then-truncate rather than rename: truncating keeps the inode, so a
+# descriptor launchd already opened for StandardOutPath stays valid and keeps
+# appending to the live file. A rename would leave launchd filling the ".old"
+# copy while the live path stayed empty.
+_cc_dj_bound_log() {
+  local file=$1 max=${2:-1048576} size=""
+  [ -f "$file" ] || return 0
+  size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+  [ -n "$size" ] && [ "$size" -gt "$max" ] || return 0
+  cp -f "$file" "$file.old" 2>/dev/null && : > "$file" 2>/dev/null
+  return 0
 }
 
 _cc_dj_log() {

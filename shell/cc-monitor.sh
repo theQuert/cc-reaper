@@ -490,6 +490,30 @@ _cc_monitor_snapshot() {
   '
 }
 
+# True while the shell that invoked cc-monitor still exists. Signals aimed at the
+# top-level PID — what `timeout` and most job runners cancel with — never reach
+# the worker subshell, so it has to notice on its own.
+_cc_monitor_owner_alive() {
+  [ -n "${_CC_MONITOR_OWNER_PID:-}" ] || return 0
+  kill -0 "$_CC_MONITOR_OWNER_PID" 2>/dev/null
+}
+
+# Sleep in short slices so cancellation is noticed promptly whatever interval the
+# caller asked for. A single `sleep "$interval"` delayed the owner check by the
+# whole interval — at --interval 30 a cancelled run kept sampling for half a
+# minute. Returns non-zero once the owner is gone.
+_cc_monitor_sleep_watching() {
+  local remaining=$1 slice=1
+  case "$remaining" in ''|*[!0-9]*) remaining=1 ;; esac
+  while [ "$remaining" -gt 0 ]; do
+    [ "$remaining" -lt "$slice" ] && slice="$remaining"
+    sleep "$slice"
+    remaining=$((remaining - slice))
+    _cc_monitor_owner_alive || return 1
+  done
+  return 0
+}
+
 _cc_monitor_collect_samples() {
   local outfile=$1
   local once=$2
@@ -516,7 +540,12 @@ _cc_monitor_collect_samples() {
     samples=$((samples + 1))
     [ "$progress" = "true" ] && printf "." >&2
     [ "$elapsed" -ge "$duration" ] && break
-    sleep "$interval"
+    # Break rather than exit: this runs inside a command substitution, so an exit
+    # here would end only that substitution and leave the worker sampling on.
+    if ! _cc_monitor_sleep_watching "$interval"; then
+      [ "$progress" = "true" ] && printf " cancelled\n" >&2
+      break
+    fi
     elapsed=$((elapsed + interval))
   done
   [ "$progress" = "true" ] && printf " done (%s snapshots)\n" "$samples" >&2
@@ -1119,44 +1148,81 @@ cc-monitor() {
     duration=0
   fi
 
-  local tmp_dir="" raw_file="" agg_file="" findings_file="" samples=""
-  tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor.XXXXXX") || return 1
-  raw_file="$tmp_dir/raw.tsv"
-  agg_file="$tmp_dir/agg.tsv"
-  findings_file="$tmp_dir/findings.tsv"
+  # Module-scoped rather than `local`: bash unwinds function scopes before running
+  # an EXIT trap, so a local would expand to empty there and `rm -rf ""` would
+  # clean nothing. Baking the path into the trap string is not the fix either —
+  # trap bodies are re-parsed as shell source, so a TMPDIR containing a quote
+  # breaks the handler and lets the path inject commands into it. A deferred
+  # expansion inside double quotes is never reparsed.
+  _CC_MONITOR_TMP=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor.XXXXXX") || return 1
+  local tmp_dir="$_CC_MONITOR_TMP"
 
-  local progress=false
-  [ "$json" = "false" ] && progress=true
+  # Whoever asked for this run: the interactive shell, or the background subshell
+  # when started with `&`. Signals aimed there — what `timeout`, job runners, and
+  # `kill $!` all use — never reach the worker, so it has to notice on its own.
+  # PID of the process actually running this invocation. $$ keeps pointing at the
+  # main shell even inside a background job, so `cc-monitor ... &` then `kill $!`
+  # would go unnoticed, and BASHPID does not exist in the bash 3.2 macOS ships. A
+  # child reports its parent instead. `exec` is load-bearing: it replaces the
+  # command substitution's own subshell rather than letting that subshell become
+  # the parent, which under bash 3.2 returned a PID that had already exited and
+  # made every run look cancelled. It cannot be wrapped in a helper function —
+  # the extra subshell a call would add reintroduces exactly that.
+  _CC_MONITOR_OWNER_PID=$(exec sh -c 'echo $PPID')
 
-  samples=$(_cc_monitor_collect_samples "$raw_file" "$once" "$duration" "$interval" "$progress")
-  _cc_monitor_aggregate_samples "$raw_file" "$agg_file"
-  _cc_monitor_enrich_findings "$agg_file" "$findings_file" "$min_cpu"
+  # Everything below runs in a subshell so its traps stay local. This file is
+  # sourced into the user's shell, where traps are global: setting EXIT here
+  # would fire in their shell, and clearing it afterwards would delete handlers
+  # they had installed themselves.
+  #
+  # The INT and TERM handlers exit rather than return. Default sampling runs 60s,
+  # so an interrupt is ordinary; without the exit, the shell would resume the run
+  # and aggregate a directory that had just been removed.
+  (
+    trap 'rm -rf "$_CC_MONITOR_TMP"; exit 130' INT
+    trap 'rm -rf "$_CC_MONITOR_TMP"; exit 143' TERM
+    trap 'rm -rf "$_CC_MONITOR_TMP"' EXIT
 
-  local dispatch_rc=0
-  if [ "$json" = "true" ]; then
-    _cc_monitor_json_report "$findings_file" "$duration" "$interval" "$samples" "$once"
-  else
-    _cc_monitor_human_report "$findings_file" "$duration" "$interval" "$samples" "$once" "$top"
+    local raw_file="" agg_file="" findings_file="" samples=""
+    raw_file="$tmp_dir/raw.tsv"
+    agg_file="$tmp_dir/agg.tsv"
+    findings_file="$tmp_dir/findings.tsv"
 
-    if [ -n "$apply_module" ]; then
-      _cc_monitor_dispatch_module "$apply_module" "true"
-      dispatch_rc=$?
-    elif [ "$no_prompt" != "true" ] && _cc_monitor_is_tty; then
-      local recommended=""
-      recommended=$(_cc_monitor_recommended_module "$findings_file") || recommended=""
-      local chosen=""
-      if [ -n "$recommended" ]; then
-        chosen=$(_cc_monitor_prompt_apply "$findings_file" "$recommended") || chosen=""
-      fi
-      if [ -n "$chosen" ]; then
-        _cc_monitor_dispatch_module "$chosen" "false"
+    local progress=false
+    [ "$json" = "false" ] && progress=true
+
+    samples=$(_cc_monitor_collect_samples "$raw_file" "$once" "$duration" "$interval" "$progress")
+    # Cancelled mid-sample: stop here so the EXIT trap clears the temp directory
+    # instead of reporting into a terminal that is gone.
+    _cc_monitor_owner_alive || exit 143
+    _cc_monitor_aggregate_samples "$raw_file" "$agg_file"
+    _cc_monitor_enrich_findings "$agg_file" "$findings_file" "$min_cpu"
+
+    local dispatch_rc=0
+    if [ "$json" = "true" ]; then
+      _cc_monitor_json_report "$findings_file" "$duration" "$interval" "$samples" "$once"
+    else
+      _cc_monitor_human_report "$findings_file" "$duration" "$interval" "$samples" "$once" "$top"
+
+      if [ -n "$apply_module" ]; then
+        _cc_monitor_dispatch_module "$apply_module" "true"
         dispatch_rc=$?
+      elif [ "$no_prompt" != "true" ] && _cc_monitor_is_tty; then
+        local recommended=""
+        recommended=$(_cc_monitor_recommended_module "$findings_file") || recommended=""
+        local chosen=""
+        if [ -n "$recommended" ]; then
+          chosen=$(_cc_monitor_prompt_apply "$findings_file" "$recommended") || chosen=""
+        fi
+        if [ -n "$chosen" ]; then
+          _cc_monitor_dispatch_module "$chosen" "false"
+          dispatch_rc=$?
+        fi
       fi
     fi
-  fi
 
-  rm -rf "$tmp_dir"
-  return "$dispatch_rc"
+    exit "$dispatch_rc"
+  )
 }
 
 if [ -n "${BASH_VERSION:-}" ]; then
