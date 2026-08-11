@@ -110,6 +110,26 @@ for mode in normal abort; do
   fi
 done
 
+# Cancelling the top-level command must stop the worker. Signals aimed at the
+# invoking shell are never delivered to cc-monitor's subshell, so the sampler
+# checks whether its owner is still there between snapshots.
+rm -rf "${TMPDIR:-/tmp}"/cc-monitor.* 2>/dev/null || true
+bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --duration 40 --interval 2 >/dev/null 2>&1" &
+cancel_pid=$!
+sleep 3
+kill -TERM "$cancel_pid" 2>/dev/null || true
+wait "$cancel_pid" 2>/dev/null || true
+sleep 6
+# pgrep exits non-zero with no match, and pipefail would abort the script on
+# that — the third time this file has been bitten by it.
+survivors=$( { pgrep -f 'cc-monitor --duration 40' 2>/dev/null || true; } | wc -l | tr -d ' ')
+[ "$survivors" = 0 ] \
+  && pass "cancelling the caller stops the sampler" \
+  || fail "$survivors sampler process(es) outlived the caller"
+[ "$(count_monitor_dirs)" = 0 ] \
+  && pass "cancelling the caller cleans the temp directory" \
+  || fail "cancelled run left a temp directory"
+
 # A TMPDIR containing a quote must not break the handler or let the path inject
 # commands into it — trap bodies are re-parsed as shell source, so the path is
 # expanded at handler time rather than embedded.

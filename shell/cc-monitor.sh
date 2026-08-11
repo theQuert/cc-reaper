@@ -490,6 +490,14 @@ _cc_monitor_snapshot() {
   '
 }
 
+# True while the shell that invoked cc-monitor still exists. Signals aimed at the
+# top-level PID — what `timeout` and most job runners cancel with — never reach
+# the worker subshell, so it has to notice on its own.
+_cc_monitor_owner_alive() {
+  [ -n "${_CC_MONITOR_OWNER_PID:-}" ] || return 0
+  kill -0 "$_CC_MONITOR_OWNER_PID" 2>/dev/null
+}
+
 _cc_monitor_collect_samples() {
   local outfile=$1
   local once=$2
@@ -518,6 +526,13 @@ _cc_monitor_collect_samples() {
     [ "$elapsed" -ge "$duration" ] && break
     sleep "$interval"
     elapsed=$((elapsed + interval))
+    # Whoever asked for this sample is gone. Break rather than exit: this runs
+    # inside a command substitution, so an exit here would end only that
+    # substitution and leave the worker sampling on.
+    if ! _cc_monitor_owner_alive; then
+      [ "$progress" = "true" ] && printf " cancelled\n" >&2
+      break
+    fi
   done
   [ "$progress" = "true" ] && printf " done (%s snapshots)\n" "$samples" >&2
   echo "$samples"
@@ -1128,6 +1143,13 @@ cc-monitor() {
   _CC_MONITOR_TMP=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor.XXXXXX") || return 1
   local tmp_dir="$_CC_MONITOR_TMP"
 
+  # The invoking shell's PID. In both bash and zsh a subshell keeps $$ pointing
+  # at the main shell, so the sampler can tell whether whoever started it is
+  # still there. Signals aimed at the top-level PID — what `timeout` and most job
+  # runners cancel with — are not delivered to the subshell, and without this the
+  # sampler outlived its caller.
+  _CC_MONITOR_OWNER_PID=$$
+
   # Everything below runs in a subshell so its traps stay local. This file is
   # sourced into the user's shell, where traps are global: setting EXIT here
   # would fire in their shell, and clearing it afterwards would delete handlers
@@ -1150,6 +1172,9 @@ cc-monitor() {
     [ "$json" = "false" ] && progress=true
 
     samples=$(_cc_monitor_collect_samples "$raw_file" "$once" "$duration" "$interval" "$progress")
+    # Cancelled mid-sample: stop here so the EXIT trap clears the temp directory
+    # instead of reporting into a terminal that is gone.
+    _cc_monitor_owner_alive || exit 143
     _cc_monitor_aggregate_samples "$raw_file" "$agg_file"
     _cc_monitor_enrich_findings "$agg_file" "$findings_file" "$min_cpu"
 
