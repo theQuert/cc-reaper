@@ -97,7 +97,12 @@ notify_rc=$( osascript() { return 1; }; _cc_reaper_notify "T" "S" "M" >/dev/null
 
 # `ls` exits non-zero when the glob matches nothing, and pipefail would abort the
 # whole script on that — counting with find keeps an empty result an empty result.
-count_monitor_dirs() { find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cc-monitor.*' -type d 2>/dev/null | wc -l | tr -d ' '; }
+# Every monitor the suite spawns gets a private TMPDIR. Globbing the user's
+# shared one would delete directories belonging to a cc-monitor they are running
+# right now, and make it aggregate files that vanished underneath it.
+mon_tmp="$tmp_dir/mon"
+mkdir -p "$mon_tmp"
+count_monitor_dirs() { find "$mon_tmp" -maxdepth 1 -name 'cc-monitor.*' -type d 2>/dev/null | wc -l | tr -d ' '; }
 
 # Both exit paths must clean up. Signal delivery is not asserted: whether
 # cc-monitor's subshell is a distinct process depends on the shell's
@@ -108,13 +113,13 @@ count_monitor_dirs() { find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cc-monitor.*' -
 # function scopes before running an EXIT trap, so it expanded to empty and
 # `rm -rf ""` cleaned nothing. The path is baked into the trap instead.
 for mode in normal abort; do
-  rm -rf "${TMPDIR:-/tmp}"/cc-monitor.* 2>/dev/null || true
+  rm -rf "$mon_tmp"/cc-monitor.* 2>/dev/null || true
   if [ "$mode" = normal ]; then
     mode_rc=0
-    bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --once >/dev/null 2>&1" || mode_rc=$?
+    TMPDIR="$mon_tmp" bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --once >/dev/null 2>&1" || mode_rc=$?
   else
     mode_rc=0
-    bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'
+    TMPDIR="$mon_tmp" bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'
              _cc_monitor_aggregate_samples() { exit 130; }
              cc-monitor --once >/dev/null 2>&1" || mode_rc=$?
   fi
@@ -141,38 +146,33 @@ done
 # Cancellation must be prompt whatever interval was asked for: a single
 # `sleep "$interval"` delayed the owner check by the whole interval, so at
 # --interval 30 a cancelled run kept sampling for half a minute.
-rm -rf "${TMPDIR:-/tmp}"/cc-monitor.* 2>/dev/null || true
-bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --duration 100 --interval 30 >/dev/null 2>&1" &
+rm -rf "$mon_tmp"/cc-monitor.* 2>/dev/null || true
+TMPDIR="$mon_tmp" bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --duration 100 --interval 30 >/dev/null 2>&1" &
 slow_pid=$!
 sleep 3
 kill -TERM "$slow_pid" 2>/dev/null || true
 wait "$slow_pid" 2>/dev/null || true
 sleep 4
-slow_survivors=$( { pgrep -f 'cc-monitor --duration 100' 2>/dev/null || true; } | wc -l | tr -d ' ')
-[ "$slow_survivors" = 0 ] \
+# The private TMPDIR is the assertion: a sampler still running would still own a
+# directory in it. Counting processes would need `pgrep -f`, which cannot tell
+# the wrapper from a worker that inherited its argv.
+[ "$(count_monitor_dirs)" = 0 ] \
   && pass "long interval still cancels promptly" \
-  || fail "$slow_survivors sampler(s) alive 4s after cancelling a 30s-interval run"
-pkill -f 'cc-monitor --duration 100' >/dev/null 2>&1 || true
+  || fail "a sampler was alive 4s after cancelling a 30s-interval run"
 
 # Cancelling the top-level command must stop the worker. Signals aimed at the
 # invoking shell are never delivered to cc-monitor's subshell, so the sampler
 # checks whether its owner is still there between snapshots.
-rm -rf "${TMPDIR:-/tmp}"/cc-monitor.* 2>/dev/null || true
-bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --duration 40 --interval 2 >/dev/null 2>&1" &
+rm -rf "$mon_tmp"/cc-monitor.* 2>/dev/null || true
+TMPDIR="$mon_tmp" bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --duration 40 --interval 2 >/dev/null 2>&1" &
 cancel_pid=$!
 sleep 3
 kill -TERM "$cancel_pid" 2>/dev/null || true
 wait "$cancel_pid" 2>/dev/null || true
 sleep 6
-# pgrep exits non-zero with no match, and pipefail would abort the script on
-# that — the third time this file has been bitten by it.
-survivors=$( { pgrep -f 'cc-monitor --duration 40' 2>/dev/null || true; } | wc -l | tr -d ' ')
-[ "$survivors" = 0 ] \
-  && pass "cancelling the caller stops the sampler" \
-  || fail "$survivors sampler process(es) outlived the caller"
 [ "$(count_monitor_dirs)" = 0 ] \
-  && pass "cancelling the caller cleans the temp directory" \
-  || fail "cancelled run left a temp directory"
+  && pass "cancelling the caller stops the sampler and cleans up" \
+  || fail "a sampler outlived the caller"
 
 # A TMPDIR containing a quote must not break the handler or let the path inject
 # commands into it — trap bodies are re-parsed as shell source, so the path is

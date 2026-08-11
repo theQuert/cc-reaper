@@ -74,12 +74,11 @@ _cc_wj_log_write() {
   log=$(_cc_wj_log)
   mkdir -p "$(dirname "$log")" 2>/dev/null || true
   # Bound from here rather than the direct-execution guard: this file is also
-  # sourced, and a sourced `_cc_wj_run` would then append without any cap. Once
-  # per process, so repeated calls cost nothing.
-  if [ -z "${_CC_WJ_LOG_BOUNDED:-}" ]; then
-    _cc_wj_bound_log "$log"
-    _CC_WJ_LOG_BOUNDED=1
-  fi
+  # sourced, and a sourced `_cc_wj_run` would otherwise append without any cap.
+  # Checked on every write rather than once per process — a long-lived shell that
+  # sourced this file would keep a one-shot flag set across runs and never look
+  # again. A run writes a handful of lines, so the cost is a handful of stats.
+  _cc_wj_bound_log "$log"
   printf "[%s] %s\n" "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$log" 2>/dev/null || true
 }
 
