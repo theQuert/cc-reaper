@@ -1119,8 +1119,14 @@ cc-monitor() {
     duration=0
   fi
 
-  local tmp_dir=""
-  tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor.XXXXXX") || return 1
+  # Module-scoped rather than `local`: bash unwinds function scopes before running
+  # an EXIT trap, so a local would expand to empty there and `rm -rf ""` would
+  # clean nothing. Baking the path into the trap string is not the fix either —
+  # trap bodies are re-parsed as shell source, so a TMPDIR containing a quote
+  # breaks the handler and lets the path inject commands into it. A deferred
+  # expansion inside double quotes is never reparsed.
+  _CC_MONITOR_TMP=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor.XXXXXX") || return 1
+  local tmp_dir="$_CC_MONITOR_TMP"
 
   # Everything below runs in a subshell so its traps stay local. This file is
   # sourced into the user's shell, where traps are global: setting EXIT here
@@ -1131,12 +1137,9 @@ cc-monitor() {
   # so an interrupt is ordinary; without the exit, the shell would resume the run
   # and aggregate a directory that had just been removed.
   (
-    # The path is baked in rather than referenced: bash unwinds function scopes
-    # before running an EXIT trap, so a `local` like $tmp_dir expands to empty by
-    # the time the handler runs, and `rm -rf ""` silently cleans nothing.
-    trap "rm -rf '$tmp_dir'; exit 130" INT
-    trap "rm -rf '$tmp_dir'; exit 143" TERM
-    trap "rm -rf '$tmp_dir'" EXIT
+    trap 'rm -rf "$_CC_MONITOR_TMP"; exit 130' INT
+    trap 'rm -rf "$_CC_MONITOR_TMP"; exit 143' TERM
+    trap 'rm -rf "$_CC_MONITOR_TMP"' EXIT
 
     local raw_file="" agg_file="" findings_file="" samples=""
     raw_file="$tmp_dir/raw.tsv"

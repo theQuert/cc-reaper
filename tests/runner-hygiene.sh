@@ -110,6 +110,26 @@ for mode in normal abort; do
   fi
 done
 
+# A TMPDIR containing a quote must not break the handler or let the path inject
+# commands into it — trap bodies are re-parsed as shell source, so the path is
+# expanded at handler time rather than embedded.
+quoted_tmp="$tmp_dir/has'quote"
+mkdir -p "$quoted_tmp"
+TMPDIR="$quoted_tmp" bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --once >/dev/null 2>&1" || true
+[ "$(find "$quoted_tmp" -maxdepth 1 -name 'cc-monitor.*' 2>/dev/null | wc -l | tr -d ' ')" = 0 ] \
+  && pass "quoted TMPDIR: temp directory still cleaned" \
+  || fail "quoted TMPDIR: temp directory leaked"
+
+inject_marker="$tmp_dir/injected"
+inject_tmp="$tmp_dir/x'\$(touch '$inject_marker')'y"
+mkdir -p "$inject_tmp" 2>/dev/null || true
+if [ -d "$inject_tmp" ]; then
+  TMPDIR="$inject_tmp" bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --once >/dev/null 2>&1" 2>/dev/null || true
+  [ -f "$inject_marker" ] \
+    && fail "a crafted TMPDIR injected a command into the trap" \
+    || pass "crafted TMPDIR cannot inject into the trap"
+fi
+
 # A completed run must leave the caller's traps alone too.
 marker2="$tmp_dir/caller-trap-2"
 ( trap 'printf fired > "$marker2"' EXIT
