@@ -727,8 +727,9 @@ claude-sessions() {
 }
 
 # Kill a session's process group, sparing immutable processes, shared services,
-# and anything a user `protect` rule covers. Prints the number of processes
-# actually signalled, so callers can report deliveries rather than intentions.
+# and anything a user `protect` rule covers. Prints "<count> <freed_mb>" for the
+# processes actually signalled, so callers report deliveries rather than
+# intentions — the tree's pre-kill RSS would also count members left running.
 #
 # `force_target` makes the named PID itself bypass the `shared` exemption — the
 # runaway phase uses it to terminate a shared service that is stuck hot, which
@@ -741,10 +742,11 @@ _claude_pgid_kill() {
   local target_pid=$1
   local force_target=${2:-0}
   local signalled=0
+  local freed_kb=0
   local target_cmd=""
   target_cmd=$(ps -o command= -p "$target_pid" 2>/dev/null)
-  _cc_reaper_has_user_rule protect "$target_cmd" && { echo 0; return 1; }
-  [ "$(_cc_reaper_protection_class "$target_cmd")" = immutable ] && { echo 0; return 1; }
+  _cc_reaper_has_user_rule protect "$target_cmd" && { echo "0 0"; return 1; }
+  [ "$(_cc_reaper_protection_class "$target_cmd")" = immutable ] && { echo "0 0"; return 1; }
 
   local pgid=$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ')
   if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
@@ -759,12 +761,19 @@ _claude_pgid_kill() {
         # Only the explicitly selected target crosses this exemption.
         { [ "$force_target" = 1 ] && [ "$pid" = "$target_pid" ]; } || continue
       fi
-      _cc_reaper_kill_pid "$pid" && signalled=$((signalled + 1))
+      local pid_rss=""
+      pid_rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+      if _cc_reaper_kill_pid "$pid"; then
+        signalled=$((signalled + 1))
+        freed_kb=$((freed_kb + ${pid_rss:-0}))
+      fi
     done < <(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$pgid" '$2 == pgid {print $1}')
   else
-    _cc_reaper_kill_pid "$target_pid" && signalled=1
+    local t_rss=""
+    t_rss=$(ps -o rss= -p "$target_pid" 2>/dev/null | tr -d ' ')
+    _cc_reaper_kill_pid "$target_pid" && { signalled=1; freed_kb=${t_rss:-0}; }
   fi
-  echo "$signalled"
+  echo "$signalled $((freed_kb / 1024))"
 }
 
 # Automatic session guard: kills bloated (RSS threshold) and idle sessions
@@ -867,15 +876,13 @@ claude-guard() {
         local rkilled=0 rfreed=0
         while IFS=$'\t' read -r rpid rcpu retime rrest; do
           [ -z "$rpid" ] && continue
-          local rrss=""
-          rrss=$(_claude_tree_rss "$rpid" 2>/dev/null || echo 0)
           # force_target: a runaway shared service is exactly what this phase
           # exists to reclaim, so the selected PID crosses the shared exemption.
-          local rsent=""
-          rsent=$(_claude_pgid_kill "$rpid" 1 2>/dev/null)
+          local rsent=0 rmb=0
+          read -r rsent rmb <<< "$(_claude_pgid_kill "$rpid" 1 2>/dev/null)"
           if [ "${rsent:-0}" -gt 0 ]; then
             rkilled=$((rkilled + 1))
-            rfreed=$((rfreed + ${rrss:-0}))
+            rfreed=$((rfreed + ${rmb:-0}))
             osascript -e "display notification \"Reaped runaway PID $rpid (CPU ${rcpu}%, etime ${retime})\" with title \"Claude Guard\" subtitle \"Runaway protected process\"" 2>/dev/null &
           else
             echo "  PID $rpid was spared at the signal stage; not counted."
@@ -964,10 +971,11 @@ claude-guard() {
       if $dry_run; then
         echo "  [DRY-RUN] Would kill PID $fpid (FDs: $ffds, threshold: $max_fd)"
       else
-        _claude_pgid_kill "$fpid" >/dev/null
+        local fsent=0 fmb=0
+        read -r fsent fmb <<< "$(_claude_pgid_kill "$fpid")"
         echo "  Killed PID $fpid (FDs: $ffds, threshold: $max_fd)"
         killed=$((killed + 1))
-        freed_mb=$((freed_mb + frss))
+        freed_mb=$((freed_mb + ${fmb:-0}))
         osascript -e "display notification \"Killed session PID $fpid — $ffds FDs (threshold: $max_fd)\" with title \"Claude Guard\" subtitle \"FD-leak session reaped\"" 2>/dev/null &
       fi
     done
@@ -985,10 +993,11 @@ claude-guard() {
         echo "  [DRY-RUN] Would kill PID $bpid (tree RSS: ${brss} MB, threshold: ${max_rss_mb} MB)"
       else
         # Kill session group, preserving whitelisted MCP servers
-        _claude_pgid_kill "$bpid" >/dev/null
+        local bsent=0 bmb=0
+        read -r bsent bmb <<< "$(_claude_pgid_kill "$bpid")"
         echo "  Killed PID $bpid (tree RSS: ${brss} MB, threshold: ${max_rss_mb} MB)"
         killed=$((killed + 1))
-        freed_mb=$((freed_mb + brss))
+        freed_mb=$((freed_mb + ${bmb:-0}))
         # macOS desktop notification
         osascript -e "display notification \"Killed session PID $bpid — ${brss} MB (threshold: ${max_rss_mb} MB)\" with title \"Claude Guard\" subtitle \"Bloated session reaped\"" 2>/dev/null &
       fi
@@ -1014,10 +1023,11 @@ claude-guard() {
         echo "  [DRY-RUN] Would kill PID $ipid (idle ${ietime}, tree RSS: ${irss} MB)"
       else
         # Kill session group, preserving whitelisted MCP servers
-        _claude_pgid_kill "$ipid" >/dev/null
+        local isent=0 imb=0
+        read -r isent imb <<< "$(_claude_pgid_kill "$ipid")"
         echo "  Killed PID $ipid (idle ${ietime}, tree RSS: ${irss} MB)"
         killed=$((killed + 1))
-        freed_mb=$((freed_mb + irss))
+        freed_mb=$((freed_mb + ${imb:-0}))
       fi
     done
   fi

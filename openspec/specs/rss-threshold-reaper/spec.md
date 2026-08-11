@@ -4,7 +4,7 @@
 
 A hard memory ceiling for Claude Code sessions. `claude-guard` terminates a session whose tree RSS meets or exceeds `CC_MAX_RSS_MB` whether it is idle or active, because a leaking session can balloon to multiple GB while still busy. A session covered by a user `protect` rule is exempt, and one that is also leaking descriptors is handled by the FD-leak phase instead.
 
-Tree RSS covers the session process, its children, and its grandchildren, each truncated to whole megabytes before summation.
+Tree RSS covers the session process and all its descendants to any depth, summed in kilobytes and converted to megabytes once.
 
 ## Requirements
 
@@ -24,18 +24,16 @@ The system SHALL support a configurable RSS threshold via the `CC_MAX_RSS_MB` en
 - **THEN** the system SHALL fall back to the default 4096 MB and print a warning
 
 ### Requirement: Tree RSS calculation
-The system SHALL calculate tree RSS over the session process, its direct children, and its grandchildren — two generations, matching the existing `claude-sessions` logic. It SHALL NOT recurse further.
 
-Each member's RSS SHALL be truncated to whole megabytes **before** summation, not summed in kilobytes and converted once. The two behaviours differ, and the shipped helper truncates per process.
+The system SHALL calculate tree RSS over the session process and **all** its descendants, to any
+depth.
 
-Both bounds make tree RSS a slight underestimate, so a session crosses the threshold marginally later than its true footprint would suggest:
+Member sizes SHALL be summed in kilobytes and converted to megabytes once, at the end. Truncating
+each member individually loses roughly 0.5 MB per process, which on a ten-process tree is several
+megabytes of silent undercount.
 
-| Source | Measured on four live sessions (6–10 processes each) |
-|---|---|
-| Per-process truncation | 2–4 MB |
-| Generations beyond grandchildren | 0–1 MB |
-
-Truncation dominates and scales with process count — roughly 0.5 MB per member — while depth costs almost nothing on ordinary session trees; a long wrapper chain (CLI → `npm` → shell → server) would shift that balance. Both are accepted rather than paid for on every sampled session. Changing either is a behavior change, not a wording change.
+Both corrections make tree RSS larger than before, so a session crosses `CC_MAX_RSS_MB` slightly
+earlier than it used to. The previous behaviour was an undercount, not a safety margin.
 
 #### Scenario: Session with MCP server children
 - **WHEN** a Claude session (PID 1000) has 3 child MCP servers each using 200 MB, and the session itself uses 500 MB
@@ -43,11 +41,15 @@ Truncation dominates and scales with process count — roughly 0.5 MB per member
 
 #### Scenario: Members carry fractional megabytes
 - **WHEN** a session's own RSS is 4095 MB plus 1023 KB and its single child holds 1 KB
-- **THEN** tree RSS SHALL be 4095 MB, because each member is truncated before summation — summing in kilobytes first would give 4096 MB and reach the threshold a member earlier
+- **THEN** tree RSS SHALL be 4096 MB, because members are summed in kilobytes before conversion
 
 #### Scenario: Great-grandchild process
 - **WHEN** a session's grandchild has spawned a further child of its own
-- **THEN** that process's RSS SHALL NOT be included in tree RSS
+- **THEN** that process's RSS SHALL be included in tree RSS
+
+#### Scenario: Deep wrapper chain
+- **WHEN** a session runs behind a chain such as CLI → `npm` → shell → server
+- **THEN** every process in that chain SHALL contribute to tree RSS
 
 ### Requirement: Bloated session detection
 The system SHALL mark a session as `[BLOATED]` when its tree RSS **meets or exceeds** the configured threshold **and** it has not already matched a higher-priority status. Tree RSS is carried as whole megabytes, so equality is a reachable boundary and is treated as bloated.
@@ -86,7 +88,7 @@ An over-threshold session that is also leaking descriptors is reaped by the FD-l
 - **THEN** the session SHALL NOT be marked as `[BLOATED]`
 
 ### Requirement: Bloated session termination
-The system SHALL terminate bloated sessions PGID-aware, regardless of whether the session is idle or active: it SHALL enumerate the members of the session's process group and signal each one individually, skipping any member that matches the shared-service whitelist or a user `protect` rule.
+The system SHALL terminate bloated sessions PGID-aware, regardless of whether the session is idle or active: it SHALL enumerate the members of the session's process group and signal each one individually, skipping any member that classifies `immutable` or `shared`, and any member a user `protect` rule covers. Classification is defined by the `agent-process-reapers` capability.
 
 It SHALL NOT signal the group as a whole (`kill -- -$PGID`), because that would take shared MCP services down with it and contradict the safety boundaries in the `agent-process-reapers` capability.
 
@@ -99,8 +101,12 @@ It SHALL NOT signal the group as a whole (`kill -- -$PGID`), because that would 
 - **THEN** the system SHALL signal each member of its process group individually (bloated takes priority over idle)
 
 #### Scenario: Bloated session shares its group with a shared MCP service
-- **WHEN** a bloated session's process group also contains a whitelisted MCP server, or a process covered by a user `protect` rule
+- **WHEN** a bloated session's process group also contains a `shared` service, an `immutable` process, or a process covered by a user `protect` rule
 - **THEN** that member SHALL be skipped and SHALL survive the reap, while the remaining members are signalled
+
+#### Scenario: Freed total after a partial reap
+- **WHEN** some members of a bloated session's group are skipped
+- **THEN** the reported freed total SHALL sum only the members actually signalled, not the session's pre-kill tree RSS
 
 ### Requirement: Bloated session prioritization
 The system SHALL kill bloated sessions before idle sessions. Bloated sessions SHALL be killed regardless of the `CC_MAX_SESSIONS` limit.
