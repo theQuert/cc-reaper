@@ -4,7 +4,7 @@
 
 A hard memory ceiling for Claude Code sessions. `claude-guard` terminates a session whose tree RSS meets or exceeds `CC_MAX_RSS_MB` whether it is idle or active, because a leaking session can balloon to multiple GB while still busy. A session covered by a user `protect` rule is exempt, and one that is also leaking descriptors is handled by the FD-leak phase instead.
 
-Tree RSS covers the session process, its children, and its grandchildren, each truncated to whole megabytes before summation.
+Tree RSS covers the session process and all its descendants to any depth, summed in kilobytes and converted to megabytes once.
 
 ## Requirements
 

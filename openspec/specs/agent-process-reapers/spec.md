@@ -106,9 +106,8 @@ The system SHALL keep explicit safety boundaries for processes that are not part
 - **THEN** cc-reaper SHALL NOT target those processes through this capability.
 
 #### Scenario: Scanner is stuck hot during the runaway phase
-- **WHEN** a scanner in the built-in protected pattern — `Bitdefender`, `mdworker`, `mds_stores` — sustains CPU ≥ `CC_RUNAWAY_CPU` for etime ≥ `CC_RUNAWAY_MIN`
-- **THEN** the runaway phase SHALL select it, which is the single exception to the scenario above
-- **AND** a user `protect` rule covering it SHALL still exempt it
+- **WHEN** a scanner such as `Bitdefender`, `mdworker`, or `mds_stores` sustains CPU ≥ `CC_RUNAWAY_CPU` for etime ≥ `CC_RUNAWAY_MIN`
+- **THEN** it SHALL NOT be selected, because it classifies `immutable`; see "Runaway never selects immutable processes"
 
 #### Scenario: Active session is running
 - **WHEN** a Codex or Claude process is still attached to an active terminal/session and does not exceed stale/orphan criteria
