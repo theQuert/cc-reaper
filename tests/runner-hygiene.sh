@@ -55,6 +55,15 @@ _cc_reaper_bound_log "$tmp_dir/missing.log" 1000 \
   || fail "missing file: returned non-zero"
 [ -e "$tmp_dir/missing.log" ] && fail "missing file: was created" || pass "missing file: nothing created"
 
+# worktree-janitor is sourceable as well as executable. The bound used to hang
+# off the direct-execution guard, so a sourced caller appended without any cap.
+wj_log="$tmp_dir/wj.log"
+head -c 1200000 /dev/zero | tr '\0' 'x' > "$wj_log"
+bash -c "source '$ROOT_DIR/shell/worktree-janitor.sh'; CC_WJ_LOG='$wj_log' _cc_wj_log_write 'sourced call'" 2>/dev/null || true
+[ -f "$wj_log.old" ] && [ "$(wc -c < "$wj_log" | tr -d ' ')" -lt 1000 ] \
+  && pass "sourced worktree-janitor still bounds its log" \
+  || fail "sourced worktree-janitor did not bound its log"
+
 # ─── Notification gating ───────────────────────────────────────────────────
 
 notify_out=$( _cc_reaper_notify "T" "S" "M" </dev/null >"$tmp_dir/n.out" 2>&1; echo "rc=$?" )
@@ -120,6 +129,14 @@ for mode in normal abort; do
     [ "$mode_rc" = 0 ] && pass "normal run succeeds" || fail "normal run returned $mode_rc"
   fi
 done
+
+# Not covered automatically: `cc-monitor ... &` followed by `kill $!`. A worker
+# subshell inherits its parent's argv, so `pgrep -f` cannot tell the wrapper from
+# the worker, and the same code reported 0 survivors with a 2s settle and 2 with
+# a 4s one. An assertion that flips on timing is worse than none. Verified by
+# hand: the job is killed, and the sampler and its directory are gone within one
+# interval. The mechanism it relies on — recording the invoking process rather
+# than $$ — is what the checks below exercise.
 
 # Cancellation must be prompt whatever interval was asked for: a single
 # `sleep "$interval"` delayed the owner check by the whole interval, so at

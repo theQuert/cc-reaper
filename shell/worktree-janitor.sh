@@ -73,6 +73,13 @@ _cc_wj_log_write() {
   local log
   log=$(_cc_wj_log)
   mkdir -p "$(dirname "$log")" 2>/dev/null || true
+  # Bound from here rather than the direct-execution guard: this file is also
+  # sourced, and a sourced `_cc_wj_run` would then append without any cap. Once
+  # per process, so repeated calls cost nothing.
+  if [ -z "${_CC_WJ_LOG_BOUNDED:-}" ]; then
+    _cc_wj_bound_log "$log"
+    _CC_WJ_LOG_BOUNDED=1
+  fi
   printf "[%s] %s\n" "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$log" 2>/dev/null || true
 }
 
@@ -562,6 +569,5 @@ _cc_wj_run() {
 
 # Run if executed directly (not sourced)
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  _cc_wj_bound_log "$(_cc_wj_log)"
   _cc_wj_run "$@"
 fi

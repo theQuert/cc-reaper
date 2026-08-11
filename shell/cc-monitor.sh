@@ -1157,12 +1157,18 @@ cc-monitor() {
   _CC_MONITOR_TMP=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor.XXXXXX") || return 1
   local tmp_dir="$_CC_MONITOR_TMP"
 
-  # The invoking shell's PID. In both bash and zsh a subshell keeps $$ pointing
-  # at the main shell, so the sampler can tell whether whoever started it is
-  # still there. Signals aimed at the top-level PID — what `timeout` and most job
-  # runners cancel with — are not delivered to the subshell, and without this the
-  # sampler outlived its caller.
-  _CC_MONITOR_OWNER_PID=$$
+  # Whoever asked for this run: the interactive shell, or the background subshell
+  # when started with `&`. Signals aimed there — what `timeout`, job runners, and
+  # `kill $!` all use — never reach the worker, so it has to notice on its own.
+  # PID of the process actually running this invocation. $$ keeps pointing at the
+  # main shell even inside a background job, so `cc-monitor ... &` then `kill $!`
+  # would go unnoticed, and BASHPID does not exist in the bash 3.2 macOS ships. A
+  # child reports its parent instead. `exec` is load-bearing: it replaces the
+  # command substitution's own subshell rather than letting that subshell become
+  # the parent, which under bash 3.2 returned a PID that had already exited and
+  # made every run look cancelled. It cannot be wrapped in a helper function —
+  # the extra subshell a call would add reintroduces exactly that.
+  _CC_MONITOR_OWNER_PID=$(exec sh -c 'echo $PPID')
 
   # Everything below runs in a subshell so its traps stay local. This file is
   # sourced into the user's shell, where traps are global: setting EXIT here
