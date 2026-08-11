@@ -125,21 +125,7 @@ Losing a parent's protection is not the same as becoming reapable. A process is 
 
 This is deliberate. A protected application's leaked helpers are exactly what cc-reaper exists to reclaim: they carry no marker of their parent, and once detached and past `CC_AGENT_STALE_MINUTES` they are indistinguishable from any other orphaned MCP server. Extending protection along the parent chain would place a leaking app's garbage permanently out of reach, leaving no recovery short of quitting the app.
 
-Three cleanup paths exist and they do not share one rule. They differ both in what protects a process and in what makes it eligible in the first place:
-
-| Path | Protection applied | What makes a process eligible |
-|---|---|---|
-| Pattern-based candidacy | full precedence chain below, including the user `cleanup` override | per-branch predicate, see below |
-| Process-group cleanup | immutable, user `protect`, or built-in protected pattern | group membership alone |
-| Runaway phase | built-in protected pattern selects processes *into* it; a user `protect` rule exempts at selection, and the group-kill MCP whitelist exempts again at the signal stage | CPU ≥ `CC_RUNAWAY_CPU` and etime ≥ `CC_RUNAWAY_MIN` |
-
-Three consequences are easy to miss.
-
-Process-group cleanup signals every member that is not directly protected on membership alone, so a recent, still-attached member of an orphaned group is reaped without its own staleness being consulted, and a user `cleanup` rule has no effect there.
-
-The runaway phase consults only the built-in protected pattern at selection, so immutability does not reach it: a system scanner that appears in both sets is a runaway candidate once it is hot and old enough.
-
-Selection and signalling are separate stages, and they apply different lists. The runaway phase selects on the protected pattern but signals through the group-kill path, which skips members matching its own MCP whitelist. A shared MCP server that goes runaway — `chrome-devtools-mcp`, `context7-mcp`, `sequential-thinking` — is therefore selected, waited on through the grace window, and then not signalled. The counters do not model this: the phase reports the candidate as reaped and adds its tree RSS to the freed total either way.
+Protection itself comes from the single classification in "One protection classification owns all three paths". The paths differ only in eligibility and in how they treat the `shared` class, never in what they consider protected.
 
 Candidacy for **pattern-based** cleanup is decided first-match against the process's own command line:
 
@@ -182,15 +168,15 @@ An orphaned parent is therefore sufficient on its own for the two family rungs, 
 - **THEN** it SHALL NOT be a candidate, because a user rule requires staleness as well
 
 #### Scenario: Live descendant of a protected application
-- **WHEN** a whitelisted application has spawned MCP servers that are still attached to it and below the stale threshold, and no orphaned group covers them
+- **WHEN** a `shared` application has spawned MCP servers that are still attached to it and below the stale threshold, and no orphaned group covers them
 - **THEN** they SHALL NOT be signalled, because they satisfy no family predicate on their own merits
 
 #### Scenario: Leaked descendant of a protected application
-- **WHEN** a whitelisted application has leaked `npx`-spawned MCP servers that are detached, older than `CC_AGENT_STALE_MINUTES`, and whose **own** command lines match no protected pattern
+- **WHEN** a `shared` application has leaked `npx`-spawned MCP servers that are detached, older than `CC_AGENT_STALE_MINUTES`, and whose **own** command lines match no protected pattern
 - **THEN** they SHALL be reaped, because a leaked helper carries no marker of its parent and is indistinguishable from any other orphan
 
-#### Scenario: Leaked descendant is itself a whitelisted service
-- **WHEN** the leaked descendant's own command line matches a protected pattern — `chrome-devtools-mcp`, `context7-mcp`, `sequential-thinking`, or another shared service
+#### Scenario: Leaked descendant is itself a shared service
+- **WHEN** the leaked descendant classifies as `shared`
 - **AND** no user rule covers it
 - **THEN** it SHALL be exempt and survive; ancestry neither condemns nor saves it
 
@@ -223,18 +209,13 @@ An orphaned parent is therefore sufficient on its own for the two family rungs, 
 - **THEN** that member SHALL still be spared, because the `cleanup` override applies to pattern-based candidacy only
 
 #### Scenario: Protected application is stuck hot
-- **WHEN** a whitelisted application such as `ChatGPT.app` or `cmux.app` meets the runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` over etime ≥ `CC_RUNAWAY_MIN`)
+- **WHEN** a `shared` application such as `ChatGPT.app` or `cmux.app` meets the runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` over etime ≥ `CC_RUNAWAY_MIN`)
 - **THEN** the runaway phase SHALL signal it after the grace window, because the whitelist protects an application that is working, not one that is stuck
-- **AND** this holds because applications are absent from the group-kill MCP whitelist; a runaway MCP server in that list reaches the opposite outcome, below
+- **AND** a `shared` MCP server reaches the same outcome, since the runaway phase signals whatever it selected
 
 #### Scenario: User protect rule during the runaway phase
 - **WHEN** a process covered by a user `protect` rule meets the runaway thresholds
 - **THEN** it SHALL NOT be selected, because a user rule outranks the built-in exception
-
-#### Scenario: Runaway candidate is a whitelisted MCP server
-- **WHEN** a shared MCP server such as `chrome-devtools-mcp` meets the runaway thresholds
-- **THEN** it SHALL be selected and listed, and SHALL NOT be signalled, because the group-kill path skips members matching its MCP whitelist
-- **AND** the reported reaped count and freed total SHALL still include it, since the phase does not observe whether a signal was delivered
 
 ### Requirement: Stale threshold is configurable
 The system SHALL expose configurable stale-age thresholds for browser automation and agent background cleanup with conservative defaults.
@@ -403,3 +384,88 @@ The reserved variable name `status` SHALL NOT be declared, since it is read-only
 #### Scenario: Session table renders under zsh
 - **WHEN** `claude-guard` or `claude-fd` prints a session's status column under zsh
 - **THEN** it SHALL not fail with `read-only variable: status`
+
+### Requirement: One protection classification owns all three paths
+The system SHALL classify a command line into exactly one protection class via
+`_cc_reaper_protection_class`, and every cleanup path SHALL consult that classification rather
+than its own list.
+
+| Class | Meaning |
+|---|---|
+| `immutable` | System processes, cc-reaper's own scripts and app binary, ordinary Chrome, Codex UI helpers. Never signalled by any path. |
+| `shared` | Long-running services other work depends on: shared MCP servers, dev servers, process managers, and whitelisted applications. |
+| `none` | Everything else. |
+
+Each path SHALL apply the class as follows:
+
+| Path | `immutable` | `shared` | `none` |
+|---|---|---|---|
+| Pattern-based cleanup | never | exempt, unless a user `cleanup` rule covers it | family predicates decide |
+| Process-group cleanup | never | skipped | signalled on membership |
+| Runaway selection | never selected | selected | not selected — the phase only considers protected processes |
+| Runaway signalling | n/a | signalled, for the selected PID only | n/a |
+
+A user `protect` rule SHALL exempt a process on every path, and SHALL outrank a user `cleanup`
+rule.
+
+#### Scenario: Same service launched two ways
+- **WHEN** `npx -y @stripe/mcp` and `node …/.bin/mcp-server-stripe` are both running
+- **THEN** both SHALL classify as `shared`, and every path SHALL treat them identically
+
+#### Scenario: Dev server in an orphaned group
+- **WHEN** an orphaned process group contains a `pm2` or `next-server` process
+- **THEN** it SHALL classify as `shared` and SHALL be skipped by process-group cleanup, matching how pattern-based cleanup already spares it
+
+#### Scenario: Classification is total
+- **WHEN** any command line is classified
+- **THEN** exactly one of `immutable`, `shared`, or `none` SHALL be returned
+
+### Requirement: Runaway never selects immutable processes
+Runaway selection SHALL exclude processes classified `immutable`. A stuck system scanner SHALL
+NOT be signalled by cc-reaper under any threshold.
+
+#### Scenario: Security software is stuck hot
+- **WHEN** `Bitdefender` sustains CPU ≥ `CC_RUNAWAY_CPU` for etime ≥ `CC_RUNAWAY_MIN`
+- **THEN** it SHALL NOT be selected, listed, or signalled
+
+#### Scenario: Spotlight indexing is stuck hot
+- **WHEN** `mdworker` or `mds_stores` meets the same thresholds
+- **THEN** neither SHALL be selected
+
+#### Scenario: Application is stuck hot
+- **WHEN** a `shared` application such as `ChatGPT.app` meets the thresholds
+- **THEN** it SHALL still be selected and signalled, because it is not `immutable`
+
+### Requirement: Runaway signals the process it selected
+When the runaway phase selects a PID, the signal stage SHALL signal that PID even when its class
+would otherwise exempt it. The exemption SHALL continue to apply to every other member of its
+process group.
+
+#### Scenario: Runaway shared MCP is terminated
+- **WHEN** `chrome-devtools-mcp` is selected as a runaway candidate
+- **THEN** it SHALL be signalled, rather than skipped as a shared service
+
+#### Scenario: Group siblings keep their protection
+- **WHEN** the selected runaway PID shares a process group with `context7-mcp`, which is not itself runaway
+- **THEN** `context7-mcp` SHALL NOT be signalled
+
+#### Scenario: User protect rule still wins
+- **WHEN** a user `protect` rule covers a process that meets the runaway thresholds
+- **THEN** it SHALL NOT be selected or signalled
+
+### Requirement: Runaway counters report deliveries
+The reaped count and freed total SHALL include only processes to which a signal was actually
+sent. A candidate that survives the signal stage SHALL NOT be counted, SHALL NOT contribute to
+the freed total, and SHALL NOT raise a notification claiming it was reaped.
+
+#### Scenario: Every candidate is signalled
+- **WHEN** two runaway candidates are selected and both are signalled
+- **THEN** the summary SHALL report two reaped
+
+#### Scenario: A candidate is exempted at the signal stage
+- **WHEN** a candidate is spared by a user `protect` rule discovered at the signal stage
+- **THEN** the summary SHALL NOT count it, and its tree RSS SHALL NOT be added to the freed total
+
+#### Scenario: Nothing is delivered
+- **WHEN** every candidate is spared at the signal stage
+- **THEN** the summary SHALL report zero reaped rather than a non-zero count
