@@ -1119,48 +1119,62 @@ cc-monitor() {
     duration=0
   fi
 
-  local tmp_dir="" raw_file="" agg_file="" findings_file="" samples=""
+  local tmp_dir=""
   tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-monitor.XXXXXX") || return 1
-  # Default sampling runs 60s, so an interrupted run is ordinary rather than an
-  # edge case. Without this the temp directory survives every Ctrl-C.
-  trap 'rm -rf "$tmp_dir"' EXIT INT TERM
-  raw_file="$tmp_dir/raw.tsv"
-  agg_file="$tmp_dir/agg.tsv"
-  findings_file="$tmp_dir/findings.tsv"
 
-  local progress=false
-  [ "$json" = "false" ] && progress=true
+  # Everything below runs in a subshell so its traps stay local. This file is
+  # sourced into the user's shell, where traps are global: setting EXIT here
+  # would fire in their shell, and clearing it afterwards would delete handlers
+  # they had installed themselves.
+  #
+  # The INT and TERM handlers exit rather than return. Default sampling runs 60s,
+  # so an interrupt is ordinary; without the exit, the shell would resume the run
+  # and aggregate a directory that had just been removed.
+  (
+    # The path is baked in rather than referenced: bash unwinds function scopes
+    # before running an EXIT trap, so a `local` like $tmp_dir expands to empty by
+    # the time the handler runs, and `rm -rf ""` silently cleans nothing.
+    trap "rm -rf '$tmp_dir'; exit 130" INT
+    trap "rm -rf '$tmp_dir'; exit 143" TERM
+    trap "rm -rf '$tmp_dir'" EXIT
 
-  samples=$(_cc_monitor_collect_samples "$raw_file" "$once" "$duration" "$interval" "$progress")
-  _cc_monitor_aggregate_samples "$raw_file" "$agg_file"
-  _cc_monitor_enrich_findings "$agg_file" "$findings_file" "$min_cpu"
+    local raw_file="" agg_file="" findings_file="" samples=""
+    raw_file="$tmp_dir/raw.tsv"
+    agg_file="$tmp_dir/agg.tsv"
+    findings_file="$tmp_dir/findings.tsv"
 
-  local dispatch_rc=0
-  if [ "$json" = "true" ]; then
-    _cc_monitor_json_report "$findings_file" "$duration" "$interval" "$samples" "$once"
-  else
-    _cc_monitor_human_report "$findings_file" "$duration" "$interval" "$samples" "$once" "$top"
+    local progress=false
+    [ "$json" = "false" ] && progress=true
 
-    if [ -n "$apply_module" ]; then
-      _cc_monitor_dispatch_module "$apply_module" "true"
-      dispatch_rc=$?
-    elif [ "$no_prompt" != "true" ] && _cc_monitor_is_tty; then
-      local recommended=""
-      recommended=$(_cc_monitor_recommended_module "$findings_file") || recommended=""
-      local chosen=""
-      if [ -n "$recommended" ]; then
-        chosen=$(_cc_monitor_prompt_apply "$findings_file" "$recommended") || chosen=""
-      fi
-      if [ -n "$chosen" ]; then
-        _cc_monitor_dispatch_module "$chosen" "false"
+    samples=$(_cc_monitor_collect_samples "$raw_file" "$once" "$duration" "$interval" "$progress")
+    _cc_monitor_aggregate_samples "$raw_file" "$agg_file"
+    _cc_monitor_enrich_findings "$agg_file" "$findings_file" "$min_cpu"
+
+    local dispatch_rc=0
+    if [ "$json" = "true" ]; then
+      _cc_monitor_json_report "$findings_file" "$duration" "$interval" "$samples" "$once"
+    else
+      _cc_monitor_human_report "$findings_file" "$duration" "$interval" "$samples" "$once" "$top"
+
+      if [ -n "$apply_module" ]; then
+        _cc_monitor_dispatch_module "$apply_module" "true"
         dispatch_rc=$?
+      elif [ "$no_prompt" != "true" ] && _cc_monitor_is_tty; then
+        local recommended=""
+        recommended=$(_cc_monitor_recommended_module "$findings_file") || recommended=""
+        local chosen=""
+        if [ -n "$recommended" ]; then
+          chosen=$(_cc_monitor_prompt_apply "$findings_file" "$recommended") || chosen=""
+        fi
+        if [ -n "$chosen" ]; then
+          _cc_monitor_dispatch_module "$chosen" "false"
+          dispatch_rc=$?
+        fi
       fi
     fi
-  fi
 
-  rm -rf "$tmp_dir"
-  trap - EXIT INT TERM
-  return "$dispatch_rc"
+    exit "$dispatch_rc"
+  )
 }
 
 if [ -n "${BASH_VERSION:-}" ]; then

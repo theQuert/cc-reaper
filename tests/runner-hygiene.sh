@@ -79,20 +79,45 @@ notify_rc=$( osascript() { return 1; }; _cc_reaper_notify "T" "S" "M" >/dev/null
 # whole script on that — counting with find keeps an empty result an empty result.
 count_monitor_dirs() { find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cc-monitor.*' -type d 2>/dev/null | wc -l | tr -d ' '; }
 
-if true; then
-  before_dirs=$(count_monitor_dirs)
-  ( source "$ROOT_DIR/shell/cc-monitor.sh"
-    cc-monitor --duration 30 --interval 5 >/dev/null 2>&1 ) &
-  monitor_pid=$!
-  sleep 2
-  kill -INT "$monitor_pid" 2>/dev/null || true
-  wait "$monitor_pid" 2>/dev/null || true
-  sleep 1
-  after_dirs=$(count_monitor_dirs)
-  [ "$after_dirs" -le "$before_dirs" ] \
-    && pass "interrupted cc-monitor leaves no temp directory" \
-    || fail "temp directories leaked: $before_dirs -> $after_dirs"
-fi
+# Both exit paths must clean up. Signal delivery is not asserted: whether
+# cc-monitor's subshell is a distinct process depends on the shell's
+# last-command optimisation, which makes signalling it racy. Failing a stage
+# inside the subshell reaches the same handler deterministically.
+#
+# Regression: the handler originally referenced $tmp_dir, a `local`. Bash unwinds
+# function scopes before running an EXIT trap, so it expanded to empty and
+# `rm -rf ""` cleaned nothing. The path is baked into the trap instead.
+for mode in normal abort; do
+  rm -rf "${TMPDIR:-/tmp}"/cc-monitor.* 2>/dev/null || true
+  if [ "$mode" = normal ]; then
+    mode_rc=0
+    bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'; cc-monitor --once >/dev/null 2>&1" || mode_rc=$?
+  else
+    mode_rc=0
+    bash -c "source '$ROOT_DIR/shell/cc-monitor.sh'
+             _cc_monitor_aggregate_samples() { exit 130; }
+             cc-monitor --once >/dev/null 2>&1" || mode_rc=$?
+  fi
+  [ "$(count_monitor_dirs)" = 0 ] \
+    && pass "$mode exit leaves no temp directory" \
+    || fail "$mode exit leaked a temp directory"
+  if [ "$mode" = abort ]; then
+    [ "$mode_rc" = 130 ] \
+      && pass "aborted run propagates the failing status" \
+      || fail "aborted run returned $mode_rc, expected 130"
+  else
+    [ "$mode_rc" = 0 ] && pass "normal run succeeds" || fail "normal run returned $mode_rc"
+  fi
+done
+
+# A completed run must leave the caller's traps alone too.
+marker2="$tmp_dir/caller-trap-2"
+( trap 'printf fired > "$marker2"' EXIT
+  source "$ROOT_DIR/shell/cc-monitor.sh"
+  cc-monitor --once >/dev/null 2>&1 ) || true
+[ -f "$marker2" ] \
+  && pass "caller's EXIT trap survives a completed run" \
+  || fail "completed run cleared the caller's EXIT trap"
 
 if [ "$failures" -gt 0 ]; then
   printf "%s validation failure(s)\n" "$failures"
