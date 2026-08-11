@@ -1,7 +1,8 @@
 # cc-monitor Specification
 
 ## Purpose
-TBD - created by archiving change cc-monitor. Update Purpose after archive.
+Read-only heat attribution: sample CPU by process family, classify each family's safety, and report what is actually driving load. Reporting never signals a process; optimization modules run only when the user dispatches them explicitly.
+
 ## Requirements
 ### Requirement: Monitor is read-only by default
 The system SHALL provide a `cc-monitor` command that observes process state and reports heat attribution without terminating or modifying processes.

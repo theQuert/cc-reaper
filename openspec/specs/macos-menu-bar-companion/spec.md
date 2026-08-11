@@ -1,7 +1,8 @@
 # macos-menu-bar-companion Specification
 
 ## Purpose
-TBD - created by archiving change macos-menu-bar-companion. Update Purpose after archive.
+Native macOS menu bar companion surfacing cc-reaper health read-only, with explicit user-initiated cleanup, user-managed process rules that cannot widen the engine's kill boundaries, and a reproducible local build workflow.
+
 ## Requirements
 ### Requirement: Native status surfaces
 The system SHALL provide a macOS menu bar companion with a main dashboard and a dedicated settings window. The menu bar SHALL remain concise and SHALL route detailed review to the dashboard.
