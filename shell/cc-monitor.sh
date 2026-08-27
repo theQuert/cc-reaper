@@ -179,61 +179,90 @@ _cc_monitor_is_runaway() {
     && [ "$elapsed_seconds" -ge "$((etime_threshold * 60))" ]
 }
 
-_cc_monitor_protected_pattern() {
-  echo "node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\\.app|cmux\\.app|Bitdefender|mdworker|mds_stores|CCReaper|Codex Computer Use\\.app|SkyComputerUseService"
-}
+# Precomputed once at source time (not per-call) since this string is static.
+# PERF: this and every predicate below used to run `printf '%s\n' "$cmd" | grep -qE "..."`,
+# forking 2 processes per check. _cc_monitor_enrich_findings calls these ~15-20x per
+# process row; on a machine with hundreds of live processes (many concurrent Claude
+# Code sessions, each with its own MCP fleet) that's thousands of forks, which is what
+# pushed cc-monitor well past the companion app's 30s scan timeout. `[[ $cmd =~ ... ]]`
+# is bash's native (fork-free) regex match — same ERE syntax as grep -E, same behavior.
+_CC_MONITOR_PROTECTED_PATTERN="node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\.app|cmux\.app|Bitdefender|mdworker|mds_stores|CCReaper|Codex Computer Use\.app|SkyComputerUseService"
+
+# NOTE ON PORTABILITY: every pattern below is precomputed into its own variable and
+# matched via `[[ $cmd =~ $VAR ]]`, never written as a bare literal after `=~`. This
+# script is sourced under both bash (CLIService/tests) and zsh (~/.zshrc, since these
+# are user-facing shell functions) — zsh's [[ ]] parser treats an unquoted `|` in an
+# inline pattern as a pipe operator and fails with "parse error near `|'"; routing the
+# same string through a variable first sidesteps that in both shells.
+_CC_MONITOR_PROTECTED_PATTERN="node.*(dev-server|http-server|next.*server)|pm2|npm exec @supabase|mcp-server-supabase|supabase.*mcp|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|claude-mem|chroma-mcp|context7|context7-mcp|chrome-devtools-mcp|mcp-remote|sequentialthinking|sequential-thinking|codex.*mcp|ChatGPT\.app|cmux\.app|Bitdefender|mdworker|mds_stores|CCReaper|Codex Computer Use\.app|SkyComputerUseService"
+_CC_MONITOR_AGENT_BROWSER_PATTERN="agent-browser-darwin-arm64|Google Chrome for Testing.*agent-browser-chrome-|agent-browser-chrome-"
+_CC_MONITOR_PUPPETEER_CHROME_PATTERN="puppeteer_dev_chrome_profile-"
+_CC_MONITOR_CODEX_APP_SERVER_PATTERN="codex app-server|app-server-broker"
+_CC_MONITOR_CODEX_AGENT_PATTERN="node /usr/local/bin/codex( --yolo| resume|$)|@openai/codex.*/codex/codex( --yolo| resume|$)|/codex/codex( --yolo| resume|$)|(^|/)codex( --yolo| resume|$)"
+_CC_MONITOR_CLAUDE_AGENT_PATTERN="claude.*stream-json|claude.*--session-id|claude --dangerously"
+_CC_MONITOR_AGENT_MCP_PATTERN="npm exec @upstash/context7-mcp|context7-mcp|chrome-devtools-mcp|npm exec mcp-remote|mcp-remote|npm exec mcp-|npx.*mcp-server"
+_CC_MONITOR_DEV_SERVER_PATTERN="react-scripts/scripts/start|react-scripts start|next dev|vite( --host| --port|$)|webpack-dev-server|astro dev|node.*(dev-server|http-server|next.*server)|npm run dev|pnpm dev|yarn dev"
+_CC_MONITOR_SYSTEM_PATTERN="WindowServer|kernel_task|coreaudiod|syspolicyd|mdworker|mds_stores|Spotlight|Bitdefender|com\.apple\.|/System/Library/|PerfPowerServices|BTLEServer|bluetoothd|UniversalControl|UserNotificationCenter|BiomeAgent|accountsd|locationd|logd|opendirectoryd|replayd|BetterSnapTool|netdisk_service"
+_CC_MONITOR_CODEX_UI_HELPER_PATTERN="Codex Computer Use\.app|SkyComputerUseService"
+_CC_MONITOR_SELF_PATTERN="cc-monitor\.sh( |$)|CCReaper\.app/Contents/MacOS/CCReaper( |$)|/CCReaper( |$)"
+_CC_MONITOR_NORMAL_CHROME_PATTERN="Google Chrome\.app|Google Chrome Helper|/Google Chrome( |$)|Chromium\.app"
+_CC_MONITOR_EDITOR_PATTERN="Cursor Helper|Cursor\.app|Visual Studio Code|Code Helper|/Code\.app|/Cursor\.app"
+_CC_MONITOR_CMUX_PATTERN="(^|/)cmux( |$)|cmux\.app"
+_CC_MONITOR_CHATGPT_PATTERN="ChatGPT\.app"
+_CC_MONITOR_CODEX_UI_LABEL_PATTERN="SkyComputerUseService|Codex Computer Use\.app"
+_CC_MONITOR_SELF_LABEL_PATTERN="CCReaper\.app/Contents/MacOS/CCReaper|(^|/)CCReaper( |$)"
 
 _cc_monitor_is_protected_cmd() {
   local cmd=$1
-  printf '%s\n' "$cmd" | grep -qE "$(_cc_monitor_protected_pattern)"
+  [[ $cmd =~ $_CC_MONITOR_PROTECTED_PATTERN ]]
 }
 
 _cc_monitor_is_agent_browser_cmd() {
   local cmd=$1
-  printf '%s\n' "$cmd" | grep -qE "agent-browser-darwin-arm64|Google Chrome for Testing.*agent-browser-chrome-|agent-browser-chrome-"
+  [[ $cmd =~ $_CC_MONITOR_AGENT_BROWSER_PATTERN ]]
 }
 
 _cc_monitor_is_puppeteer_chrome_cmd() {
   local cmd=$1
-  printf '%s\n' "$cmd" | grep -qE "puppeteer_dev_chrome_profile-"
+  [[ $cmd =~ $_CC_MONITOR_PUPPETEER_CHROME_PATTERN ]]
 }
 
 _cc_monitor_is_codex_agent_cmd() {
   local cmd=$1
-  if printf '%s\n' "$cmd" | grep -qE "codex app-server|app-server-broker"; then
+  if [[ $cmd =~ $_CC_MONITOR_CODEX_APP_SERVER_PATTERN ]]; then
     return 1
   fi
-  printf '%s\n' "$cmd" | grep -qE "node /usr/local/bin/codex( --yolo| resume|$)|@openai/codex.*/codex/codex( --yolo| resume|$)|/codex/codex( --yolo| resume|$)|(^|/)codex( --yolo| resume|$)"
+  [[ $cmd =~ $_CC_MONITOR_CODEX_AGENT_PATTERN ]]
 }
 
 _cc_monitor_is_claude_agent_cmd() {
   local cmd=$1
-  printf '%s\n' "$cmd" | grep -qE "claude.*stream-json|claude.*--session-id|claude --dangerously"
+  [[ $cmd =~ $_CC_MONITOR_CLAUDE_AGENT_PATTERN ]]
 }
 
 _cc_monitor_is_agent_mcp_cmd() {
   local cmd=$1
-  printf '%s\n' "$cmd" | grep -qE "npm exec @upstash/context7-mcp|context7-mcp|chrome-devtools-mcp|npm exec mcp-remote|mcp-remote|npm exec mcp-|npx.*mcp-server"
+  [[ $cmd =~ $_CC_MONITOR_AGENT_MCP_PATTERN ]]
 }
 
 _cc_monitor_is_dev_server_cmd() {
   local cmd=$1
-  printf '%s\n' "$cmd" | grep -qE "react-scripts/scripts/start|react-scripts start|next dev|vite( --host| --port|$)|webpack-dev-server|astro dev|node.*(dev-server|http-server|next.*server)|npm run dev|pnpm dev|yarn dev"
+  [[ $cmd =~ $_CC_MONITOR_DEV_SERVER_PATTERN ]]
 }
 
 _cc_monitor_is_system_cmd() {
   local cmd=$1
-  printf '%s\n' "$cmd" | grep -qE "WindowServer|kernel_task|coreaudiod|syspolicyd|mdworker|mds_stores|Spotlight|Bitdefender|com\\.apple\\.|/System/Library/|PerfPowerServices|BTLEServer|bluetoothd|UniversalControl|UserNotificationCenter|BiomeAgent|accountsd|locationd|logd|opendirectoryd|replayd|BetterSnapTool|netdisk_service"
+  [[ $cmd =~ $_CC_MONITOR_SYSTEM_PATTERN ]]
 }
 
 _cc_monitor_is_codex_ui_helper_cmd() {
   local cmd=$1
-  printf '%s\n' "$cmd" | grep -qE "Codex Computer Use\\.app|SkyComputerUseService"
+  [[ $cmd =~ $_CC_MONITOR_CODEX_UI_HELPER_PATTERN ]]
 }
 
 _cc_monitor_is_self_cmd() {
   local cmd=$1
-  printf '%s\n' "$cmd" | grep -qE "cc-monitor\\.sh( |$)|CCReaper\\.app/Contents/MacOS/CCReaper( |$)|/CCReaper( |$)"
+  [[ $cmd =~ $_CC_MONITOR_SELF_PATTERN ]]
 }
 
 _cc_monitor_is_normal_chrome_cmd() {
@@ -241,7 +270,7 @@ _cc_monitor_is_normal_chrome_cmd() {
   if _cc_monitor_is_agent_browser_cmd "$cmd" || _cc_monitor_is_puppeteer_chrome_cmd "$cmd"; then
     return 1
   fi
-  printf '%s\n' "$cmd" | grep -qE "Google Chrome\\.app|Google Chrome Helper|/Google Chrome( |$)|Chromium\\.app"
+  [[ $cmd =~ $_CC_MONITOR_NORMAL_CHROME_PATTERN ]]
 }
 
 _cc_monitor_is_immutable_cmd() {
@@ -302,9 +331,9 @@ _cc_monitor_family() {
     echo "codex"
   elif _cc_monitor_is_claude_agent_cmd "$cmd"; then
     echo "claude"
-  elif printf '%s\n' "$cmd" | grep -qE "Cursor Helper|Cursor\\.app|Visual Studio Code|Code Helper|/Code\\.app|/Cursor\\.app"; then
+  elif [[ $cmd =~ $_CC_MONITOR_EDITOR_PATTERN ]]; then
     echo "editor"
-  elif printf '%s\n' "$cmd" | grep -qE "(^|/)cmux( |$)|cmux\\.app"; then
+  elif [[ $cmd =~ $_CC_MONITOR_CMUX_PATTERN ]]; then
     echo "cmux"
   elif _cc_monitor_is_normal_chrome_cmd "$cmd"; then
     echo "chrome"
@@ -383,7 +412,7 @@ _cc_monitor_reason() {
     DO_NOT_KILL:*)
       echo "protected process matched cc-reaper safety boundaries" ;;
     *)
-      if printf '%s\n' "$cmd" | grep -qE "ChatGPT\\.app"; then
+      if [[ $cmd =~ $_CC_MONITOR_CHATGPT_PATTERN ]]; then
         echo "ChatGPT.app is protected user software"
       else
         echo "unknown process family; inspect manually before killing"
@@ -455,27 +484,27 @@ _cc_monitor_label() {
   local family=$1
   local cmd=$2
 
-  if printf '%s\n' "$cmd" | grep -q "Cursor Helper"; then
+  if [[ $cmd == *"Cursor Helper"* ]]; then
     echo "Cursor Helper"
-  elif printf '%s\n' "$cmd" | grep -q "Visual Studio Code"; then
+  elif [[ $cmd == *"Visual Studio Code"* ]]; then
     echo "VS Code"
-  elif printf '%s\n' "$cmd" | grep -q "WindowServer"; then
+  elif [[ $cmd == *"WindowServer"* ]]; then
     echo "WindowServer"
-  elif printf '%s\n' "$cmd" | grep -q "agent-browser-darwin-arm64"; then
+  elif [[ $cmd == *"agent-browser-darwin-arm64"* ]]; then
     echo "agent-browser"
-  elif printf '%s\n' "$cmd" | grep -q "puppeteer_dev_chrome_profile"; then
+  elif [[ $cmd == *"puppeteer_dev_chrome_profile"* ]]; then
     echo "Puppeteer Chrome"
-  elif printf '%s\n' "$cmd" | grep -q "Google Chrome for Testing"; then
+  elif [[ $cmd == *"Google Chrome for Testing"* ]]; then
     echo "Chrome for Testing"
-  elif printf '%s\n' "$cmd" | grep -q "react-scripts"; then
+  elif [[ $cmd == *"react-scripts"* ]]; then
     echo "react-scripts start"
-  elif printf '%s\n' "$cmd" | grep -q "chrome-devtools-mcp"; then
+  elif [[ $cmd == *"chrome-devtools-mcp"* ]]; then
     echo "chrome-devtools-mcp"
-  elif printf '%s\n' "$cmd" | grep -q "SkyComputerUseService\|Codex Computer Use\\.app"; then
+  elif [[ $cmd =~ $_CC_MONITOR_CODEX_UI_LABEL_PATTERN ]]; then
     echo "Codex Computer Use"
-  elif printf '%s\n' "$cmd" | grep -qE "CCReaper\\.app/Contents/MacOS/CCReaper|(^|/)CCReaper( |$)"; then
+  elif [[ $cmd =~ $_CC_MONITOR_SELF_LABEL_PATTERN ]]; then
     echo "cc-reaper"
-  elif printf '%s\n' "$cmd" | grep -qE "(^|/)cmux( |$)|cmux\\.app"; then
+  elif [[ $cmd =~ $_CC_MONITOR_CMUX_PATTERN ]]; then
     echo "cmux"
   elif [ "$family" = "chrome" ]; then
     echo "Google Chrome"
