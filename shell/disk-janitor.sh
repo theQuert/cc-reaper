@@ -46,12 +46,17 @@ CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
 # Prepended rather than replaced, so an operator who has put a different toolchain ahead
 # on PATH keeps it. `command -v` downstream then answers the same question for an agent
 # and for an interactive shell.
+# The list covers where the targets below actually install: Homebrew, Docker Desktop and
+# pipx/uv under the first three, plus Bun's own installer (`$HOME/.bun/bin`) and the official
+# Go macOS package (`/usr/local/go/bin`), neither of which lands anywhere else. A default
+# list that misses a tool's standard location reproduces the bug it exists to fix.
+#
 # Appended, never prepended. Whatever the caller put on PATH keeps priority - an operator
 # with their own toolchain, and a test sandbox shimming `docker` so a suite cannot reach
 # the real daemon. Prepending would silently step over both, which is the same class of
 # fault as the one being fixed. Set CC_DJ_TOOL_DIRS empty to make PATH the whole answer,
 # which is how a test simulates a tool that is genuinely not installed.
-CC_DJ_TOOL_DIRS="${CC_DJ_TOOL_DIRS-/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin}"
+CC_DJ_TOOL_DIRS="${CC_DJ_TOOL_DIRS-/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.bun/bin:/usr/local/go/bin}"
 if [ -n "$CC_DJ_TOOL_DIRS" ]; then
   _cc_dj_dir=""
   while IFS= read -r _cc_dj_dir; do
@@ -378,6 +383,11 @@ print("\\n".join(n for n in anon if n not in used))
 # ---------------------------------------------------------------------------
 _cc_dj_clean() {
   _cc_dj_init_dirs || return 1
+  # Per run, not per source. This file is meant to be sourced, and counters initialised only
+  # at load time make a second `_cc_dj_clean` in the same shell report cumulative totals -
+  # the accounting added to make a skipped run legible would itself become wrong.
+  CC_DJ_RAN=0
+  CC_DJ_SKIPPED=0
   local free_before free_after
   free_before="$(_cc_dj_free_pct)"
   _cc_dj_log "clean: starting — disk free=${free_before}%"

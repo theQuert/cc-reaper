@@ -645,6 +645,44 @@ expect_no "inventory: a short 'docker inspect' does not authorise removal" \
     'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rm_dead_anon_volumes >/dev/null 2>&1'
 
 # ---------------------------------------------------------------------------
+# TEST 14: the default tool list covers where the targets actually install,
+#          and the per-run counters are per run
+# ---------------------------------------------------------------------------
+printf "\n# Test group 14: tool-dir coverage and counter scope\n"
+
+# Bun's own installer and the official Go macOS package land nowhere else, so a default
+# list that omits them reproduces the bug this change exists to fix.
+for d in "\$HOME/.bun/bin" "/usr/local/go/bin"; do
+  expect_yes "tool dirs: default list covers $d" \
+    bash -c 'grep -q -- "$2" "$1"' _ "$DJ" "$d"
+done
+
+# Counters are reset per run, not per source. The file supports being sourced, and a
+# second _cc_dj_clean in the same shell reporting cumulative totals would make the
+# accounting added to expose a skipped run wrong in exactly the same way.
+COUNT_LOG="$SANDBOX/dj-twice.log"
+env PATH="$FAKE_BIN_NOBUN:$SAFE_SYS_PATH" HOME="$FAKE_HOME" \
+    CC_DJ_TOOL_DIRS="" FAKE_DF_FREE_PCT=80 FAKE_STAT_MTIME=0 \
+    CC_DJ_LOG="$COUNT_LOG" CC_DJ_STATE_DIR="$SANDBOX/state" \
+    CC_DJ_DISK_MIN_PCT=15 CC_DJ_COOLDOWN_SECS=3600 DJ="$DJ" \
+    /bin/bash -c 'source "$DJ" >/dev/null 2>&1; _cc_dj_clean; _cc_dj_clean' >/dev/null 2>&1
+
+# The two runs are not expected to be identical - the first one deletes the cache
+# directories the second then reports as missing - so the invariant is the total number of
+# targets attempted, which is fixed. Counters that accumulate across runs show it doubling.
+expect_yes "counters: per-run totals do not accumulate across two runs in one shell" \
+  bash -c '
+    [ "$(grep -c "clean: finished" "$1")" = "2" ] || exit 1
+    tot() {
+      grep "clean: finished" "$1" | sed -n "$2p" \
+        | grep -oE "(ran|SKIPPED|skipped)=[0-9]+" \
+        | grep -oE "[0-9]+" | awk "{t+=\$1} END{print t+0}"
+    }
+    a="$(tot "$1" 1)"; b="$(tot "$1" 2)"
+    [ "$a" -gt 0 ] && [ "$a" = "$b" ]
+  ' _ "$COUNT_LOG"
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 rm -rf "$SANDBOX"
