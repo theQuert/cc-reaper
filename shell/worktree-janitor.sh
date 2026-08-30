@@ -79,14 +79,6 @@ _cc_wj_log_write() {
   # sourced this file would keep a one-shot flag set across runs and never look
   # again. A run writes a handful of lines, so the cost is a handful of stats.
   _cc_wj_bound_log "$log"
-  # The scheduled agent's stdout/stderr pair is written by launchd, so no script owns it
-  # unless one claims it. Every other runner bounds its own pair; this one prints roughly
-  # three lines per worktree per day, and the installation this was written for has 83.
-  local agent_log
-  for agent_log in "$HOME/.cc-reaper/logs/launchd-worktree-report-stdout.log" \
-                   "$HOME/.cc-reaper/logs/launchd-worktree-report-stderr.log"; do
-    _cc_wj_bound_log "$agent_log"
-  done
   printf "[%s] %s\n" "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$log" 2>/dev/null || true
 }
 
@@ -375,6 +367,17 @@ _cc_wj_remove_worktree() {
 # ─── Main report/apply logic ─────────────────────────────────────────────────
 
 _cc_wj_run() {
+  # The scheduled agent's stdout/stderr pair is written by launchd, so no script owns it
+  # unless one claims it. Bounded here, at the top of every run, rather than from
+  # `_cc_wj_log_write`: a report-only run never calls that helper - every call site is in
+  # removal, pruning, or the apply-only summary - so bounding from there was unreachable
+  # for the one caller that produces these files daily.
+  local agent_log
+  for agent_log in "$HOME/.cc-reaper/logs/launchd-worktree-report-stdout.log" \
+                   "$HOME/.cc-reaper/logs/launchd-worktree-report-stderr.log"; do
+    _cc_wj_bound_log "$agent_log"
+  done
+
   local apply=0
   local explicit_repos=()
 

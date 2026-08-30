@@ -298,6 +298,24 @@ PATH="$STUBS_IDLE:$PATH" bash "$ROOT_DIR/shell/worktree-janitor.sh" \
 expect_no "--apply does remove it, so the capability is not merely disabled" \
   test -d "$ADMIN_DIR"
 
+# ─── The report-only path bounds the scheduled agent's launchd logs ──────────
+#
+# A report never calls `_cc_wj_log_write` - every call site is in removal, pruning, or the
+# apply-only summary - so bounding from there was unreachable for the one caller that
+# writes these files daily.
+
+WJ_HOME="$TMPDIR_ROOT/fakehome"
+AGENT_LOG_DIR="$WJ_HOME/.cc-reaper/logs"
+mkdir -p "$AGENT_LOG_DIR"
+BIG_LOG="$AGENT_LOG_DIR/launchd-worktree-report-stdout.log"
+head -c 2000000 /dev/zero | tr '\0' 'x' > "$BIG_LOG"
+
+HOME="$WJ_HOME" PATH="$STUBS_IDLE:$PATH" \
+  bash "$ROOT_DIR/shell/worktree-janitor.sh" --repo "$PRUNE_REPO" >/dev/null 2>&1
+
+expect_yes "report-only bounds the scheduled agent's stdout log" \
+  bash -c '[ "$(wc -c < "$1")" -le 1048576 ]' _ "$BIG_LOG"
+
 # ─── Final result ─────────────────────────────────────────────────────────────
 
 if [ "$failures" -gt 0 ]; then

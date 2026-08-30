@@ -109,7 +109,7 @@ sys.exit(0 if f and f.get("family") == "runaway" and f.get("classification") == 
 # An Always Protect rule says what may be done to a process, not how it is behaving.
 # Suppressing the label for one hid the case a user most wants to see: their own protected
 # service pinned hot for hours. The rule must still govern the action.
-RULES_FILE="$(mktemp -t ccr-rules)"
+RULES_FILE="$(mktemp "${TMPDIR:-/tmp}/ccr-rules.XXXXXX")"
 printf 'protect\tmcp-server-supabase\n' > "$RULES_FILE"
 ruled_out=$(CC_REAPER_RULES_FILE="$RULES_FILE" CC_MONITOR_SNAPSHOT_FILE="$fixture" \
   bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json 2>/dev/null)

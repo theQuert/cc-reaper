@@ -586,6 +586,65 @@ expect_no "inventory: a failing 'docker volume ls' is not 'no volumes'" \
     'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rm_dead_anon_volumes >/dev/null 2>&1'
 
 # ---------------------------------------------------------------------------
+# TEST 13: an unreadable container inventory must not authorise removal
+#
+# The failure mode here is not a missed cleanup. An empty reference set makes every
+# anonymous volume look orphaned, so believing a failed `docker ps -aq` or a short
+# `docker inspect` deletes volumes that are still mounted.
+# ---------------------------------------------------------------------------
+printf "\n# Test group 13: container inventory failures\n"
+
+ANON_A=$(python3 -c "print('a'*64)")
+
+make_inv_stub() {  # $1 = dir, $2 = which producer fails
+  mkdir -p "$1"
+  cat > "$1/docker" <<STUB
+#!/bin/bash
+case "\$1 \$2" in
+  "volume ls")  echo "$ANON_A" ;;
+  "ps -aq")     [ "$2" = "ps" ] && exit 1; echo c0ffee ;;
+  "inspect c0ffee") [ "$2" = "inspect" ] && exit 1; echo '[{"Mounts":[]}]' ;;
+  "volume rm")  shift 2; for v in "\$@"; do echo "RM \$v"; done ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "$1/docker"
+}
+
+make_inv_stub "$SANDBOX/bin-nops" ps
+expect_no "inventory: a failing 'docker ps -aq' does not authorise removal" \
+  env PATH="$SANDBOX/bin-nops:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rm_dead_anon_volumes >/dev/null 2>&1'
+
+expect_no "inventory: nothing is removed when 'docker ps -aq' fails" \
+  env PATH="$SANDBOX/bin-nops:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" 2>/dev/null; _cc_dj_docker_rm_dead_anon_volumes 2>/dev/null | grep -q "^RM "'
+
+make_inv_stub "$SANDBOX/bin-noinspect" inspect
+expect_no "inventory: a failing 'docker inspect' does not authorise removal" \
+  env PATH="$SANDBOX/bin-noinspect:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rm_dead_anon_volumes >/dev/null 2>&1'
+
+# A short inspect result describes fewer containers than were listed, so the reference
+# set is incomplete and cannot authorise anything either.
+SHORTDIR="$SANDBOX/bin-shortinspect"
+mkdir -p "$SHORTDIR"
+cat > "$SHORTDIR/docker" <<STUB
+#!/bin/bash
+case "\$1 \$2" in
+  "volume ls") echo "$ANON_A" ;;
+  "ps -aq")    printf 'c0ffee\ndecade\n' ;;
+  "inspect"*)  echo '[{"Mounts":[]}]' ;;
+  "volume rm") shift 2; for v in "\$@"; do echo "RM \$v"; done ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$SHORTDIR/docker"
+expect_no "inventory: a short 'docker inspect' does not authorise removal" \
+  env PATH="$SHORTDIR:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rm_dead_anon_volumes >/dev/null 2>&1'
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 rm -rf "$SANDBOX"

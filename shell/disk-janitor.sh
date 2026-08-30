@@ -333,21 +333,34 @@ anon = [n for n in names if re.fullmatch(r"[0-9a-f]{64}", n)]
 if not anon:
     sys.exit(0)
 
-ids = subprocess.run(["docker", "ps", "-aq"], capture_output=True, text=True).stdout.split()
+# Every producer is checked before its output is believed. An unreadable container
+# inventory yields an empty reference set, and an empty reference set makes every
+# anonymous volume look orphaned - the failure mode here is not a missed cleanup but a
+# deletion of volumes that are still mounted. Silence is never read as "nothing".
+ps = subprocess.run(["docker", "ps", "-aq"], capture_output=True, text=True)
+if ps.returncode != 0:
+    sys.exit(1)
+ids = ps.stdout.split()
 used = set()
 if ids:
-    out = subprocess.run(["docker", "inspect", *ids], capture_output=True, text=True).stdout
-    try:
-        for c in json.loads(out or "[]"):
-            for m in c.get("Mounts") or []:
-                if m.get("Name"):
-                    used.add(m["Name"])
-    except ValueError:
-        # An inventory we could not parse is not evidence that nothing is referenced.
+    ins = subprocess.run(["docker", "inspect", *ids], capture_output=True, text=True)
+    if ins.returncode != 0:
         sys.exit(1)
+    try:
+        parsed = json.loads(ins.stdout or "[]")
+    except ValueError:
+        sys.exit(1)
+    if len(parsed) != len(ids):
+        # A short inspect result means some container was not described, so the
+        # reference set is incomplete and cannot authorise any removal.
+        sys.exit(1)
+    for c in parsed:
+        for m in c.get("Mounts") or []:
+            if m.get("Name"):
+                used.add(m["Name"])
 
 print("\\n".join(n for n in anon if n not in used))
-')" || { echo "container inventory unreadable; removing nothing"; return 0; }
+')" || { echo "container inventory unreadable; removing nothing"; return 1; }
   [ -n "$dead" ] || { echo "no unreferenced anonymous volumes"; return 0; }
   local count
   count="$(printf '%s\n' "$dead" | grep -c .)"
