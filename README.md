@@ -232,8 +232,8 @@ claude-guard --dry-run  # preview without killing
 | `CC_MAX_RSS_MB` | 4096 | Tree RSS threshold (MB); sessions exceeding this are killed regardless of activity |
 | `CC_MAX_FD` | 10000 | File descriptor threshold; sessions exceeding this are killed as FD-leak |
 | `CC_AGENT_STALE_MINUTES` | 360 | Age threshold for stale agent-browser, Puppeteer Chrome, and detached Codex/MCP cleanup |
-| `CC_RUNAWAY_CPU` | 80 | CPU% above which a protected process is treated as stuck/runaway (combined with `CC_RUNAWAY_MIN`) |
-| `CC_RUNAWAY_MIN` | 60 | Minutes of elapsed time required before a hot protected process is treated as runaway |
+| `CC_RUNAWAY_CPU` | 80 | CPU% above which a process is treated as stuck/runaway (combined with `CC_RUNAWAY_MIN`). Shared by both tools |
+| `CC_RUNAWAY_MIN` | **30** in `cc-monitor`, **60** in `claude-guard` | Minutes of elapsed time before a hot process is treated as runaway. The two defaults differ on purpose — the monitor only reports, the guard signals — and setting this env var overrides both at once |
 | `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds `claude-guard` waits (Ctrl+C to abort) before SIGTERM-ing runaway protected processes |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip `claude-guard`'s runaway phase entirely |
 | `CC_RUNAWAY_ORPHAN_MIN_SEC` | 180 | LaunchAgent monitor only: minimum **seconds** a PPID=1 orphan must have lived before its sustained-CPU burn (`CC_RUNAWAY_CPU`) can trigger the whitelist-override reap. Distinct from `CC_RUNAWAY_MIN` (minutes, for live protected processes). |
@@ -354,22 +354,30 @@ cc-monitor --once --apply proc-janitor-scan     # preview-only via daemon
 
 `--apply` skips the confirmation prompt — the flag is itself the explicit opt-in. It cannot be combined with `--json` (exit 2). Module exit codes propagate.
 
-### Stuck/runaway protected processes
+### Stuck/runaway processes
 
 Long-running MCP servers, dev servers, and security daemons are intentionally `protected` — `claude-cleanup` will never kill them. But "protected" is not absolute: a process pinned at high CPU for hours is broken, regardless of category.
 
-`cc-monitor` and `claude-guard` detect **runaway protected processes** when both thresholds are met:
+Runaway is a claim about behaviour, so since 2026-08-30 **any** non-immutable process can be identified as one — not only those already on the protection list, which was backwards: the processes that run away are the ones nobody listed. Protection still decides what may be *done* about it.
 
-- average CPU% ≥ `CC_RUNAWAY_CPU` (default `80`)
-- elapsed time ≥ `CC_RUNAWAY_MIN` minutes (default `60`)
+**Reporting and reaping use different floors, deliberately.**
 
-`cc-monitor` then reclassifies the finding from `DO_NOT_KILL` to family `runaway` / `ASK_BEFORE_KILL`, and prints a dedicated "Stuck/runaway protected processes" section with a copy-pasteable kill line:
+| | threshold | acts on |
+|---|---|---|
+| `cc-monitor` (reports, never kills) | CPU ≥ `CC_RUNAWAY_CPU` (`80`) for ≥ `CC_RUNAWAY_MIN` minutes (**`30`**) | any non-immutable process |
+| `claude-guard` (SIGTERMs) | CPU ≥ `CC_RUNAWAY_CPU` (`80`) for ≥ `CC_RUNAWAY_MIN` minutes (**`60`**) | whitelisted protected MCP servers only |
+
+Reporting earlier than the reaper acts is the point: the report costs a line an operator ignores, while the old shared floor meant a stuck loop held a core for a full hour before it could be named. `claude-guard`'s selection is a separate implementation with its own whitelist and its own default; nothing about which processes can be signalled changed.
+
+`cc-monitor` reclassifies the finding to family `runaway` / `ASK_BEFORE_KILL` and prints a dedicated section with a copy-pasteable kill line. The suggested action differs by protection status, because `claude-guard` filters through its whitelist and suggesting it for an unlisted process would name a remedy that does nothing:
 
 ```text
-Stuck/runaway protected processes:
-  PID 9594    node    avg 102.70% etime 09:07:51 — protected process appears stuck (sustained high CPU over long elapsed time); review and kill if not actively serving
+Stuck/runaway processes:
+  PID 9594    node    avg 102.70% etime 09:07:51 — appears stuck (sustained high CPU over long elapsed time); review and kill if not actively serving
     suggested: kill 9594
 ```
+
+A process carrying an Always Protect user rule is still labelled a runaway; its suggested action stays the Always Protect wording.
 
 `claude-guard` adds a Phase 0.5 that reaps these PIDs in PGID-aware mode after `CC_RUNAWAY_GRACE_SEC` (default 5) seconds, so you can `Ctrl+C` if the report surprises you:
 
@@ -408,10 +416,12 @@ Beyond process hygiene, cc-reaper ships three system-level janitors (added after
 |---|---|---|
 | `resource-watch.sh` | every 10 min (launchd) | Single-pass snapshot (load / CPU idle / memory / disk) to `~/.cc-reaper/logs/resource-watch.log`; macOS notification when load > 2× cores, disk free < 15%, or memory is critically tight. Per-metric 60-min cooldown. |
 | `disk-janitor.sh --check` | hourly (launchd) | **Read-only**: disk free % + Time Machine local-snapshot pin detection (snapshots holding freed space hostage after big deletes). Alerts, never deletes. |
-| `disk-janitor.sh --clean` | Sunday 04:00 (launchd) | Cleans **rebuildable-only** targets: go-build / yarn / pip / brew / bun caches, Spotify / ShipIt / CoreSimulator caches, `docker system prune -af` (never `--volumes`), TM snapshot thinning (dated `com.apple.TimeMachine.*` only, only when disk is below threshold). |
+| `disk-janitor.sh --clean` | Sunday 04:00 (launchd) | Cleans **rebuildable-only** targets: go-build / yarn / pip / brew / bun caches, Spotify / ShipIt / CoreSimulator caches, docker **dangling images and unreferenced anonymous volumes** (by explicit id and name — no `prune` verb, and tagged images are never removed), TM snapshot thinning (dated `com.apple.TimeMachine.*` only, only when disk is below threshold). Tools are resolved from a known directory list, not the caller's `PATH`, because launchd supplies neither Homebrew nor Docker. |
 | `worktree-janitor.sh` | manual | Inventories git worktrees under `~/Documents/GitHub` (or `--repo <path>`); classifies KEEP/REMOVABLE with a **dual safety gate** (uncommitted changes OR an active process cwd inside ⇒ KEEP). **Dry-run by default** — only `--apply` removes; branches/commits are never deleted. |
 
-Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`, `~/Desktop`), never `docker prune --volumes`, never kills processes, scheduled runs never delete worktrees.
+Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`, `~/Desktop`), never runs any `docker prune`, never removes a tagged image, never removes a **named** volume, never kills processes, scheduled runs never delete worktrees or prune their administrative records.
+
+What the docker step *does* remove, changed 2026-08-30: dangling images (no tag points at them) and anonymous volumes (64-hex names) that no container references — each by explicit id or name, computed from the current inventory, and skipped entirely if any inventory command fails. It previously ran `docker system prune -af`, which reaches every unused tagged image including ones that take hours to rebuild; that is not "rebuildable-only" and is gone. **If you relied on the old line, note the direction of the change: unused tagged images now survive, and unreferenced anonymous volumes now do not.**
 
 Config via env: `CC_RW_LOAD_FACTOR` / `CC_RW_DISK_MIN_PCT` / `CC_RW_MEM_MIN_PCT` / `CC_RW_COOLDOWN_SECS` (watch), `CC_DJ_DISK_MIN_PCT` / `CC_DJ_COOLDOWN_SECS` (disk), `CC_WJ_ROOT` / `CC_WJ_NOTIFY_MIN_GB` (worktree).
 
