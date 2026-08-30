@@ -436,6 +436,49 @@ expect_yes "freed bytes: no target reports an unknown" \
   bash -c '! grep -q "freed=?" "$1"' _ "$SANDBOX/dj-nobun.log"
 
 # ---------------------------------------------------------------------------
+# TEST 10: anonymous-volume selection
+#
+# The one behaviour that replaced `docker system prune -af`, so it is the one that has to
+# be pinned by name. Verified against the live daemon on 2026-08-30 with a held volume, an
+# orphan, and four named pretrieval-* data volumes present; only the orphan was selected.
+# Reproduced here with stubs so the suite needs no daemon.
+# ---------------------------------------------------------------------------
+printf "\n# Test group 10: anonymous volume selection\n"
+
+VOL_BIN="$SANDBOX/bin-vol"
+mkdir -p "$VOL_BIN"
+A_VOL=$(python3 -c "print('a'*64)")
+B_VOL=$(python3 -c "print('b'*64)")
+cat > "$VOL_BIN/docker" <<STUB
+#!/bin/bash
+case "\$1 \$2" in
+  "volume ls")  printf '%s\\n%s\\npretrieval-qdrant-data\\nnot-hex-but-64-chars-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' "$A_VOL" "$B_VOL" ;;
+  "ps -aq")     echo c0ffee ;;
+  "inspect c0ffee") printf '[{"Mounts":[{"Name":"%s"}]}]\\n' "$A_VOL" ;;
+  "volume rm")  shift 2; for v in "\$@"; do echo "RM \$v"; done ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$VOL_BIN/docker"
+
+VOL_OUT="$(PATH="$VOL_BIN:$SAFE_SYS_PATH" bash -c '
+  source "$1" >/dev/null 2>&1
+  _cc_dj_docker_rm_dead_anon_volumes
+' _ "$ROOT_DIR/shell/disk-janitor.sh")"
+
+expect_yes "volumes: the unreferenced anonymous volume is removed" \
+  bash -c 'printf "%s" "$1" | grep -q "RM $2"' _ "$VOL_OUT" "$B_VOL"
+
+expect_no "volumes: a volume a container still mounts is left alone" \
+  bash -c 'printf "%s" "$1" | grep -q "RM $2"' _ "$VOL_OUT" "$A_VOL"
+
+expect_no "volumes: a named data volume is never selected" \
+  bash -c 'printf "%s" "$1" | grep -q "pretrieval-qdrant-data"' _ "$VOL_OUT"
+
+expect_no "volumes: a 64-character name that is not hex is never selected" \
+  bash -c 'printf "%s" "$1" | grep -q "not-hex-but-64-chars"' _ "$VOL_OUT"
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 rm -rf "$SANDBOX"
