@@ -152,10 +152,19 @@ _cc_monitor_runaway_cpu_threshold() {
   echo "$v"
 }
 
+# Minutes a process must have been above the CPU threshold before it is called a runaway.
+# 30 rather than 60: this path only reports, so the cost of naming a long build is a line an
+# operator ignores, while the cost of the old floor was a full hour in which a provably
+# non-terminating loop held a core and was labelled "other".
+#
+# The killing path is deliberately not this one and deliberately not this number.
+# `_cc_guard_runaway_protected_pids` in claude-cleanup.sh carries its own CC_RUNAWAY_MIN
+# default of 60 and its own whitelist, and the guard agent SIGTERMs from there. Reporting
+# earlier than the reaper acts is the intended asymmetry, not drift between two copies.
 _cc_monitor_runaway_min_threshold() {
-  local v=${CC_RUNAWAY_MIN:-60}
-  echo "$v" | grep -qE '^[0-9]+$' || v=60
-  [ "$v" -gt 0 ] || v=60
+  local v=${CC_RUNAWAY_MIN:-30}
+  echo "$v" | grep -qE '^[0-9]+$' || v=30
+  [ "$v" -gt 0 ] || v=30
   echo "$v"
 }
 
@@ -364,7 +373,7 @@ _cc_monitor_reason() {
     ASK_BEFORE_KILL:mcp)
       echo "MCP process may be shared or attached; confirm ownership before stopping" ;;
     ASK_BEFORE_KILL:runaway)
-      echo "protected process appears stuck (sustained high CPU over long elapsed time); review and kill if not actively serving" ;;
+      echo "appears stuck (sustained high CPU over long elapsed time); review and kill if not actively serving" ;;
     DO_NOT_KILL:system)
       echo "system, security, or UI process; do not terminate directly" ;;
     DO_NOT_KILL:chrome)
@@ -624,8 +633,19 @@ _cc_monitor_enrich_findings() {
     family=$(_cc_monitor_family "$cmd")
     classification=$(_cc_monitor_classification "$ppid" "$tty" "$etime" "$cmd" "$family")
 
-    if _cc_monitor_is_protected_cmd "$cmd" \
-      && ! _cc_monitor_is_immutable_cmd "$cmd" \
+    # Runaway is a statement about behaviour, not about identity, so it is evaluated for
+    # every row. It used to sit inside the protected-command branch, which meant a process
+    # could only be called a runaway if it was already on the protection list - and the
+    # processes that actually run away are the ones nobody listed. Measured 2026-08-30: a
+    # Python process at 99% CPU for 51 minutes under a live session was never labelled,
+    # because `/opt/homebrew/.../Python -c ...` matches no protected pattern. Its loop was
+    # `for c in iter(lambda: gzip.open(p,"rb").read(), b"")`, which reopens the file on
+    # every call and can never return the sentinel: it could not have terminated.
+    #
+    # Protection still decides what may be done about it. Every runaway is ASK_BEFORE_KILL
+    # and never SAFE_TO_REAP, because a live session's child at 100% CPU may equally be a
+    # legitimate long build, and this tool cannot tell those apart. The operator can.
+    if ! _cc_monitor_is_immutable_cmd "$cmd" \
       && ! _cc_monitor_has_user_rule protect "$cmd" \
       && _cc_monitor_is_runaway "$avg_cpu" "$etime"; then
       family="runaway"
@@ -738,7 +758,7 @@ _cc_monitor_human_report() {
   runaway_count=$(awk -F '\t' '$10 == "runaway" && $11 == "ASK_BEFORE_KILL" { count++ } END { print count+0 }' "$findings_file")
   if [ "$runaway_count" -gt 0 ]; then
     echo ""
-    echo "Stuck/runaway protected processes:"
+    echo "Stuck/runaway processes:"
     awk -F '\t' '
       $10 == "runaway" && $11 == "ASK_BEFORE_KILL" {
         printf "  PID %-7s %-24s avg %6.2f%% etime %s — %s\n", $4, $12, $1, $8, $13

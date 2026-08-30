@@ -240,7 +240,7 @@ for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cle
   chmod +x "$REAPER_DIR/$SCRIPT.sh"
 done
 
-for AGENT in resource-watch disk-check weekly-clean guard; do
+for AGENT in resource-watch disk-check weekly-clean guard worktree-report; do
   AGENT_LABEL="com.cc-reaper.$AGENT"
   AGENT_PLIST="$PLIST_DIR/$AGENT_LABEL.plist"
   sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/$AGENT_LABEL.plist" > "$AGENT_PLIST"
@@ -251,7 +251,7 @@ _cc_report_failed_agents
 echo "  resource-watch: snapshot every 10 min (alerts on load/disk/memory thresholds)"
 echo "  disk-check:     read-only disk + TM-snapshot check every hour"
 echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
-echo "  worktree-janitor: manual — run '~/.cc-reaper/worktree-janitor.sh' (report), add --apply to clean"
+echo "  worktree-report: worktree inventory daily 09:30, report only — add --apply by hand to clean"
 echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs whitelisted MCP pinned >80% CPU for >60 min)"
 
 # ─── 6. Uninstall hint ────────────────────────────────────────────────────────

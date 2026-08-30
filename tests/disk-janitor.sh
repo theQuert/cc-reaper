@@ -307,6 +307,11 @@ SAFE_SYS_PATH="/bin:/usr/bin:/usr/sbin:/sbin"
 
 (
   export PATH="$FAKE_BIN_NOBUN:$SAFE_SYS_PATH"
+  # The janitor appends its known tool directories to PATH so a LaunchAgent resolves the
+  # same tools an interactive shell does. That is what defeats simulating an absent tool
+  # through PATH alone - the real bun in /opt/homebrew/bin would resolve. Absence has to
+  # be simulated at the layer where resolution happens.
+  export CC_DJ_TOOL_DIRS=""
   export HOME="$FAKE_HOME"
   export FAKE_DF_FREE_PCT=80       # above threshold so no TM thinning
   export FAKE_STAT_MTIME=0
@@ -372,6 +377,63 @@ _run_dj --check 10 0
 
 expect_yes "check: notification sent after cooldown expired" \
   test -s "$OSASCRIPT_CAPTURE"
+
+# ---------------------------------------------------------------------------
+# TEST 8: tool resolution does not depend on the caller's PATH
+#
+# Red-verified 2026-08-30 against the pre-change script: under launchd's default PATH all
+# of go/yarn/brew/bun/docker resolved as absent and their targets were skipped, while all
+# five were installed. The weekly clean logged "clean: finished" either way.
+#
+# The janitor is sourced through a path held in a variable rather than through "$0": its
+# entry-point guard compares BASH_SOURCE[0] with $0, so sourcing it as $0 runs the CLI
+# and prints usage instead of defining anything.
+# ---------------------------------------------------------------------------
+printf "\n# Test group 8: tool resolution\n"
+
+LAUNCHD_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+DJ="$ROOT_DIR/shell/disk-janitor.sh"
+
+for tool in go docker; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    expect_yes "tool resolution: $tool resolves under launchd's PATH" \
+      env -i HOME="$HOME" PATH="$LAUNCHD_PATH" DJ="$DJ" TOOL="$tool" /bin/bash -c \
+        'source "$DJ" >/dev/null 2>&1; command -v "$TOOL" >/dev/null 2>&1'
+  else
+    printf "ok - tool resolution: %s not installed on this host, skipped\n" "$tool"
+  fi
+done
+
+# An empty CC_DJ_TOOL_DIRS hands the whole answer back to PATH, which is how a sandbox
+# simulates a tool that is genuinely not installed.
+expect_no "tool resolution: empty CC_DJ_TOOL_DIRS leaves PATH authoritative" \
+  env -i HOME="$HOME" PATH="$LAUNCHD_PATH" CC_DJ_TOOL_DIRS= DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; command -v go >/dev/null 2>&1'
+
+# A caller's own PATH entry keeps priority, so a shimmed tool is never stepped over -
+# the appended directories must not be able to reach past a test sandbox's stubs.
+SHIM_DIR="$SANDBOX/shim-priority"
+mkdir -p "$SHIM_DIR"
+printf '#!/bin/bash\necho SHIMMED\n' > "$SHIM_DIR/go"
+chmod +x "$SHIM_DIR/go"
+expect_yes "tool resolution: caller's PATH entry wins over the appended dirs" \
+  env -i HOME="$HOME" PATH="$SHIM_DIR:$LAUNCHD_PATH" DJ="$DJ" SHIM="$SHIM_DIR" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; [ "$(command -v go)" = "$SHIM/go" ]'
+
+# ---------------------------------------------------------------------------
+# TEST 9: no prune verb reaches docker, and a skipped run says so
+# ---------------------------------------------------------------------------
+printf "\n# Test group 9: docker cleanup shape and skip accounting\n"
+
+expect_no "docker: no 'prune' invocation survives outside comments" \
+  bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -q "docker.*prune"' _ "$DJ"
+
+expect_yes "skip accounting: a skipped run names the fact on its final line" \
+  bash -c 'grep -q "SKIPPED=" "$1" && grep -q "a skipped target cleaned nothing" "$1"' \
+    _ "$SANDBOX/dj-nobun.log"
+
+expect_yes "freed bytes: no target reports an unknown" \
+  bash -c '! grep -q "freed=?" "$1"' _ "$SANDBOX/dj-nobun.log"
 
 # ---------------------------------------------------------------------------
 # Cleanup

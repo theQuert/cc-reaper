@@ -36,6 +36,41 @@ CC_DJ_COOLDOWN_SECS="${CC_DJ_COOLDOWN_SECS:-3600}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
 CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
 
+# launchd hands an agent PATH=/usr/bin:/bin:/usr/sbin:/sbin and nothing more unless the
+# plist sets it, while Homebrew and Docker Desktop install outside that set. Resolving
+# tools through the inherited environment therefore reports them absent, which is a fact
+# about the caller and not about the machine. Measured here 2026-08-30: a weekly clean
+# skipped go, yarn, brew, bun and docker - 21 GB of go build cache among them - and still
+# ended on "clean: finished".
+#
+# Prepended rather than replaced, so an operator who has put a different toolchain ahead
+# on PATH keeps it. `command -v` downstream then answers the same question for an agent
+# and for an interactive shell.
+# Appended, never prepended. Whatever the caller put on PATH keeps priority - an operator
+# with their own toolchain, and a test sandbox shimming `docker` so a suite cannot reach
+# the real daemon. Prepending would silently step over both, which is the same class of
+# fault as the one being fixed. Set CC_DJ_TOOL_DIRS empty to make PATH the whole answer,
+# which is how a test simulates a tool that is genuinely not installed.
+CC_DJ_TOOL_DIRS="${CC_DJ_TOOL_DIRS-/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin}"
+if [ -n "$CC_DJ_TOOL_DIRS" ]; then
+  _cc_dj_dir=""
+  while IFS= read -r _cc_dj_dir; do
+    [ -n "$_cc_dj_dir" ] && [ -d "$_cc_dj_dir" ] || continue
+    case ":$PATH:" in
+      *":$_cc_dj_dir:"*) ;;
+      *) PATH="$PATH:$_cc_dj_dir" ;;
+    esac
+  done <<< "$(printf '%s' "$CC_DJ_TOOL_DIRS" | tr ':' '\n')"
+  unset _cc_dj_dir
+fi
+export PATH
+
+# Targets that ran, and targets skipped because their tool did not resolve. A clean that
+# skipped most of its work ended on the same line as one that did all of it, which is how
+# five dead targets survived weeks of weekly runs.
+CC_DJ_RAN=0
+CC_DJ_SKIPPED=0
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -83,6 +118,36 @@ _cc_dj_free_pct() {
   local vol="${CC_DJ_VOLUME:-/System/Volumes/Data}"
   [ -d "$vol" ] || vol="/"
   df -P "$vol" | awk 'NR==2 { gsub(/%/,"",$5); print 100 - $5 }'
+}
+
+# Free 1K-blocks on the same volume free_pct measures. Used to price a target from the
+# delta across it: a target that freed 21 GB and one that did nothing logged the same
+# "freed=?" before, and that is the distinction an operator needs.
+_cc_dj_free_kb() {
+  local vol="${CC_DJ_VOLUME:-/System/Volumes/Data}"
+  [ -d "$vol" ] || vol="/"
+  df -P "$vol" | awk 'NR==2 { print $4 }'
+}
+
+# Human-readable byte count from a 1K-block delta. Negative deltas happen - another
+# process can write during a target - and are reported as 0 rather than as a negative
+# saving, which would read as the target having consumed space.
+_cc_dj_fmt_kb_delta() {
+  local kb="$1"
+  [ -n "$kb" ] || { printf '0B'; return; }
+  [ "$kb" -gt 0 ] 2>/dev/null || { printf '0B'; return; }
+  awk -v k="$kb" 'BEGIN{
+    b=k*1024
+    if (b>=1073741824) printf "%.1fG", b/1073741824
+    else if (b>=1048576) printf "%.1fM", b/1048576
+    else printf "%.0fK", b/1024
+  }'
+}
+
+# One place that records a target as skipped, so the counter cannot drift from the log.
+_cc_dj_skip() {
+  CC_DJ_SKIPPED=$(( CC_DJ_SKIPPED + 1 ))
+  _cc_dj_log "SKIP $*"
 }
 
 # Returns newline-separated list of TM snapshot date tokens (e.g. 2026-06-10-040000)
@@ -177,13 +242,18 @@ _cc_dj_clean_target() {
   shift
   # "$@" is the command to run
   _cc_dj_log "clean: running target '${label}'"
-  local out rc=0
+  local out rc=0 before after
+  before="$(_cc_dj_free_kb)"
   out=$("$@" 2>&1) || rc=$?
   [ -n "$out" ] && printf '%s\n' "$out" >> "$CC_DJ_LOG"
+  after="$(_cc_dj_free_kb)"
+  local freed
+  freed="$(_cc_dj_fmt_kb_delta "$(( ${after:-0} - ${before:-0} ))")"
+  CC_DJ_RAN=$(( CC_DJ_RAN + 1 ))
   if [ "$rc" -eq 0 ]; then
-    _cc_dj_log "clean: target '${label}' done (freed=?)"
+    _cc_dj_log "clean: target '${label}' done (freed=${freed})"
   else
-    _cc_dj_log "clean: target '${label}' returned non-zero (rc=${rc}, may be fine)"
+    _cc_dj_log "clean: target '${label}' returned non-zero (rc=${rc}, may be fine, freed=${freed})"
   fi
 }
 
@@ -192,13 +262,68 @@ _cc_dj_clean_dir() {
   local path="$2"
   [ -z "$path" ] && { _cc_dj_log "SKIP ${label} (empty path)"; return 0; }
   if [ ! -e "$path" ]; then
-    _cc_dj_log "SKIP ${label} (path not found: ${path})"
+    _cc_dj_skip "${label} (path not found: ${path})"
     return
   fi
   local bytes
   bytes="$(_cc_dj_du_bytes "$path")"
   rm -rf "$path"
+  CC_DJ_RAN=$(( CC_DJ_RAN + 1 ))
   _cc_dj_log "clean: removed '${label}' freed=${bytes} bytes"
+}
+
+# Dangling images: built layers no tag points at any more. `-f dangling=true` is a
+# filter, not a prune verb - it enumerates, and each id is passed to `rmi` explicitly, so
+# a tagged image cannot be reached however the inventory changes between calls.
+_cc_dj_docker_rmi_dangling() {
+  local ids
+  ids="$(docker images -f dangling=true -q 2>/dev/null | sort -u)"
+  [ -n "$ids" ] || { echo "no dangling images"; return 0; }
+  # shellcheck disable=SC2086
+  docker rmi $ids 2>&1 | tail -40
+  return 0
+}
+
+# Anonymous volumes are the ones docker names itself when an image declares VOLUME and
+# the container is started without --rm: 64 hex characters, and orphaned the moment the
+# container is removed. Nothing can mount one again, because the name existed only inside
+# the container that is gone.
+#
+# The reference set is taken from every container, not just running ones: a stopped
+# container is restartable and still owns its mounts. Named volumes are excluded by the
+# hex test, which is what keeps a data volume such as `pretrieval-qdrant-data` out of
+# reach even when nothing is currently running.
+_cc_dj_docker_rm_dead_anon_volumes() {
+  local dead
+  dead="$(docker volume ls --format '{{.Name}}' 2>/dev/null | python3 -c '
+import json, re, subprocess, sys
+
+names = [n.strip() for n in sys.stdin if n.strip()]
+anon = [n for n in names if re.fullmatch(r"[0-9a-f]{64}", n)]
+if not anon:
+    sys.exit(0)
+
+ids = subprocess.run(["docker", "ps", "-aq"], capture_output=True, text=True).stdout.split()
+used = set()
+if ids:
+    out = subprocess.run(["docker", "inspect", *ids], capture_output=True, text=True).stdout
+    try:
+        for c in json.loads(out or "[]"):
+            for m in c.get("Mounts") or []:
+                if m.get("Name"):
+                    used.add(m["Name"])
+    except ValueError:
+        # An inventory we could not parse is not evidence that nothing is referenced.
+        sys.exit(1)
+
+print("\\n".join(n for n in anon if n not in used))
+')" || { echo "container inventory unreadable; removing nothing"; return 0; }
+  [ -n "$dead" ] || { echo "no unreferenced anonymous volumes"; return 0; }
+  local count
+  count="$(printf '%s\n' "$dead" | grep -c .)"
+  echo "removing $count unreferenced anonymous volumes"
+  printf '%s\n' "$dead" | xargs -n 50 docker volume rm 2>&1 | tail -5
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -214,35 +339,35 @@ _cc_dj_clean() {
   if command -v go >/dev/null 2>&1; then
     _cc_dj_clean_target "go clean -cache" go clean -cache
   else
-    _cc_dj_log "SKIP go clean -cache (go not found)"
+    _cc_dj_skip "go clean -cache (go not found)"
   fi
 
   # -- yarn cache clean -------------------------------------------------------
   if command -v yarn >/dev/null 2>&1; then
     _cc_dj_clean_target "yarn cache clean" yarn cache clean
   else
-    _cc_dj_log "SKIP yarn cache clean (yarn not found)"
+    _cc_dj_skip "yarn cache clean (yarn not found)"
   fi
 
   # -- pip3 cache purge -------------------------------------------------------
   if command -v pip3 >/dev/null 2>&1; then
     _cc_dj_clean_target "pip3 cache purge" pip3 cache purge
   else
-    _cc_dj_log "SKIP pip3 cache purge (pip3 not found)"
+    _cc_dj_skip "pip3 cache purge (pip3 not found)"
   fi
 
   # -- brew cleanup -s --------------------------------------------------------
   if command -v brew >/dev/null 2>&1; then
     _cc_dj_clean_target "brew cleanup -s" brew cleanup -s
   else
-    _cc_dj_log "SKIP brew cleanup -s (brew not found)"
+    _cc_dj_skip "brew cleanup -s (brew not found)"
   fi
 
   # -- bun pm cache rm --------------------------------------------------------
   if command -v bun >/dev/null 2>&1; then
     _cc_dj_clean_target "bun pm cache rm" bun pm cache rm
   else
-    _cc_dj_log "SKIP bun pm cache rm (bun not found)"
+    _cc_dj_skip "bun pm cache rm (bun not found)"
   fi
 
   # -- Spotify cache ----------------------------------------------------------
@@ -257,11 +382,25 @@ _cc_dj_clean() {
   local sim_cache="$HOME/Library/Developer/CoreSimulator/Caches"
   _cc_dj_clean_dir "CoreSimulator caches" "$sim_cache"
 
-  # -- docker system prune ----------------------------------------------------
-  if command -v docker >/dev/null 2>&1; then
-    _cc_dj_clean_target "docker system prune" docker system prune -af
+  # -- docker: dangling images and unreferenced anonymous volumes -------------
+  #
+  # Not `docker system prune -af`. That removes every image no running container holds,
+  # which on a development host reaches images that take hours to rebuild and pinned
+  # versions kept on purpose - neither of which "rebuilds automatically on next use",
+  # the property every other target here satisfies. Until 2026-08-30 this line was
+  # `prune -af` and had never fired only because launchd's PATH hid the docker binary;
+  # repairing that PATH without replacing this would have armed it.
+  #
+  # What is removed instead is addressed by id or name, computed from the current
+  # inventory, and provably unreachable: a dangling image carries no tag, and an
+  # anonymous volume whose container is gone can never be mounted again.
+  if ! command -v docker >/dev/null 2>&1; then
+    _cc_dj_skip "docker cleanup (docker not found)"
+  elif ! docker info >/dev/null 2>&1; then
+    _cc_dj_skip "docker (daemon unreachable)"
   else
-    _cc_dj_log "SKIP docker system prune (docker not found)"
+    _cc_dj_clean_target "docker dangling images" _cc_dj_docker_rmi_dangling
+    _cc_dj_clean_target "docker anonymous volumes" _cc_dj_docker_rm_dead_anon_volumes
   fi
 
   # -- TM snapshot thinning (only when below threshold) ----------------------
@@ -290,7 +429,14 @@ _cc_dj_clean() {
   fi
 
   free_after="$(_cc_dj_free_pct)"
-  _cc_dj_log "clean: finished — disk free=${free_after}%"
+  # The counts are on this line because their absence is what let five dead targets run
+  # weekly for weeks: a clean that skipped most of its work and one that did all of it
+  # both ended on "clean: finished - disk free=16%".
+  if [ "$CC_DJ_SKIPPED" -gt 0 ]; then
+    _cc_dj_log "clean: finished — disk free=${free_after}% — ran=${CC_DJ_RAN} SKIPPED=${CC_DJ_SKIPPED} (a skipped target cleaned nothing)"
+  else
+    _cc_dj_log "clean: finished — disk free=${free_after}% — ran=${CC_DJ_RAN} skipped=0"
+  fi
 }
 
 # ---------------------------------------------------------------------------

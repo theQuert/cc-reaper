@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cc-reaper.worktree-report</string>
+
+    <!-- Report only. --apply is never passed here: the inventory cannot tell work that
+         was never pushed from work that was abandoned, and on this host 43 of 83
+         worktrees had a HEAD that existed on no remote. Removal stays a human decision. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/.cc-reaper/worktree-janitor.sh</string>
+    </array>
+
+    <!-- Daily at 09:30. The reclaim hook only ever sweeps the repository a session
+         happened to be sitting in, so nothing else looks across repositories. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.cc-reaper/logs/launchd-worktree-report-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.cc-reaper/logs/launchd-worktree-report-stderr.log</string>
+</dict>
+</plist>
