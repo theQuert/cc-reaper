@@ -39,8 +39,8 @@ line omitted, and the omission survived weeks of weekly runs.
 ### Requirement: Rebuildable-only cleanup targets
 The janitor SHALL clean only artifacts that rebuild automatically on next use: go-build
 cache (`go clean -cache`), Yarn cache, pip cache, Homebrew cleanup, bun install cache,
-Spotify cache, ShipIt updater cache, CoreSimulator caches, and docker artifacts that no
-container references — dangling images, and anonymous volumes whose containers are gone.
+Spotify cache, ShipIt updater cache, CoreSimulator caches, and dangling docker images — those
+no tag points at.
 
 The janitor SHALL NOT invoke any `prune` verb. `docker system prune -af` removes every
 image not currently held by a running container, which on a development host includes
@@ -63,9 +63,13 @@ or editor state (`~/.cursor/extensions`).
 - **WHEN** an image carries a tag and is held by no container
 - **THEN** it SHALL be left alone, because only dangling images are removable
 
-#### Scenario: An anonymous volume outlives its container
+#### Scenario: A volume looks docker-generated and is unreferenced
 - **WHEN** a volume's name is a 64-character hex string and no container references it
-- **THEN** it SHALL be removed by name, since nothing can ever mount it again
+- **THEN** it SHALL be reported with the command to review it, and SHALL NOT be removed — `docker volume create` accepts such a name from anyone and `docker volume inspect` exposes no flag separating a daemon-created volume from a user-created one, so the name cannot establish provenance and an unreferenced volume is not an abandoned one
+
+#### Scenario: Any volume at all
+- **WHEN** the docker cleanup target runs
+- **THEN** no code path SHALL invoke `docker volume rm`
 
 #### Scenario: Forbidden verbs are structurally absent
 - **WHEN** the janitor source is inspected

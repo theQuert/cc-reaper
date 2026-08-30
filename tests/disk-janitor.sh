@@ -465,6 +465,9 @@ printf "\n# Test group 9: docker cleanup shape and skip accounting\n"
 expect_no "docker: no 'prune' invocation survives outside comments" \
   bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -q "docker.*prune"' _ "$DJ"
 
+expect_no "docker: no volume removal survives outside comments" \
+  bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -q "volume rm"' _ "$DJ"
+
 expect_yes "skip accounting: a skipped run names the fact on its final line" \
   bash -c 'grep -q "SKIPPED=" "$1" && grep -q "a skipped target cleaned nothing" "$1"' \
     _ "$SANDBOX/dj-nobun.log"
@@ -500,14 +503,17 @@ chmod +x "$VOL_BIN/docker"
 
 VOL_OUT="$(PATH="$VOL_BIN:$SAFE_SYS_PATH" bash -c '
   source "$1" >/dev/null 2>&1
-  _cc_dj_docker_rm_dead_anon_volumes
+  _cc_dj_docker_report_dead_anon_volumes
 ' _ "$ROOT_DIR/shell/disk-janitor.sh")"
 
-expect_yes "volumes: the unreferenced anonymous volume is removed" \
-  bash -c 'printf "%s" "$1" | grep -q "RM $2"' _ "$VOL_OUT" "$B_VOL"
+expect_no "volumes: nothing is removed, whatever the name looks like" \
+  bash -c 'printf "%s" "$1" | grep -q "RM "' _ "$VOL_OUT"
 
-expect_no "volumes: a volume a container still mounts is left alone" \
-  bash -c 'printf "%s" "$1" | grep -q "RM $2"' _ "$VOL_OUT" "$A_VOL"
+expect_yes "volumes: the unreferenced volume is reported" \
+  bash -c 'printf "%s" "$1" | grep -q "unreferenced volumes"' _ "$VOL_OUT"
+
+expect_yes "volumes: a mounted volume is not counted as unreferenced" \
+  bash -c 'printf "%s" "$1" | grep -q "^1 unreferenced volumes"' _ "$VOL_OUT"
 
 expect_no "volumes: a named data volume is never selected" \
   bash -c 'printf "%s" "$1" | grep -q "pretrieval-qdrant-data"' _ "$VOL_OUT"
@@ -586,7 +592,7 @@ expect_no "inventory: a failing 'docker images' is not 'no dangling images'" \
 
 expect_no "inventory: a failing 'docker volume ls' is not 'no volumes'" \
   env PATH="$DEADD:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
-    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rm_dead_anon_volumes >/dev/null 2>&1'
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_report_dead_anon_volumes >/dev/null 2>&1'
 
 # ---------------------------------------------------------------------------
 # TEST 13: an unreadable container inventory must not authorise removal
@@ -617,16 +623,16 @@ STUB
 make_inv_stub "$SANDBOX/bin-nops" ps
 expect_no "inventory: a failing 'docker ps -aq' does not authorise removal" \
   env PATH="$SANDBOX/bin-nops:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
-    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rm_dead_anon_volumes >/dev/null 2>&1'
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_report_dead_anon_volumes >/dev/null 2>&1'
 
-expect_no "inventory: nothing is removed when 'docker ps -aq' fails" \
+expect_no "inventory: nothing is reported when 'docker ps -aq' fails" \
   env PATH="$SANDBOX/bin-nops:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
-    'source "$DJ" 2>/dev/null; _cc_dj_docker_rm_dead_anon_volumes 2>/dev/null | grep -q "^RM "'
+    'source "$DJ" 2>/dev/null; _cc_dj_docker_report_dead_anon_volumes 2>/dev/null | grep -q "unreferenced volumes"'
 
 make_inv_stub "$SANDBOX/bin-noinspect" inspect
 expect_no "inventory: a failing 'docker inspect' does not authorise removal" \
   env PATH="$SANDBOX/bin-noinspect:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
-    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rm_dead_anon_volumes >/dev/null 2>&1'
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_report_dead_anon_volumes >/dev/null 2>&1'
 
 # A short inspect result describes fewer containers than were listed, so the reference
 # set is incomplete and cannot authorise anything either.
@@ -645,7 +651,7 @@ STUB
 chmod +x "$SHORTDIR/docker"
 expect_no "inventory: a short 'docker inspect' does not authorise removal" \
   env PATH="$SHORTDIR:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
-    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rm_dead_anon_volumes >/dev/null 2>&1'
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_report_dead_anon_volumes >/dev/null 2>&1'
 
 # ---------------------------------------------------------------------------
 # TEST 14: the default tool list covers where the targets actually install,

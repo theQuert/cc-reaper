@@ -311,18 +311,22 @@ _cc_dj_docker_rmi_dangling() {
   return "$rc"
 }
 
-# Anonymous volumes are the ones docker names itself when an image declares VOLUME and
-# the container is started without --rm: 64 hex characters, and orphaned the moment the
-# container is removed. Nothing can mount one again, because the name existed only inside
-# the container that is gone.
+# Unreferenced volumes with docker-generated-looking names: 64 lowercase hex characters,
+# referenced by no container.
 #
-# The reference set is taken from every container, not just running ones: a stopped
-# container is restartable and still owns its mounts. Named volumes are excluded by the
-# hex test, which is what keeps a data volume such as `pretrieval-qdrant-data` out of
-# reach even when nothing is currently running.
-_cc_dj_docker_rm_dead_anon_volumes() {
-  # Same reason as above: an empty volume list from a dead daemon is indistinguishable
-  # from a machine with no volumes unless the producer's status is kept.
+# Reported, never removed. The name is the only signal available - `docker volume inspect`
+# exposes no "anonymous" flag, and a user-created volume carries the same empty Labels and
+# Options as a daemon-created one - and `docker volume create <name>` accepts a 64-hex name
+# from anyone. So the name cannot establish provenance, an unreferenced volume is not the
+# same as an abandoned one, and deleting on that inference risks persistent data for space
+# an operator can reclaim by hand in one command.
+#
+# Reporting is not a lesser version of this target, it is the correct one. The premise of
+# this change is that a janitor which cannot see is indistinguishable from a clean machine;
+# what it is not is a licence to act on what it cannot establish.
+_cc_dj_docker_report_dead_anon_volumes() {
+  # Same reason as the image inventory: an empty volume list from a dead daemon is
+  # indistinguishable from a machine with no volumes unless the producer's status is kept.
   local names ls_rc=0
   names="$(docker volume ls --format '{{.Name}}' 2>/dev/null)" || ls_rc=$?
   if [ "$ls_rc" -ne 0 ]; then
@@ -340,8 +344,7 @@ if not anon:
 
 # Every producer is checked before its output is believed. An unreadable container
 # inventory yields an empty reference set, and an empty reference set makes every
-# anonymous volume look orphaned - the failure mode here is not a missed cleanup but a
-# deletion of volumes that are still mounted. Silence is never read as "nothing".
+# such volume look unreferenced. Silence is never read as "nothing".
 ps = subprocess.run(["docker", "ps", "-aq"], capture_output=True, text=True)
 if ps.returncode != 0:
     sys.exit(1)
@@ -356,8 +359,6 @@ if ids:
     except ValueError:
         sys.exit(1)
     if len(parsed) != len(ids):
-        # A short inspect result means some container was not described, so the
-        # reference set is incomplete and cannot authorise any removal.
         sys.exit(1)
     for c in parsed:
         for m in c.get("Mounts") or []:
@@ -365,17 +366,14 @@ if ids:
                 used.add(m["Name"])
 
 print("\\n".join(n for n in anon if n not in used))
-')" || { echo "container inventory unreadable; removing nothing"; return 1; }
-  [ -n "$dead" ] || { echo "no unreferenced anonymous volumes"; return 0; }
+')" || { echo "container inventory unreadable; reporting nothing"; return 1; }
+  [ -n "$dead" ] || { echo "no unreferenced anonymous-looking volumes"; return 0; }
   local count
   count="$(printf '%s\n' "$dead" | grep -c .)"
-  echo "removing $count unreferenced anonymous volumes"
-  # `xargs` exits non-zero when the command it ran did, and that status is what the caller
-  # needs; `tail` must not stand in for it.
-  local out rc=0
-  out="$(printf '%s\n' "$dead" | xargs -n 50 docker volume rm 2>&1)" || rc=$?
-  printf '%s\n' "$out" | tail -5
-  return "$rc"
+  echo "$count unreferenced volumes with docker-generated-looking names; not removed"
+  echo "  a 64-hex name can also be one you chose, so review before removing:"
+  echo "  docker volume ls --format '{{.Name}}' | grep -E '^[0-9a-f]{64}\$'"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -448,16 +446,18 @@ _cc_dj_clean() {
   # `prune -af` and had never fired only because launchd's PATH hid the docker binary;
   # repairing that PATH without replacing this would have armed it.
   #
-  # What is removed instead is addressed by id or name, computed from the current
-  # inventory, and provably unreachable: a dangling image carries no tag, and an
-  # anonymous volume whose container is gone can never be mounted again.
+  # What is removed instead is addressed by id, computed from the current inventory, and
+  # provably unreachable: a dangling image carries no tag. Volumes are reported and never
+  # removed - see `_cc_dj_docker_report_dead_anon_volumes` for why a 64-hex name cannot
+  # establish that docker, rather than an operator, chose it.
   if ! command -v docker >/dev/null 2>&1; then
     _cc_dj_skip "docker cleanup (docker not found)"
   elif ! docker info >/dev/null 2>&1; then
     _cc_dj_skip "docker (daemon unreachable)"
   else
     _cc_dj_clean_target "docker dangling images" _cc_dj_docker_rmi_dangling
-    _cc_dj_clean_target "docker anonymous volumes" _cc_dj_docker_rm_dead_anon_volumes
+    _cc_dj_clean_target "docker unreferenced volumes (report only)" \
+      _cc_dj_docker_report_dead_anon_volumes
   fi
 
   # -- TM snapshot thinning (only when below threshold) ----------------------

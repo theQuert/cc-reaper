@@ -73,8 +73,15 @@ which is most of the window in which noticing is worth anything.
   summary names how many targets ran and how many were skipped, so a run that skipped most
   of its work cannot end on a line that reads like success.
 - Each target's freed bytes are measured from free-space deltas rather than logged as `?`.
-- `docker system prune -af` is replaced by removal of dangling images and of anonymous
-  volumes no container references, each named explicitly. No `prune` verb remains.
+- `docker system prune -af` is replaced by removal of dangling images, by explicit id. No
+  `prune` verb remains, and no tagged image can be reached.
+- Volumes are reported, never removed. A 64-hex name looks docker-generated but does not
+  prove it — `docker volume create` accepts such a name from anyone, and `docker volume
+  inspect` exposes no flag separating a daemon-created volume from a user-created one — so
+  an unreferenced one cannot be shown to be abandoned. Reporting is the correct form of this
+  target, not a lesser one: the premise here is that a janitor which cannot see is
+  indistinguishable from a clean machine, which is not a licence to act on what it cannot
+  establish.
 - worktree-janitor stays manual, and the installer now says why rather than leaving the
   absence to read as an oversight. A LaunchAgent cannot read `~/Documents` — measured with
   a probe agent on 2026-08-30: `ls ~/Documents/GitHub` returned `DENIED`, and `git rev-parse`
@@ -102,7 +109,8 @@ repositories from npm to pnpm; any change to the reclaim hook's removal criteria
 ### Modified Capabilities
 
 - `disk-janitor`: tool resolution stops depending on the caller's environment; skips and
-  freed bytes become observable; docker cleanup stops being able to delete expensive images.
+  freed bytes become observable; docker cleanup stops being able to delete expensive images,
+  and stops deleting volumes at all.
 - `worktree-janitor`: report mode stops mutating the repository; the cross-repository gap
   it was meant to close is recorded as still open, with the measurement that closes off the
   scheduled approach.
