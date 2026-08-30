@@ -563,6 +563,29 @@ expect_yes "status: a succeeding docker rmi returns success" \
     'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rmi_dangling >/dev/null 2>&1'
 
 # ---------------------------------------------------------------------------
+# TEST 12: an inventory that failed is not an empty inventory
+# ---------------------------------------------------------------------------
+printf "\n# Test group 12: inventory status\n"
+
+DEADD="$SANDBOX/bin-deaddaemon"
+mkdir -p "$DEADD"
+cat > "$DEADD/docker" <<'STUB'
+#!/bin/bash
+# The daemon answered `info` and then went away: every later command fails silently.
+[ "$1" = "info" ] && exit 0
+exit 1
+STUB
+chmod +x "$DEADD/docker"
+
+expect_no "inventory: a failing 'docker images' is not 'no dangling images'" \
+  env PATH="$DEADD:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rmi_dangling >/dev/null 2>&1'
+
+expect_no "inventory: a failing 'docker volume ls' is not 'no volumes'" \
+  env PATH="$DEADD:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rm_dead_anon_volumes >/dev/null 2>&1'
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 rm -rf "$SANDBOX"

@@ -653,9 +653,17 @@ _cc_monitor_enrich_findings() {
     # and never SAFE_TO_REAP, because a live session's child at 100% CPU may equally be a
     # legitimate long build, and this tool cannot tell those apart. The operator can.
     if ! _cc_monitor_is_immutable_cmd "$cmd" \
-      && ! _cc_monitor_has_user_rule protect "$cmd" \
       && _cc_monitor_is_runaway "$avg_cpu" "$etime"; then
+      # An Always Protect rule is a statement about what may be done to a process, not
+      # about how it is behaving, so it no longer suppresses the label either - the same
+      # correction that moved this test out of the protected-command branch. A user's
+      # protected service pinned at 99% for hours is the thing they most need to see.
       family="runaway"
+      # Unconditional, as before. A protected MCP's base classification is DO_NOT_KILL and
+      # promoting a runaway one to ASK_BEFORE_KILL is the whole point of the feature -
+      # guarding against that downgrade turned it off. System, security and UI processes
+      # are held out by `_cc_monitor_is_immutable_cmd` on the branch above, which is where
+      # that concern already lives.
       classification="ASK_BEFORE_KILL"
     fi
 

@@ -269,6 +269,35 @@ expect_yes "branch wt-residue-branch ref still exists" \
 expect_yes "osascript notification triggered on apply" \
   test -s "$OSASCRIPT_LOG"
 
+# ─── Report-only must not mutate the repository ──────────────────────────────
+#
+# `git worktree prune` removes administrative records, and this script's own usage says
+# removal needs --apply. Running it from a report made the default mode mutate the
+# repository it was only supposed to describe. That became load-bearing once the
+# scheduled agent landed: an agent that never passes --apply was deleting metadata daily
+# under the name "report-only".
+
+PRUNE_REPO="$TMPDIR_ROOT/prune-probe"
+mkdir -p "$PRUNE_REPO"
+git -C "$PRUNE_REPO" init -q 2>/dev/null
+git -C "$PRUNE_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null
+git -C "$PRUNE_REPO" worktree add -q "$TMPDIR_ROOT/prune-probe-wt" -b probe 2>/dev/null
+# The worktree directory disappears; its administrative record must survive a report.
+rm -rf "$TMPDIR_ROOT/prune-probe-wt"
+ADMIN_DIR="$PRUNE_REPO/.git/worktrees/prune-probe-wt"
+
+PATH="$STUBS_IDLE:$PATH" bash "$ROOT_DIR/shell/worktree-janitor.sh" \
+  --repo "$PRUNE_REPO" >/dev/null 2>&1
+
+expect_yes "report-only leaves the administrative record for a missing worktree" \
+  test -d "$ADMIN_DIR"
+
+PATH="$STUBS_IDLE:$PATH" bash "$ROOT_DIR/shell/worktree-janitor.sh" \
+  --apply --repo "$PRUNE_REPO" >/dev/null 2>&1
+
+expect_no "--apply does remove it, so the capability is not merely disabled" \
+  test -d "$ADMIN_DIR"
+
 # ─── Final result ─────────────────────────────────────────────────────────────
 
 if [ "$failures" -gt 0 ]; then

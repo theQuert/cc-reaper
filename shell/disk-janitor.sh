@@ -281,8 +281,17 @@ _cc_dj_clean_dir() {
 # filter, not a prune verb - it enumerates, and each id is passed to `rmi` explicitly, so
 # a tagged image cannot be reached however the inventory changes between calls.
 _cc_dj_docker_rmi_dangling() {
-  local ids
-  ids="$(docker images -f dangling=true -q 2>/dev/null | sort -u)"
+  # The inventory's own status is checked before its output is believed. If the daemon
+  # goes away after the `docker info` probe, `docker images` fails and prints nothing, and
+  # reading that as "no dangling images" reports a target as done when nothing was
+  # examined - the same fault as the swallowed `rmi` status, one command earlier.
+  local ids ls_rc=0
+  ids="$(docker images -f dangling=true -q 2>/dev/null)" || ls_rc=$?
+  if [ "$ls_rc" -ne 0 ]; then
+    echo "docker images failed (rc=$ls_rc); nothing examined"
+    return "$ls_rc"
+  fi
+  ids="$(printf '%s\n' "$ids" | sort -u)"
   [ -n "$ids" ] || { echo "no dangling images"; return 0; }
   # The pipeline's status must be docker's, not tail's: an image that became referenced
   # between the inventory and the removal makes `rmi` fail, and swallowing that reported a
@@ -307,8 +316,16 @@ _cc_dj_docker_rmi_dangling() {
 # hex test, which is what keeps a data volume such as `pretrieval-qdrant-data` out of
 # reach even when nothing is currently running.
 _cc_dj_docker_rm_dead_anon_volumes() {
+  # Same reason as above: an empty volume list from a dead daemon is indistinguishable
+  # from a machine with no volumes unless the producer's status is kept.
+  local names ls_rc=0
+  names="$(docker volume ls --format '{{.Name}}' 2>/dev/null)" || ls_rc=$?
+  if [ "$ls_rc" -ne 0 ]; then
+    echo "docker volume ls failed (rc=$ls_rc); nothing examined"
+    return "$ls_rc"
+  fi
   local dead
-  dead="$(docker volume ls --format '{{.Name}}' 2>/dev/null | python3 -c '
+  dead="$(printf '%s\n' "$names" | python3 -c '
 import json, re, subprocess, sys
 
 names = [n.strip() for n in sys.stdin if n.strip()]

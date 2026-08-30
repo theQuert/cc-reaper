@@ -24,6 +24,14 @@ tell those apart.
 - **WHEN** a protected process exceeds both thresholds
 - **THEN** it SHALL be reported as a runaway on the same terms, preserving the existing behaviour
 
+#### Scenario: A process carrying an Always Protect user rule
+- **WHEN** a process the user has marked Always Protect exceeds both thresholds
+- **THEN** it SHALL still be labelled a runaway, and its suggested action SHALL remain the Always Protect wording — a rule about what may be done is not a claim about how the process is behaving, and a user's own protected service pinned hot for hours is what they most need to see
+
+#### Scenario: A system, security or UI process
+- **WHEN** an immutable process exceeds both thresholds
+- **THEN** it SHALL NOT be reclassified, because that concern is held out on the branch rather than by refusing to downgrade a classification afterwards
+
 #### Scenario: Short CPU burst
 - **WHEN** a process is above the CPU threshold but below the duration floor
 - **THEN** it SHALL NOT be identified as a runaway, because a build and a stuck loop are indistinguishable at that timescale

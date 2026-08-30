@@ -106,6 +106,23 @@ sys.exit(0 if f and f.get("family") == "runaway" and f.get("classification") == 
 ' && ok "unprotected runaway is family=runaway / ASK_BEFORE_KILL" \
   || fail "unprotected runaway is family=runaway / ASK_BEFORE_KILL"
 
+# An Always Protect rule says what may be done to a process, not how it is behaving.
+# Suppressing the label for one hid the case a user most wants to see: their own protected
+# service pinned hot for hours. The rule must still govern the action.
+RULES_FILE="$(mktemp -t ccr-rules)"
+printf 'protect\tmcp-server-supabase\n' > "$RULES_FILE"
+ruled_out=$(CC_REAPER_RULES_FILE="$RULES_FILE" CC_MONITOR_SNAPSHOT_FILE="$fixture" \
+  bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json 2>/dev/null)
+printf '%s' "$ruled_out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+f = next((x for x in d.get("findings", []) if x.get("pid") == 9594), None)
+sys.exit(0 if f and f.get("family") == "runaway"
+         and "Always Protect" in (f.get("suggested_action") or "") else 1)
+' && ok "a user-protected runaway is still labelled, with the Always Protect action" \
+  || fail "a user-protected runaway is still labelled, with the Always Protect action"
+rm -f "$RULES_FILE"
+
 # The suggested action has to be applicable. claude-guard reaps through its own protected-
 # process whitelist, so telling an operator to run it for a process that is not on that list
 # names a remedy that does nothing - which is what the label change would have produced if
