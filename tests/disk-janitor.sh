@@ -521,6 +521,30 @@ expect_no "volumes: a named data volume is never selected" \
 expect_no "volumes: a 64-character name that is not hex is never selected" \
   bash -c 'printf "%s" "$1" | grep -q "not-hex-but-64-chars"' _ "$VOL_OUT"
 
+# The count has to be a count. The list is joined inside python, inside a shell
+# single-quoted string, inside a command substitution; an escaped newline survives that
+# stack as a literal backslash-n, collapsing the list to one physical line so the count
+# read 1 however many volumes there were - wrong exactly when it starts to matter.
+MULTI_BIN="$SANDBOX/bin-multivol"
+mkdir -p "$MULTI_BIN"
+cat > "$MULTI_BIN/docker" <<'STUB'
+#!/bin/bash
+case "$1 $2" in
+  "volume ls") python3 -c "print('a'*64); print('b'*64); print('c'*64)" ;;
+  "ps -aq")    ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$MULTI_BIN/docker"
+
+MULTI_OUT="$(PATH="$MULTI_BIN:$SAFE_SYS_PATH" bash -c '
+  source "$1" >/dev/null 2>&1
+  _cc_dj_docker_report_dead_anon_volumes
+' _ "$DJ")"
+
+expect_yes "volumes: three unreferenced volumes are counted as three" \
+  bash -c 'printf "%s" "$1" | grep -q "^3 unreferenced volumes"' _ "$MULTI_OUT"
+
 # ---------------------------------------------------------------------------
 # TEST 11: free-space units, and docker failures reaching the caller
 # ---------------------------------------------------------------------------

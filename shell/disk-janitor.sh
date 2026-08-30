@@ -365,7 +365,11 @@ if ids:
             if m.get("Name"):
                 used.add(m["Name"])
 
-print("\\n".join(n for n in anon if n not in used))
+# chr(10), not an escape. This python is nested inside a shell single-quoted string
+# inside a command substitution, and an escaped newline survives that stack as a literal
+# backslash-n: the whole list became one physical line and `grep -c .` reported 1 no
+# matter how many volumes there were - wrong exactly when the count starts to matter.
+print(chr(10).join(n for n in anon if n not in used))
 ')" || { echo "container inventory unreadable; reporting nothing"; return 1; }
   [ -n "$dead" ] || { echo "no unreferenced anonymous-looking volumes"; return 0; }
   local count
