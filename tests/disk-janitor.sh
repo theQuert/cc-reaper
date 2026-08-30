@@ -716,6 +716,60 @@ expect_yes "counters: per-run totals do not accumulate across two runs in one sh
   ' _ "$COUNT_LOG"
 
 # ---------------------------------------------------------------------------
+# TEST 15: a missing python3 is a skip, not a silent failed target
+#
+# macOS does not ship python3 without Command Line Tools. Left to fail inside the target,
+# it exits 127 and `_cc_dj_clean_target` counts a failed command as one that ran - so the
+# summary reports `skipped=0` for a run whose volume inventory never happened.
+# ---------------------------------------------------------------------------
+printf "\n# Test group 15: declared dependencies\n"
+
+NOPY="$SANDBOX/bin-nopython"
+mkdir -p "$NOPY"
+# docker present and healthy; python3 deliberately absent from every searched directory.
+cat > "$NOPY/docker" <<'STUB'
+#!/bin/bash
+[ "$1" = "info" ] && exit 0
+case "$1 $2" in
+  "images -f") ;;
+  "volume ls") ;;
+  *) ;;
+esac
+exit 0
+STUB
+chmod +x "$NOPY/docker"
+# A PATH that genuinely lacks python3 while keeping everything else the janitor needs:
+# a symlink farm over the system directories, minus python*. Shimming python3 to fail
+# would not do - `command -v` would still find it, and the guard under test is exactly
+# that lookup.
+for d in /bin /usr/bin /usr/sbin /sbin; do
+  for f in "$d"/*; do
+    b="$(basename "$f")"
+    case "$b" in python*) continue ;; esac
+    [ -e "$NOPY/$b" ] || ln -s "$f" "$NOPY/$b" 2>/dev/null || true
+  done
+done
+for tool in df tmutil osascript stat du; do
+  cp -f "$FAKE_BIN/$tool" "$NOPY/$tool" 2>/dev/null || true
+done
+
+expect_no "dependencies: the probe PATH really has no python3" \
+  env PATH="$NOPY" /bin/bash -c 'command -v python3 >/dev/null 2>&1' 
+
+NOPY_LOG="$SANDBOX/dj-nopython.log"
+env PATH="$NOPY" HOME="$FAKE_HOME" CC_DJ_TOOL_DIRS="" \
+    FAKE_DF_FREE_PCT=80 FAKE_STAT_MTIME=0 \
+    CC_DJ_LOG="$NOPY_LOG" CC_DJ_STATE_DIR="$SANDBOX/state" \
+    CC_DJ_DISK_MIN_PCT=15 CC_DJ_COOLDOWN_SECS=3600 \
+    /bin/bash "$DJ" --clean >/dev/null 2>&1
+
+expect_yes "dependencies: a missing python3 is logged as a SKIP" \
+  bash -c 'grep -q "SKIP docker unreferenced volumes report (python3 not found)" "$1"' _ "$NOPY_LOG"
+
+expect_no "dependencies: a run missing python3 does not report skipped=0" \
+  bash -c 'grep "clean: finished" "$1" | grep -q "skipped=0"' _ "$NOPY_LOG"
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 rm -rf "$SANDBOX"

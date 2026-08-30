@@ -18,6 +18,10 @@ the caller and not of the machine.
 - **WHEN** a tool is installed nowhere on the machine
 - **THEN** its target SHALL be skipped and counted as skipped, and the run SHALL NOT fail
 
+#### Scenario: A target's helper interpreter is absent
+- **WHEN** a target needs `python3` and macOS has shipped without it
+- **THEN** the dependency SHALL be checked before the target runs, and the target SHALL be counted as skipped — a command that exits 127 inside the target is counted as one that ran, so the summary would report `skipped=0` for a run that did not happen
+
 ### Requirement: A run that skipped its work cannot report success
 The janitor SHALL count targets run and targets skipped, and SHALL state both counts in its
 final line. When any target was skipped, the final line SHALL name that fact.

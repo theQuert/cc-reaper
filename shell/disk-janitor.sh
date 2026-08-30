@@ -460,8 +460,18 @@ _cc_dj_clean() {
     _cc_dj_skip "docker (daemon unreachable)"
   else
     _cc_dj_clean_target "docker dangling images" _cc_dj_docker_rmi_dangling
-    _cc_dj_clean_target "docker unreferenced volumes (report only)" \
-      _cc_dj_docker_report_dead_anon_volumes
+    # The volume report needs python3, which macOS does not ship without Command Line
+    # Tools. Declared here rather than left to fail inside the target: a missing
+    # interpreter makes it exit 127, and `_cc_dj_clean_target` counts a failed command as
+    # one that ran - so the summary would report `skipped=0` for a run whose volume
+    # inventory never happened. That is the shape of false success this change exists to
+    # remove, so the dependency is named and counted.
+    if command -v python3 >/dev/null 2>&1; then
+      _cc_dj_clean_target "docker unreferenced volumes (report only)" \
+        _cc_dj_docker_report_dead_anon_volumes
+    else
+      _cc_dj_skip "docker unreferenced volumes report (python3 not found)"
+    fi
   fi
 
   # -- TM snapshot thinning (only when below threshold) ----------------------
