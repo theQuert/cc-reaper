@@ -626,8 +626,16 @@ _cc_monitor_enrich_findings() {
     # reporting floor. Non-candidates still fall through the normal floor.
     cp "$agg_file" "$filtered_file"
   else
-    awk -F '\t' -v min_cpu="$min_cpu" '
-      ($1+0) >= (min_cpu+0) || $10 ~ /agent-browser|puppeteer_dev_chrome_profile|Chrome for Testing|codex|claude|mcp|stream-json/ {
+    # The runaway CPU threshold is an admission rule of its own, not only a
+    # classification rule. Without it, an operator who raises --min-cpu above
+    # CC_RUNAWAY_CPU loses exactly the rows the runaway check exists to catch - while a
+    # command matching the pattern list below survives at the same CPU. That would leave
+    # detection depending on identity again, one layer above the branch that was moved
+    # out of the protected-command test for precisely that reason.
+    local runaway_cpu
+    runaway_cpu=$(_cc_monitor_runaway_cpu_threshold)
+    awk -F '\t' -v min_cpu="$min_cpu" -v runaway_cpu="$runaway_cpu" '
+      ($1+0) >= (min_cpu+0) || ($1+0) >= (runaway_cpu+0) || $10 ~ /agent-browser|puppeteer_dev_chrome_profile|Chrome for Testing|codex|claude|mcp|stream-json/ {
         print
       }
     ' "$agg_file" > "$filtered_file"

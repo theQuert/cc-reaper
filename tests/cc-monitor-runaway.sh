@@ -109,6 +109,25 @@ sys.exit(0 if f and f.get("family") == "runaway" and f.get("classification") == 
 # An Always Protect rule says what may be done to a process, not how it is behaving.
 # Suppressing the label for one hid the case a user most wants to see: their own protected
 # service pinned hot for hours. The rule must still govern the action.
+# The runaway CPU threshold has to admit rows, not only classify them. With --min-cpu
+# above CC_RUNAWAY_CPU the prefilter dropped an unprotected process in that band before
+# classification, while a command matching its pattern list survived at the same CPU -
+# leaving detection dependent on identity one layer above the branch that was moved out
+# of the protected-command test for exactly that reason.
+band_fixture="$(mktemp "${TMPDIR:-/tmp}/ccr-band.XXXXXX")"
+printf "53630\t53620\t53620\t??\t00:51:40\t85.0\t14000\t/opt/homebrew/bin/python3 -c loop\n" > "$band_fixture"
+printf "9594\t9370\t9594\tttys001\t09:07:51\t85.0\t348160\tnode /x/node_modules/.bin/mcp-server-supabase run\n" >> "$band_fixture"
+band_out=$(CC_MONITOR_SNAPSHOT_FILE="$band_fixture" \
+  bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json --min-cpu 90 2>/dev/null)
+printf '%s' "$band_out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+fam = {x.get("pid"): x.get("family") for x in d.get("findings", [])}
+sys.exit(0 if fam.get(53630) == "runaway" and fam.get(9594) == "runaway" else 1)
+' && ok "runaway CPU admits rows below --min-cpu, for protected and unprotected alike" \
+  || fail "runaway CPU admits rows below --min-cpu, for protected and unprotected alike"
+rm -f "$band_fixture"
+
 RULES_FILE="$(mktemp "${TMPDIR:-/tmp}/ccr-rules.XXXXXX")"
 printf 'protect\tmcp-server-supabase\n' > "$RULES_FILE"
 ruled_out=$(CC_REAPER_RULES_FILE="$RULES_FILE" CC_MONITOR_SNAPSHOT_FILE="$fixture" \
