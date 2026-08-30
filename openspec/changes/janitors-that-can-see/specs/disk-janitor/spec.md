@@ -2,13 +2,20 @@
 
 ### Requirement: Tool resolution is independent of the caller's environment
 The janitor SHALL resolve its cleanup tools from a known set of installation directories
-prepended to `PATH` before any target runs, so that a LaunchAgent and an interactive shell
-resolve the same tools.
+**appended** to `PATH` before any target runs, so that a LaunchAgent and an interactive
+shell resolve the same tools. The list SHALL cover where the targets actually install,
+including `$HOME/.bun/bin` and `/usr/local/go/bin`, which nothing else covers.
 
 launchd hands an agent `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else unless the plist
 sets it. Homebrew and Docker Desktop install outside that set. Resolving through the
 inherited environment therefore reports every such tool as absent, which is a property of
 the caller and not of the machine.
+
+Appended and not prepended, because whatever the caller put on `PATH` must keep priority:
+an operator with their own toolchain, and a test sandbox shimming `docker` so a suite
+cannot reach the real daemon. Prepending would step over both, which is the same class of
+fault as the one being fixed. Setting `CC_DJ_TOOL_DIRS` empty makes `PATH` the whole
+answer, which is how a test simulates a tool that is genuinely not installed.
 
 #### Scenario: Agent runs with launchd's default PATH
 - **WHEN** the weekly clean runs from a LaunchAgent whose plist sets no `PATH`
@@ -17,6 +24,10 @@ the caller and not of the machine.
 #### Scenario: A tool is genuinely absent
 - **WHEN** a tool is installed nowhere on the machine
 - **THEN** its target SHALL be skipped and counted as skipped, and the run SHALL NOT fail
+
+#### Scenario: The caller has already put a tool on PATH
+- **WHEN** a directory earlier on `PATH` provides a tool that also exists in the known list
+- **THEN** the caller's entry SHALL win, so a test stub is never stepped over
 
 #### Scenario: A target's helper interpreter is absent
 - **WHEN** a target needs `python3` and macOS has shipped without it

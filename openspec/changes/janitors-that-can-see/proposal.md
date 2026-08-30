@@ -67,8 +67,10 @@ which is most of the window in which noticing is worth anything.
 
 ## What Changes
 
-- disk-janitor prepends the known tool directories to `PATH` before resolving anything, so
-  a LaunchAgent and an interactive shell resolve the same tools.
+- disk-janitor appends the known tool directories to `PATH` before resolving anything, so a
+  LaunchAgent and an interactive shell resolve the same tools. Appended rather than
+  prepended so a caller's own entry — and a test sandbox's stubs — keep priority; the list
+  covers `$HOME/.bun/bin` and `/usr/local/go/bin` alongside Homebrew and Docker Desktop.
 - A target whose tool does not resolve is reported by absence *and* counted. The run
   summary names how many targets ran and how many were skipped, so a run that skipped most
   of its work cannot end on a line that reads like success.
