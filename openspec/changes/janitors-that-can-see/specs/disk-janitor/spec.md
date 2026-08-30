@@ -81,8 +81,14 @@ or editor state (`~/.cursor/extensions`).
 
 ### Requirement: Per-target freed bytes are measured
 Each cleanup target SHALL report the space it actually freed, measured from the volume's
-free-space delta across the target. A target that freed nothing SHALL be distinguishable in
-the log from a target that freed gigabytes.
+free-space delta across the target — directory removals included, not only command targets.
+A target that freed nothing SHALL be distinguishable in the log from a target that freed
+gigabytes.
+
+A directory removal SHALL additionally report the directory's `du` size. The two diverge
+when a process still holds a deleted file open, because those blocks are not reclaimed until
+it closes, and the gap between them is the only place that shows it. Reporting the `du`
+figure alone overstates the saving.
 
 #### Scenario: Target frees space
 - **WHEN** a target completes and free space increased
@@ -91,3 +97,7 @@ the log from a target that freed gigabytes.
 #### Scenario: Target frees nothing
 - **WHEN** a target completes and free space did not increase
 - **THEN** the log line SHALL report zero rather than an unknown
+
+#### Scenario: A removed directory's blocks are still held open
+- **WHEN** a directory target removes files another process still holds open
+- **THEN** the log SHALL report the `du` size and the measured delta separately, so the unreclaimed blocks are visible rather than counted as freed

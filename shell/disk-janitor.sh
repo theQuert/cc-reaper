@@ -275,11 +275,20 @@ _cc_dj_clean_dir() {
     _cc_dj_skip "${label} (path not found: ${path})"
     return
   fi
-  local bytes
+  # Two numbers, because they answer different questions and their gap is informative.
+  # `du` says how large the directory was; the free-space delta says how much the volume
+  # actually got back. They diverge when a process still holds a deleted file open - the
+  # blocks are not reclaimed until it closes - so reporting only `du` overstates the
+  # saving, which is the failure this target's accounting was added to prevent. The
+  # command targets already measure the delta; this one now measures the same way.
+  local bytes before after freed
   bytes="$(_cc_dj_du_bytes "$path")"
+  before="$(_cc_dj_free_kb)"
   rm -rf "$path"
+  after="$(_cc_dj_free_kb)"
+  freed="$(_cc_dj_fmt_kb_delta "$(( ${after:-0} - ${before:-0} ))")"
   CC_DJ_RAN=$(( CC_DJ_RAN + 1 ))
-  _cc_dj_log "clean: removed '${label}' freed=${bytes} bytes"
+  _cc_dj_log "clean: removed '${label}' size=${bytes} bytes freed=${freed}"
 }
 
 # Dangling images: built layers no tag points at any more. `-f dangling=true` is a

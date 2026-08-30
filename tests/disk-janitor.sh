@@ -468,6 +468,19 @@ expect_no "docker: no 'prune' invocation survives outside comments" \
 expect_no "docker: no volume removal survives outside comments" \
   bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -q "volume rm"' _ "$DJ"
 
+# A directory target reports both numbers: `du` for how large it was, and the volume
+# delta for how much came back. They diverge when a process holds a deleted file open,
+# and reporting only `du` overstates the saving - the failure this accounting exists to
+# prevent. Under the fixed `df` stub the delta is 0, so the `freed=` field must read 0B
+# while `size=` still carries the du figure.
+expect_yes "directory targets report a du size and a measured delta separately" \
+  bash -c '
+    line="$(grep "clean: removed .Spotify cache." "$1" | tail -1)"
+    [ -n "$line" ] || exit 1
+    printf "%s" "$line" | grep -q "size=[0-9]* bytes" || exit 1
+    printf "%s" "$line" | grep -q "freed=0B"
+  ' _ "$SANDBOX/dj-nobun.log"
+
 expect_yes "skip accounting: a skipped run names the fact on its final line" \
   bash -c 'grep -q "SKIPPED=" "$1" && grep -q "a skipped target cleaned nothing" "$1"' \
     _ "$SANDBOX/dj-nobun.log"
