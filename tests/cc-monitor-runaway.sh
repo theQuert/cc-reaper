@@ -106,6 +106,22 @@ sys.exit(0 if f and f.get("family") == "runaway" and f.get("classification") == 
 ' && ok "unprotected runaway is family=runaway / ASK_BEFORE_KILL" \
   || fail "unprotected runaway is family=runaway / ASK_BEFORE_KILL"
 
+# The suggested action has to be applicable. claude-guard reaps through its own protected-
+# process whitelist, so telling an operator to run it for a process that is not on that list
+# names a remedy that does nothing - which is what the label change would have produced if
+# the action had been left keyed on the old protected-only assumption.
+printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+by = {x.get("pid"): x for x in d.get("findings", [])}
+un, pr = by.get(53630), by.get(9594)
+ok = (un and "claude-guard will not reap it" in (un.get("suggested_action") or "")
+      and pr and "claude-guard" in (pr.get("suggested_action") or "")
+      and "will not reap" not in (pr.get("suggested_action") or ""))
+sys.exit(0 if ok else 1)
+' && ok "runaway action distinguishes protected from report-only candidates" \
+  || fail "runaway action distinguishes protected from report-only candidates"
+
 #######################################################
 # Reclassification: family is runaway, classification is ASK_BEFORE_KILL
 #######################################################

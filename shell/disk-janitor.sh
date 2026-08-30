@@ -123,10 +123,15 @@ _cc_dj_free_pct() {
 # Free 1K-blocks on the same volume free_pct measures. Used to price a target from the
 # delta across it: a target that freed 21 GB and one that did nothing logged the same
 # "freed=?" before, and that is the distinction an operator needs.
+#
+# `-Pk`, not `-P`. POSIX leaves `-P` alone reporting 512-byte blocks and macOS does exactly
+# that - `df -P` here prints a "512-blocks" header - so treating column 4 as KiB reported
+# every saving at twice its real size. A number that is confidently wrong by 2x is worse
+# than the "freed=?" it replaced, because it invites arithmetic.
 _cc_dj_free_kb() {
   local vol="${CC_DJ_VOLUME:-/System/Volumes/Data}"
   [ -d "$vol" ] || vol="/"
-  df -P "$vol" | awk 'NR==2 { print $4 }'
+  df -Pk "$vol" | awk 'NR==2 { print $4 }'
 }
 
 # Human-readable byte count from a 1K-block delta. Negative deltas happen - another
@@ -279,9 +284,17 @@ _cc_dj_docker_rmi_dangling() {
   local ids
   ids="$(docker images -f dangling=true -q 2>/dev/null | sort -u)"
   [ -n "$ids" ] || { echo "no dangling images"; return 0; }
+  # The pipeline's status must be docker's, not tail's: an image that became referenced
+  # between the inventory and the removal makes `rmi` fail, and swallowing that reported a
+  # failed cleanup as `done`, which is the exact fault this change exists to remove.
+  # Output is captured before it is trimmed. Piping the command group into `tail` would put
+  # the group in a subshell, where the status assignment is lost - the fix has to survive
+  # the shape of the pipeline, not just be written down.
+  local out rc=0
   # shellcheck disable=SC2086
-  docker rmi $ids 2>&1 | tail -40
-  return 0
+  out="$(docker rmi $ids 2>&1)" || rc=$?
+  printf '%s\n' "$out" | tail -40
+  return "$rc"
 }
 
 # Anonymous volumes are the ones docker names itself when an image declares VOLUME and
@@ -322,8 +335,12 @@ print("\\n".join(n for n in anon if n not in used))
   local count
   count="$(printf '%s\n' "$dead" | grep -c .)"
   echo "removing $count unreferenced anonymous volumes"
-  printf '%s\n' "$dead" | xargs -n 50 docker volume rm 2>&1 | tail -5
-  return 0
+  # `xargs` exits non-zero when the command it ran did, and that status is what the caller
+  # needs; `tail` must not stand in for it.
+  local out rc=0
+  out="$(printf '%s\n' "$dead" | xargs -n 50 docker volume rm 2>&1)" || rc=$?
+  printf '%s\n' "$out" | tail -5
+  return "$rc"
 }
 
 # ---------------------------------------------------------------------------

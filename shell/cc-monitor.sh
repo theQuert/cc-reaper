@@ -423,7 +423,14 @@ _cc_monitor_action() {
     ASK_BEFORE_KILL:mcp)
       echo "Check which agent owns the MCP process before stopping it." ;;
     ASK_BEFORE_KILL:runaway)
-      echo "Run 'kill $pid' to terminate the stuck protected process, or 'claude-guard' to auto-reap runaway protected processes." ;;
+      # claude-guard reaps through its own protected-process whitelist, so suggesting it for
+      # a process that is not on that list names a remedy that does nothing. Since runaway is
+      # no longer a protected-only label, the suggestion has to be split the same way.
+      if _cc_monitor_is_protected_cmd "$cmd"; then
+        echo "Run 'kill $pid' to terminate the stuck protected process, or 'claude-guard' to auto-reap runaway protected processes."
+      else
+        echo "Run 'kill $pid' if this is not doing work you need; claude-guard will not reap it, because it is not a protected process."
+      fi ;;
     DO_NOT_KILL:system)
       echo "Do not kill system/security/UI processes; reduce workload or wait for the system task to finish." ;;
     DO_NOT_KILL:chrome)

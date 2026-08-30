@@ -67,15 +67,27 @@ FREE_PCT="${FREE_PCT_OVERRIDE:-10}"
 # df stub: returns controllable free percentage
 cat > "$FAKE_BIN/df" <<'STUB'
 #!/usr/bin/env bash
-# Intercept "df -P <any volume>" — pass through anything else
-if [ "${1:-}" = "-P" ]; then
+# Intercept "df -P" and "df -Pk" — pass through anything else.
+#
+# `-Pk` is listed because the janitor prices targets in KiB and POSIX `-P` alone is
+# 512-byte blocks on macOS. It is also load-bearing for a second reason: the passthrough
+# below must never be reached from a shape the janitor actually uses. `command df` skips
+# shell functions but not PATH, and this stub *is* the first `df` on PATH, so an
+# unintercepted flag re-executes this file and forks until the suite hangs. That is what
+# `df -Pk` did before this line existed.
+case "${1:-}" in
+  -P|-Pk|-Pk*|-kP) intercept=1 ;;
+  *) intercept=0 ;;
+esac
+if [ "$intercept" = "1" ]; then
   FREE="${FAKE_DF_FREE_PCT:-10}"
   USED=$((100 - FREE))
   # Columns: Filesystem 1024-blocks Used Available Use% Mounted
   printf "Filesystem     1024-blocks      Used Available Capacity Mounted on\n"
   printf "/dev/disk1s1   976490576 %d %d   %d%%  /\n" "$((USED * 1000))" "$((FREE * 1000))" "$USED"
 else
-  command df "$@"
+  # Absolute path, never `command df`: this file is the first df on PATH.
+  /bin/df "$@"
 fi
 STUB
 chmod +x "$FAKE_BIN/df"
@@ -394,14 +406,36 @@ printf "\n# Test group 8: tool resolution\n"
 LAUNCHD_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 DJ="$ROOT_DIR/shell/disk-janitor.sh"
 
+# A fixture in a directory the script actually searches, rather than whatever the host
+# happens to have installed. Conditioning on the ambient PATH proves only that a tool exists
+# somewhere - under mise, say - while the assertion clears that PATH and exposes only the
+# script's own directories, so the precondition can pass where the assertion cannot.
+TOOLDIR="$SANDBOX/tooldir"
+mkdir -p "$TOOLDIR"
+printf '#!/bin/bash\nexit 0\n' > "$TOOLDIR/pretend-tool"
+chmod +x "$TOOLDIR/pretend-tool"
+
+expect_yes "tool resolution: a tool in CC_DJ_TOOL_DIRS resolves under launchd's PATH" \
+  env -i HOME="$HOME" PATH="$LAUNCHD_PATH" CC_DJ_TOOL_DIRS="$TOOLDIR" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; command -v pretend-tool >/dev/null 2>&1'
+
+expect_no "tool resolution: a tool in no searched directory stays unresolved" \
+  env -i HOME="$HOME" PATH="$LAUNCHD_PATH" CC_DJ_TOOL_DIRS="$SANDBOX/empty" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; command -v pretend-tool >/dev/null 2>&1'
+
+# The real defaults, asserted only for a tool this host really keeps in one of them: the
+# point of the change is that the shipped list covers where things are actually installed.
 for tool in go docker; do
-  if command -v "$tool" >/dev/null 2>&1; then
-    expect_yes "tool resolution: $tool resolves under launchd's PATH" \
-      env -i HOME="$HOME" PATH="$LAUNCHD_PATH" DJ="$DJ" TOOL="$tool" /bin/bash -c \
-        'source "$DJ" >/dev/null 2>&1; command -v "$TOOL" >/dev/null 2>&1'
-  else
-    printf "ok - tool resolution: %s not installed on this host, skipped\n" "$tool"
-  fi
+  loc="$(command -v "$tool" 2>/dev/null)"
+  case "$loc" in
+    /opt/homebrew/bin/*|/usr/local/bin/*|"$HOME"/.local/bin/*)
+      expect_yes "tool resolution: $tool resolves under launchd's PATH" \
+        env -i HOME="$HOME" PATH="$LAUNCHD_PATH" DJ="$DJ" TOOL="$tool" /bin/bash -c \
+          'source "$DJ" >/dev/null 2>&1; command -v "$TOOL" >/dev/null 2>&1' ;;
+    *)
+      printf "ok - tool resolution: %s is not in a default tool dir here (%s), skipped\n" \
+        "$tool" "${loc:-absent}" ;;
+  esac
 done
 
 # An empty CC_DJ_TOOL_DIRS hands the whole answer back to PATH, which is how a sandbox
@@ -477,6 +511,56 @@ expect_no "volumes: a named data volume is never selected" \
 
 expect_no "volumes: a 64-character name that is not hex is never selected" \
   bash -c 'printf "%s" "$1" | grep -q "not-hex-but-64-chars"' _ "$VOL_OUT"
+
+# ---------------------------------------------------------------------------
+# TEST 11: free-space units, and docker failures reaching the caller
+# ---------------------------------------------------------------------------
+printf "\n# Test group 11: units and status propagation\n"
+
+# `df -P` alone is 512-byte blocks on macOS. Reading it as KiB reported every saving at
+# twice its size - a number confidently wrong by 2x is worse than the "freed=?" it replaced.
+# Asserted against the real df rather than the stub, because the stub is what would have to
+# agree with the bug for the bug to hide.
+expect_yes "units: _cc_dj_free_kb agrees with df -Pk, not df -P" \
+  bash -c '
+    source "$1" >/dev/null 2>&1
+    mine="$(_cc_dj_free_kb)"
+    real="$(/bin/df -Pk "${CC_DJ_VOLUME:-/System/Volumes/Data}" | awk "NR==2{print \$4}")"
+    [ -n "$mine" ] && [ -n "$real" ] || exit 1
+    # Free space moves between the two calls; agreement within 1% is agreement on units,
+    # while a 512-vs-1024 mistake is a clean factor of two.
+    awk -v a="$mine" -v b="$real" "BEGIN{ d=(a>b?a-b:b-a); exit !(b>0 && d/b < 0.01) }"
+  ' _ "$DJ"
+
+# A docker command that fails must not be logged as a target that succeeded: that is the
+# exact observability fault this change exists to remove, reintroduced one layer down.
+DOCKFAIL="$SANDBOX/bin-dockfail"
+mkdir -p "$DOCKFAIL"
+cat > "$DOCKFAIL/docker" <<'STUB'
+#!/bin/bash
+case "$1 $2" in
+  "images -f") echo deadbeef ;;
+  "rmi "*|"rmi") echo "Error response from daemon: conflict: unable to delete" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$DOCKFAIL/docker"
+
+expect_no "status: a failing docker rmi does not return success" \
+  env PATH="$DOCKFAIL:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rmi_dangling >/dev/null 2>&1'
+
+cat > "$DOCKFAIL/docker" <<'STUB'
+#!/bin/bash
+case "$1 $2" in
+  "images -f") echo deadbeef ;;
+  "rmi "*|"rmi") echo "Deleted: deadbeef"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+expect_yes "status: a succeeding docker rmi returns success" \
+  env PATH="$DOCKFAIL:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rmi_dangling >/dev/null 2>&1'
 
 # ---------------------------------------------------------------------------
 # Cleanup
