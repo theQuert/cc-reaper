@@ -749,9 +749,28 @@ for d in /bin /usr/bin /usr/sbin /sbin; do
     [ -e "$NOPY/$b" ] || ln -s "$f" "$NOPY/$b" 2>/dev/null || true
   done
 done
+# `rm -f` before each copy, and never `cp -f` alone. The destination is already a symlink
+# into a system directory from the loop above, and `cp -f` opens through the link rather
+# than replacing it - it writes the stub into `/usr/bin/df`. Verified 2026-08-30 against a
+# temporary target: `cp -f stub farm/df` replaced the contents of the real file, while
+# `rm -f farm/df` first left it untouched. On a host where the runner can write to
+# `/usr/bin`, which root-owned CI containers routinely can, this test would corrupt the
+# machine it runs on.
 for tool in df tmutil osascript stat du; do
-  cp -f "$FAKE_BIN/$tool" "$NOPY/$tool" 2>/dev/null || true
+  rm -f "$NOPY/$tool"
+  cp "$FAKE_BIN/$tool" "$NOPY/$tool" 2>/dev/null || true
 done
+
+# A guard against reintroducing that by reordering: every stubbed entry must be a real
+# file in the sandbox, not a link pointing out of it.
+expect_yes "dependencies: stubbed tools are files in the sandbox, not links out of it" \
+  bash -c '
+    for t in df tmutil osascript stat du; do
+      [ -e "$1/$t" ] || continue
+      [ -L "$1/$t" ] && exit 1
+    done
+    exit 0
+  ' _ "$NOPY"
 
 expect_no "dependencies: the probe PATH really has no python3" \
   env PATH="$NOPY" /bin/bash -c 'command -v python3 >/dev/null 2>&1' 
