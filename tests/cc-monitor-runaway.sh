@@ -23,8 +23,14 @@ out=$(bash -c '
   source "$1"
   # Hot supabase MCP — protected and over both thresholds.
   _cc_monitor_is_runaway 102.0 09:07:51 && echo "is_runaway:yes" || echo "is_runaway:no"
-  # Same MCP but only 30 minutes elapsed — below default 60-minute threshold.
-  _cc_monitor_is_runaway 102.0 00:30:00 && echo "etime_short:yes" || echo "etime_short:no"
+  # Same MCP, well under the duration floor. Deliberately not a value that sits on the
+  # default: the previous 00:30:00 encoded a 60-minute floor into a test whose stated
+  # intent is only "hot but short is not a runaway", so lowering the default failed it for
+  # no behavioural reason.
+  _cc_monitor_is_runaway 102.0 00:12:00 && echo "etime_short:yes" || echo "etime_short:no"
+  # Exactly at the floor counts, so the boundary is pinned rather than implied.
+  CC_RUNAWAY_MIN=30 _cc_monitor_is_runaway 102.0 00:30:00 && echo "etime_at_floor:yes" || echo "etime_at_floor:no"
+  CC_RUNAWAY_MIN=30 _cc_monitor_is_runaway 102.0 00:29:59 && echo "etime_below_floor:yes" || echo "etime_below_floor:no"
   # CPU below 80% threshold.
   _cc_monitor_is_runaway 50.0 09:07:51 && echo "cpu_low:yes" || echo "cpu_low:no"
   # Threshold override via env.
@@ -36,6 +42,8 @@ echo "$out" | grep -q "^etime_short:no$" && ok "is_runaway: hot+short → no" ||
 echo "$out" | grep -q "^cpu_low:no$" && ok "is_runaway: cool+long → no" || fail "is_runaway low cpu"
 echo "$out" | grep -q "^cpu_override:yes$" && ok "is_runaway: CC_RUNAWAY_CPU honored" || fail "CC_RUNAWAY_CPU"
 echo "$out" | grep -q "^min_override:yes$" && ok "is_runaway: CC_RUNAWAY_MIN honored" || fail "CC_RUNAWAY_MIN"
+echo "$out" | grep -q "^etime_at_floor:yes$" && ok "is_runaway: elapsed exactly at floor → yes" || fail "is_runaway floor boundary"
+echo "$out" | grep -q "^etime_below_floor:no$" && ok "is_runaway: one second below floor → no" || fail "is_runaway below floor"
 
 #######################################################
 # Report section: stuck/runaway present in human report when fixture has hot cloudflare MCP
@@ -45,14 +53,26 @@ fixture=$(mktemp)
 printf "9594\t9370\t9594\tttys001\t09:07:51\t102.7\t348160\tnode /Users/quert/.npm/_npx/0a3d156e77e8dd08/node_modules/.bin/mcp-server-supabase run abc123\n" > "$fixture"
 # Cool cmux — protected but cool, should stay DO_NOT_KILL.
 printf "62199\t1\t62199\t??\t02:00:00\t1.0\t51200\t/Applications/cmux.app/Contents/MacOS/cmux\n" >> "$fixture"
+# Unprotected runaway under a LIVE parent, taken from the real 2026-08-30 incident: a
+# Homebrew Python at 99% CPU for 51 minutes, PPID a live zsh, no controlling terminal, and
+# matching no protected pattern. Before the runaway test was hoisted out of the
+# protected-command branch this row was never labelled, because being on the protection
+# list was a precondition for being called a runaway.
+printf "53630\t53620\t53620\t??\t00:51:40\t99.1\t14000\t/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python -c import gzip,hashlib\n" >> "$fixture"
 
 out=$(CC_MONITOR_SNAPSHOT_FILE="$fixture" bash "$ROOT_DIR/shell/cc-monitor.sh" --once 2>/dev/null)
-echo "$out" | grep -q "Stuck/runaway protected processes:" \
+echo "$out" | grep -q "Stuck/runaway processes:" \
   && ok "human report has stuck/runaway section" \
   || fail "human report missing stuck/runaway section"
 echo "$out" | grep -q "PID 9594" \
   && ok "stuck/runaway lists PID 9594" \
   || fail "stuck/runaway missing PID 9594"
+# The hoisted runaway test. Asserting the row is *present* proves nothing: before the
+# hoist it was already listed, as family "other" with ASK_BEFORE_KILL. What was missing
+# was the identification, so the assertion is on the label.
+echo "$out" | sed -n '/^Stuck\/runaway/,/^$/p' | grep -q "PID 53630" \
+  && ok "unprotected runaway with a live parent lands in the runaway section" \
+  || fail "unprotected runaway with a live parent lands in the runaway section"
 echo "$out" | grep -q "suggested: kill 9594" \
   && ok "stuck/runaway prints kill command" \
   || fail "stuck/runaway no kill command"
@@ -63,7 +83,7 @@ echo "$out" | grep -q "suggested: kill 9594" \
 fixture_clean=$(mktemp)
 printf "62199\t1\t62199\t??\t02:00:00\t1.0\t51200\t/Applications/cmux.app/Contents/MacOS/cmux\n" > "$fixture_clean"
 out=$(CC_MONITOR_SNAPSHOT_FILE="$fixture_clean" bash "$ROOT_DIR/shell/cc-monitor.sh" --once 2>/dev/null)
-echo "$out" | grep -q "Stuck/runaway protected processes:" \
+echo "$out" | grep -q "Stuck/runaway processes:" \
   && fail "report shows runaway section without candidates" \
   || ok "report omits runaway section without candidates"
 rm "$fixture_clean"
@@ -78,6 +98,65 @@ echo "$out" | grep -q '"runaway_candidates":' \
 echo "$out" | grep -q '"pid": 9594' \
   && ok "JSON includes runaway PID" \
   || fail "JSON missing runaway PID 9594"
+printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+f = next((x for x in d.get("findings", []) if x.get("pid") == 53630), None)
+sys.exit(0 if f and f.get("family") == "runaway" and f.get("classification") == "ASK_BEFORE_KILL" else 1)
+' && ok "unprotected runaway is family=runaway / ASK_BEFORE_KILL" \
+  || fail "unprotected runaway is family=runaway / ASK_BEFORE_KILL"
+
+# An Always Protect rule says what may be done to a process, not how it is behaving.
+# Suppressing the label for one hid the case a user most wants to see: their own protected
+# service pinned hot for hours. The rule must still govern the action.
+# The runaway CPU threshold has to admit rows, not only classify them. With --min-cpu
+# above CC_RUNAWAY_CPU the prefilter dropped an unprotected process in that band before
+# classification, while a command matching its pattern list survived at the same CPU -
+# leaving detection dependent on identity one layer above the branch that was moved out
+# of the protected-command test for exactly that reason.
+band_fixture="$(mktemp "${TMPDIR:-/tmp}/ccr-band.XXXXXX")"
+printf "53630\t53620\t53620\t??\t00:51:40\t85.0\t14000\t/opt/homebrew/bin/python3 -c loop\n" > "$band_fixture"
+printf "9594\t9370\t9594\tttys001\t09:07:51\t85.0\t348160\tnode /x/node_modules/.bin/mcp-server-supabase run\n" >> "$band_fixture"
+band_out=$(CC_MONITOR_SNAPSHOT_FILE="$band_fixture" \
+  bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json --min-cpu 90 2>/dev/null)
+printf '%s' "$band_out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+fam = {x.get("pid"): x.get("family") for x in d.get("findings", [])}
+sys.exit(0 if fam.get(53630) == "runaway" and fam.get(9594) == "runaway" else 1)
+' && ok "runaway CPU admits rows below --min-cpu, for protected and unprotected alike" \
+  || fail "runaway CPU admits rows below --min-cpu, for protected and unprotected alike"
+rm -f "$band_fixture"
+
+RULES_FILE="$(mktemp "${TMPDIR:-/tmp}/ccr-rules.XXXXXX")"
+printf 'protect\tmcp-server-supabase\n' > "$RULES_FILE"
+ruled_out=$(CC_REAPER_RULES_FILE="$RULES_FILE" CC_MONITOR_SNAPSHOT_FILE="$fixture" \
+  bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json 2>/dev/null)
+printf '%s' "$ruled_out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+f = next((x for x in d.get("findings", []) if x.get("pid") == 9594), None)
+sys.exit(0 if f and f.get("family") == "runaway"
+         and "Always Protect" in (f.get("suggested_action") or "") else 1)
+' && ok "a user-protected runaway is still labelled, with the Always Protect action" \
+  || fail "a user-protected runaway is still labelled, with the Always Protect action"
+rm -f "$RULES_FILE"
+
+# The suggested action has to be applicable. claude-guard reaps through its own protected-
+# process whitelist, so telling an operator to run it for a process that is not on that list
+# names a remedy that does nothing - which is what the label change would have produced if
+# the action had been left keyed on the old protected-only assumption.
+printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+by = {x.get("pid"): x for x in d.get("findings", [])}
+un, pr = by.get(53630), by.get(9594)
+ok = (un and "claude-guard will not reap it" in (un.get("suggested_action") or "")
+      and pr and "claude-guard" in (pr.get("suggested_action") or "")
+      and "will not reap" not in (pr.get("suggested_action") or ""))
+sys.exit(0 if ok else 1)
+' && ok "runaway action distinguishes protected from report-only candidates" \
+  || fail "runaway action distinguishes protected from report-only candidates"
 
 #######################################################
 # Reclassification: family is runaway, classification is ASK_BEFORE_KILL
@@ -102,7 +181,7 @@ rm "$fixture"
 fixture_borderline=$(mktemp)
 printf "9594\t9370\t9594\tttys001\t09:07:51\t90.0\t348160\tnode /usr/local/bin/mcp-server-supabase run\n" > "$fixture_borderline"
 out=$(CC_RUNAWAY_CPU=99 CC_MONITOR_SNAPSHOT_FILE="$fixture_borderline" bash "$ROOT_DIR/shell/cc-monitor.sh" --once 2>/dev/null)
-echo "$out" | grep -q "Stuck/runaway protected processes:" \
+echo "$out" | grep -q "Stuck/runaway processes:" \
   && fail "CC_RUNAWAY_CPU=99 still flagged 90% process" \
   || ok "CC_RUNAWAY_CPU=99 gates out 90% process"
 rm "$fixture_borderline"

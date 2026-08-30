@@ -152,10 +152,19 @@ _cc_monitor_runaway_cpu_threshold() {
   echo "$v"
 }
 
+# Minutes a process must have been above the CPU threshold before it is called a runaway.
+# 30 rather than 60: this path only reports, so the cost of naming a long build is a line an
+# operator ignores, while the cost of the old floor was a full hour in which a provably
+# non-terminating loop held a core and was labelled "other".
+#
+# The killing path is deliberately not this one and deliberately not this number.
+# `_cc_guard_runaway_protected_pids` in claude-cleanup.sh carries its own CC_RUNAWAY_MIN
+# default of 60 and its own whitelist, and the guard agent SIGTERMs from there. Reporting
+# earlier than the reaper acts is the intended asymmetry, not drift between two copies.
 _cc_monitor_runaway_min_threshold() {
-  local v=${CC_RUNAWAY_MIN:-60}
-  echo "$v" | grep -qE '^[0-9]+$' || v=60
-  [ "$v" -gt 0 ] || v=60
+  local v=${CC_RUNAWAY_MIN:-30}
+  echo "$v" | grep -qE '^[0-9]+$' || v=30
+  [ "$v" -gt 0 ] || v=30
   echo "$v"
 }
 
@@ -364,7 +373,7 @@ _cc_monitor_reason() {
     ASK_BEFORE_KILL:mcp)
       echo "MCP process may be shared or attached; confirm ownership before stopping" ;;
     ASK_BEFORE_KILL:runaway)
-      echo "protected process appears stuck (sustained high CPU over long elapsed time); review and kill if not actively serving" ;;
+      echo "appears stuck (sustained high CPU over long elapsed time); review and kill if not actively serving" ;;
     DO_NOT_KILL:system)
       echo "system, security, or UI process; do not terminate directly" ;;
     DO_NOT_KILL:chrome)
@@ -414,7 +423,14 @@ _cc_monitor_action() {
     ASK_BEFORE_KILL:mcp)
       echo "Check which agent owns the MCP process before stopping it." ;;
     ASK_BEFORE_KILL:runaway)
-      echo "Run 'kill $pid' to terminate the stuck protected process, or 'claude-guard' to auto-reap runaway protected processes." ;;
+      # claude-guard reaps through its own protected-process whitelist, so suggesting it for
+      # a process that is not on that list names a remedy that does nothing. Since runaway is
+      # no longer a protected-only label, the suggestion has to be split the same way.
+      if _cc_monitor_is_protected_cmd "$cmd"; then
+        echo "Run 'kill $pid' to terminate the stuck protected process, or 'claude-guard' to auto-reap runaway protected processes."
+      else
+        echo "Run 'kill $pid' if this is not doing work you need; claude-guard will not reap it, because it is not a protected process."
+      fi ;;
     DO_NOT_KILL:system)
       echo "Do not kill system/security/UI processes; reduce workload or wait for the system task to finish." ;;
     DO_NOT_KILL:chrome)
@@ -610,8 +626,16 @@ _cc_monitor_enrich_findings() {
     # reporting floor. Non-candidates still fall through the normal floor.
     cp "$agg_file" "$filtered_file"
   else
-    awk -F '\t' -v min_cpu="$min_cpu" '
-      ($1+0) >= (min_cpu+0) || $10 ~ /agent-browser|puppeteer_dev_chrome_profile|Chrome for Testing|codex|claude|mcp|stream-json/ {
+    # The runaway CPU threshold is an admission rule of its own, not only a
+    # classification rule. Without it, an operator who raises --min-cpu above
+    # CC_RUNAWAY_CPU loses exactly the rows the runaway check exists to catch - while a
+    # command matching the pattern list below survives at the same CPU. That would leave
+    # detection depending on identity again, one layer above the branch that was moved
+    # out of the protected-command test for precisely that reason.
+    local runaway_cpu
+    runaway_cpu=$(_cc_monitor_runaway_cpu_threshold)
+    awk -F '\t' -v min_cpu="$min_cpu" -v runaway_cpu="$runaway_cpu" '
+      ($1+0) >= (min_cpu+0) || ($1+0) >= (runaway_cpu+0) || $10 ~ /agent-browser|puppeteer_dev_chrome_profile|Chrome for Testing|codex|claude|mcp|stream-json/ {
         print
       }
     ' "$agg_file" > "$filtered_file"
@@ -624,11 +648,30 @@ _cc_monitor_enrich_findings() {
     family=$(_cc_monitor_family "$cmd")
     classification=$(_cc_monitor_classification "$ppid" "$tty" "$etime" "$cmd" "$family")
 
-    if _cc_monitor_is_protected_cmd "$cmd" \
-      && ! _cc_monitor_is_immutable_cmd "$cmd" \
-      && ! _cc_monitor_has_user_rule protect "$cmd" \
+    # Runaway is a statement about behaviour, not about identity, so it is evaluated for
+    # every row. It used to sit inside the protected-command branch, which meant a process
+    # could only be called a runaway if it was already on the protection list - and the
+    # processes that actually run away are the ones nobody listed. Measured 2026-08-30: a
+    # Python process at 99% CPU for 51 minutes under a live session was never labelled,
+    # because `/opt/homebrew/.../Python -c ...` matches no protected pattern. Its loop was
+    # `for c in iter(lambda: gzip.open(p,"rb").read(), b"")`, which reopens the file on
+    # every call and can never return the sentinel: it could not have terminated.
+    #
+    # Protection still decides what may be done about it. Every runaway is ASK_BEFORE_KILL
+    # and never SAFE_TO_REAP, because a live session's child at 100% CPU may equally be a
+    # legitimate long build, and this tool cannot tell those apart. The operator can.
+    if ! _cc_monitor_is_immutable_cmd "$cmd" \
       && _cc_monitor_is_runaway "$avg_cpu" "$etime"; then
+      # An Always Protect rule is a statement about what may be done to a process, not
+      # about how it is behaving, so it no longer suppresses the label either - the same
+      # correction that moved this test out of the protected-command branch. A user's
+      # protected service pinned at 99% for hours is the thing they most need to see.
       family="runaway"
+      # Unconditional, as before. A protected MCP's base classification is DO_NOT_KILL and
+      # promoting a runaway one to ASK_BEFORE_KILL is the whole point of the feature -
+      # guarding against that downgrade turned it off. System, security and UI processes
+      # are held out by `_cc_monitor_is_immutable_cmd` on the branch above, which is where
+      # that concern already lives.
       classification="ASK_BEFORE_KILL"
     fi
 
@@ -738,7 +781,7 @@ _cc_monitor_human_report() {
   runaway_count=$(awk -F '\t' '$10 == "runaway" && $11 == "ASK_BEFORE_KILL" { count++ } END { print count+0 }' "$findings_file")
   if [ "$runaway_count" -gt 0 ]; then
     echo ""
-    echo "Stuck/runaway protected processes:"
+    echo "Stuck/runaway processes:"
     awk -F '\t' '
       $10 == "runaway" && $11 == "ASK_BEFORE_KILL" {
         printf "  PID %-7s %-24s avg %6.2f%% etime %s — %s\n", $4, $12, $1, $8, $13

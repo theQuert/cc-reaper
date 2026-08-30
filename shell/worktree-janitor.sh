@@ -367,6 +367,17 @@ _cc_wj_remove_worktree() {
 # ─── Main report/apply logic ─────────────────────────────────────────────────
 
 _cc_wj_run() {
+  # The scheduled agent's stdout/stderr pair is written by launchd, so no script owns it
+  # unless one claims it. Bounded here, at the top of every run, rather than from
+  # `_cc_wj_log_write`: a report-only run never calls that helper - every call site is in
+  # removal, pruning, or the apply-only summary - so bounding from there was unreachable
+  # for the one caller that produces these files daily.
+  local agent_log
+  for agent_log in "$HOME/.cc-reaper/logs/launchd-worktree-report-stdout.log" \
+                   "$HOME/.cc-reaper/logs/launchd-worktree-report-stderr.log"; do
+    _cc_wj_bound_log "$agent_log"
+  done
+
   local apply=0
   local explicit_repos=()
 
@@ -529,8 +540,16 @@ _cc_wj_run() {
 
   done
 
-  # Run git worktree prune on repos that had removals or missing dirs (deduped)
-  if [ "${#prune_repos[@]}" -gt 0 ]; then
+  # Run git worktree prune on repos that had removals or missing dirs (deduped).
+  #
+  # Gated on --apply. `git worktree prune` removes administrative records, and this
+  # script's own usage says removal needs --apply; running it from a report made the
+  # default mode mutate the repository it was only supposed to describe. That became
+  # load-bearing when the scheduled agent landed: an agent that never passes --apply
+  # was deleting metadata daily under the name "report-only". The report still prints
+  # `[cue: git worktree prune]` for a missing directory, so the finding is not lost -
+  # only the unrequested action is.
+  if [ "$apply" -eq 1 ] && [ "${#prune_repos[@]}" -gt 0 ]; then
     local pruned_repos=()
     for repo in "${prune_repos[@]}"; do
       local already=0
