@@ -16,10 +16,11 @@
 - [x] 3.3 Distinguish "docker absent" from "daemon unreachable" in the skip line
 - [x] 3.4 Assert no `docker .* prune` string survives anywhere in the source
 
-## 4. worktree inventory gets a schedule
+## 4. worktree inventory: what a schedule can and cannot do
 
-- [x] 4.1 Add `launchd/com.cc-reaper.worktree-report.plist`, report-only, hourly
-- [x] 4.2 Wire it into `install.sh`'s agent list and verification
+- [x] 4.1 Measure whether a LaunchAgent can reach `~/Documents`; it cannot, so no agent is added
+- [x] 4.2 Have `install.sh` state that the inventory is manual and why
+- [x] 4.3 Gate the report path's prune on `--apply`
 
 ## 5. cc-monitor sees runaways with living parents
 

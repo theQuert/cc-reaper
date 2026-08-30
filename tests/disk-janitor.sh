@@ -426,7 +426,10 @@ expect_no "tool resolution: a tool in no searched directory stays unresolved" \
 # The real defaults, asserted only for a tool this host really keeps in one of them: the
 # point of the change is that the shipped list covers where things are actually installed.
 for tool in go docker; do
-  loc="$(command -v "$tool" 2>/dev/null)"
+  # `|| true`: this lookup is optional, and the file runs under `set -e`, so an absent
+  # tool would abort the suite here instead of reaching the skip branch below - taking
+  # every later test with it, on a host that simply does not have docker.
+  loc="$(command -v "$tool" 2>/dev/null || true)"
   case "$loc" in
     /opt/homebrew/bin/*|/usr/local/bin/*|"$HOME"/.local/bin/*)
       expect_yes "tool resolution: $tool resolves under launchd's PATH" \

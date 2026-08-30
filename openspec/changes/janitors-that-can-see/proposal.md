@@ -75,8 +75,15 @@ which is most of the window in which noticing is worth anything.
 - Each target's freed bytes are measured from free-space deltas rather than logged as `?`.
 - `docker system prune -af` is replaced by removal of dangling images and of anonymous
   volumes no container references, each named explicitly. No `prune` verb remains.
-- worktree-janitor gets an hourly report-only LaunchAgent. It does not gain removal
-  authority; `--apply` stays a human decision.
+- worktree-janitor stays manual, and the installer now says why rather than leaving the
+  absence to read as an oversight. A LaunchAgent cannot read `~/Documents` — measured with
+  a probe agent on 2026-08-30: `ls ~/Documents/GitHub` returned `DENIED`, and `git rev-parse`
+  in a repository there returned `Operation not permitted` — and `_cc_wj_root` defaults to
+  `$HOME/Documents/GitHub`, so a schedule would traverse nothing and report nothing. A
+  silent empty report is the failure shape this change exists to remove, so shipping one
+  would have been worse than shipping nothing.
+- Report mode stops running a prune. Removing administrative records is a removal, and this
+  tool's own contract is that removal needs `--apply`.
 - cc-monitor's existing sustained-CPU test moves out of the protected-command branch, so any
   process can be identified as a runaway. Classification stays `ASK_BEFORE_KILL` and this
   path still kills nothing: a live session's child at 100% CPU may be a legitimate long build.
@@ -96,7 +103,9 @@ repositories from npm to pnpm; any change to the reclaim hook's removal criteria
 
 - `disk-janitor`: tool resolution stops depending on the caller's environment; skips and
   freed bytes become observable; docker cleanup stops being able to delete expensive images.
-- `worktree-janitor`: gains a schedule, staying report-only.
+- `worktree-janitor`: report mode stops mutating the repository; the cross-repository gap
+  it was meant to close is recorded as still open, with the measurement that closes off the
+  scheduled approach.
 - `cc-monitor`: runaway identification stops requiring the process to be on the protection list; the reporting floor drops to 30 minutes while the reaper keeps 60.
 
 ## Impact
@@ -104,7 +113,6 @@ repositories from npm to pnpm; any change to the reclaim hook's removal criteria
 - `shell/disk-janitor.sh`: PATH prelude, `_cc_dj_clean_target` measurement and skip
   accounting, docker target rewritten.
 - `shell/cc-monitor.sh`: one additional check.
-- `launchd/com.cc-reaper.worktree-report.plist`: new.
-- `install.sh`: installs and verifies the new agent.
-- Behavior: the weekly clean starts actually deleting the caches it always claimed to;
-  it stops being able to delete docker images; one more hourly report exists.
+- `install.sh`: states that the worktree inventory is manual, and why.
+- Behavior: the weekly clean starts actually deleting the caches it always claimed to; it
+  stops being able to delete docker images; the worktree report stops pruning; no new agent.

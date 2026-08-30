@@ -1,21 +1,28 @@
 ## ADDED Requirements
 
-### Requirement: Worktree inventory runs on a schedule, report-only
-A LaunchAgent SHALL run the worktree inventory on a schedule in its default report-only
-mode. The agent SHALL NOT pass `--apply`.
+### Requirement: The worktree inventory stays manual, and says why
+The inventory SHALL NOT be installed as a LaunchAgent, and the installer SHALL state the
+reason rather than leaving its absence to look like an oversight.
 
-The reclaim hook derives its repository root from the session's working directory, so it
-sweeps only the repository someone was sitting in. Nothing else crosses repositories. On
-this host that left 83 live worktrees in one repository while a working cross-repo
-inventory sat on disk with no agent to run it.
+A LaunchAgent cannot read `~/Documents`. Measured 2026-08-30 with a probe agent loaded
+through `launchctl bootstrap`: `ls ~/Documents/GitHub` returned `DENIED`, and
+`git -C ~/Documents/GitHub/stima-api rev-parse` returned `fatal: Unable to read current
+working directory: Operation not permitted`. `_cc_wj_root` defaults to
+`$HOME/Documents/GitHub`, so a scheduled run would traverse nothing and report nothing —
+a silent empty report, which is the failure shape this whole change exists to remove.
 
-Removal stays a human decision: the inventory's own criteria cannot distinguish work that
-was never pushed from work that was abandoned, and on this host 43 of 83 worktrees had a
-HEAD that exists on no remote.
+The gap it was meant to close stays open and is recorded as such: the reclaim hook
+derives its root from the session's working directory, so nothing sweeps a repository
+nobody is sitting in. On this host that left 83 live worktrees in one repository. Closing
+it needs a TCC-capable host process, which this project does not have.
 
-#### Scenario: Scheduled inventory runs
-- **WHEN** the agent fires
-- **THEN** the inventory SHALL run in report-only mode and SHALL delete nothing
+#### Scenario: Installing cc-reaper
+- **WHEN** `install.sh` runs
+- **THEN** it SHALL NOT install a worktree-report agent, and SHALL print that the inventory is manual and why
+
+#### Scenario: An operator wants the inventory
+- **WHEN** an operator runs `~/.cc-reaper/worktree-janitor.sh`
+- **THEN** it SHALL report, and SHALL remove nothing without `--apply`
 
 ### Requirement: Report-only mode does not mutate the repository
 Report mode SHALL NOT run `git worktree prune`. Removing administrative records is a
@@ -33,13 +40,16 @@ which never passes `--apply` — deleted metadata daily under the name "report-o
 - **WHEN** the inventory runs with `--apply`
 - **THEN** the stale record SHALL be pruned, so the capability is gated rather than removed
 
-### Requirement: The scheduled agent bounds its own launchd logs
-The runner SHALL bound the `launchd-worktree-report-{stdout,stderr}.log` pair it causes
-launchd to write, on the same terms as every other cc-reaper runner. Those files are opened
-by launchd, so no script owns them unless one claims them, and the inventory prints roughly
-three lines per worktree per run.
+### Requirement: The runner bounds any launchd log pair written on its behalf
+The runner SHALL bound the `launchd-worktree-report-{stdout,stderr}.log` pair, at the top of
+every run, on the same terms as every other cc-reaper runner.
 
-#### Scenario: The agent's log pair crosses the cap
+Kept although the agent that would write them is not installed: the bounding is where a
+future scheduled or user-installed invocation needs it, and it costs two `stat` calls. It is
+placed at the top of `_cc_wj_run` because a report-only run never reaches `_cc_wj_log_write`,
+where bounding it would be unreachable for the only caller that produces those files.
+
+#### Scenario: Either file crosses the cap
 - **WHEN** the inventory runs and either file exceeds the cap
 - **THEN** it SHALL be bounded the same way the runner bounds its own log
 
