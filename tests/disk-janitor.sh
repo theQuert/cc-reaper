@@ -814,6 +814,11 @@ printf "\n# Test group: stale temp checkouts\n"
 
 TMPT="$SANDBOX/tmproot"
 mkdir -p "$TMPT"
+# 2 MB fixtures against a 1 MB floor, not 200 MB against 100. Ten 200 MB fixtures
+# wrote about 2 GiB on every run of a suite this repository documents as lightweight,
+# on the same developer disks the janitor exists to protect. The gate under test is
+# `size >= floor`; the absolute numbers were never part of it.
+FIXTURE_KB=2048
 mkfile_kb() { dd if=/dev/zero of="$1" bs=1024 count="$2" >/dev/null 2>&1; }
 # Age the WHOLE subtree. Ageing only the directory entry is the defect under test:
 # a directory's mtime advances only when its direct entries change, so a container
@@ -822,7 +827,7 @@ age_tree() { find "$1" -exec touch -t 202001010000 {} + 2>/dev/null; }
 
 # Big and old throughout: the one thing that should be collected.
 mkdir -p "$TMPT/stale-checkout"
-mkfile_kb "$TMPT/stale-checkout/blob" 204800
+mkfile_kb "$TMPT/stale-checkout/blob" "$FIXTURE_KB"
 age_tree "$TMPT/stale-checkout"
 
 # Old container, live child. This is `/private/tmp/claude-501` on the reporting
@@ -830,12 +835,12 @@ age_tree "$TMPT/stale-checkout"
 # only when a new project appears. Files are written and closed, not held open, so
 # the lsof gate does not save it either.
 mkdir -p "$TMPT/live-container/session"
-mkfile_kb "$TMPT/live-container/session/blob" 204800
+mkfile_kb "$TMPT/live-container/session/blob" "$FIXTURE_KB"
 touch -t 202001010000 "$TMPT/live-container"
 
 # Old and big, but a linked worktree: git still has a record pointing here.
 mkdir -p "$TMPT/linked-worktree"
-mkfile_kb "$TMPT/linked-worktree/blob" 204800
+mkfile_kb "$TMPT/linked-worktree/blob" "$FIXTURE_KB"
 echo "gitdir: /somewhere/.git/worktrees/x" > "$TMPT/linked-worktree/.git"
 age_tree "$TMPT/linked-worktree"
 
@@ -843,23 +848,23 @@ age_tree "$TMPT/linked-worktree"
 # nowhere else. The gate keyed on `-f` matched only the gitfile above, so the one
 # case whose loss is unrecoverable was the one that passed through.
 mkdir -p "$TMPT/plain-clone/.git"
-mkfile_kb "$TMPT/plain-clone/blob" 204800
+mkfile_kb "$TMPT/plain-clone/blob" "$FIXTURE_KB"
 age_tree "$TMPT/plain-clone"
 
 # Old but small: below the floor, not worth being wrong about.
-mkdir -p "$TMPT/tiny"; mkfile_kb "$TMPT/tiny/blob" 16; age_tree "$TMPT/tiny"
+mkdir -p "$TMPT/tiny"; mkfile_kb "$TMPT/tiny/blob" 16; age_tree "$TMPT/tiny"   # 16 KB: under the 1 MB floor
 
 # Big but fresh.
-mkdir -p "$TMPT/fresh"; mkfile_kb "$TMPT/fresh/blob" 204800
+mkdir -p "$TMPT/fresh"; mkfile_kb "$TMPT/fresh/blob" "$FIXTURE_KB"
 
 # A glob character in the name. `/private/tmp` is world-writable, so nothing
 # constrains these. Under the old `grep "^$path\(/\|$\)"` this became `fo` plus
 # zero-or-more `o`, matched nothing, and a HELD directory was offered for deletion.
-mkdir -p "$TMPT/glob*dir"; mkfile_kb "$TMPT/glob*dir/blob" 204800; age_tree "$TMPT/glob*dir"
+mkdir -p "$TMPT/glob*dir"; mkfile_kb "$TMPT/glob*dir/blob" "$FIXTURE_KB"; age_tree "$TMPT/glob*dir"
 
 enumerate() {
   bash -c 'source "$1" >/dev/null 2>&1
-           CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=100 _cc_dj_stale_tmp_dirs' \
+           CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 _cc_dj_stale_tmp_dirs' \
     _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT" 2>/dev/null
 }
 # Captured, then matched - never `enumerate | grep -q`. `grep -q` exits on its first
@@ -907,11 +912,11 @@ dj_run() {   # <extra-PATH|""> <root> <out|err>
   local extra="$1" root="$2" stream="$3"
   if [ "$stream" = err ]; then
     PATH="${extra:+$extra:}$PATH" bash -c 'source "$1" >/dev/null 2>&1
-      CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=100 _cc_dj_stale_tmp_dirs' \
+      CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 _cc_dj_stale_tmp_dirs' \
       _ "$ROOT_DIR/shell/disk-janitor.sh" "$root" 2>&1 >/dev/null
   else
     PATH="${extra:+$extra:}$PATH" bash -c 'source "$1" >/dev/null 2>&1
-      CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=100 _cc_dj_stale_tmp_dirs' \
+      CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 _cc_dj_stale_tmp_dirs' \
       _ "$ROOT_DIR/shell/disk-janitor.sh" "$root" 2>/dev/null
   fi
 }
@@ -951,12 +956,12 @@ broken_find_explains()           { local o; o="$(dj_run "$FIND_STUB" "$TMPT" err
 
 # ── git repositories, however they are shaped or wherever they sit ───────────
 mkdir -p "$TMPT/nested-repo/inner/.git"
-mkfile_kb "$TMPT/nested-repo/blob" 204800
+mkfile_kb "$TMPT/nested-repo/blob" "$FIXTURE_KB"
 age_tree "$TMPT/nested-repo"
 
 mkdir -p "$TMPT/bare-repo/objects" "$TMPT/bare-repo/refs"
 : > "$TMPT/bare-repo/HEAD"
-mkfile_kb "$TMPT/bare-repo/blob" 204800
+mkfile_kb "$TMPT/bare-repo/blob" "$FIXTURE_KB"
 age_tree "$TMPT/bare-repo"
 
 expect_no "a repository nested inside a candidate protects it" collects "nested-repo"
@@ -964,8 +969,38 @@ expect_no "a bare repository is recognised without a .git"     collects "bare-re
 
 # A directory that merely holds a file called HEAD is not a bare repository.
 mkdir -p "$TMPT/not-bare"; : > "$TMPT/not-bare/HEAD"
-mkfile_kb "$TMPT/not-bare/blob" 204800; age_tree "$TMPT/not-bare"
+mkfile_kb "$TMPT/not-bare/blob" "$FIXTURE_KB"; age_tree "$TMPT/not-bare"
 expect_yes "a stray HEAD file does not make a directory a repository" collects "not-bare"
+
+# A bare repository BELOW the top level: no `.git` for the name search to find, and
+# `_cc_dj_looks_bare "$d"` only ever looked at the candidate itself.
+mkdir -p "$TMPT/nested-bare/session/repo.git/objects" "$TMPT/nested-bare/session/repo.git/refs"
+: > "$TMPT/nested-bare/session/repo.git/HEAD"
+mkfile_kb "$TMPT/nested-bare/blob" "$FIXTURE_KB"
+age_tree "$TMPT/nested-bare"
+expect_no "a bare repository nested inside a candidate protects it" collects "nested-bare"
+
+# ── a blind scan is a failed target, not a completed one ─────────────────────
+#
+# "Nothing to clean" and "could not look" produce the same empty list, and
+# `_cc_dj_clean_target` calls a target that returned 0 done.
+clean_rc_with_broken_lsof() {
+  PATH="$LSOF_STUB:$PATH" bash -c 'source "$1" >/dev/null 2>&1
+    CC_DJ_LOG="$3/blind-clean.log" CC_DJ_STATE_DIR="$3/state" \
+    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 CC_DJ_TMP_DELETE=0 \
+    _cc_dj_clean_stale_tmp_dirs >/dev/null 2>&1' \
+    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT" "$SANDBOX"
+}
+expect_no "a clean whose scan went blind does not report success" clean_rc_with_broken_lsof
+
+clean_rc_normal() {
+  bash -c 'source "$1" >/dev/null 2>&1
+    CC_DJ_LOG="$3/ok-clean.log" CC_DJ_STATE_DIR="$3/state" \
+    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 CC_DJ_TMP_DELETE=0 \
+    _cc_dj_clean_stale_tmp_dirs >/dev/null 2>&1' \
+    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT" "$SANDBOX"
+}
+expect_yes "a clean that scanned successfully still reports success" clean_rc_normal
 
 # ── deletion is opt-in; the report is not ────────────────────────────────────
 #
@@ -976,7 +1011,7 @@ OPTIN_ROOT="$SANDBOX/optin-root"
 dj_clean_tmp() {   # <CC_DJ_TMP_DELETE value>
   bash -c 'source "$1" >/dev/null 2>&1
     CC_DJ_LOG="$4/clean.log" CC_DJ_STATE_DIR="$4/state" \
-    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=100 CC_DJ_TMP_DELETE="$3" \
+    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 CC_DJ_TMP_DELETE="$3" \
     _cc_dj_clean_stale_tmp_dirs' \
     _ "$ROOT_DIR/shell/disk-janitor.sh" "$OPTIN_ROOT" "$1" "$SANDBOX" 2>&1
 }
@@ -984,7 +1019,7 @@ dj_clean_tmp() {   # <CC_DJ_TMP_DELETE value>
 # Its own victim, in its own root: the opt-in case really removes, and pointing it at
 # a shared fixture pulled the ground out from under every later assertion.
 mkdir -p "$OPTIN_ROOT/victim"
-mkfile_kb "$OPTIN_ROOT/victim/blob" 204800
+mkfile_kb "$OPTIN_ROOT/victim/blob" "$FIXTURE_KB"
 age_tree "$OPTIN_ROOT/victim"
 VICTIM="$OPTIN_ROOT/victim"
 out_default="$(dj_clean_tmp 0)"

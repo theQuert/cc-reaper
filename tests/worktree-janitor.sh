@@ -434,7 +434,20 @@ undiscounted_is() {
   [ "$got" = "$want" ] || { printf "       got %s, want %s\n" "$got" "$want" >&2; return 1; }
 }
 
+# An entry on the list is a claim that losing it is safe, so the list is tested from
+# both ends: a cache is discounted, and a local database that merely looks like
+# tooling is not.
+R_WRANGLER=$(make_ign_repo wrangler)
+printf 'node_modules\n.env\n.wrangler/\n' > "$R_WRANGLER/.gitignore"
+# Committed, or the modified .gitignore is itself an undiscounted change and the
+# count says 2 for a reason that has nothing to do with what is under test.
+git -C "$R_WRANGLER" add -A >/dev/null 2>&1
+git -C "$R_WRANGLER" commit -qm "ignore wrangler" >/dev/null 2>&1
+mkdir -p "$R_WRANGLER/.wrangler/state/v3/d1"
+echo "local data" > "$R_WRANGLER/.wrangler/state/v3/d1/db.sqlite"
+
 expect_yes "a package cache is discounted"                 undiscounted_is "$R_CACHE" 0
+expect_yes "local wrangler state is NOT discounted"        undiscounted_is "$R_WRANGLER" 1
 expect_yes "a generated file is discounted"                undiscounted_is "$R_GEN" 0
 expect_yes "a symlink to a cache is discounted"            undiscounted_is "$R_LINK" 0
 expect_yes "an ignored .env keeps the worktree"            undiscounted_is "$R_ENV" 1

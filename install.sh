@@ -324,16 +324,24 @@ PLIST
 
   # Bounded wait. A probe that never answered is reported as unknown, never as OK:
   # silence here would recreate the exact fault being probed for.
+  # Every path, not the first. Breaking on the first `OK|DENIED` line meant that if
+  # one directory answered quickly and another was slow to enumerate, the probe was
+  # torn down mid-run - and a first result of OK would have been reported as "the
+  # agents can read Documents/Desktop/Downloads" without the others ever being asked.
   local i=0
   while [ "$i" -lt 30 ]; do
-    grep -qE '^(OK|DENIED) ' "$out" 2>/dev/null && break
+    [ "$(grep -cE '^(OK|DENIED) ' "$out" 2>/dev/null)" -ge "${#present[@]}" ] && break
     i=$((i + 1)); sleep 0.5
   done
   launchctl bootout "$AGENT_UI/$label" 2>/dev/null || true
   rm -f "$plist"
 
-  if ! grep -qE '^(OK|DENIED) ' "$out" 2>/dev/null; then
-    echo "  TCC: probe did not report; could not determine what the agents can read."
+  # A partial answer is not an answer: reporting "all readable" on the strength of
+  # one path that happened to finish is the same false success the probe exists to
+  # prevent, one level in.
+  if [ "$(grep -cE '^(OK|DENIED) ' "$out" 2>/dev/null)" -lt "${#present[@]}" ]; then
+    echo "  TCC: probe reported on only $(grep -cE '^(OK|DENIED) ' "$out" 2>/dev/null) of ${#present[@]} paths;"
+    echo "       could not determine what the agents can read."
     return 0
   fi
 

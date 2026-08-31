@@ -316,7 +316,19 @@ _cc_wj_list_worktrees() {
 # Caches a documented command rebuilds. Kept deliberately short: an entry here is a
 # claim that losing the directory is safe, and the default for anything not named is
 # to keep the worktree, which is the direction that cannot lose work.
-CC_WJ_REGENERABLE="${CC_WJ_REGENERABLE:-node_modules .next .turbo .parcel-cache .svelte-kit .nuxt .astro .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .gradle .nyc_output coverage playwright-report test-results .wrangler .wrangler-dist dist build target}"
+CC_WJ_REGENERABLE="${CC_WJ_REGENERABLE:-node_modules .next .turbo .parcel-cache .svelte-kit .nuxt .astro .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .gradle .nyc_output coverage playwright-report test-results .wrangler-dist}"
+# `.superpowers` is deliberately absent too: it holds brainstorm mockups, SDD
+# ledgers, briefs, reports and review packages - a record of decisions, which no
+# command regenerates.
+# Four names came off this list rather than onto it, because an entry here is a claim
+# that losing the directory is safe:
+#   .wrangler  - `.wrangler/state` is local D1, KV, R2 and Durable Object data. A
+#                developer's database, not a cache; nothing rebuilds it. The name
+#                looks like tooling scaffolding, which is how it got in.
+#   dist/build/target - conventionally build output and usually regenerable, but the
+#                names are generic enough to be anything, and this list authorises
+#                deleting the whole worktree when only its entries remain.
+# `.wrangler-dist` stays: that one really is build output.
 # The same claim for ignored entries that are not whole directories. `--porcelain`
 # gives a trailing slash to a directory and to nothing else, so a generated file and
 # a symlink pointing at a cache both arrive shaped like a hand-written `.env` and a

@@ -336,8 +336,25 @@ _cc_dj_looks_bare() {
   [ -f "$1/HEAD" ] && [ -d "$1/objects" ] && [ -d "$1/refs" ]
 }
 
+# Any of the newline-separated candidates a real bare repository?
+_cc_dj_any_bare() {
+  local c
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    _cc_dj_looks_bare "$c" && return 0
+  done <<EOF
+$1
+EOF
+  return 1
+}
+
+# Set when a run of the enumerator could not scan something it was asked to scan.
+# A file rather than a variable: the enumerator is consumed through a process
+# substitution, so anything it assigns is assigned in a child and lost.
+CC_DJ_TMP_BLIND_FILE=""
+
 _cc_dj_stale_tmp_dirs() {
-  local root d d_real held cwd recent listing repo_hit min_kb age roots=()
+  local root d d_real held cwd recent listing repo_hit bare_hit min_kb age roots=()
   age="$CC_DJ_TMP_AGE_DAYS"
   min_kb=$(( CC_DJ_TMP_MIN_MB * 1024 ))
 
@@ -352,10 +369,12 @@ _cc_dj_stale_tmp_dirs() {
   for root in ${roots[@]+"${roots[@]}"}; do
     [ -n "$root" ] || continue
     if [ ! -d "$root" ] || [ ! -r "$root" ]; then
+      [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
       echo "disk-janitor: temp root unusable, scanned nothing: $root" >&2
       continue
     fi
     if ! _cc_dj_lsof_usable; then
+      [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
       echo "disk-janitor: lsof cannot report open files; skipped $root rather than assume nothing is held" >&2
       continue
     fi
@@ -367,6 +386,7 @@ _cc_dj_stale_tmp_dirs() {
     # that fails produces no directories, and "no directories" is indistinguishable
     # from "nothing to clean" unless somebody says so.
     if ! listing="$(find "$root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)"; then
+      [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
       echo "disk-janitor: could not list temp root, scanned nothing: $root" >&2
       continue
     fi
@@ -388,11 +408,25 @@ _cc_dj_stale_tmp_dirs() {
       # every check. A find that FAILS keeps the candidate, for the same reason as
       # everywhere else in this function.
       if ! repo_hit="$(find "$d" -maxdepth 3 -name .git -print -quit 2>/dev/null)"; then
-        echo "disk-janitor: could not scan for git repositories, kept: $d" >&2
+        [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
+      echo "disk-janitor: could not scan for git repositories, kept: $d" >&2
         continue
       fi
       [ -n "$repo_hit" ] && continue
+
+      # Bare repositories, at the top level and nested. A bare repo has no `.git` for
+      # the search above to find, and checking only `$d` missed `$d/session/repo.git`
+      # - an old, large, unheld candidate whose unique commits would go with it.
+      # Matched on the conventional `.git`-suffixed directory name, then confirmed by
+      # the three entries git itself requires, so an ordinary directory that happens
+      # to end in `.git` does not qualify.
       _cc_dj_looks_bare "$d" && continue
+      if ! bare_hit="$(find "$d" -maxdepth 3 -type d -name '*.git' -print 2>/dev/null)"; then
+        [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
+      echo "disk-janitor: could not scan for bare repositories, kept: $d" >&2
+        continue
+      fi
+      _cc_dj_any_bare "$bare_hit" && continue
 
       # Staleness is a property of the subtree, not of the directory entry. A
       # directory's mtime advances only when its DIRECT entries change, so a
@@ -414,7 +448,8 @@ _cc_dj_stale_tmp_dirs() {
       # not evidence that the tree is idle, and this is the check standing between a
       # live tree and `rm -rf`.
       if ! recent="$(find "$d" -mtime -"$age" -print -quit 2>/dev/null)"; then
-        echo "disk-janitor: could not test staleness, kept: $d" >&2
+        [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
+      echo "disk-janitor: could not test staleness, kept: $d" >&2
         continue
       fi
       [ -n "$recent" ] && continue
@@ -457,7 +492,12 @@ _cc_dj_report_stale_tmp_dirs() {
 }
 
 _cc_dj_clean_stale_tmp_dirs() {
-  local d n=0
+  local d n=0 rc=0
+  # "Nothing to clean" and "could not look" produce the same empty list, and
+  # `_cc_dj_clean_target` reports a target that returned 0 as done. That is the
+  # false-success shape this whole target was added to remove, so a blind scan
+  # returns nonzero and is counted as a failure rather than a completion.
+  CC_DJ_TMP_BLIND_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-dj-blind.XXXXXX")" || CC_DJ_TMP_BLIND_FILE=""
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     n=$(( n + 1 ))
@@ -470,8 +510,15 @@ _cc_dj_clean_stale_tmp_dirs() {
       _cc_dj_log "clean: would remove ${d} ($(_cc_dj_du_bytes "$d") bytes) — set CC_DJ_TMP_DELETE=1 to enable"
     fi
   done < <(_cc_dj_stale_tmp_dirs)
-  [ "$n" -eq 0 ] && _cc_dj_log "clean: no stale temp checkouts older than ${CC_DJ_TMP_AGE_DAYS}d over ${CC_DJ_TMP_MIN_MB}MB"
-  return 0
+  if [ -n "$CC_DJ_TMP_BLIND_FILE" ] && [ -s "$CC_DJ_TMP_BLIND_FILE" ]; then
+    _cc_dj_log "clean: stale-temp scan was incomplete — see stderr for which roots"
+    rc=1
+  elif [ "$n" -eq 0 ]; then
+    _cc_dj_log "clean: no stale temp checkouts older than ${CC_DJ_TMP_AGE_DAYS}d over ${CC_DJ_TMP_MIN_MB}MB"
+  fi
+  [ -n "$CC_DJ_TMP_BLIND_FILE" ] && rm -f "$CC_DJ_TMP_BLIND_FILE"
+  CC_DJ_TMP_BLIND_FILE=""
+  return "$rc"
 }
 
 _cc_dj_clean_dir() {
