@@ -949,6 +949,54 @@ chmod +x "$FIND_STUB/find"
 broken_find_collects_something() { local o; o="$(dj_run "$FIND_STUB" "$TMPT" out)"; [ -n "$o" ]; }
 broken_find_explains()           { local o; o="$(dj_run "$FIND_STUB" "$TMPT" err)"; printf '%s\n' "$o" | grep -q "could not"; }
 
+# ── git repositories, however they are shaped or wherever they sit ───────────
+mkdir -p "$TMPT/nested-repo/inner/.git"
+mkfile_kb "$TMPT/nested-repo/blob" 204800
+age_tree "$TMPT/nested-repo"
+
+mkdir -p "$TMPT/bare-repo/objects" "$TMPT/bare-repo/refs"
+: > "$TMPT/bare-repo/HEAD"
+mkfile_kb "$TMPT/bare-repo/blob" 204800
+age_tree "$TMPT/bare-repo"
+
+expect_no "a repository nested inside a candidate protects it" collects "nested-repo"
+expect_no "a bare repository is recognised without a .git"     collects "bare-repo"
+
+# A directory that merely holds a file called HEAD is not a bare repository.
+mkdir -p "$TMPT/not-bare"; : > "$TMPT/not-bare/HEAD"
+mkfile_kb "$TMPT/not-bare/blob" 204800; age_tree "$TMPT/not-bare"
+expect_yes "a stray HEAD file does not make a directory a repository" collects "not-bare"
+
+# ── deletion is opt-in; the report is not ────────────────────────────────────
+#
+# Every other --clean target is a named cache at a known path. This one is a
+# heuristic over a world-writable directory, so the unattended weekly agent reports
+# and does not remove unless an operator says otherwise.
+OPTIN_ROOT="$SANDBOX/optin-root"
+dj_clean_tmp() {   # <CC_DJ_TMP_DELETE value>
+  bash -c 'source "$1" >/dev/null 2>&1
+    CC_DJ_LOG="$4/clean.log" CC_DJ_STATE_DIR="$4/state" \
+    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=100 CC_DJ_TMP_DELETE="$3" \
+    _cc_dj_clean_stale_tmp_dirs' \
+    _ "$ROOT_DIR/shell/disk-janitor.sh" "$OPTIN_ROOT" "$1" "$SANDBOX" 2>&1
+}
+
+# Its own victim, in its own root: the opt-in case really removes, and pointing it at
+# a shared fixture pulled the ground out from under every later assertion.
+mkdir -p "$OPTIN_ROOT/victim"
+mkfile_kb "$OPTIN_ROOT/victim/blob" 204800
+age_tree "$OPTIN_ROOT/victim"
+VICTIM="$OPTIN_ROOT/victim"
+out_default="$(dj_clean_tmp 0)"
+expect_yes "the default clean reports rather than removes" \
+  bash -c '[ -d "$1" ]' _ "$VICTIM"
+expect_yes "and says how to enable removal" \
+  bash -c 'printf "%s\n" "$1" | grep -q "CC_DJ_TMP_DELETE=1"' _ "$out_default"
+
+out_optin="$(dj_clean_tmp 1)"
+expect_no "the opt-in clean does remove" \
+  bash -c '[ -d "$1" ]' _ "$VICTIM"
+
 expect_no  "a find that fails yields no deletion candidates" broken_find_collects_something
 expect_yes "a find that fails says why it kept them"         broken_find_explains
 

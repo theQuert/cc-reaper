@@ -47,6 +47,14 @@ CC_DJ_TMP_DIRS="${CC_DJ_TMP_DIRS:-/private/tmp}"
 CC_DJ_TMP_AGE_DAYS="${CC_DJ_TMP_AGE_DAYS:-3}"
 # Below this a directory is not worth the risk of being wrong about it.
 CC_DJ_TMP_MIN_MB="${CC_DJ_TMP_MIN_MB:-100}"
+# Report only, unless an operator opts in. Every other `--clean` target is a NAMED
+# cache at a KNOWN path whose owner documents how to rebuild it. This one is a
+# heuristic over a world-writable directory, and age plus size plus "no open handle"
+# does not establish that something is an abandoned checkout: an old application
+# directory, an archive, a database, a mounted data directory all satisfy it. So the
+# default is the half that cannot be wrong - say what is there, let a human decide -
+# and the weekly unattended agent never deletes here unless told to.
+CC_DJ_TMP_DELETE="${CC_DJ_TMP_DELETE:-0}"
 
 # launchd hands an agent PATH=/usr/bin:/bin:/usr/sbin:/sbin and nothing more unless the
 # plist sets it, while Homebrew and Docker Desktop install outside that set. Resolving
@@ -321,8 +329,15 @@ _cc_dj_lsof_usable() {
 #
 # Deliberately not matched by name. A name pattern would have to guess which prefixes
 # agents use, and the twelve found on the reporting host shared no prefix at all.
+# A bare repository carries no `.git`; it IS the git directory. Checked by the three
+# entries git itself requires, so an ordinary directory that happens to hold a file
+# called `HEAD` does not qualify.
+_cc_dj_looks_bare() {
+  [ -f "$1/HEAD" ] && [ -d "$1/objects" ] && [ -d "$1/refs" ]
+}
+
 _cc_dj_stale_tmp_dirs() {
-  local root d d_real held cwd recent listing min_kb age roots=()
+  local root d d_real held cwd recent listing repo_hit min_kb age roots=()
   age="$CC_DJ_TMP_AGE_DAYS"
   min_kb=$(( CC_DJ_TMP_MIN_MB * 1024 ))
 
@@ -359,13 +374,25 @@ _cc_dj_stale_tmp_dirs() {
     while IFS= read -r d; do
       [ -n "$d" ] || continue
 
-      # Any git repository, not only a linked worktree. `-f` matched a gitfile alone,
-      # so a plain `git clone` - whose `.git` is a directory, and whose unpushed
-      # commits exist nowhere else - sailed through the one gate meant to catch it,
-      # while a linked worktree whose commits survive on a branch was protected.
-      # Backwards. Worktrees belong to worktree-janitor, which knows how to retire
-      # one; a clone belongs to whoever made it.
-      [ -e "$d/.git" ] && continue
+      # Any git repository anywhere in the candidate, and bare ones too.
+      #
+      # `-f "$d/.git"` matched a gitfile alone, so a plain clone - whose `.git` is a
+      # directory, and whose unpushed commits exist nowhere else - passed the one
+      # gate meant to catch it, while a linked worktree whose commits survive on a
+      # branch was caught. Backwards. `-e "$d/.git"` then fixed the clone but still
+      # only looked at the top level, so `/private/tmp/session/repo/.git` was invisible
+      # and the whole container went; and a bare repository has no `.git` at all.
+      #
+      # Bounded to depth 3: a scratch checkout parks its repository at the top or one
+      # or two levels down, and an unbounded walk here runs over every candidate on
+      # every check. A find that FAILS keeps the candidate, for the same reason as
+      # everywhere else in this function.
+      if ! repo_hit="$(find "$d" -maxdepth 3 -name .git -print -quit 2>/dev/null)"; then
+        echo "disk-janitor: could not scan for git repositories, kept: $d" >&2
+        continue
+      fi
+      [ -n "$repo_hit" ] && continue
+      _cc_dj_looks_bare "$d" && continue
 
       # Staleness is a property of the subtree, not of the directory entry. A
       # directory's mtime advances only when its DIRECT entries change, so a
@@ -433,8 +460,15 @@ _cc_dj_clean_stale_tmp_dirs() {
   local d n=0
   while IFS= read -r d; do
     [ -n "$d" ] || continue
-    _cc_dj_clean_dir "stale temp checkout $(basename "$d")" "$d"
     n=$(( n + 1 ))
+    if [ "$CC_DJ_TMP_DELETE" = 1 ]; then
+      _cc_dj_clean_dir "stale temp checkout $(basename "$d")" "$d"
+    else
+      # Counted and named, never removed. A target that reports what it would have
+      # done is still doing its job here: the finding was that nobody was looking at
+      # /private/tmp at all, and looking is the part that has no failure mode.
+      _cc_dj_log "clean: would remove ${d} ($(_cc_dj_du_bytes "$d") bytes) — set CC_DJ_TMP_DELETE=1 to enable"
+    fi
   done < <(_cc_dj_stale_tmp_dirs)
   [ "$n" -eq 0 ] && _cc_dj_log "clean: no stale temp checkouts older than ${CC_DJ_TMP_AGE_DAYS}d over ${CC_DJ_TMP_MIN_MB}MB"
   return 0

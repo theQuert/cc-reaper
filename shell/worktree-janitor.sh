@@ -117,7 +117,14 @@ _cc_wj_unreadable_roots() {
   while IFS= read -r root; do
     [ -n "$root" ] || continue
     [ -d "$root" ] || continue
-    { [ -r "$root" ] && [ -x "$root" ]; } || echo "$root"
+    # Mode bits are a cheap pre-filter, not the answer: TCC can deny enumeration
+    # after they say yes, an ACL can block listing, and permissions can change
+    # between the two probes. So the question is asked the way discovery asks it -
+    # by listing - and a listing that fails marks the root blind. Piped straight
+    # into a `while`, that failure produced an empty list indistinguishable from a
+    # root holding no repositories, and the run reported success.
+    { [ -r "$root" ] && [ -x "$root" ]; } || { echo "$root"; continue; }
+    find "$root" -maxdepth 1 -mindepth 1 -type d >/dev/null 2>&1 || echo "$root"
   done < <(_cc_wj_roots)
 }
 
