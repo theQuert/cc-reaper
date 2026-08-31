@@ -197,6 +197,12 @@ _run_dj() {
     export CC_DJ_STATE_DIR="$SANDBOX/state"
     export CC_DJ_DISK_MIN_PCT=15
     export CC_DJ_COOLDOWN_SECS=3600
+    # Never the machine's real /private/tmp. These runs exercise the cache targets,
+    # and letting them enumerate the host's temp directory made the result depend on
+    # whatever else was running - besides being slow and pointing a deletion path at
+    # somebody's live scratch space.
+    mkdir -p "$SANDBOX/tmp-empty"
+    export CC_DJ_TMP_DIRS="$SANDBOX/tmp-empty"
     # Create fixture cache dirs so rm -rf hits the sandbox
     mkdir -p "$FAKE_HOME/Library/Caches/com.spotify.client"
     mkdir -p "$FAKE_HOME/Library/Caches/com.todesktop.230313mzl4w4u92.ShipIt"
@@ -334,7 +340,12 @@ SAFE_SYS_PATH="/bin:/usr/bin:/usr/sbin:/sbin"
   mkdir -p "$FAKE_HOME/Library/Caches/com.spotify.client"
   mkdir -p "$FAKE_HOME/Library/Caches/com.todesktop.230313mzl4w4u92.ShipIt"
   mkdir -p "$FAKE_HOME/Library/Developer/CoreSimulator/Caches"
-  /bin/bash "$ROOT_DIR/shell/disk-janitor.sh" --clean
+  mkdir -p "$SANDBOX/tmp-empty"
+  export CC_DJ_TMP_DIRS="$SANDBOX/tmp-empty"
+  # `|| true`: --clean now exits non-zero when any target failed, and this scenario
+  # deliberately removes a tool. A skip is not a failure, but the guard keeps the
+  # suite from dying here if that ever changes.
+  /bin/bash "$ROOT_DIR/shell/disk-janitor.sh" --clean || true
 )
 
 expect_yes "clean: SKIP logged for missing bun" \
@@ -482,8 +493,14 @@ expect_yes "directory targets report a du size and a measured delta separately" 
   ' _ "$SANDBOX/dj-nobun.log"
 
 expect_yes "skip accounting: a skipped run names the fact on its final line" \
-  bash -c 'grep -q "SKIPPED=" "$1" && grep -q "a skipped target cleaned nothing" "$1"' \
+  bash -c 'grep -q "SKIPPED=" "$1" && grep -q "a skipped or failed target cleaned nothing" "$1"' \
     _ "$SANDBOX/dj-nobun.log"
+
+# FAILED is on the same line for the same reason SKIPPED is: a target that returned
+# non-zero was logged and then forgotten, so a blind stale-temp scan reached the
+# summary as a completed run and the process exited 0.
+expect_yes "failure accounting: the final line carries a FAILED count" \
+  bash -c 'grep -q "FAILED=" "$1" || grep -q "failed=0" "$1"' _ "$SANDBOX/dj-nobun.log"
 
 expect_yes "freed bytes: no target reports an unknown" \
   bash -c '! grep -q "freed=?" "$1"' _ "$SANDBOX/dj-nobun.log"
@@ -789,11 +806,17 @@ expect_no "dependencies: the probe PATH really has no python3" \
   env PATH="$NOPY" /bin/bash -c 'command -v python3 >/dev/null 2>&1' 
 
 NOPY_LOG="$SANDBOX/dj-nopython.log"
+mkdir -p "$SANDBOX/tmp-empty"
+# A sandbox temp root, and `|| true`. This run strips PATH to prove python3 is
+# absent, which also takes lsof with it - so the stale-temp scan correctly reports
+# itself blind and --clean now exits non-zero. That is the behaviour under test
+# elsewhere; here it must not take the suite down with it.
 env PATH="$NOPY" HOME="$FAKE_HOME" CC_DJ_TOOL_DIRS="" \
     FAKE_DF_FREE_PCT=80 FAKE_STAT_MTIME=0 \
     CC_DJ_LOG="$NOPY_LOG" CC_DJ_STATE_DIR="$SANDBOX/state" \
+    CC_DJ_TMP_DIRS="$SANDBOX/tmp-empty" \
     CC_DJ_DISK_MIN_PCT=15 CC_DJ_COOLDOWN_SECS=3600 \
-    /bin/bash "$DJ" --clean >/dev/null 2>&1
+    /bin/bash "$DJ" --clean >/dev/null 2>&1 || true
 
 expect_yes "dependencies: a missing python3 is logged as a SKIP" \
   bash -c 'grep -q "SKIP docker unreferenced volumes report (python3 not found)" "$1"' _ "$NOPY_LOG"
@@ -875,7 +898,11 @@ enumerate() {
 # it should. The file's own `file_has` helper carries the same warning.
 collects() {
   local out
-  out="$(enumerate)"
+  # `tr` because the enumerator's contract is NUL-delimited: a path may contain a
+  # newline, which is the whole point. These fixtures are named tamely, so
+  # translating for a substring test is fine - the newline case has its own,
+  # NUL-aware assertion below.
+  out="$(enumerate | tr '\0' '\n')"
   printf '%s\n' "$out" | grep -qF -- "$1"
 }
 
@@ -890,10 +917,14 @@ expect_no  "a freshly touched directory is not collected"       collects "/fresh
 # In this shell, not `bash -c`: a fresh shell has never seen `enumerate`, so the
 # loop read nothing and the assertion passed on an empty list.
 check_only_dirs() {
-  local out l
-  out="$(enumerate)"
-  [ -n "$out" ] || return 0
-  while IFS= read -r l; do [ -n "$l" ] || continue; [ -d "$l" ] || return 1; done <<< "$out"
+  local l tmpf
+  tmpf="$(mktemp)" || return 1
+  enumerate > "$tmpf"
+  while IFS= read -r -d '' l; do
+    [ -n "$l" ] || continue
+    [ -d "$l" ] || { rm -f "$tmpf"; return 1; }
+  done < "$tmpf"
+  rm -f "$tmpf"
 }
 expect_yes "every emitted line is an existing directory" check_only_dirs
 
@@ -935,9 +966,9 @@ mkdir -p "$LSOF_STUB"
 printf '#!/bin/sh\nexit 127\n' > "$LSOF_STUB/lsof"
 chmod +x "$LSOF_STUB/lsof"
 
-broken_lsof_collects_something() { local o; o="$(dj_run "$LSOF_STUB" "$TMPT" out)"; [ -n "$o" ]; }
+broken_lsof_collects_something() { local o; o="$(dj_run "$LSOF_STUB" "$TMPT" out | tr '\0' '\n')"; [ -n "$o" ]; }
 broken_lsof_explains() { local o; o="$(dj_run "$LSOF_STUB" "$TMPT" err)"; printf '%s\n' "$o" | grep -q "lsof cannot report"; }
-broken_lsof_collects_something_with_real_lsof() { local o; o="$(dj_run "" "$TMPT" out)"; [ -n "$o" ]; }
+broken_lsof_collects_something_with_real_lsof() { local o; o="$(dj_run "" "$TMPT" out | tr '\0' '\n')"; [ -n "$o" ]; }
 
 # ── a find that cannot answer must keep, not delete ──────────────────────────
 #
@@ -951,7 +982,7 @@ mkdir -p "$FIND_STUB"
 printf '#!/bin/sh\necho "find: unrecognised primary" >&2\nexit 1\n' > "$FIND_STUB/find"
 chmod +x "$FIND_STUB/find"
 
-broken_find_collects_something() { local o; o="$(dj_run "$FIND_STUB" "$TMPT" out)"; [ -n "$o" ]; }
+broken_find_collects_something() { local o; o="$(dj_run "$FIND_STUB" "$TMPT" out | tr '\0' '\n')"; [ -n "$o" ]; }
 broken_find_explains()           { local o; o="$(dj_run "$FIND_STUB" "$TMPT" err)"; printf '%s\n' "$o" | grep -q "could not"; }
 
 # ── git repositories, however they are shaped or wherever they sit ───────────
@@ -979,6 +1010,34 @@ mkdir -p "$TMPT/nested-bare/session/repo.git/objects" "$TMPT/nested-bare/session
 mkfile_kb "$TMPT/nested-bare/blob" "$FIXTURE_KB"
 age_tree "$TMPT/nested-bare"
 expect_no "a bare repository nested inside a candidate protects it" collects "nested-bare"
+
+# A nested bare repository NOT named `*.git`. `git init --bare repo` produces an
+# ordinary `repo/`, which a name filter walks straight past.
+mkdir -p "$TMPT/nested-bare-plain/session/repo/objects" "$TMPT/nested-bare-plain/session/repo/refs"
+: > "$TMPT/nested-bare-plain/session/repo/HEAD"
+mkfile_kb "$TMPT/nested-bare-plain/blob" "$FIXTURE_KB"
+age_tree "$TMPT/nested-bare-plain"
+expect_no "a nested bare repo without a .git suffix protects it" collects "nested-bare-plain"
+
+# A newline in a directory name. `/private/tmp` is world-writable, and a
+# line-delimited listing split this into two candidates - the second of them the
+# bare relative path `Documents`.
+NL_DIR="$TMPT/$(printf 'weird\nDocuments')"
+mkdir -p "$NL_DIR"
+mkfile_kb "$NL_DIR/blob" "$FIXTURE_KB"
+age_tree "$NL_DIR"
+only_absolute_children() {
+  local l tmpf
+  tmpf="$(mktemp)" || return 1
+  enumerate > "$tmpf"
+  while IFS= read -r -d '' l; do
+    [ -n "$l" ] || continue
+    case "$l" in "$TMPT"/*) ;; *) rm -f "$tmpf"; return 1 ;; esac
+  done < "$tmpf"
+  rm -f "$tmpf"
+}
+expect_yes "a newline in a name cannot produce a candidate outside the root" \
+  only_absolute_children
 
 # ── a blind scan is a failed target, not a completed one ─────────────────────
 #

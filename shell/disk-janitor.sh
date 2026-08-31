@@ -272,6 +272,12 @@ _cc_dj_du_bytes() {
   fi
 }
 
+# Targets that ran, and targets that FAILED. `_cc_dj_clean_target` logs a non-zero
+# return and then returns success itself, because for a cache target "rc may be fine"
+# is genuinely true. It is not true of the stale-temp scan, where non-zero means the
+# scan was blind - so the count is kept and reaches the run's own exit status.
+CC_DJ_FAILED=0
+
 _cc_dj_clean_target() {
   local label="$1"
   shift
@@ -289,13 +295,18 @@ _cc_dj_clean_target() {
     _cc_dj_log "clean: target '${label}' done (freed=${freed})"
   else
     _cc_dj_log "clean: target '${label}' returned non-zero (rc=${rc}, may be fine, freed=${freed})"
+    CC_DJ_FAILED=$(( CC_DJ_FAILED + 1 ))
   fi
 }
 
 # KiB, the unit the size floor is expressed in. `_cc_dj_du_bytes` exists but prints
 # "?" on failure, and "?" in an arithmetic comparison is a syntax error, not a skip.
 _cc_dj_du_kib() {
-  du -sk "$1" 2>/dev/null | awk '{print $1; found=1} END {if (!found) print 0}'
+  # `head -1`, because `du -sk` echoes the path back and a path containing a newline
+  # therefore produces two lines. The second one made this print `2048\nDocuments`,
+  # `[ … -ge … ]` failed as "illegal number", and the candidate was dropped by a gate
+  # that was supposed to be measuring its size. Safe direction, silent, and wrong.
+  du -sk "$1" 2>/dev/null | head -1 | awk '{print $1 + 0; found=1} END {if (!found) print 0}'
 }
 
 # Emit one path per line: a directory directly under a temp root that is stale, large,
@@ -320,8 +331,12 @@ _cc_dj_lsof_usable() {
   return 0
 }
 
-# Emit one path per line: a directory directly under a temp root that is stale,
-# large, unheld, and holds no git repository. Every gate is a reason to *skip*,
+# Emit one NUL-terminated path per candidate: a directory directly under a temp root
+# that is stale, large, unheld, and holds no git repository.
+#
+# NUL and not newline, all the way to the consumers. A newline-delimited contract
+# re-creates at the reader the exact split this function works to avoid at the
+# writer - `/private/tmp` is world-writable, and a directory may be called anything. Every gate is a reason to *skip*,
 # because the failure mode here is deleting work, not leaving a cache behind.
 #
 # Diagnostics go to stderr, never stdout. This function's stdout IS the deletion
@@ -336,12 +351,12 @@ _cc_dj_looks_bare() {
   [ -f "$1/HEAD" ] && [ -d "$1/objects" ] && [ -d "$1/refs" ]
 }
 
-# Any of the newline-separated candidates a real bare repository?
-_cc_dj_any_bare() {
-  local c
-  while IFS= read -r c; do
-    [ -n "$c" ] || continue
-    _cc_dj_looks_bare "$c" && return 0
+# Does any of these `HEAD` paths sit in a real bare repository?
+_cc_dj_any_bare_parent() {
+  local h
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    _cc_dj_looks_bare "${h%/HEAD}" && return 0
   done <<EOF
 $1
 EOF
@@ -354,7 +369,7 @@ EOF
 CC_DJ_TMP_BLIND_FILE=""
 
 _cc_dj_stale_tmp_dirs() {
-  local root d d_real held cwd recent listing repo_hit bare_hit min_kb age roots=()
+  local root root_real d d_parent d_real held cwd recent listing repo_hit head_hits min_kb age roots=()
   age="$CC_DJ_TMP_AGE_DAYS"
   min_kb=$(( CC_DJ_TMP_MIN_MB * 1024 ))
 
@@ -382,17 +397,43 @@ _cc_dj_stale_tmp_dirs() {
     # and per-directory it is quadratic on exactly the hosts that need this most.
     held="$(lsof -Fn +D "$root" 2>/dev/null | sed -n 's/^n//p')"
 
-    # The root listing gets the same treatment as everything else here: a `find`
+    # NUL-delimited, through a FILE, and every candidate re-checked afterwards.
+    #
+    # `/private/tmp` is world-writable and a directory name may contain a newline. A
+    # line-delimited listing split `$'\nDocuments'` into two candidates, the second
+    # of them the bare relative path `Documents` - which a manual run from $HOME
+    # would resolve against the wrong directory entirely, and whose open handles are
+    # of course absent from an lsof inventory taken over /private/tmp.
+    #
+    # A file rather than `listing="$(find … -print0)"`, because command substitution
+    # STRIPS NUL bytes: that version threw away the delimiters that made it safe and
+    # split on newlines again, exactly as before. The file keeps the NULs and keeps
+    # find's exit status, and both are load-bearing - one so a name cannot forge a
+    # second candidate, the other so a failed listing is not read as an empty root.
+    #
+    # The root listing also gets the same treatment as everything else here: a `find`
     # that fails produces no directories, and "no directories" is indistinguishable
     # from "nothing to clean" unless somebody says so.
-    if ! listing="$(find "$root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)"; then
+    root_real="$( (cd -P "$root" 2>/dev/null && pwd) || echo "$root" )"
+    listing="$(mktemp "${TMPDIR:-/tmp}/cc-dj-list.XXXXXX")" || {
+      [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
+      echo "disk-janitor: could not create a work file, scanned nothing: $root" >&2
+      continue
+    }
+    if ! find "$root" -maxdepth 1 -mindepth 1 -type d -print0 >"$listing" 2>/dev/null; then
       [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
       echo "disk-janitor: could not list temp root, scanned nothing: $root" >&2
+      rm -f "$listing"
       continue
     fi
 
-    while IFS= read -r d; do
+    while IFS= read -r -d '' d; do
       [ -n "$d" ] || continue
+      # Belt and braces: whatever the traversal produced, act only on something that
+      # really is a direct child of the root we were asked to scan.
+      case "$d" in "$root"/*) ;; *) continue ;; esac
+      d_parent="$( (cd -P "$d/.." 2>/dev/null && pwd) || echo "" )"
+      [ "$d_parent" = "$root_real" ] || continue
 
       # Any git repository anywhere in the candidate, and bare ones too.
       #
@@ -417,16 +458,20 @@ _cc_dj_stale_tmp_dirs() {
       # Bare repositories, at the top level and nested. A bare repo has no `.git` for
       # the search above to find, and checking only `$d` missed `$d/session/repo.git`
       # - an old, large, unheld candidate whose unique commits would go with it.
-      # Matched on the conventional `.git`-suffixed directory name, then confirmed by
-      # the three entries git itself requires, so an ordinary directory that happens
-      # to end in `.git` does not qualify.
+      #
+      # Found by STRUCTURE, not by name. The `.git` suffix is a convention and
+      # nothing enforces it - `git init --bare repo` produces a perfectly ordinary
+      # `repo/`, which a name filter walks straight past. The search is for the `HEAD`
+      # file every git directory has, and each hit is confirmed by the three entries
+      # git actually requires, which is also what stops a stray file called HEAD from
+      # pinning a candidate forever.
       _cc_dj_looks_bare "$d" && continue
-      if ! bare_hit="$(find "$d" -maxdepth 3 -type d -name '*.git' -print 2>/dev/null)"; then
+      if ! head_hits="$(find "$d" -maxdepth 4 -type f -name HEAD -print 2>/dev/null)"; then
         [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
-      echo "disk-janitor: could not scan for bare repositories, kept: $d" >&2
+        echo "disk-janitor: could not scan for bare repositories, kept: $d" >&2
         continue
       fi
-      _cc_dj_any_bare "$bare_hit" && continue
+      _cc_dj_any_bare_parent "$head_hits" && continue
 
       # Staleness is a property of the subtree, not of the directory entry. A
       # directory's mtime advances only when its DIRECT entries change, so a
@@ -473,16 +518,15 @@ EOF
       [ "$skip" -eq 1 ] && continue
 
       [ "$(_cc_dj_du_kib "$d")" -ge "$min_kb" ] 2>/dev/null || continue
-      echo "$d"
-    done <<EOF
-$listing
-EOF
+      printf '%s\0' "$d"
+    done < "$listing"
+    rm -f "$listing"
   done
 }
 
 _cc_dj_report_stale_tmp_dirs() {
   local d n=0 kb=0
-  while IFS= read -r d; do
+  while IFS= read -r -d '' d; do
     [ -n "$d" ] || continue
     n=$(( n + 1 )); kb=$(( kb + $(_cc_dj_du_kib "$d") ))
     _cc_dj_log "check: stale temp checkout ${d} ($(_cc_dj_du_bytes "$d") bytes)"
@@ -498,7 +542,7 @@ _cc_dj_clean_stale_tmp_dirs() {
   # false-success shape this whole target was added to remove, so a blind scan
   # returns nonzero and is counted as a failure rather than a completion.
   CC_DJ_TMP_BLIND_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-dj-blind.XXXXXX")" || CC_DJ_TMP_BLIND_FILE=""
-  while IFS= read -r d; do
+  while IFS= read -r -d '' d; do
     [ -n "$d" ] || continue
     n=$(( n + 1 ))
     if [ "$CC_DJ_TMP_DELETE" = 1 ]; then
@@ -775,11 +819,16 @@ _cc_dj_clean() {
   # The counts are on this line because their absence is what let five dead targets run
   # weekly for weeks: a clean that skipped most of its work and one that did all of it
   # both ended on "clean: finished - disk free=16%".
-  if [ "$CC_DJ_SKIPPED" -gt 0 ]; then
-    _cc_dj_log "clean: finished — disk free=${free_after}% — ran=${CC_DJ_RAN} SKIPPED=${CC_DJ_SKIPPED} (a skipped target cleaned nothing)"
+  # FAILED joins them for the same reason. A target that returned non-zero was
+  # logged and then forgotten, so a blind stale-temp scan - one that could not read a
+  # root, or whose lsof or find failed - reached this line as a completed run and the
+  # process exited 0. Under launchd that status is the only thing anyone sees.
+  if [ "$CC_DJ_SKIPPED" -gt 0 ] || [ "$CC_DJ_FAILED" -gt 0 ]; then
+    _cc_dj_log "clean: finished — disk free=${free_after}% — ran=${CC_DJ_RAN} SKIPPED=${CC_DJ_SKIPPED} FAILED=${CC_DJ_FAILED} (a skipped or failed target cleaned nothing)"
   else
-    _cc_dj_log "clean: finished — disk free=${free_after}% — ran=${CC_DJ_RAN} skipped=0"
+    _cc_dj_log "clean: finished — disk free=${free_after}% — ran=${CC_DJ_RAN} skipped=0 failed=0"
   fi
+  [ "$CC_DJ_FAILED" -eq 0 ]
 }
 
 # ---------------------------------------------------------------------------

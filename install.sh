@@ -321,8 +321,16 @@ _cc_probe_tcc() {
 PLIST
 
   launchctl bootout "$AGENT_UI/$label" 2>/dev/null || true
-  launchctl bootstrap "$AGENT_UI" "$plist" 2>/dev/null || {
-    rm -f "$plist"; return 0; }
+  # A bootstrap that fails - an SSH or non-GUI install, launchctl rejecting the
+  # plist - used to return silently, so the installer printed no TCC line at all and
+  # the operator could not tell a clean machine from a probe that never ran. Same
+  # rule as everywhere else here: not knowing is its own answer, and it gets said.
+  if ! launchctl bootstrap "$AGENT_UI" "$plist" 2>/dev/null; then
+    rm -f "$plist"
+    echo "  TCC: probe could not start (no GUI session, or launchctl refused it);"
+    echo "       could not determine what the agents can read."
+    return 0
+  fi
   launchctl kickstart -k "$AGENT_UI/$label" 2>/dev/null || true
 
   # Bounded wait. A probe that never answered is reported as unknown, never as OK:
