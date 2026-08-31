@@ -455,6 +455,27 @@ echo "local data" > "$R_WRANGLER/.wrangler/state/v3/d1/db.sqlite"
 
 expect_yes "a package cache is discounted"                 undiscounted_is "$R_CACHE" 0
 expect_yes "local wrangler state is NOT discounted"        undiscounted_is "$R_WRANGLER" 1
+
+# ── sourced from zsh, which this file advertises and which reserves names ────
+#
+# `status` is READ-ONLY in zsh. `local status` aborts the function before git runs,
+# the dirty field comes back empty, the tab-separated inventory line shifts by one,
+# and `--apply` then classifies a worktree holding ignored local data as REMOVABLE.
+# bash cannot see this at all, so only a zsh run can.
+if command -v zsh >/dev/null 2>&1; then
+  zsh_counts_the_same() {
+    local b z
+    b="$(bash -c 'source "$1" >/dev/null 2>&1; _cc_wj_undiscounted_count "$2"' \
+         _ "$ROOT_DIR/shell/worktree-janitor.sh" "$R_ENV" 2>/dev/null)"
+    z="$(zsh -c 'source "$1" >/dev/null 2>&1; _cc_wj_undiscounted_count "$2"' \
+         _ "$ROOT_DIR/shell/worktree-janitor.sh" "$R_ENV" 2>/dev/null)"
+    [ -n "$z" ] && [ "$b" = "$z" ]
+  }
+  expect_yes "sourced from zsh, the dirty gate answers the same as bash" \
+    zsh_counts_the_same
+else
+  printf "ok - zsh not installed, reserved-name case skipped\n"
+fi
 expect_yes "a generated file is discounted"                undiscounted_is "$R_GEN" 0
 expect_yes "a symlink to a cache is discounted"            undiscounted_is "$R_LINK" 0
 expect_yes "an ignored .env keeps the worktree"            undiscounted_is "$R_ENV" 1

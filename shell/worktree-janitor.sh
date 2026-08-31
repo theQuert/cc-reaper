@@ -340,8 +340,14 @@ CC_WJ_REGENERABLE_FILES="${CC_WJ_REGENERABLE_FILES:-next-env.d.ts tsconfig.tsbui
 # unreadable repository is distinguishable from an empty one, and answered with a
 # count that keeps the worktree rather than with zero.
 _cc_wj_undiscounted_count() {
-  local wt="$1" status line rest base n=0
-  status="$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" || { echo 1; return; }
+  # `wt_status`, not `status`: this file advertises itself as sourceable, and in zsh
+  # `status` is READ-ONLY. `local status` aborts the function before git runs, the
+  # dirty field comes back empty, the tab-separated inventory line shifts by one -
+  # and `--apply` then classifies a worktree holding ignored local data as REMOVABLE
+  # and reaches the force-removal fallback. The trap is in CLAUDE.md; this is what it
+  # looks like when it fires.
+  local wt="$1" wt_status line rest base n=0
+  wt_status="$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" || { echo 1; return; }
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     case "$line" in
@@ -361,7 +367,7 @@ _cc_wj_undiscounted_count() {
     esac
     n=$((n + 1))
   done <<EOF
-$status
+$wt_status
 EOF
   echo "$n"
 }
