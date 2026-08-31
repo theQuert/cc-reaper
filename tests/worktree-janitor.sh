@@ -155,8 +155,8 @@ expect_yes "inventory: wt-clean shows dirty=0" \
 
 # ─── Test 2: dirty → KEEP in report mode ─────────────────────────────────────
 
-expect_yes "dirty: classified KEEP(dirty=...) in report mode" \
-  file_after "$OUT1" "wt-dirty" 4 "KEEP(dirty="
+expect_yes "dirty: classified KEEP(unrebuildable=...) in report mode" \
+  file_after "$OUT1" "wt-dirty" 4 "KEEP(unrebuildable="
 
 # ─── Test 3: active-cwd → KEEP ────────────────────────────────────────────────
 
@@ -370,6 +370,76 @@ expect_yes "a clean idle branch is still removable" \
 
 expect_yes "an unpushed branch is still removable — the branch keeps the commits" \
   classify_is "task/unpushed" "REMOVABLE"
+
+
+# ─── Ignored content is what a removal actually destroys ─────────────────────
+#
+# Removing a worktree deletes its ignored content along with the checkout, and plain
+# `--porcelain` shows none of it. The gate was measuring the wrong thing: on the
+# reporting host 29 worktrees were REMOVABLE and 28 of them held ignored content the
+# report never mentioned. Anything not known to be rebuildable now keeps the tree.
+
+IGN_ROOT="$TMPDIR_ROOT/ignored"
+mkdir -p "$IGN_ROOT"
+make_ign_repo() {
+  # Two declarations, not one: under `set -u` the right-hand sides of a single
+  # `local a=$1 b="$a"` are expanded before either name is bound.
+  local name=$1
+  local r="$IGN_ROOT/$name"
+  mkdir -p "$r"
+  git -C "$r" init -q 2>/dev/null
+  git -C "$r" config user.email t@t; git -C "$r" config user.name t
+  printf 'node_modules/\n.env\nnext-env.d.ts\nblobs/\n' > "$r/.gitignore"
+  echo x > "$r/README"
+  git -C "$r" add -A >/dev/null 2>&1
+  git -C "$r" commit -qm base >/dev/null 2>&1
+  echo "$r"
+}
+
+R_CACHE=$(make_ign_repo cache); mkdir -p "$R_CACHE/node_modules/p"; echo 1 > "$R_CACHE/node_modules/p/i.js"
+R_ENV=$(make_ign_repo env);     printf 'SECRET=1\n' > "$R_ENV/.env"
+R_GEN=$(make_ign_repo gen);     echo '/// ref' > "$R_GEN/next-env.d.ts"
+R_UNK=$(make_ign_repo unk);     mkdir -p "$R_UNK/blobs"; echo 1 > "$R_UNK/blobs/x.bin"
+# Reproducing the measured shape exactly, because two easier fixtures test nothing:
+#
+#  - the link's parent must hold TRACKED files. git collapses a wholly-ignored
+#    directory to a single `dir/` line and never names what is inside it, so with no
+#    sources beside the link the entry under test does not appear at all.
+#  - the ignore rule must be `node_modules`, not `node_modules/`. A trailing slash
+#    matches directories only, and a symlink is not a directory - it then arrives as
+#    `?? b/node_modules`, an untracked entry, which is a different class this gate
+#    deliberately treats as real work.
+#
+# Both hold in the repository this came from, where porcelain emits exactly
+# `!! web/shared/node_modules` for `web/shared/node_modules -> ../next/node_modules`.
+R_LINK=$(make_ign_repo link)
+printf 'node_modules\n' > "$R_LINK/.gitignore"
+mkdir -p "$R_LINK/web/next" "$R_LINK/web/shared"
+echo 'export const a = 1' > "$R_LINK/web/next/app.ts"
+echo 'export const b = 1' > "$R_LINK/web/shared/src.ts"
+git -C "$R_LINK" add -A >/dev/null 2>&1
+git -C "$R_LINK" commit -qm sources >/dev/null 2>&1
+mkdir -p "$R_LINK/web/next/node_modules"; echo 1 > "$R_LINK/web/next/node_modules/i.js"
+ln -s ../next/node_modules "$R_LINK/web/shared/node_modules"
+
+# The fixture is only evidence if it produces the shape it claims to. A silent
+# mismatch here would let the gate regress while this file still reported "ok".
+expect_yes "the symlink fixture reproduces the measured porcelain shape" \
+  bash -c 'git -C "$1" status --porcelain --ignored | grep -qx "!! web/shared/node_modules"' \
+    _ "$R_LINK"
+
+undiscounted_is() {
+  local repo="$1" want="$2" got
+  got="$(_cc_wj_undiscounted_count "$repo")"
+  [ "$got" = "$want" ] || { printf "       got %s, want %s\n" "$got" "$want" >&2; return 1; }
+}
+
+expect_yes "a package cache is discounted"                 undiscounted_is "$R_CACHE" 0
+expect_yes "a generated file is discounted"                undiscounted_is "$R_GEN" 0
+expect_yes "a symlink to a cache is discounted"            undiscounted_is "$R_LINK" 0
+expect_yes "an ignored .env keeps the worktree"            undiscounted_is "$R_ENV" 1
+expect_yes "unknown ignored content keeps the worktree"    undiscounted_is "$R_UNK" 1
+expect_yes "an unreadable repo counts as dirty, not clean" undiscounted_is "$IGN_ROOT/nope" 1
 
 # ─── Final result ─────────────────────────────────────────────────────────────
 

@@ -226,7 +226,15 @@ _cc_wj_emit_wt_block() {
   if [ ! -d "$wt" ]; then
     printf "%s\t%s\t%s\t%s\t%s\n" "$wt" "${br:-?}" "MISSING" "?" "no_remote"
   else
-    dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    # `--ignored`, because `git worktree remove` deletes ignored content along with
+    # the checkout and plain `--porcelain` cannot see any of it. Without this the
+    # "dirty" gate was blind to exactly the files nothing can rebuild - a `.env`, a
+    # key, a local database - while reporting the worktree as clean.
+    #
+    # Discounting is then what keeps the gate usable rather than absolute: measured
+    # on the reporting host, 28 of 29 otherwise-removable worktrees carried ignored
+    # content and every one of them was a package or build cache.
+    dirty=$(_cc_wj_undiscounted_count "$wt")
     # Resolve remote SHA once; pass to both helpers to avoid double rev-parse
     remote_sha=""
     if [ -n "${br:-}" ] && [ "$br" != "(detached)" ]; then
@@ -296,6 +304,49 @@ _cc_wj_list_worktrees() {
   fi
 }
 
+# ─── Ignored content: what a removal would take with it ──────────────────────
+
+# Caches a documented command rebuilds. Kept deliberately short: an entry here is a
+# claim that losing the directory is safe, and the default for anything not named is
+# to keep the worktree, which is the direction that cannot lose work.
+CC_WJ_REGENERABLE="${CC_WJ_REGENERABLE:-node_modules .next .turbo .parcel-cache .svelte-kit .nuxt .astro .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .gradle .nyc_output coverage playwright-report test-results .wrangler .wrangler-dist dist build target}"
+# The same claim for ignored entries that are not whole directories. `--porcelain`
+# gives a trailing slash to a directory and to nothing else, so a generated file and
+# a symlink pointing at a cache both arrive shaped like a hand-written `.env` and a
+# directory-keyed list can never reach either.
+CC_WJ_REGENERABLE_FILES="${CC_WJ_REGENERABLE_FILES:-next-env.d.ts tsconfig.tsbuildinfo .eslintcache}"
+
+# Count the entries a removal would destroy that nothing is known to rebuild.
+# A `git status` that FAILS is not a clean worktree: read into a variable so an
+# unreadable repository is distinguishable from an empty one, and answered with a
+# count that keeps the worktree rather than with zero.
+_cc_wj_undiscounted_count() {
+  local wt="$1" status line rest base n=0
+  status="$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" || { echo 1; return; }
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      '!! '*) ;;
+      *) n=$((n + 1)); continue ;;   # tracked change or untracked file: real work
+    esac
+    rest="${line#!! }"
+    rest="${rest%/}"
+    base="${rest##*/}"
+    case "$line" in
+      *'/') case " $CC_WJ_REGENERABLE " in *" $base "*) continue ;; esac ;;
+      *)
+        if [ -L "$wt/$rest" ]; then
+          case " $CC_WJ_REGENERABLE " in *" $base "*) continue ;; esac
+        fi
+        case " $CC_WJ_REGENERABLE_FILES " in *" $base "*) continue ;; esac ;;
+    esac
+    n=$((n + 1))
+  done <<EOF
+$status
+EOF
+  echo "$n"
+}
+
 # ─── Classification ───────────────────────────────────────────────────────────
 
 # Print KEEP(<reason>) or REMOVABLE
@@ -317,7 +368,7 @@ _cc_wj_classify() {
   fi
 
   if [ "$dirty" -gt 0 ] 2>/dev/null; then
-    echo "KEEP(dirty=$dirty)"
+    echo "KEEP(unrebuildable=$dirty)"
     return
   fi
 
