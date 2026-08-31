@@ -1058,6 +1058,25 @@ mkfile_kb "$TMPT/nested-bare-plain/blob" "$FIXTURE_KB"
 age_tree "$TMPT/nested-bare-plain"
 expect_no "a nested bare repo without a .git suffix protects it" collects "nested-bare-plain"
 
+# A held directory whose name lsof cannot represent. macOS lsof ESCAPES a newline
+# rather than emitting it, so the reported path never equals the real one and the
+# literal comparison reads "nothing holds this" - which, with deletion enabled, is
+# the answer that removes a tree somebody has open.
+NLHELD="$TMPT/$(printf 'held\nname')"
+mkdir -p "$NLHELD"
+mkfile_kb "$NLHELD/blob" "$FIXTURE_KB"
+age_tree "$NLHELD"
+expect_no "a name lsof cannot represent is never collected" collects "held"
+
+# A function, not `bash -c`: a fresh shell has never seen `dj_run`, so the assertion
+# would pass or fail on the helper being missing rather than on the message. This
+# file has now made that mistake twice.
+says_why_lsof_kept_it() {
+  local o; o="$(dj_run "" "$TMPT" err)"
+  printf '%s\n' "$o" | grep -q "cannot be matched against lsof"
+}
+expect_yes "and it says why it kept it" says_why_lsof_kept_it
+
 # A newline in a directory name. `/private/tmp` is world-writable, and a
 # line-delimited listing split this into two candidates - the second of them the
 # bare relative path `Documents`.

@@ -100,6 +100,9 @@ CC_DJ_SKIPPED=0
 # FAILED>0 and return non-zero with nothing wrong, which is how a real signal turns
 # into one nobody reads.
 CC_DJ_FAILED=0
+# Targets whose non-zero return means something went wrong rather than "may be fine".
+# Space-delimited labels, matched exactly as passed to `_cc_dj_clean_target`.
+CC_DJ_STRICT_TARGETS="stale-temp-checkouts"
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -355,14 +358,15 @@ _cc_dj_looks_bare() {
 }
 
 # Does any of these `HEAD` paths sit in a real bare repository?
+# Does any of these `HEAD` paths sit in a real bare repository? Reads a NUL-delimited
+# FILE, so a repository under a path containing a newline is confirmed as itself
+# rather than as fragments that happen to name nothing.
 _cc_dj_any_bare_parent() {
   local h
-  while IFS= read -r h; do
+  while IFS= read -r -d '' h; do
     [ -n "$h" ] || continue
     _cc_dj_looks_bare "${h%/HEAD}" && return 0
-  done <<EOF
-$1
-EOF
+  done < "$1"
   return 1
 }
 
@@ -398,7 +402,8 @@ _cc_dj_stale_tmp_dirs() {
     fi
     # One lsof for the whole root rather than one per directory: `+D` walks the tree,
     # and per-directory it is quadratic on exactly the hosts that need this most.
-    held="$(lsof -Fn +D "$root" 2>/dev/null | sed -n 's/^n//p')"
+    # `-F0n`: NUL-terminated fields, so a field cannot be split by its own content.
+    held="$(lsof -F0n +D "$root" 2>/dev/null | tr '\0' '\n' | sed -n 's/^n//p')"
 
     # NUL-delimited, through a FILE, and every candidate re-checked afterwards.
     #
@@ -469,12 +474,22 @@ _cc_dj_stale_tmp_dirs() {
       # git actually requires, which is also what stops a stray file called HEAD from
       # pinning a candidate forever.
       _cc_dj_looks_bare "$d" && continue
-      if ! head_hits="$(find "$d" -maxdepth 4 -type f -name HEAD -print 2>/dev/null)"; then
+      # `-print0` into a file, for the same reason the root listing uses one: command
+      # substitution strips NULs, and `-print` alone lets a path split itself so the
+      # confirmation runs against fragments rather than against the repository.
+      head_hits="$(mktemp "${TMPDIR:-/tmp}/cc-dj-heads.XXXXXX")" || {
+        [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
+        echo "disk-janitor: could not create a work file, kept: $d" >&2
+        continue
+      }
+      if ! find "$d" -maxdepth 4 -type f -name HEAD -print0 >"$head_hits" 2>/dev/null; then
         [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
         echo "disk-janitor: could not scan for bare repositories, kept: $d" >&2
+        rm -f "$head_hits"
         continue
       fi
-      _cc_dj_any_bare_parent "$head_hits" && continue
+      if _cc_dj_any_bare_parent "$head_hits"; then rm -f "$head_hits"; continue; fi
+      rm -f "$head_hits"
 
       # Staleness is a property of the subtree, not of the directory entry. A
       # directory's mtime advances only when its DIRECT entries change, so a
@@ -508,6 +523,16 @@ _cc_dj_stale_tmp_dirs() {
       # deletion. `/private/tmp` is world-writable, so nothing constrains the names
       # in it. `.`, `+` and `[1]` merely over-matched - wrong in the safe direction -
       # but `*` and an unmatched `[` fail toward deleting.
+      # A name lsof would escape cannot be checked against its inventory, so it is
+      # never cleared. macOS lsof reports `weird<LF>name` as the eight characters
+      # `weird\nname`, so the comparison below never matches the real path - which
+      # reads as "nothing holds this" and, with CC_DJ_TMP_DELETE=1, removes a tree
+      # somebody has open. Not being able to prove a tree unheld has to mean keeping.
+      case "$d" in
+        *[$'\n\t\r\\']*)
+          echo "disk-janitor: name cannot be matched against lsof output, kept: $d" >&2
+          continue ;;
+      esac
       d_real="$( (cd -P "$d" 2>/dev/null && pwd) || echo "$d" )"
       local skip=0
       while IFS= read -r cwd; do
@@ -764,7 +789,7 @@ _cc_dj_clean() {
   # than through a path constant: stale by mtime, over a size floor, no open handle,
   # and not a registered git worktree. `_cc_dj_clean_target` is used so a failure is
   # counted rather than swallowed.
-  _cc_dj_clean_target "stale temp checkouts" _cc_dj_clean_stale_tmp_dirs
+  _cc_dj_clean_target "stale-temp-checkouts" _cc_dj_clean_stale_tmp_dirs
 
   # -- Spotify cache ----------------------------------------------------------
   local spotify_cache="$HOME/Library/Caches/com.spotify.client"
