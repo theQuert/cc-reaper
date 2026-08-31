@@ -34,10 +34,31 @@ done
 # `systemd --user` manager(s) if present (matched by UID so another user's
 # manager is never included). macOS / no-systemd hosts resolve to exactly
 # " 1 ", so behavior there is unchanged. Space-padded for `case`/awk matching.
+#
+# The manager is identified by its EXECUTABLE, not by its command line, and the
+# probe does not run off Linux at all. Searching full command text for the
+# string put every process that merely MENTIONED it into the set - a shell
+# running `echo "... systemd --user ..."`, a grep for it, this hook's own
+# ancestor - and every child of such a process then passed the orphan filter
+# below and was killed. Verified on 2026-08-21: on macOS, which has no systemd
+# at all, a harmless `bash -c 'echo "systemd --user"; sleep'` matched, and so
+# did its parent shell. `comm` carries only the executable name, so a process
+# that talks about systemd no longer impersonates it.
 _uid=$(id -u 2>/dev/null)
-_systemd_user_pids=$(ps -eo pid=,uid=,command= 2>/dev/null \
-  | awk -v uid="$_uid" '$2 == uid && /systemd --user/ {print $1}' | tr '\n' ' ')
+if [ "$(uname -s 2>/dev/null)" = Linux ]; then
+  _systemd_user_pids=$(ps -eo pid=,uid=,comm=,args= 2>/dev/null \
+    | awk -v uid="$_uid" '$2 == uid && $3 == "systemd" && /--user/ {print $1}' \
+    | tr '\n' ' ')
+else
+  _systemd_user_pids=""
+fi
 ORPHAN_PPIDS=" 1 ${_systemd_user_pids}"
+
+# Both kill paths below ask the same question, so they ask it through the same
+# predicate. It was written out twice before, and only the copy in the PGID sweep
+# was ever given the ancestor list — the pattern fallback killed the CLI this hook
+# runs under whenever that CLI's PPID landed in the orphan-parent set.
+is_ancestor() { echo "$_ancestors" | grep -qw "$1"; }
 
 # ─── Shared MCP whitelist ────────────────────────────────────────────────────
 MCP_WHITELIST="supabase|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*mcp|context7|context7-mcp|claude-mem|chroma-mcp|chrome-devtools-mcp|mcp-remote|cloudflare/mcp-server|mcp-server-cloudflare|sequentialthinking|sequential-thinking|codex.*mcp"
@@ -66,9 +87,7 @@ if [ -n "$SESSION_PGID" ] && [ "$SESSION_PGID" != "0" ] && [ "$SESSION_PGID" != 
     [ -z "$pid" ] && continue
 
     # Never kill any ancestor process (Claude CLI, intermediate shells, init)
-    if echo "$_ancestors" | grep -qw "$pid"; then
-      continue
-    fi
+    is_ancestor "$pid" && continue
 
     # PPID filter: only kill truly orphaned processes — those reparented to an
     # orphan parent (PID 1, or this user's `systemd --user` manager on Linux).
@@ -78,8 +97,16 @@ if [ -n "$SESSION_PGID" ] && [ "$SESSION_PGID" != "0" ] && [ "$SESSION_PGID" != 
       case "$ORPHAN_PPIDS" in *" $pid_ppid "*) ;; *) continue ;; esac
     fi
 
-    # Skip whitelisted MCP servers (shared across sessions)
+    # Skip whitelisted MCP servers (shared across sessions).
+    # Fail CLOSED on an empty lookup, the same direction as the PPID check above:
+    # ps answers nothing when the process just exited, when ps itself errored, or
+    # when the PID has been reused — and an empty command can never match the
+    # whitelist, so without this guard "we could not tell what this is" resolved to
+    # "kill it". The direction matters because the two mistakes are not symmetric:
+    # skipping wrongly leaks one process until the next sweep, killing wrongly
+    # takes out a shared MCP server, or whatever now owns a recycled PID.
     pid_cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+    [ -z "$pid_cmd" ] && continue
     if echo "$pid_cmd" | grep -qE "$MCP_WHITELIST"; then
       continue
     fi
@@ -108,6 +135,9 @@ ps -eo pid=,ppid=,command= 2>/dev/null | awk -v set="$ORPHAN_PPIDS" 'index(set, 
   # Never kill an orphan parent itself (e.g. the `systemd --user` manager) —
   # it is a reparent target, not an orphan.
   case "$ORPHAN_PPIDS" in *" $_pid "*) continue ;; esac
+  # Same ancestor protection the PGID sweep gets: a `claude … --stream-json`
+  # matched here can be the CLI this hook is running under.
+  is_ancestor "$_pid" && continue
   if echo "$_cmd" | grep -qE "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"; then
     echo "$_cmd" | grep -qE "$MCP_WHITELIST" && continue
     kill "$_pid" 2>/dev/null
