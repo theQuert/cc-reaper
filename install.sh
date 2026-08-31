@@ -98,8 +98,21 @@ fi
 
 HOOKS_DIR="$HOME_DIR/.claude/hooks"
 mkdir -p "$HOOKS_DIR"
-cp "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$HOOKS_DIR/"
-chmod +x "$HOOKS_DIR/stop-cleanup-orphans.sh"
+# Never through a symlink. This path is a symlink into another repository on at
+# least one machine, and `cp` follows it: installing cc-reaper silently rewrote a
+# file inside somebody else's checkout, leaving it dirty and replacing whatever
+# version lived there with this one. Measured on the reporting host, twice - the
+# second time by this very installer, after the content drift it caused had already
+# been found and fixed.
+_CC_HOOK_DEST="$HOOKS_DIR/stop-cleanup-orphans.sh"
+if [ -L "$_CC_HOOK_DEST" ]; then
+  echo "  Stop hook at $_CC_HOOK_DEST is a symlink to $(readlink "$_CC_HOOK_DEST")."
+  echo "  Left alone: writing through it would modify that file in place. Update it"
+  echo "  there, or remove the symlink and re-run this installer."
+else
+  cp "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$_CC_HOOK_DEST"
+  chmod +x "$_CC_HOOK_DEST"
+fi
 
 # Update global settings.json
 SETTINGS_FILE="$HOME_DIR/.claude/settings.json"
@@ -254,6 +267,131 @@ echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
 echo "  worktree-janitor: manual — run '~/.cc-reaper/worktree-janitor.sh' (report), add --apply to clean"
 echo "                    not scheduled: a LaunchAgent has no TCC access to ~/Documents, measured 2026-08-30"
 echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs whitelisted MCP pinned >80% CPU for >60 min)"
+
+# ─── 5b. TCC probe ────────────────────────────────────────────────────────────
+#
+# The agents just installed run under launchd, and launchd's context does not carry
+# the operator's TCC grants. `~/Documents`, `~/Desktop` and `~/Downloads` are
+# protected on macOS, so an agent reads them only if the program named in the plist
+# holds Full Disk Access.
+#
+# Probed from launchd rather than from here, because the two contexts disagree and
+# only one of them is the one the agents run in - an operator who checks by hand sees
+# it work and never learns the agent cannot. That disagreement is the whole reason
+# this is invisible without a probe.
+#
+# Reported, not recommended. No agent this installer schedules reads these paths -
+# they work under ~/Library and /private/tmp - so telling an operator to grant
+# /bin/bash Full Disk Access would hand every bash script on the machine access to all
+# protected user data while enabling no sweep that exists. What the probe is for is
+# the operator who later schedules something of their own over ~/Documents: that run
+# would exit 0 reporting nothing found, which is what an empty machine looks like.
+_cc_probe_tcc() {
+  command -v launchctl >/dev/null 2>&1 || return 0
+  [ "$(uname -s 2>/dev/null)" = Darwin ] || return 0
+
+  local label="com.cc-reaper.tcc-probe"
+  local plist="$PLIST_DIR/$label.plist"
+  local out="$REAPER_DIR/logs/tcc-probe.out"
+
+  # Absent is not denied, and reporting the two the same way is the bug this exists
+  # to avoid. Only a path that exists is worth asking about.
+  local present=() d
+  for d in "$HOME_DIR/Documents" "$HOME_DIR/Desktop" "$HOME_DIR/Downloads"; do
+    [ -d "$d" ] && present+=("$d")
+  done
+  [ "${#present[@]}" -gt 0 ] || return 0
+
+  : > "$out" 2>/dev/null || return 0
+
+  # Each path is its own <string> in ProgramArguments and the probe iterates "$@".
+  # Splicing them into a single `-c` word list split `/Users/John Smith/Documents`
+  # into two, and the installer then reported a Full Disk Access grant as missing
+  # when it was already held - a false alarm in the one place whose whole value is
+  # being believed.
+  local args="" xd
+  for xd in "${present[@]}"; do
+    xd="${xd//&/&amp;}"; xd="${xd//</&lt;}"; xd="${xd//>/&gt;}"
+    args="$args
+    <string>$xd</string>"
+  done
+
+  cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>for d in "\$@"; do if [ -r "\$d" ] &amp;&amp; [ -x "\$d" ] &amp;&amp; ls "\$d" >/dev/null 2>&amp;1; then echo "OK \$d"; else echo "DENIED \$d"; fi; done</string>
+    <string>probe</string>$args
+  </array>
+  <key>StandardOutPath</key><string>$out</string>
+  <key>RunAtLoad</key><false/>
+</dict></plist>
+PLIST
+
+  launchctl bootout "$AGENT_UI/$label" 2>/dev/null || true
+  # A bootstrap that fails - an SSH or non-GUI install, launchctl rejecting the
+  # plist - used to return silently, so the installer printed no TCC line at all and
+  # the operator could not tell a clean machine from a probe that never ran. Same
+  # rule as everywhere else here: not knowing is its own answer, and it gets said.
+  if ! launchctl bootstrap "$AGENT_UI" "$plist" 2>/dev/null; then
+    rm -f "$plist"
+    echo "  TCC: probe could not start (no GUI session, or launchctl refused it);"
+    echo "       could not determine what the agents can read."
+    return 0
+  fi
+  launchctl kickstart -k "$AGENT_UI/$label" 2>/dev/null || true
+
+  # Bounded wait. A probe that never answered is reported as unknown, never as OK:
+  # silence here would recreate the exact fault being probed for.
+  # Every path, not the first. Breaking on the first `OK|DENIED` line meant that if
+  # one directory answered quickly and another was slow to enumerate, the probe was
+  # torn down mid-run - and a first result of OK would have been reported as "the
+  # agents can read Documents/Desktop/Downloads" without the others ever being asked.
+  local i=0
+  while [ "$i" -lt 30 ]; do
+    [ "$(grep -cE '^(OK|DENIED) ' "$out" 2>/dev/null)" -ge "${#present[@]}" ] && break
+    i=$((i + 1)); sleep 0.5
+  done
+  launchctl bootout "$AGENT_UI/$label" 2>/dev/null || true
+  rm -f "$plist"
+
+  # A partial answer is not an answer: reporting "all readable" on the strength of
+  # one path that happened to finish is the same false success the probe exists to
+  # prevent, one level in.
+  if [ "$(grep -cE '^(OK|DENIED) ' "$out" 2>/dev/null)" -lt "${#present[@]}" ]; then
+    echo "  TCC: probe reported on only $(grep -cE '^(OK|DENIED) ' "$out" 2>/dev/null) of ${#present[@]} paths;"
+    echo "       could not determine what the agents can read."
+    return 0
+  fi
+
+  local denied
+  denied=$(sed -n 's/^DENIED //p' "$out" | tr '\n' ' ')
+  if [ -z "$denied" ]; then
+    echo "  TCC: agents can read Documents/Desktop/Downloads."
+    return 0
+  fi
+
+  echo ""
+  echo "  TCC: from a LaunchAgent, this machine cannot read:$denied"
+  echo "       Nothing installed here reads them today - resource-watch, disk-check,"
+  echo "       weekly-clean and guard work under ~/Library and /private/tmp, and"
+  echo "       worktree-janitor is manual by design for exactly this reason."
+  echo "       It matters if you schedule a sweep of your own over those paths: it"
+  echo "       would run, exit 0, and report nothing found, which is what an empty"
+  echo "       machine looks like."
+  echo "       Granting Full Disk Access to /bin/bash would fix that and would also"
+  echo "       give EVERY bash script on this machine access to all protected user"
+  echo "       data. Keep the repositories you want swept outside those directories"
+  echo "       instead, unless you have a reason to accept that trade."
+  echo ""
+}
+
+_cc_probe_tcc || true
 
 # ─── 6. Uninstall hint ────────────────────────────────────────────────────────
 

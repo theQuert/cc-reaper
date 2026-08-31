@@ -56,12 +56,56 @@ SYSTEMD_USER_PID=4242
 # ─────────────────────────────────────────────────────────────────────────────
 # Scenario A: Linux host with a `systemd --user` manager owned by this user
 # ─────────────────────────────────────────────────────────────────────────────
+# Linux, because the manager only exists there and the code says so.
+uname() { if [ "${1:-}" = "-s" ]; then echo Linux; else command uname "$@"; fi; }
+
 ps() {
-  if [ "$1" = "-eo" ] && [ "$2" = "pid=,uid=,command=" ]; then
+  # The authoritative inventory reads pid/uid/comm only - a process chooses its argv
+  # and an embedded newline in it would otherwise forge a row of this very listing.
+  if [ "$1" = "-eo" ] && [ "$2" = "pid=,uid=,comm=" ]; then
+    cat <<EOF
+$SYSTEMD_USER_PID $MY_UID systemd
+9001 $OTHER_UID systemd
+1 0 init
+9500 $MY_UID bash
+9600 $MY_UID systemd
+EOF
+  # uid, comm and argv together, one PID at a time. Asking only for argv would trust
+  # a PID that had exited and been reused between the two calls.
+  elif [ "$1" = "-o" ] && [ "$2" = "uid=,comm=,args=" ] && [ "$3" = "-p" ]; then
+    case "$4" in
+      "$SYSTEMD_USER_PID") echo "$MY_UID systemd /usr/lib/systemd/systemd --user" ;;
+      9001)                echo "$OTHER_UID systemd /usr/lib/systemd/systemd --user" ;;
+      9500)                echo "$MY_UID bash bash -c echo \"systemd --user\"" ;;
+      # A recycled PID: the number is still in the candidate list, but the process
+      # behind it is now something else that merely mentions the manager.
+      9600)                echo "$MY_UID python python -c print(\"--user\")" ;;
+      *)                   echo "" ;;
+    esac
+  elif [ "$1" = "-o" ] && [ "$2" = "args=" ] && [ "$3" = "-p" ]; then
+    # The legacy args-only query, kept so the recycled-PID case discriminates: read
+    # this way 9600 looks like the manager, and only the combined query sees that the
+    # process behind that number is a python.
+    case "$4" in
+      "$SYSTEMD_USER_PID") echo "/usr/lib/systemd/systemd --user" ;;
+      9001)                echo "/usr/lib/systemd/systemd --user" ;;
+      9600)                echo "python -c print(\"--user\")" ;;
+      # A process that merely TALKS about the manager. Matched against a whole
+      # command line this joined the orphan-parent set and took its children with it.
+      9500)                echo 'bash -c echo "systemd --user"' ;;
+      *)                   echo "" ;;
+    esac
+  elif [ "$1" = "-eo" ] && [ "$2" = "pid=,uid=,command=" ]; then
+    # The legacy form, kept so this fixture discriminates: the old code read it and
+    # matched `/systemd --user/` against the whole line, so PID 9500 - an ordinary
+    # bash that merely PRINTS that string - joined the orphan-parent set. Without
+    # this row the assertion below passes against the old code too, and proves
+    # nothing.
     cat <<EOF
 $SYSTEMD_USER_PID $MY_UID /usr/lib/systemd/systemd --user
 9001 $OTHER_UID /usr/lib/systemd/systemd --user
 1 0 /sbin/init
+9500 $MY_UID bash -c echo "systemd --user"
 EOF
   elif [ "$1" = "-eo" ] && [ "$2" = "pid=,ppid=,command=" ]; then
     cat <<EOF
@@ -77,6 +121,19 @@ EOF
 }
 
 _CC_REAPER_ORPHAN_PPIDS=""
+# The forgery case, which is why the inventory stopped reading argv: PID 9500 is an
+# ordinary `bash` whose ARGUMENTS contain the manager's command line. Matched against
+# a whole command line it joined the orphan-parent set and every child of it was then
+# treated as an orphan and killed. `comm` says `bash`, and a process cannot choose it.
+# PID reuse: 9600 answers `systemd` in the inventory pass and is something else by
+# the time the second query runs. Trusting the first answer would put a stranger's
+# children in the kill set.
+expect_no "a recycled PID is not trusted from the first probe" \
+  bash -c 'printf "%s\n" "$(_cc_reaper_orphan_ppids)" | grep -qw 9600'
+
+expect_no "a process that merely mentions the manager is not an orphan parent" \
+  bash -c 'printf "%s\n" "$(_cc_reaper_orphan_ppids)" | grep -qw 9500'
+
 expect_eq "orphan-parent set = PID 1 + this user's systemd --user manager" \
   "1 $SYSTEMD_USER_PID" "$(_cc_reaper_orphan_ppids)"
 
@@ -104,8 +161,17 @@ expect_no "systemd --user manager itself is NOT reaped" \
 # ─────────────────────────────────────────────────────────────────────────────
 # Scenario B: macOS / no `systemd --user` manager → set is exactly "1"
 # ─────────────────────────────────────────────────────────────────────────────
+unset -f uname 2>/dev/null || true
+
 ps() {
-  if [ "$1" = "-eo" ] && [ "$2" = "pid=,uid=,command=" ]; then
+  if [ "$1" = "-eo" ] && [ "$2" = "pid=,uid=,comm=" ]; then
+    cat <<EOF
+1 0 init
+9500 $MY_UID bash
+EOF
+  elif [ "$1" = "-o" ] && [ "$2" = "args=" ] && [ "$3" = "-p" ]; then
+    echo ""
+  elif [ "$1" = "-eo" ] && [ "$2" = "pid=,uid=,command=" ]; then
     cat <<EOF
 1 0 /sbin/launchd
 500 $MY_UID /usr/local/bin/node some-service.js

@@ -35,6 +35,38 @@ CC_DJ_DISK_MIN_PCT="${CC_DJ_DISK_MIN_PCT:-15}"
 CC_DJ_COOLDOWN_SECS="${CC_DJ_COOLDOWN_SECS:-3600}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
 CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
+# Abandoned scratch checkouts under the shared temp directory. Agents and review
+# sessions copy or clone a repository there and nothing ever revisits it; measured
+# 2026-08-31 on one host, twelve of them between 484 MB and 1.3 GB, 5.7 GB in total,
+# the oldest three days untouched. macOS does not clear `/private/tmp` on any
+# schedule a developer machine reaches - the periodic scripts are off by default and
+# the boot-time sweep does not run on a host that stays up.
+CC_DJ_TMP_DIRS="${CC_DJ_TMP_DIRS:-/private/tmp}"
+# Applied to the whole SUBTREE, not to the top-level directory entry - see the
+# staleness gate for why the difference is the whole finding.
+CC_DJ_TMP_AGE_DAYS="${CC_DJ_TMP_AGE_DAYS:-3}"
+# Below this a directory is not worth the risk of being wrong about it.
+CC_DJ_TMP_MIN_MB="${CC_DJ_TMP_MIN_MB:-100}"
+# Report only, unless an operator opts in. Every other `--clean` target is a NAMED
+# cache at a KNOWN path whose owner documents how to rebuild it. This one is a
+# heuristic over a world-writable directory, and age plus size plus "no open handle"
+# does not establish that something is an abandoned checkout: an old application
+# directory, an archive, a database, a mounted data directory all satisfy it. So the
+# default is the half that cannot be wrong - say what is there, let a human decide -
+# and the weekly unattended agent never deletes here unless told to.
+# This target REPORTS and never removes, and there is no flag to change that.
+#
+# Every other `--clean` target is a named cache at a known path whose owner documents
+# how to rebuild it. `/private/tmp` is a heuristic over a world-writable directory,
+# and age plus size plus "no open handle" does not establish that something is an
+# abandoned checkout - an old application directory, an archive, a database, a
+# mounted data directory all satisfy it.
+#
+# A deletion path was written, gated behind an opt-in, then removed. It produced
+# three CRITICAL review findings and most of the rest; roughly 300 lines existed to
+# make safe a code path that was off by default; and it reclaimed nothing on the host
+# that motivated it - the 5.7 GB found there was removed by hand, after reading the
+# report. Seeing the accumulation is the half with no failure mode.
 
 # launchd hands an agent PATH=/usr/bin:/bin:/usr/sbin:/sbin and nothing more unless the
 # plist sets it, while Homebrew and Docker Desktop install outside that set. Resolving
@@ -75,6 +107,10 @@ export PATH
 # five dead targets survived weeks of weekly runs.
 CC_DJ_RAN=0
 CC_DJ_SKIPPED=0
+# Reset per run alongside the other two - see `_cc_dj_clean`. Initialised only at
+# load time, one failure made every later `_cc_dj_clean` in the same shell report
+# FAILED>0 and return non-zero with nothing wrong, which is how a real signal turns
+# into one nobody reads.
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -215,6 +251,11 @@ _cc_dj_check() {
     done <<< "$snapshots"
   fi
 
+  # Reported on every check, not only below threshold. This is the one target whose
+  # contents are somebody's abandoned work rather than a rebuildable cache, so the
+  # operator gets to see it accumulating well before free space forces the question.
+  _cc_dj_report_stale_tmp_dirs
+
   if [ "$free_pct" -lt "$CC_DJ_DISK_MIN_PCT" ]; then
     _cc_dj_log "check: BELOW threshold — free=${free_pct}% < ${CC_DJ_DISK_MIN_PCT}%"
     if [ -n "$snapshots" ]; then
@@ -247,6 +288,8 @@ _cc_dj_du_bytes() {
   fi
 }
 
+# `_cc_dj_clean_target` logs a non-zero return and then returns success itself,
+# because for a cache target "rc may be fine" is genuinely true. It is not true of
 _cc_dj_clean_target() {
   local label="$1"
   shift
@@ -265,6 +308,263 @@ _cc_dj_clean_target() {
   else
     _cc_dj_log "clean: target '${label}' returned non-zero (rc=${rc}, may be fine, freed=${freed})"
   fi
+}
+
+# KiB, the unit the size floor is expressed in. `_cc_dj_du_bytes` exists but prints
+# "?" on failure, and "?" in an arithmetic comparison is a syntax error, not a skip.
+_cc_dj_du_kib() {
+  # `head -1`, because `du -sk` echoes the path back and a path containing a newline
+  # therefore produces two lines. The second one made this print `2048\nDocuments`,
+  # `[ … -ge … ]` failed as "illegal number", and the candidate was dropped by a gate
+  # that was supposed to be measuring its size. Safe direction, silent, and wrong.
+  du -sk "$1" 2>/dev/null | head -1 | awk '{print $1 + 0; found=1} END {if (!found) print 0}'
+}
+
+# Emit one path per line: a directory directly under a temp root that is stale, large,
+# unheld, and not something git still points at. Every gate is a reason to *skip*,
+# because the failure mode here is deleting work, not leaving a cache behind - so the
+# report and the clean share this one enumerator and no skip is silent.
+#
+# Deliberately not matched by name. A name pattern would have to guess which prefixes
+# agents use, and the twelve found here shared no prefix at all.
+# Is lsof usable at all? Its exit status cannot answer that: measured on macOS,
+# `lsof -Fn +D` returns 1 both for a populated directory (42 result lines) and for an
+# empty one, so a status check either skips always or never. Ask it something whose
+# answer is known instead - this process has a working directory - and treat an lsof
+# that cannot report that as an lsof that cannot report anything.
+#
+# A probe that has not been shown to see a positive case cannot be trusted when it
+# reports nothing, and "nothing is held" is the single answer here that authorises
+# `rm -rf`.
+_cc_dj_lsof_usable() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -p "$$" -d cwd -Fn 2>/dev/null | grep -q '^n/' || return 1
+  return 0
+}
+
+# Emit one NUL-terminated path per candidate: a directory directly under a temp root
+# that is stale, large, unheld, and holds no git repository.
+#
+# NUL and not newline, all the way to the consumers. A newline-delimited contract
+# re-creates at the reader the exact split this function works to avoid at the
+# writer - `/private/tmp` is world-writable, and a directory may be called anything. Every gate is a reason to *skip*,
+# because the failure mode here is deleting work, not leaving a cache behind.
+#
+# Diagnostics go to stderr, never stdout. This function's stdout IS the deletion
+# list, so a log line written to it becomes a path somebody tries to remove.
+#
+# Deliberately not matched by name. A name pattern would have to guess which prefixes
+# agents use, and the twelve found on the reporting host shared no prefix at all.
+# A bare repository carries no `.git`; it IS the git directory. Checked by the three
+# entries git itself requires, so an ordinary directory that happens to hold a file
+# called `HEAD` does not qualify.
+_cc_dj_looks_bare() {
+  [ -f "$1/HEAD" ] && [ -d "$1/objects" ] && [ -d "$1/refs" ]
+}
+
+# Does any of these `HEAD` paths sit in a real bare repository?
+# Does any of these `HEAD` paths sit in a real bare repository? Reads a NUL-delimited
+# FILE, so a repository under a path containing a newline is confirmed as itself
+# rather than as fragments that happen to name nothing.
+_cc_dj_any_bare_parent() {
+  local h
+  while IFS= read -r -d '' h; do
+    [ -n "$h" ] || continue
+    _cc_dj_looks_bare "${h%/HEAD}" && return 0
+  done < "$1"
+  return 1
+}
+
+_cc_dj_stale_tmp_dirs() {
+  local root root_real d d_parent d_real held cwd recent listing repo_hit head_hits min_kb age roots=()
+  age="$CC_DJ_TMP_AGE_DAYS"
+  min_kb=$(( CC_DJ_TMP_MIN_MB * 1024 ))
+
+  # Read the fields rather than word-splitting an unquoted expansion: a configured
+  # root containing a space was split into two nonexistent roots and skipped in
+  # silence, which is the "clean machine" quiet this target exists to remove. The
+  # unquoted form was also subject to globbing.
+  local IFS=:
+  read -ra roots <<< "$CC_DJ_TMP_DIRS"
+  unset IFS
+
+  for root in ${roots[@]+"${roots[@]}"}; do
+    [ -n "$root" ] || continue
+    # Trailing slashes off, `/` kept. `find` emits children as `<root>/name` with a
+    # single separator, so a configured `/private/tmp/` made the direct-child pattern
+    # `/private/tmp//*` and every candidate was silently skipped - the report went
+    # quiet for a root that was perfectly fine, which is the failure this whole file
+    # is about.
+    while [ "${root%/}" != "$root" ] && [ "$root" != "/" ]; do root="${root%/}"; done
+    if [ ! -d "$root" ] || [ ! -r "$root" ]; then
+      echo "disk-janitor: temp root unusable, scanned nothing: $root" >&2
+      continue
+    fi
+    if ! _cc_dj_lsof_usable; then
+      echo "disk-janitor: lsof cannot report open files; skipped $root rather than assume nothing is held" >&2
+      continue
+    fi
+    # One lsof for the whole root rather than one per directory: `+D` walks the tree,
+    # and per-directory it is quadratic on exactly the hosts that need this most.
+    # `-F0n`: NUL-terminated fields, so a field cannot be split by its own content.
+    held="$(lsof -F0n +D "$root" 2>/dev/null | tr '\0' '\n' | sed -n 's/^n//p')"
+
+    # NUL-delimited, through a FILE, and every candidate re-checked afterwards.
+    #
+    # `/private/tmp` is world-writable and a directory name may contain a newline. A
+    # line-delimited listing split `$'\nDocuments'` into two candidates, the second
+    # of them the bare relative path `Documents` - which a manual run from $HOME
+    # would resolve against the wrong directory entirely, and whose open handles are
+    # of course absent from an lsof inventory taken over /private/tmp.
+    #
+    # A file rather than `listing="$(find … -print0)"`, because command substitution
+    # STRIPS NUL bytes: that version threw away the delimiters that made it safe and
+    # split on newlines again, exactly as before. The file keeps the NULs and keeps
+    # find's exit status, and both are load-bearing - one so a name cannot forge a
+    # second candidate, the other so a failed listing is not read as an empty root.
+    #
+    # The root listing also gets the same treatment as everything else here: a `find`
+    # that fails produces no directories, and "no directories" is indistinguishable
+    # from "nothing to clean" unless somebody says so.
+    # Resolved, and the resolved form is what gets enumerated. `find` defaults to
+    # `-P` and will not descend a symlink named on the command line, so a configured
+    # `/tmp` - which IS a symlink to `/private/tmp` on macOS, and the spelling most
+    # people would use - passed every directory check and then produced an empty
+    # listing. The report said there was nothing there. There was 7.9 GB.
+    root_real="$( (cd -P "$root" 2>/dev/null && pwd) || echo "$root" )"
+    root="$root_real"
+    listing="$(mktemp "${TMPDIR:-/tmp}/cc-dj-list.XXXXXX")" || {
+      echo "disk-janitor: could not create a work file, scanned nothing: $root" >&2
+      continue
+    }
+    if ! find "$root" -maxdepth 1 -mindepth 1 -type d -print0 >"$listing" 2>/dev/null; then
+      echo "disk-janitor: could not list temp root, scanned nothing: $root" >&2
+      rm -f "$listing"
+      continue
+    fi
+
+    while IFS= read -r -d '' d; do
+      [ -n "$d" ] || continue
+      # Belt and braces: whatever the traversal produced, act only on something that
+      # really is a direct child of the root we were asked to scan.
+      case "$d" in "$root"/*) ;; *) continue ;; esac
+      d_parent="$( (cd -P "$d/.." 2>/dev/null && pwd) || echo "" )"
+      [ "$d_parent" = "$root_real" ] || continue
+
+      # Any git repository anywhere in the candidate, and bare ones too.
+      #
+      # `-f "$d/.git"` matched a gitfile alone, so a plain clone - whose `.git` is a
+      # directory, and whose unpushed commits exist nowhere else - passed the one
+      # gate meant to catch it, while a linked worktree whose commits survive on a
+      # branch was caught. Backwards. `-e "$d/.git"` then fixed the clone but still
+      # only looked at the top level, so `/private/tmp/session/repo/.git` was invisible
+      # and the whole container went; and a bare repository has no `.git` at all.
+      #
+      # Bounded to depth 3: a scratch checkout parks its repository at the top or one
+      # or two levels down, and an unbounded walk here runs over every candidate on
+      # every check. A find that FAILS keeps the candidate, for the same reason as
+      # everywhere else in this function.
+      if ! repo_hit="$(find "$d" -maxdepth 3 -name .git -print -quit 2>/dev/null)"; then
+        echo "disk-janitor: could not scan for git repositories, kept: $d" >&2
+        continue
+      fi
+      [ -n "$repo_hit" ] && continue
+
+      # Bare repositories, at the top level and nested. A bare repo has no `.git` for
+      # the search above to find, and checking only `$d` missed `$d/session/repo.git`
+      # - an old, large, unheld candidate whose unique commits would go with it.
+      #
+      # Found by STRUCTURE, not by name. The `.git` suffix is a convention and
+      # nothing enforces it - `git init --bare repo` produces a perfectly ordinary
+      # `repo/`, which a name filter walks straight past. The search is for the `HEAD`
+      # file every git directory has, and each hit is confirmed by the three entries
+      # git actually requires, which is also what stops a stray file called HEAD from
+      # pinning a candidate forever.
+      _cc_dj_looks_bare "$d" && continue
+      # `-print0` into a file, for the same reason the root listing uses one: command
+      # substitution strips NULs, and `-print` alone lets a path split itself so the
+      # confirmation runs against fragments rather than against the repository.
+      head_hits="$(mktemp "${TMPDIR:-/tmp}/cc-dj-heads.XXXXXX")" || {
+          echo "disk-janitor: could not create a work file, kept: $d" >&2
+        continue
+      }
+      if ! find "$d" -maxdepth 4 -type f -name HEAD -print0 >"$head_hits" 2>/dev/null; then
+          echo "disk-janitor: could not scan for bare repositories, kept: $d" >&2
+        rm -f "$head_hits"
+        continue
+      fi
+      if _cc_dj_any_bare_parent "$head_hits"; then rm -f "$head_hits"; continue; fi
+      rm -f "$head_hits"
+
+      # Staleness is a property of the subtree, not of the directory entry. A
+      # directory's mtime advances only when its DIRECT entries change, so a
+      # container whose children are written to constantly still reads as stale.
+      # `/private/tmp/claude-501` on the reporting host is exactly that: the
+      # scratchpad root for every live session, its mtime moving only when a new
+      # project appears, 720 MB of in-use files that the top-level test called
+      # three days idle.
+      #
+      # `-mtime -N`, not `-newermt "-N days"`. POSIX `-mtime` works in BSD find, GNU
+      # find and bfs alike; the relative-timestamp form is a GNU extension that bfs
+      # - a drop-in `find` many developers have on PATH - rejects outright. Measured
+      # on the reporting host: the gate errored, printed nothing, and an empty result
+      # reads as "nothing recent here", which is the answer that authorises deletion.
+      # `/private/tmp/claude-501`, 720 MB of live session scratchpads, was left
+      # standing only by the lsof gate behind it.
+      #
+      # A find that FAILS keeps the directory. Empty output from a failed probe is
+      # not evidence that the tree is idle, and this is the check standing between a
+      # live tree and `rm -rf`.
+      if ! recent="$(find "$d" -mtime -"$age" -print -quit 2>/dev/null)"; then
+        echo "disk-janitor: could not test staleness, kept: $d" >&2
+        continue
+      fi
+      [ -n "$recent" ] && continue
+
+      # Prefix match on the literal string. `grep "^$d_real\(/\|$\)"` put an
+      # unescaped path into a regex: `/private/tmp/foo*` became `fo` + zero-or-more
+      # `o`, matched nothing, and a directory a process held open was emitted for
+      # deletion. `/private/tmp` is world-writable, so nothing constrains the names
+      # in it. `.`, `+` and `[1]` merely over-matched - wrong in the safe direction -
+      # but `*` and an unmatched `[` fail toward deleting.
+      # A name lsof would escape cannot be checked against its inventory, so it is
+      # never cleared. macOS lsof reports `weird<LF>name` as the eight characters
+      # `weird\nname`, so the comparison below never matches the real path and the
+      # directory reads as unheld. Nothing is deleted here any more, but a report
+      # that names a tree somebody is actively using is a report people stop reading.
+      case "$d" in
+        *[$'\n\t\r\\']*)
+          echo "disk-janitor: name cannot be matched against lsof output, kept: $d" >&2
+          continue ;;
+      esac
+      d_real="$( (cd -P "$d" 2>/dev/null && pwd) || echo "$d" )"
+      local skip=0
+      while IFS= read -r cwd; do
+        [ -n "$cwd" ] || continue
+        case "$cwd" in
+          "$d_real"|"$d_real"/*) skip=1; break ;;
+        esac
+      done <<EOF
+$held
+EOF
+      [ "$skip" -eq 1 ] && continue
+
+      [ "$(_cc_dj_du_kib "$d")" -ge "$min_kb" ] 2>/dev/null || continue
+      printf '%s\0' "$d"
+    done < "$listing"
+    rm -f "$listing"
+  done
+}
+
+_cc_dj_report_stale_tmp_dirs() {
+  local d n=0 kb=0
+  while IFS= read -r -d '' d; do
+    [ -n "$d" ] || continue
+    n=$(( n + 1 )); kb=$(( kb + $(_cc_dj_du_kib "$d") ))
+    _cc_dj_log "check: stale temp checkout ${d} ($(_cc_dj_du_bytes "$d") bytes)"
+  done < <(_cc_dj_stale_tmp_dirs)
+  [ "$n" -gt 0 ] && _cc_dj_log "check: ${n} stale temp checkout(s), $(( kb / 1024 )) MB — review them and remove by hand; --clean does not touch these"
+  return 0
 }
 
 _cc_dj_clean_dir() {

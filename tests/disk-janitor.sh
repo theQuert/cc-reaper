@@ -197,6 +197,12 @@ _run_dj() {
     export CC_DJ_STATE_DIR="$SANDBOX/state"
     export CC_DJ_DISK_MIN_PCT=15
     export CC_DJ_COOLDOWN_SECS=3600
+    # Never the machine's real /private/tmp. These runs exercise the cache targets,
+    # and letting them enumerate the host's temp directory made the result depend on
+    # whatever else was running - besides being slow and pointing a deletion path at
+    # somebody's live scratch space.
+    mkdir -p "$SANDBOX/tmp-empty"
+    export CC_DJ_TMP_DIRS="$SANDBOX/tmp-empty"
     # Create fixture cache dirs so rm -rf hits the sandbox
     mkdir -p "$FAKE_HOME/Library/Caches/com.spotify.client"
     mkdir -p "$FAKE_HOME/Library/Caches/com.todesktop.230313mzl4w4u92.ShipIt"
@@ -334,7 +340,12 @@ SAFE_SYS_PATH="/bin:/usr/bin:/usr/sbin:/sbin"
   mkdir -p "$FAKE_HOME/Library/Caches/com.spotify.client"
   mkdir -p "$FAKE_HOME/Library/Caches/com.todesktop.230313mzl4w4u92.ShipIt"
   mkdir -p "$FAKE_HOME/Library/Developer/CoreSimulator/Caches"
-  /bin/bash "$ROOT_DIR/shell/disk-janitor.sh" --clean
+  mkdir -p "$SANDBOX/tmp-empty"
+  export CC_DJ_TMP_DIRS="$SANDBOX/tmp-empty"
+  # `|| true`: --clean now exits non-zero when any target failed, and this scenario
+  # deliberately removes a tool. A skip is not a failure, but the guard keeps the
+  # suite from dying here if that ever changes.
+  /bin/bash "$ROOT_DIR/shell/disk-janitor.sh" --clean || true
 )
 
 expect_yes "clean: SKIP logged for missing bun" \
@@ -789,17 +800,357 @@ expect_no "dependencies: the probe PATH really has no python3" \
   env PATH="$NOPY" /bin/bash -c 'command -v python3 >/dev/null 2>&1' 
 
 NOPY_LOG="$SANDBOX/dj-nopython.log"
+mkdir -p "$SANDBOX/tmp-empty"
+# A sandbox temp root, and `|| true`. This run strips PATH to prove python3 is
+# absent, which also takes lsof with it - so the stale-temp scan correctly reports
+# itself blind and --clean now exits non-zero. That is the behaviour under test
+# elsewhere; here it must not take the suite down with it.
 env PATH="$NOPY" HOME="$FAKE_HOME" CC_DJ_TOOL_DIRS="" \
     FAKE_DF_FREE_PCT=80 FAKE_STAT_MTIME=0 \
     CC_DJ_LOG="$NOPY_LOG" CC_DJ_STATE_DIR="$SANDBOX/state" \
+    CC_DJ_TMP_DIRS="$SANDBOX/tmp-empty" \
     CC_DJ_DISK_MIN_PCT=15 CC_DJ_COOLDOWN_SECS=3600 \
-    /bin/bash "$DJ" --clean >/dev/null 2>&1
+    /bin/bash "$DJ" --clean >/dev/null 2>&1 || true
 
 expect_yes "dependencies: a missing python3 is logged as a SKIP" \
   bash -c 'grep -q "SKIP docker unreferenced volumes report (python3 not found)" "$1"' _ "$NOPY_LOG"
 
 expect_no "dependencies: a run missing python3 does not report skipped=0" \
   bash -c 'grep "clean: finished" "$1" | grep -q "skipped=0"' _ "$NOPY_LOG"
+
+# ---------------------------------------------------------------------------
+# Stale temp checkouts: every gate is a reason to SKIP
+# ---------------------------------------------------------------------------
+#
+# This is the only target here whose contents are somebody's abandoned work rather
+# than a rebuildable cache, so being wrong deletes work. Measured 2026-08-31 on one
+# host: twelve scratch checkouts, 484 MB to 1.3 GB, 5.7 GB in total, and no janitor
+# looked at /private/tmp at all.
+
+# ── the installer must not write through a symlinked hook destination ────────
+#
+# `cp src dst` follows a symlinked dst and rewrites the file it points at. This path
+# is a symlink into another repository on at least one machine, and installing here
+# silently modified that checkout - twice, the second time after the drift it caused
+# had already been found.
+# `launchctl` is stubbed, not just `HOME`. Overriding HOME alone does not isolate
+# the launchd domain: `bootout`/`bootstrap` are addressed as `gui/<uid>/<label>`, so
+# this test tore down the developer's REAL agents and replaced them with ones
+# pointing into a temporary home - which the sandbox then deleted. Measured on the
+# reporting host: after two runs, `gui/501/com.cc-reaper.disk-check` was loaded
+# against `/var/folders/.../inst-home/.cc-reaper/disk-janitor.sh`, a path that no
+# longer existed. The test that proves an installer does not damage things outside
+# its target must not damage things outside its target.
+INST_HOME="$SANDBOX/inst-home"
+mkdir -p "$INST_HOME/.claude/hooks"
+LC_STUB="$SANDBOX/stub-launchctl"
+mkdir -p "$LC_STUB"
+printf '#!/bin/sh\nexit 0\n' > "$LC_STUB/launchctl"
+chmod +x "$LC_STUB/launchctl"
+
+REAL_HOOK="$SANDBOX/other-repo-hook.sh"
+printf '#!/bin/sh\n# the other repository owns this\n' > "$REAL_HOOK"
+ln -sf "$REAL_HOOK" "$INST_HOME/.claude/hooks/stop-cleanup-orphans.sh"
+BEFORE_SUM="$(shasum "$REAL_HOOK" | cut -d" " -f1)"
+INST_OUT="$(printf 'b\n' | env PATH="$LC_STUB:$PATH" HOME="$INST_HOME" \
+  bash "$ROOT_DIR/install.sh" 2>&1 || true)"
+AFTER_SUM="$(shasum "$REAL_HOOK" | cut -d" " -f1)"
+
+expect_yes "install does not write through a symlinked stop-hook path" \
+  bash -c '[ "$1" = "$2" ]' _ "$BEFORE_SUM" "$AFTER_SUM"
+
+expect_yes "install says why it left the symlink alone" \
+  bash -c 'printf "%s\n" "$1" | grep -q "is a symlink to"' _ "$INST_OUT"
+
+# The stub is the point, so prove it was actually the thing standing in.
+expect_yes "the installer under test really used the stubbed launchctl" \
+  bash -c 'command -v launchctl >/dev/null && [ -x "$1/launchctl" ]' _ "$LC_STUB"
+
+printf "\n# Test group: stale temp checkouts\n"
+
+TMPT="$SANDBOX/tmproot"
+mkdir -p "$TMPT"
+# 2 MB fixtures against a 1 MB floor, not 200 MB against 100. Ten 200 MB fixtures
+# wrote about 2 GiB on every run of a suite this repository documents as lightweight,
+# on the same developer disks the janitor exists to protect. The gate under test is
+# `size >= floor`; the absolute numbers were never part of it.
+FIXTURE_KB=2048
+mkfile_kb() { dd if=/dev/zero of="$1" bs=1024 count="$2" >/dev/null 2>&1; }
+# Age the WHOLE subtree. Ageing only the directory entry is the defect under test:
+# a directory's mtime advances only when its direct entries change, so a container
+# full of files being written right now still reads as stale.
+age_tree() { find "$1" -exec touch -t 202001010000 {} + 2>/dev/null; }
+
+# Big and old throughout: the one thing that should be collected.
+mkdir -p "$TMPT/stale-checkout"
+mkfile_kb "$TMPT/stale-checkout/blob" "$FIXTURE_KB"
+age_tree "$TMPT/stale-checkout"
+
+# Old container, live child. This is `/private/tmp/claude-501` on the reporting
+# host: the scratchpad root for every running session, 720 MB, its own mtime moving
+# only when a new project appears. Files are written and closed, not held open, so
+# the lsof gate does not save it either.
+mkdir -p "$TMPT/live-container/session"
+mkfile_kb "$TMPT/live-container/session/blob" "$FIXTURE_KB"
+touch -t 202001010000 "$TMPT/live-container"
+
+# Old and big, but a linked worktree: git still has a record pointing here.
+mkdir -p "$TMPT/linked-worktree"
+mkfile_kb "$TMPT/linked-worktree/blob" "$FIXTURE_KB"
+echo "gitdir: /somewhere/.git/worktrees/x" > "$TMPT/linked-worktree/.git"
+age_tree "$TMPT/linked-worktree"
+
+# Old and big, and a plain clone: `.git` is a DIRECTORY, and its commits may exist
+# nowhere else. The gate keyed on `-f` matched only the gitfile above, so the one
+# case whose loss is unrecoverable was the one that passed through.
+mkdir -p "$TMPT/plain-clone/.git"
+mkfile_kb "$TMPT/plain-clone/blob" "$FIXTURE_KB"
+age_tree "$TMPT/plain-clone"
+
+# Old but small: below the floor, not worth being wrong about.
+mkdir -p "$TMPT/tiny"; mkfile_kb "$TMPT/tiny/blob" 16; age_tree "$TMPT/tiny"   # 16 KB: under the 1 MB floor
+
+# Big but fresh.
+mkdir -p "$TMPT/fresh"; mkfile_kb "$TMPT/fresh/blob" "$FIXTURE_KB"
+
+# A glob character in the name. `/private/tmp` is world-writable, so nothing
+# constrains these. Under the old `grep "^$path\(/\|$\)"` this became `fo` plus
+# zero-or-more `o`, matched nothing, and a HELD directory was offered for deletion.
+mkdir -p "$TMPT/glob*dir"; mkfile_kb "$TMPT/glob*dir/blob" "$FIXTURE_KB"; age_tree "$TMPT/glob*dir"
+
+enumerate() {
+  bash -c 'source "$1" >/dev/null 2>&1
+           CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 _cc_dj_stale_tmp_dirs' \
+    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT" 2>/dev/null
+}
+# Captured, then matched - never `enumerate | grep -q`. `grep -q` exits on its first
+# match and closes the pipe, the writer takes SIGPIPE, and under this file's
+# `set -o pipefail` the pipeline reports 141. Measured: every negative assertion in
+# this block was passing because of the signal rather than because the path was
+# absent, while every positive one failed with the enumerator emitting exactly what
+# it should. The file's own `file_has` helper carries the same warning.
+collects() {
+  local out
+  # `tr` because the enumerator's contract is NUL-delimited: a path may contain a
+  # newline, which is the whole point. These fixtures are named tamely, so
+  # translating for a substring test is fine - the newline case has its own,
+  # NUL-aware assertion below.
+  out="$(enumerate | tr '\0' '\n')"
+  printf '%s\n' "$out" | grep -qF -- "$1"
+}
+
+expect_yes "a large stale checkout is collected"                collects "stale-checkout"
+
+# The same root, spelled with a trailing slash. `find` emits `<root>/name`, so an
+# unnormalised `<root>/` made the direct-child pattern `<root>//*` and every
+# candidate was skipped without a word.
+collects_with_trailing_slash() {
+  local out
+  out="$(bash -c 'source "$1" >/dev/null 2>&1
+    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 _cc_dj_stale_tmp_dirs' \
+    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT/" 2>/dev/null | tr '\0' '\n')"
+  printf '%s\n' "$out" | grep -qF -- "stale-checkout"
+}
+expect_yes "a root spelled with a trailing slash still finds its children" \
+  collects_with_trailing_slash
+
+# A root that is a SYMLINK to the real directory - which is what `/tmp` is on macOS,
+# and the spelling most people would configure. `find` defaults to `-P` and will not
+# descend one named on the command line: every check passed and the listing came back
+# empty, so the report said there was nothing there.
+TMPT_LINK="$SANDBOX/tmproot-link"
+ln -sfn "$TMPT" "$TMPT_LINK"
+collects_through_symlink() {
+  local out
+  out="$(bash -c 'source "$1" >/dev/null 2>&1
+    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 _cc_dj_stale_tmp_dirs' \
+    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT_LINK" 2>/dev/null | tr '\0' '\n')"
+  printf '%s\n' "$out" | grep -qF -- "stale-checkout"
+}
+expect_yes "a symlinked root is followed, not silently skipped" collects_through_symlink
+expect_no  "an old container with a live child is NOT collected" collects "live-container"
+expect_no  "a registered linked worktree is never collected"    collects "linked-worktree"
+expect_no  "a plain clone is never collected"                   collects "plain-clone"
+expect_no  "a directory under the size floor is not collected"  collects "/tiny"
+expect_no  "a freshly touched directory is not collected"       collects "/fresh"
+
+# ── the enumerator's stdout is a deletion list, so nothing else may go there ──
+# In this shell, not `bash -c`: a fresh shell has never seen `enumerate`, so the
+# loop read nothing and the assertion passed on an empty list.
+check_only_dirs() {
+  local l tmpf
+  tmpf="$(mktemp)" || return 1
+  enumerate > "$tmpf"
+  while IFS= read -r -d '' l; do
+    [ -n "$l" ] || continue
+    [ -d "$l" ] || { rm -f "$tmpf"; return 1; }
+  done < "$tmpf"
+  rm -f "$tmpf"
+}
+expect_yes "every emitted line is an existing directory" check_only_dirs
+
+# ── a root that cannot be used must say so, and collect nothing ──────────────
+#
+# Two traps this block already fell into, both of which made every assertion here
+# fail for reasons unrelated to the code under test:
+#
+#   - `bash -c '<script>' "$path"` puts `$path` in $0, so `source "$0"` makes the
+#     sourced file see BASH_SOURCE[0] == $0, conclude it was executed rather than
+#     sourced, and run its own entry point instead of defining functions. `_` goes
+#     in $0 and the real path in $1.
+#   - `expect_yes ... bash -c '<uses a helper>'` runs a fresh shell that has never
+#     seen the helper. Assertions are plain functions, invoked directly.
+dj_run() {   # <extra-PATH|""> <root> <out|err>
+  local extra="$1" root="$2" stream="$3"
+  if [ "$stream" = err ]; then
+    PATH="${extra:+$extra:}$PATH" bash -c 'source "$1" >/dev/null 2>&1
+      CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 _cc_dj_stale_tmp_dirs' \
+      _ "$ROOT_DIR/shell/disk-janitor.sh" "$root" 2>&1 >/dev/null
+  else
+    PATH="${extra:+$extra:}$PATH" bash -c 'source "$1" >/dev/null 2>&1
+      CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 _cc_dj_stale_tmp_dirs' \
+      _ "$ROOT_DIR/shell/disk-janitor.sh" "$root" 2>/dev/null
+  fi
+}
+
+# ── a root that cannot be used must say so, and collect nothing ──────────────
+unusable_root_is_named() { local o; o="$(dj_run "" "$SANDBOX/no-such-root" err)"; printf '%s\n' "$o" | grep -q "unusable"; }
+expect_yes "an unusable root is named on stderr, not passed over in silence" \
+  unusable_root_is_named
+
+# ── a broken lsof must never read as "nothing is held" ───────────────────────
+#
+# This is what let the dead guard ship green: with a working lsof both branches
+# behave identically, so only a stubbed failure can tell them apart.
+LSOF_STUB="$SANDBOX/stub-lsof"
+mkdir -p "$LSOF_STUB"
+printf '#!/bin/sh\nexit 127\n' > "$LSOF_STUB/lsof"
+chmod +x "$LSOF_STUB/lsof"
+
+broken_lsof_collects_something() { local o; o="$(dj_run "$LSOF_STUB" "$TMPT" out | tr '\0' '\n')"; [ -n "$o" ]; }
+broken_lsof_explains() { local o; o="$(dj_run "$LSOF_STUB" "$TMPT" err)"; printf '%s\n' "$o" | grep -q "lsof cannot report"; }
+broken_lsof_collects_something_with_real_lsof() { local o; o="$(dj_run "" "$TMPT" out | tr '\0' '\n')"; [ -n "$o" ]; }
+
+# ── a find that cannot answer must keep, not delete ──────────────────────────
+#
+# The staleness gate used `-newermt "-N days"`, a GNU extension. This host's `find`
+# is bfs, which rejects it: the gate errored, emitted nothing, and empty read as
+# "nothing recent here" - the answer that authorises deletion. Only the lsof gate
+# behind it kept 720 MB of live session scratchpads. A stub that fails every
+# invocation is the only way to tell a working probe from a silent one.
+FIND_STUB="$SANDBOX/stub-find"
+mkdir -p "$FIND_STUB"
+printf '#!/bin/sh\necho "find: unrecognised primary" >&2\nexit 1\n' > "$FIND_STUB/find"
+chmod +x "$FIND_STUB/find"
+
+broken_find_collects_something() { local o; o="$(dj_run "$FIND_STUB" "$TMPT" out | tr '\0' '\n')"; [ -n "$o" ]; }
+broken_find_explains()           { local o; o="$(dj_run "$FIND_STUB" "$TMPT" err)"; printf '%s\n' "$o" | grep -q "could not"; }
+
+# ── git repositories, however they are shaped or wherever they sit ───────────
+mkdir -p "$TMPT/nested-repo/inner/.git"
+mkfile_kb "$TMPT/nested-repo/blob" "$FIXTURE_KB"
+age_tree "$TMPT/nested-repo"
+
+mkdir -p "$TMPT/bare-repo/objects" "$TMPT/bare-repo/refs"
+: > "$TMPT/bare-repo/HEAD"
+mkfile_kb "$TMPT/bare-repo/blob" "$FIXTURE_KB"
+age_tree "$TMPT/bare-repo"
+
+expect_no "a repository nested inside a candidate protects it" collects "nested-repo"
+expect_no "a bare repository is recognised without a .git"     collects "bare-repo"
+
+# A directory that merely holds a file called HEAD is not a bare repository.
+mkdir -p "$TMPT/not-bare"; : > "$TMPT/not-bare/HEAD"
+mkfile_kb "$TMPT/not-bare/blob" "$FIXTURE_KB"; age_tree "$TMPT/not-bare"
+expect_yes "a stray HEAD file does not make a directory a repository" collects "not-bare"
+
+# A bare repository BELOW the top level: no `.git` for the name search to find, and
+# `_cc_dj_looks_bare "$d"` only ever looked at the candidate itself.
+mkdir -p "$TMPT/nested-bare/session/repo.git/objects" "$TMPT/nested-bare/session/repo.git/refs"
+: > "$TMPT/nested-bare/session/repo.git/HEAD"
+mkfile_kb "$TMPT/nested-bare/blob" "$FIXTURE_KB"
+age_tree "$TMPT/nested-bare"
+expect_no "a bare repository nested inside a candidate protects it" collects "nested-bare"
+
+# A nested bare repository NOT named `*.git`. `git init --bare repo` produces an
+# ordinary `repo/`, which a name filter walks straight past.
+mkdir -p "$TMPT/nested-bare-plain/session/repo/objects" "$TMPT/nested-bare-plain/session/repo/refs"
+: > "$TMPT/nested-bare-plain/session/repo/HEAD"
+mkfile_kb "$TMPT/nested-bare-plain/blob" "$FIXTURE_KB"
+age_tree "$TMPT/nested-bare-plain"
+expect_no "a nested bare repo without a .git suffix protects it" collects "nested-bare-plain"
+
+# A held directory whose name lsof cannot represent. macOS lsof ESCAPES a newline
+# rather than emitting it, so the reported path never equals the real one and the
+# literal comparison reads "nothing holds this" - which, with deletion enabled, is
+# the answer that removes a tree somebody has open.
+NLHELD="$TMPT/$(printf 'held\nname')"
+mkdir -p "$NLHELD"
+mkfile_kb "$NLHELD/blob" "$FIXTURE_KB"
+age_tree "$NLHELD"
+expect_no "a name lsof cannot represent is never collected" collects "held"
+
+# A function, not `bash -c`: a fresh shell has never seen `dj_run`, so the assertion
+# would pass or fail on the helper being missing rather than on the message. This
+# file has now made that mistake twice.
+says_why_lsof_kept_it() {
+  local o; o="$(dj_run "" "$TMPT" err)"
+  printf '%s\n' "$o" | grep -q "cannot be matched against lsof"
+}
+expect_yes "and it says why it kept it" says_why_lsof_kept_it
+
+# A newline in a directory name. `/private/tmp` is world-writable, and a
+# line-delimited listing split this into two candidates - the second of them the
+# bare relative path `Documents`.
+NL_DIR="$TMPT/$(printf 'weird\nDocuments')"
+mkdir -p "$NL_DIR"
+mkfile_kb "$NL_DIR/blob" "$FIXTURE_KB"
+age_tree "$NL_DIR"
+only_absolute_children() {
+  local l tmpf root_real
+  # The enumerator resolves its root before enumerating - it has to, or a symlinked
+  # `/tmp` yields nothing - so the paths it emits are in resolved form and comparing
+  # them against the unresolved `$TMPT` fails on spelling rather than on substance.
+  root_real="$( (cd -P "$TMPT" && pwd) )"
+  tmpf="$(mktemp)" || return 1
+  enumerate > "$tmpf"
+  while IFS= read -r -d '' l; do
+    [ -n "$l" ] || continue
+    case "$l" in "$root_real"/*) ;; *) rm -f "$tmpf"; return 1 ;; esac
+  done < "$tmpf"
+  rm -f "$tmpf"
+}
+expect_yes "a newline in a name cannot produce a candidate outside the root" \
+  only_absolute_children
+
+# The two blind-clean assertions that stood here went with the deletion path they
+# guarded: `_cc_dj_clean_stale_tmp_dirs` no longer exists, and `--check` reports
+# rather than returning a status for anyone to act on. The enumerator gates they
+# exercised are still covered above, from the reporting side.
+
+
+expect_no  "a find that fails yields no deletion candidates" broken_find_collects_something
+expect_yes "a find that fails says why it kept them"         broken_find_explains
+
+expect_no  "a broken lsof does not yield deletion candidates" broken_lsof_collects_something
+expect_yes "a broken lsof says why it collected nothing"      broken_lsof_explains
+
+# Calibration: the stub must be what changes the answer, not something else.
+expect_yes "the same root DOES yield candidates with a working lsof" \
+  broken_lsof_collects_something_with_real_lsof
+exec 9<"$TMPT/stale-checkout/blob"
+expect_no "a directory a live process holds open is not collected" collects "stale-checkout"
+exec 9<&-
+
+# A held directory whose name contains a glob character. The regex form matched
+# nothing here and emitted it for deletion; a literal prefix comparison does not.
+exec 8<"$TMPT/glob*dir/blob"
+expect_no "a held directory with a glob character in its name is not collected" \
+  collects "glob*dir"
+exec 8<&-
+expect_yes "that same directory IS collected once nothing holds it" \
+  collects "glob*dir"
+
 
 # ---------------------------------------------------------------------------
 # Cleanup

@@ -27,8 +27,18 @@ EOF
 
 # ─── Config defaults ──────────────────────────────────────────────────────────
 
+# Colon-separated, because one root was never enough and the single default was
+# wrong on the machine that reported this: `~/Documents/GitHub` did not exist, so
+# discovery found no repositories, said "no repos found", and exited 0 - the same
+# output and the same status as a machine with nothing to clean. 34 GB of stale
+# worktrees sat under `~/Documents` and `~/GitHub` throughout.
+_cc_wj_roots() {
+  printf '%s\n' "${CC_WJ_ROOT:-$HOME/Documents/GitHub:$HOME/GitHub:$HOME/Documents}" | tr ':' '\n'
+}
+
+# Back-compat for anything sourcing the old single-root helper.
 _cc_wj_root() {
-  echo "${CC_WJ_ROOT:-$HOME/Documents/GitHub}"
+  _cc_wj_roots | head -1
 }
 
 _cc_wj_log() {
@@ -85,18 +95,51 @@ _cc_wj_log_write() {
 # ─── Repo discovery ───────────────────────────────────────────────────────────
 
 # Emit one path per line: each directory directly under root that is a git repo
-_cc_wj_discover_repos() {
+# Sets CC_WJ_BLIND=1 when a configured root exists but cannot be read. A root that
+# is simply absent is not an error - a default list naming three plausible locations
+# will always miss some - but one that is there and denied means this run swept less
+# than it was asked to, and that has to reach the exit status. Under launchd on macOS
+# the usual cause is TCC: `~/Documents`, `~/Desktop` and `~/Downloads` need a Full
+# Disk Access grant for the program in the plist, and without it every call is denied
+# while the run still reports normally.
+# Emit one line per configured root that exists and cannot be read. A root that is
+# simply absent is not an error - a default list naming three plausible locations will
+# always miss some - but one that is there and denied means this run swept less than it
+# was asked to. Under launchd on macOS the usual cause is TCC: `~/Documents`,
+# `~/Desktop` and `~/Downloads` need a Full Disk Access grant for the program in the
+# plist, and without it every call is denied while the run reports normally.
+#
+# Called from `_cc_wj_run` rather than reported by `_cc_wj_discover_repos`: that one is
+# consumed through a process substitution, so a flag it sets is set in a child and the
+# caller never sees it.
+_cc_wj_unreadable_roots() {
   local root
-  root=$(_cc_wj_root)
-  if [ ! -d "$root" ]; then
-    return
-  fi
-  # Use find at depth 1: repos have a .git entry (file for worktrees, dir for real repos)
-  find "$root" -maxdepth 1 -mindepth 1 -type d | while IFS= read -r d; do
-    if [ -e "$d/.git" ]; then
-      echo "$d"
-    fi
-  done
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    [ -d "$root" ] || continue
+    # Mode bits are a cheap pre-filter, not the answer: TCC can deny enumeration
+    # after they say yes, an ACL can block listing, and permissions can change
+    # between the two probes. So the question is asked the way discovery asks it -
+    # by listing - and a listing that fails marks the root blind. Piped straight
+    # into a `while`, that failure produced an empty list indistinguishable from a
+    # root holding no repositories, and the run reported success.
+    { [ -r "$root" ] && [ -x "$root" ]; } || { echo "$root"; continue; }
+    find "$root" -maxdepth 1 -mindepth 1 -type d >/dev/null 2>&1 || echo "$root"
+  done < <(_cc_wj_roots)
+}
+
+_cc_wj_discover_repos() {
+  local root d
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    [ -d "$root" ] && [ -r "$root" ] && [ -x "$root" ] || continue
+    # Use find at depth 1: repos have a .git entry (file for worktrees, dir for real repos)
+    find "$root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | while IFS= read -r d; do
+      if [ -e "$d/.git" ]; then
+        echo "$d"
+      fi
+    done
+  done < <(_cc_wj_roots)
 }
 
 # ─── Active-process detection ─────────────────────────────────────────────────
@@ -190,7 +233,15 @@ _cc_wj_emit_wt_block() {
   if [ ! -d "$wt" ]; then
     printf "%s\t%s\t%s\t%s\t%s\n" "$wt" "${br:-?}" "MISSING" "?" "no_remote"
   else
-    dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    # `--ignored`, because `git worktree remove` deletes ignored content along with
+    # the checkout and plain `--porcelain` cannot see any of it. Without this the
+    # "dirty" gate was blind to exactly the files nothing can rebuild - a `.env`, a
+    # key, a local database - while reporting the worktree as clean.
+    #
+    # Discounting is then what keeps the gate usable rather than absolute: measured
+    # on the reporting host, 28 of 29 otherwise-removable worktrees carried ignored
+    # content and every one of them was a package or build cache.
+    dirty=$(_cc_wj_undiscounted_count "$wt")
     # Resolve remote SHA once; pass to both helpers to avoid double rev-parse
     remote_sha=""
     if [ -n "${br:-}" ] && [ "$br" != "(detached)" ]; then
@@ -260,6 +311,67 @@ _cc_wj_list_worktrees() {
   fi
 }
 
+# ─── Ignored content: what a removal would take with it ──────────────────────
+
+# Caches a documented command rebuilds. Kept deliberately short: an entry here is a
+# claim that losing the directory is safe, and the default for anything not named is
+# to keep the worktree, which is the direction that cannot lose work.
+CC_WJ_REGENERABLE="${CC_WJ_REGENERABLE:-node_modules .next .turbo .parcel-cache .svelte-kit .nuxt .astro .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .gradle .nyc_output coverage playwright-report test-results .wrangler-dist}"
+# `.superpowers` is deliberately absent too: it holds brainstorm mockups, SDD
+# ledgers, briefs, reports and review packages - a record of decisions, which no
+# command regenerates.
+# Four names came off this list rather than onto it, because an entry here is a claim
+# that losing the directory is safe:
+#   .wrangler  - `.wrangler/state` is local D1, KV, R2 and Durable Object data. A
+#                developer's database, not a cache; nothing rebuilds it. The name
+#                looks like tooling scaffolding, which is how it got in.
+#   dist/build/target - conventionally build output and usually regenerable, but the
+#                names are generic enough to be anything, and this list authorises
+#                deleting the whole worktree when only its entries remain.
+# `.wrangler-dist` stays: that one really is build output.
+# The same claim for ignored entries that are not whole directories. `--porcelain`
+# gives a trailing slash to a directory and to nothing else, so a generated file and
+# a symlink pointing at a cache both arrive shaped like a hand-written `.env` and a
+# directory-keyed list can never reach either.
+CC_WJ_REGENERABLE_FILES="${CC_WJ_REGENERABLE_FILES:-next-env.d.ts tsconfig.tsbuildinfo .eslintcache}"
+
+# Count the entries a removal would destroy that nothing is known to rebuild.
+# A `git status` that FAILS is not a clean worktree: read into a variable so an
+# unreadable repository is distinguishable from an empty one, and answered with a
+# count that keeps the worktree rather than with zero.
+_cc_wj_undiscounted_count() {
+  # `wt_status`, not `status`: this file advertises itself as sourceable, and in zsh
+  # `status` is READ-ONLY. `local status` aborts the function before git runs, the
+  # dirty field comes back empty, the tab-separated inventory line shifts by one -
+  # and `--apply` then classifies a worktree holding ignored local data as REMOVABLE
+  # and reaches the force-removal fallback. The trap is in CLAUDE.md; this is what it
+  # looks like when it fires.
+  local wt="$1" wt_status line rest base n=0
+  wt_status="$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" || { echo 1; return; }
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      '!! '*) ;;
+      *) n=$((n + 1)); continue ;;   # tracked change or untracked file: real work
+    esac
+    rest="${line#!! }"
+    rest="${rest%/}"
+    base="${rest##*/}"
+    case "$line" in
+      *'/') case " $CC_WJ_REGENERABLE " in *" $base "*) continue ;; esac ;;
+      *)
+        if [ -L "$wt/$rest" ]; then
+          case " $CC_WJ_REGENERABLE " in *" $base "*) continue ;; esac
+        fi
+        case " $CC_WJ_REGENERABLE_FILES " in *" $base "*) continue ;; esac ;;
+    esac
+    n=$((n + 1))
+  done <<EOF
+$wt_status
+EOF
+  echo "$n"
+}
+
 # ─── Classification ───────────────────────────────────────────────────────────
 
 # Print KEEP(<reason>) or REMOVABLE
@@ -268,6 +380,7 @@ _cc_wj_classify() {
   local dirty="$2"    # integer or "MISSING"
   local active="$3"   # "yes" or "no"
   local lsof_ok="$4"  # "yes" or "no" — "no" means lsof failed → conservative
+  local branch="${5:-}"      # branch name, or "(detached)" — "" keeps the old behaviour
 
   if [ "$dirty" = "MISSING" ]; then
     echo "KEEP(missing-dir)"
@@ -280,12 +393,22 @@ _cc_wj_classify() {
   fi
 
   if [ "$dirty" -gt 0 ] 2>/dev/null; then
-    echo "KEEP(dirty=$dirty)"
+    echo "KEEP(unrebuildable=$dirty)"
     return
   fi
 
   if [ "$active" = "yes" ]; then
     echo "KEEP(active-session)"
+    return
+  fi
+
+  # Removal takes the checkout and leaves the branch, so commits on a branch survive
+  # it whether or not a remote has them - unpushed is not the hazard here. A detached
+  # HEAD is: nothing references those commits once the worktree is gone, and the next
+  # gc takes them. This script never deletes branches, so that is the single case
+  # where its one irreversible action is actually irreversible.
+  if [ "$branch" = "(detached)" ]; then
+    echo "KEEP(detached-head)"
     return
   fi
 
@@ -409,6 +532,23 @@ _cc_wj_run() {
     esac
   done
 
+  # Asked once, before discovery, so the reason a scan came back empty is on the
+  # record next to the emptiness rather than inferred from it.
+  #
+  # Only when discovery is what answers the question. With `--repo` the caller named
+  # the repositories, the roots are never read, and failing the run over a default
+  # root nobody asked about made every targeted run on a TCC host exit 1 - training
+  # the operator to ignore the one signal this whole change is built on.
+  local blind=0 blind_root
+  if [ "${#explicit_repos[@]}" -eq 0 ]; then
+  while IFS= read -r blind_root; do
+    [ -n "$blind_root" ] || continue
+    echo "worktree-janitor: root exists but cannot be read, scanned nothing: $blind_root" >&2
+    echo "worktree-janitor:   (under launchd, a path in ~/Documents, ~/Desktop or ~/Downloads needs Full Disk Access)" >&2
+    blind=1
+  done < <(_cc_wj_unreadable_roots)
+  fi
+
   # Determine repo list
   local repos=()
   if [ "${#explicit_repos[@]}" -gt 0 ]; then
@@ -420,7 +560,10 @@ _cc_wj_run() {
   fi
 
   if [ "${#repos[@]}" -eq 0 ]; then
-    echo "worktree-janitor: no repos found under $(_cc_wj_root)" >&2
+    echo "worktree-janitor: no repos found under $(_cc_wj_roots | paste -sd, -)" >&2
+    # Blind is not idle, and the two used to print the same line and return the same
+    # status. A scheduled run leaves nothing behind but that status.
+    [ "$blind" -eq 1 ] && return 1
     return 0
   fi
 
@@ -505,7 +648,7 @@ _cc_wj_run() {
       fi
 
       local classification
-      classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$lsof_ok")
+      classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$lsof_ok" "$branch")
 
       printf "  WORKTREE  %s\n" "$wt_path"
       printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s\n" \
@@ -581,6 +724,11 @@ _cc_wj_run() {
   if [ "$apply" -eq 1 ] && [ "$total_reclaimed" -gt 0 ]; then
     _cc_wj_maybe_notify "$total_reclaimed"
   fi
+
+  # Finding repositories under one root does not make a denial on another harmless:
+  # the worktrees under the denied one were never even listed.
+  [ "$blind" -eq 1 ] && return 1
+  return 0
 }
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
