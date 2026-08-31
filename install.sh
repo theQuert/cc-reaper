@@ -98,8 +98,21 @@ fi
 
 HOOKS_DIR="$HOME_DIR/.claude/hooks"
 mkdir -p "$HOOKS_DIR"
-cp "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$HOOKS_DIR/"
-chmod +x "$HOOKS_DIR/stop-cleanup-orphans.sh"
+# Never through a symlink. This path is a symlink into another repository on at
+# least one machine, and `cp` follows it: installing cc-reaper silently rewrote a
+# file inside somebody else's checkout, leaving it dirty and replacing whatever
+# version lived there with this one. Measured on the reporting host, twice - the
+# second time by this very installer, after the content drift it caused had already
+# been found and fixed.
+_CC_HOOK_DEST="$HOOKS_DIR/stop-cleanup-orphans.sh"
+if [ -L "$_CC_HOOK_DEST" ]; then
+  echo "  Stop hook at $_CC_HOOK_DEST is a symlink to $(readlink "$_CC_HOOK_DEST")."
+  echo "  Left alone: writing through it would modify that file in place. Update it"
+  echo "  there, or remove the symlink and re-run this installer."
+else
+  cp "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$_CC_HOOK_DEST"
+  chmod +x "$_CC_HOOK_DEST"
+fi
 
 # Update global settings.json
 SETTINGS_FILE="$HOME_DIR/.claude/settings.json"

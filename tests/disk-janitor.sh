@@ -833,6 +833,28 @@ expect_no "dependencies: a run missing python3 does not report skipped=0" \
 # host: twelve scratch checkouts, 484 MB to 1.3 GB, 5.7 GB in total, and no janitor
 # looked at /private/tmp at all.
 
+# ── the installer must not write through a symlinked hook destination ────────
+#
+# `cp src dst` follows a symlinked dst and rewrites the file it points at. This path
+# is a symlink into another repository on at least one machine, and installing here
+# silently modified that checkout - twice, the second time after the drift it caused
+# had already been found.
+INST_HOME="$SANDBOX/inst-home"
+mkdir -p "$INST_HOME/.claude/hooks"
+REAL_HOOK="$SANDBOX/other-repo-hook.sh"
+printf '#!/bin/sh\n# the other repository owns this\n' > "$REAL_HOOK"
+ln -sf "$REAL_HOOK" "$INST_HOME/.claude/hooks/stop-cleanup-orphans.sh"
+BEFORE_SUM="$(shasum "$REAL_HOOK" | cut -d" " -f1)"
+printf 'b\n' | env HOME="$INST_HOME" bash "$ROOT_DIR/install.sh" >/dev/null 2>&1 || true
+AFTER_SUM="$(shasum "$REAL_HOOK" | cut -d" " -f1)"
+
+expect_yes "install does not write through a symlinked stop-hook path" \
+  bash -c '[ "$1" = "$2" ]' _ "$BEFORE_SUM" "$AFTER_SUM"
+
+expect_yes "install says why it left the symlink alone" \
+  bash -c 'printf "b\n" | env HOME="$1" bash "$2" 2>&1 | grep -q "is a symlink to"' \
+    _ "$INST_HOME" "$ROOT_DIR/install.sh"
+
 printf "\n# Test group: stale temp checkouts\n"
 
 TMPT="$SANDBOX/tmproot"
