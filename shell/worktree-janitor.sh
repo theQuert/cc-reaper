@@ -509,13 +509,20 @@ _cc_wj_run() {
 
   # Asked once, before discovery, so the reason a scan came back empty is on the
   # record next to the emptiness rather than inferred from it.
+  #
+  # Only when discovery is what answers the question. With `--repo` the caller named
+  # the repositories, the roots are never read, and failing the run over a default
+  # root nobody asked about made every targeted run on a TCC host exit 1 - training
+  # the operator to ignore the one signal this whole change is built on.
   local blind=0 blind_root
+  if [ "${#explicit_repos[@]}" -eq 0 ]; then
   while IFS= read -r blind_root; do
     [ -n "$blind_root" ] || continue
     echo "worktree-janitor: root exists but cannot be read, scanned nothing: $blind_root" >&2
     echo "worktree-janitor:   (under launchd, a path in ~/Documents, ~/Desktop or ~/Downloads needs Full Disk Access)" >&2
     blind=1
   done < <(_cc_wj_unreadable_roots)
+  fi
 
   # Determine repo list
   local repos=()

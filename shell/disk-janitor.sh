@@ -42,6 +42,8 @@ CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
 # schedule a developer machine reaches - the periodic scripts are off by default and
 # the boot-time sweep does not run on a host that stays up.
 CC_DJ_TMP_DIRS="${CC_DJ_TMP_DIRS:-/private/tmp}"
+# Applied to the whole SUBTREE, not to the top-level directory entry - see the
+# staleness gate for why the difference is the whole finding.
 CC_DJ_TMP_AGE_DAYS="${CC_DJ_TMP_AGE_DAYS:-3}"
 # Below this a directory is not worth the risk of being wrong about it.
 CC_DJ_TMP_MIN_MB="${CC_DJ_TMP_MIN_MB:-100}"
@@ -295,40 +297,124 @@ _cc_dj_du_kib() {
 #
 # Deliberately not matched by name. A name pattern would have to guess which prefixes
 # agents use, and the twelve found here shared no prefix at all.
+# Is lsof usable at all? Its exit status cannot answer that: measured on macOS,
+# `lsof -Fn +D` returns 1 both for a populated directory (42 result lines) and for an
+# empty one, so a status check either skips always or never. Ask it something whose
+# answer is known instead - this process has a working directory - and treat an lsof
+# that cannot report that as an lsof that cannot report anything.
+#
+# A probe that has not been shown to see a positive case cannot be trusted when it
+# reports nothing, and "nothing is held" is the single answer here that authorises
+# `rm -rf`.
+_cc_dj_lsof_usable() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -p "$$" -d cwd -Fn 2>/dev/null | grep -q '^n/' || return 1
+  return 0
+}
+
+# Emit one path per line: a directory directly under a temp root that is stale,
+# large, unheld, and holds no git repository. Every gate is a reason to *skip*,
+# because the failure mode here is deleting work, not leaving a cache behind.
+#
+# Diagnostics go to stderr, never stdout. This function's stdout IS the deletion
+# list, so a log line written to it becomes a path somebody tries to remove.
+#
+# Deliberately not matched by name. A name pattern would have to guess which prefixes
+# agents use, and the twelve found on the reporting host shared no prefix at all.
 _cc_dj_stale_tmp_dirs() {
-  local root d d_real held min_kb age
+  local root d d_real held cwd recent listing min_kb age roots=()
   age="$CC_DJ_TMP_AGE_DAYS"
   min_kb=$(( CC_DJ_TMP_MIN_MB * 1024 ))
-  # One lsof for the whole root rather than one per directory: `lsof +D` walks the
-  # tree, and per-directory it is quadratic on exactly the hosts that need this most.
-  # A failed lsof yields no lines, and no lines must not read as "nothing is held" -
-  # that is the one conclusion authorising deletion - so failure skips the root.
-  for root in $(printf '%s' "$CC_DJ_TMP_DIRS" | tr ':' ' '); do
-    [ -d "$root" ] && [ -r "$root" ] || continue
-    if ! held="$(lsof -Fn +D "$root" 2>/dev/null | sed -n 's/^n//p')"; then
-      _cc_dj_skip "stale temp checkouts under $root (lsof could not report open files)"
+
+  # Read the fields rather than word-splitting an unquoted expansion: a configured
+  # root containing a space was split into two nonexistent roots and skipped in
+  # silence, which is the "clean machine" quiet this target exists to remove. The
+  # unquoted form was also subject to globbing.
+  local IFS=:
+  read -ra roots <<< "$CC_DJ_TMP_DIRS"
+  unset IFS
+
+  for root in ${roots[@]+"${roots[@]}"}; do
+    [ -n "$root" ] || continue
+    if [ ! -d "$root" ] || [ ! -r "$root" ]; then
+      echo "disk-janitor: temp root unusable, scanned nothing: $root" >&2
       continue
     fi
+    if ! _cc_dj_lsof_usable; then
+      echo "disk-janitor: lsof cannot report open files; skipped $root rather than assume nothing is held" >&2
+      continue
+    fi
+    # One lsof for the whole root rather than one per directory: `+D` walks the tree,
+    # and per-directory it is quadratic on exactly the hosts that need this most.
+    held="$(lsof -Fn +D "$root" 2>/dev/null | sed -n 's/^n//p')"
+
+    # The root listing gets the same treatment as everything else here: a `find`
+    # that fails produces no directories, and "no directories" is indistinguishable
+    # from "nothing to clean" unless somebody says so.
+    if ! listing="$(find "$root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)"; then
+      echo "disk-janitor: could not list temp root, scanned nothing: $root" >&2
+      continue
+    fi
+
     while IFS= read -r d; do
       [ -n "$d" ] || continue
-      # A gitfile, not a directory, means a linked worktree: its repository still has a
-      # record pointing here, and removing the tree behind git's back leaves that record
-      # dangling. Those belong to worktree-janitor, which knows how to retire one.
-      [ -f "$d/.git" ] && continue
-      # Anything a live process has open, including the session scratchpads every
-      # running agent writes into.
+
+      # Any git repository, not only a linked worktree. `-f` matched a gitfile alone,
+      # so a plain `git clone` - whose `.git` is a directory, and whose unpushed
+      # commits exist nowhere else - sailed through the one gate meant to catch it,
+      # while a linked worktree whose commits survive on a branch was protected.
+      # Backwards. Worktrees belong to worktree-janitor, which knows how to retire
+      # one; a clone belongs to whoever made it.
+      [ -e "$d/.git" ] && continue
+
+      # Staleness is a property of the subtree, not of the directory entry. A
+      # directory's mtime advances only when its DIRECT entries change, so a
+      # container whose children are written to constantly still reads as stale.
+      # `/private/tmp/claude-501` on the reporting host is exactly that: the
+      # scratchpad root for every live session, its mtime moving only when a new
+      # project appears, 720 MB of in-use files that the top-level test called
+      # three days idle.
       #
-      # Compared through `cd -P`, because the two sides do not agree on the spelling
-      # of the same path: on macOS lsof reports `/private/var/folders/...` while find
-      # yields the `/var/folders/...` symlink it was given, and `/private/tmp` against
-      # `/tmp` is the same trap. A prefix match on the raw strings never fires, so
-      # every held directory reads as unheld - which is the one answer that authorises
-      # deletion.
+      # `-mtime -N`, not `-newermt "-N days"`. POSIX `-mtime` works in BSD find, GNU
+      # find and bfs alike; the relative-timestamp form is a GNU extension that bfs
+      # - a drop-in `find` many developers have on PATH - rejects outright. Measured
+      # on the reporting host: the gate errored, printed nothing, and an empty result
+      # reads as "nothing recent here", which is the answer that authorises deletion.
+      # `/private/tmp/claude-501`, 720 MB of live session scratchpads, was left
+      # standing only by the lsof gate behind it.
+      #
+      # A find that FAILS keeps the directory. Empty output from a failed probe is
+      # not evidence that the tree is idle, and this is the check standing between a
+      # live tree and `rm -rf`.
+      if ! recent="$(find "$d" -mtime -"$age" -print -quit 2>/dev/null)"; then
+        echo "disk-janitor: could not test staleness, kept: $d" >&2
+        continue
+      fi
+      [ -n "$recent" ] && continue
+
+      # Prefix match on the literal string. `grep "^$d_real\(/\|$\)"` put an
+      # unescaped path into a regex: `/private/tmp/foo*` became `fo` + zero-or-more
+      # `o`, matched nothing, and a directory a process held open was emitted for
+      # deletion. `/private/tmp` is world-writable, so nothing constrains the names
+      # in it. `.`, `+` and `[1]` merely over-matched - wrong in the safe direction -
+      # but `*` and an unmatched `[` fail toward deleting.
       d_real="$( (cd -P "$d" 2>/dev/null && pwd) || echo "$d" )"
-      printf '%s\n' "$held" | grep -q "^$d_real\(/\|$\)" && continue
+      local skip=0
+      while IFS= read -r cwd; do
+        [ -n "$cwd" ] || continue
+        case "$cwd" in
+          "$d_real"|"$d_real"/*) skip=1; break ;;
+        esac
+      done <<EOF
+$held
+EOF
+      [ "$skip" -eq 1 ] && continue
+
       [ "$(_cc_dj_du_kib "$d")" -ge "$min_kb" ] 2>/dev/null || continue
       echo "$d"
-    done < <(find "$root" -maxdepth 1 -mindepth 1 -type d -mtime +"$age" 2>/dev/null)
+    done <<EOF
+$listing
+EOF
   done
 }
 

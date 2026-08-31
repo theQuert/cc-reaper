@@ -814,44 +814,162 @@ printf "\n# Test group: stale temp checkouts\n"
 
 TMPT="$SANDBOX/tmproot"
 mkdir -p "$TMPT"
-
-# Big and old: the one thing that should be collected.
-mkdir -p "$TMPT/stale-checkout"
 mkfile_kb() { dd if=/dev/zero of="$1" bs=1024 count="$2" >/dev/null 2>&1; }
-mkfile_kb "$TMPT/stale-checkout/blob" 204800
-touch -t 202001010000 "$TMPT/stale-checkout"
+# Age the WHOLE subtree. Ageing only the directory entry is the defect under test:
+# a directory's mtime advances only when its direct entries change, so a container
+# full of files being written right now still reads as stale.
+age_tree() { find "$1" -exec touch -t 202001010000 {} + 2>/dev/null; }
 
-# Old and big, but a registered linked worktree: git still points at it.
+# Big and old throughout: the one thing that should be collected.
+mkdir -p "$TMPT/stale-checkout"
+mkfile_kb "$TMPT/stale-checkout/blob" 204800
+age_tree "$TMPT/stale-checkout"
+
+# Old container, live child. This is `/private/tmp/claude-501` on the reporting
+# host: the scratchpad root for every running session, 720 MB, its own mtime moving
+# only when a new project appears. Files are written and closed, not held open, so
+# the lsof gate does not save it either.
+mkdir -p "$TMPT/live-container/session"
+mkfile_kb "$TMPT/live-container/session/blob" 204800
+touch -t 202001010000 "$TMPT/live-container"
+
+# Old and big, but a linked worktree: git still has a record pointing here.
 mkdir -p "$TMPT/linked-worktree"
 mkfile_kb "$TMPT/linked-worktree/blob" 204800
 echo "gitdir: /somewhere/.git/worktrees/x" > "$TMPT/linked-worktree/.git"
-touch -t 202001010000 "$TMPT/linked-worktree"
+age_tree "$TMPT/linked-worktree"
+
+# Old and big, and a plain clone: `.git` is a DIRECTORY, and its commits may exist
+# nowhere else. The gate keyed on `-f` matched only the gitfile above, so the one
+# case whose loss is unrecoverable was the one that passed through.
+mkdir -p "$TMPT/plain-clone/.git"
+mkfile_kb "$TMPT/plain-clone/blob" 204800
+age_tree "$TMPT/plain-clone"
 
 # Old but small: below the floor, not worth being wrong about.
-mkdir -p "$TMPT/tiny"
-mkfile_kb "$TMPT/tiny/blob" 16
-touch -t 202001010000 "$TMPT/tiny"
+mkdir -p "$TMPT/tiny"; mkfile_kb "$TMPT/tiny/blob" 16; age_tree "$TMPT/tiny"
 
 # Big but fresh.
-mkdir -p "$TMPT/fresh"
-mkfile_kb "$TMPT/fresh/blob" 204800
+mkdir -p "$TMPT/fresh"; mkfile_kb "$TMPT/fresh/blob" 204800
+
+# A glob character in the name. `/private/tmp` is world-writable, so nothing
+# constrains these. Under the old `grep "^$path\(/\|$\)"` this became `fo` plus
+# zero-or-more `o`, matched nothing, and a HELD directory was offered for deletion.
+mkdir -p "$TMPT/glob*dir"; mkfile_kb "$TMPT/glob*dir/blob" 204800; age_tree "$TMPT/glob*dir"
 
 enumerate() {
   bash -c 'source "$1" >/dev/null 2>&1
            CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=100 _cc_dj_stale_tmp_dirs' \
-    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT"
+    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT" 2>/dev/null
+}
+# Captured, then matched - never `enumerate | grep -q`. `grep -q` exits on its first
+# match and closes the pipe, the writer takes SIGPIPE, and under this file's
+# `set -o pipefail` the pipeline reports 141. Measured: every negative assertion in
+# this block was passing because of the signal rather than because the path was
+# absent, while every positive one failed with the enumerator emitting exactly what
+# it should. The file's own `file_has` helper carries the same warning.
+collects() {
+  local out
+  out="$(enumerate)"
+  printf '%s\n' "$out" | grep -qF -- "$1"
 }
 
-collects() { enumerate | grep -q "$1"; }
+expect_yes "a large stale checkout is collected"                collects "stale-checkout"
+expect_no  "an old container with a live child is NOT collected" collects "live-container"
+expect_no  "a registered linked worktree is never collected"    collects "linked-worktree"
+expect_no  "a plain clone is never collected"                   collects "plain-clone"
+expect_no  "a directory under the size floor is not collected"  collects "/tiny"
+expect_no  "a freshly touched directory is not collected"       collects "/fresh"
 
-expect_yes "a large stale checkout is collected"            collects "stale-checkout"
-expect_no  "a registered linked worktree is never collected" collects "linked-worktree"
-expect_no  "a directory under the size floor is not collected" collects "/tiny$"
-expect_no  "a freshly touched directory is not collected"    collects "/fresh$"
+# ── the enumerator's stdout is a deletion list, so nothing else may go there ──
+# In this shell, not `bash -c`: a fresh shell has never seen `enumerate`, so the
+# loop read nothing and the assertion passed on an empty list.
+check_only_dirs() {
+  local out l
+  out="$(enumerate)"
+  [ -n "$out" ] || return 0
+  while IFS= read -r l; do [ -n "$l" ] || continue; [ -d "$l" ] || return 1; done <<< "$out"
+}
+expect_yes "every emitted line is an existing directory" check_only_dirs
 
+# ── a root that cannot be used must say so, and collect nothing ──────────────
+#
+# Two traps this block already fell into, both of which made every assertion here
+# fail for reasons unrelated to the code under test:
+#
+#   - `bash -c '<script>' "$path"` puts `$path` in $0, so `source "$0"` makes the
+#     sourced file see BASH_SOURCE[0] == $0, conclude it was executed rather than
+#     sourced, and run its own entry point instead of defining functions. `_` goes
+#     in $0 and the real path in $1.
+#   - `expect_yes ... bash -c '<uses a helper>'` runs a fresh shell that has never
+#     seen the helper. Assertions are plain functions, invoked directly.
+dj_run() {   # <extra-PATH|""> <root> <out|err>
+  local extra="$1" root="$2" stream="$3"
+  if [ "$stream" = err ]; then
+    PATH="${extra:+$extra:}$PATH" bash -c 'source "$1" >/dev/null 2>&1
+      CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=100 _cc_dj_stale_tmp_dirs' \
+      _ "$ROOT_DIR/shell/disk-janitor.sh" "$root" 2>&1 >/dev/null
+  else
+    PATH="${extra:+$extra:}$PATH" bash -c 'source "$1" >/dev/null 2>&1
+      CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=100 _cc_dj_stale_tmp_dirs' \
+      _ "$ROOT_DIR/shell/disk-janitor.sh" "$root" 2>/dev/null
+  fi
+}
+
+# ── a root that cannot be used must say so, and collect nothing ──────────────
+unusable_root_is_named() { local o; o="$(dj_run "" "$SANDBOX/no-such-root" err)"; printf '%s\n' "$o" | grep -q "unusable"; }
+expect_yes "an unusable root is named on stderr, not passed over in silence" \
+  unusable_root_is_named
+
+# ── a broken lsof must never read as "nothing is held" ───────────────────────
+#
+# This is what let the dead guard ship green: with a working lsof both branches
+# behave identically, so only a stubbed failure can tell them apart.
+LSOF_STUB="$SANDBOX/stub-lsof"
+mkdir -p "$LSOF_STUB"
+printf '#!/bin/sh\nexit 127\n' > "$LSOF_STUB/lsof"
+chmod +x "$LSOF_STUB/lsof"
+
+broken_lsof_collects_something() { local o; o="$(dj_run "$LSOF_STUB" "$TMPT" out)"; [ -n "$o" ]; }
+broken_lsof_explains() { local o; o="$(dj_run "$LSOF_STUB" "$TMPT" err)"; printf '%s\n' "$o" | grep -q "lsof cannot report"; }
+broken_lsof_collects_something_with_real_lsof() { local o; o="$(dj_run "" "$TMPT" out)"; [ -n "$o" ]; }
+
+# ── a find that cannot answer must keep, not delete ──────────────────────────
+#
+# The staleness gate used `-newermt "-N days"`, a GNU extension. This host's `find`
+# is bfs, which rejects it: the gate errored, emitted nothing, and empty read as
+# "nothing recent here" - the answer that authorises deletion. Only the lsof gate
+# behind it kept 720 MB of live session scratchpads. A stub that fails every
+# invocation is the only way to tell a working probe from a silent one.
+FIND_STUB="$SANDBOX/stub-find"
+mkdir -p "$FIND_STUB"
+printf '#!/bin/sh\necho "find: unrecognised primary" >&2\nexit 1\n' > "$FIND_STUB/find"
+chmod +x "$FIND_STUB/find"
+
+broken_find_collects_something() { local o; o="$(dj_run "$FIND_STUB" "$TMPT" out)"; [ -n "$o" ]; }
+broken_find_explains()           { local o; o="$(dj_run "$FIND_STUB" "$TMPT" err)"; printf '%s\n' "$o" | grep -q "could not"; }
+
+expect_no  "a find that fails yields no deletion candidates" broken_find_collects_something
+expect_yes "a find that fails says why it kept them"         broken_find_explains
+
+expect_no  "a broken lsof does not yield deletion candidates" broken_lsof_collects_something
+expect_yes "a broken lsof says why it collected nothing"      broken_lsof_explains
+
+# Calibration: the stub must be what changes the answer, not something else.
+expect_yes "the same root DOES yield candidates with a working lsof" \
+  broken_lsof_collects_something_with_real_lsof
 exec 9<"$TMPT/stale-checkout/blob"
 expect_no "a directory a live process holds open is not collected" collects "stale-checkout"
 exec 9<&-
+
+# A held directory whose name contains a glob character. The regex form matched
+# nothing here and emitted it for deletion; a literal prefix comparison does not.
+exec 8<"$TMPT/glob*dir/blob"
+expect_no "a held directory with a glob character in its name is not collected" \
+  collects "glob*dir"
+exec 8<&-
+expect_yes "that same directory IS collected once nothing holds it" \
+  collects "glob*dir"
 
 
 # ---------------------------------------------------------------------------
