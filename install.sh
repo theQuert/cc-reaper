@@ -255,6 +255,90 @@ echo "  worktree-janitor: manual — run '~/.cc-reaper/worktree-janitor.sh' (rep
 echo "                    not scheduled: a LaunchAgent has no TCC access to ~/Documents, measured 2026-08-30"
 echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs whitelisted MCP pinned >80% CPU for >60 min)"
 
+# ─── 5b. TCC probe ────────────────────────────────────────────────────────────
+#
+# The agents just installed run under launchd, and launchd's context does not carry
+# the operator's TCC grants. `~/Documents`, `~/Desktop` and `~/Downloads` are
+# protected on macOS, so an agent reads them only if the program named in the plist
+# holds Full Disk Access.
+#
+# Probed from launchd rather than from here, because the two contexts disagree and
+# only one of them is the one the agents run in - an operator who checks by hand sees
+# it work and never learns the agent cannot. That disagreement is the whole reason
+# this is invisible without a probe.
+#
+# The grant is a GUI action nobody can automate. That is the argument for naming it,
+# not for staying quiet: an agent that cannot read half its inventory otherwise
+# reports exactly what a clean machine reports.
+_cc_probe_tcc() {
+  command -v launchctl >/dev/null 2>&1 || return 0
+  [ "$(uname -s 2>/dev/null)" = Darwin ] || return 0
+
+  local label="com.cc-reaper.tcc-probe"
+  local plist="$PLIST_DIR/$label.plist"
+  local out="$REAPER_DIR/logs/tcc-probe.out"
+  local paths="$HOME_DIR/Documents $HOME_DIR/Desktop $HOME_DIR/Downloads"
+
+  # Absent is not denied, and reporting the two the same way is the bug this exists
+  # to avoid. Only a path that exists is worth asking about.
+  local present="" d
+  for d in $paths; do [ -d "$d" ] && present="$present $d"; done
+  [ -n "$present" ] || return 0
+
+  : > "$out" 2>/dev/null || return 0
+  cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string><string>-c</string>
+    <string>for d in$present; do [ -r "\$d" ] &amp;&amp; [ -x "\$d" ] &amp;&amp; ls "\$d" >/dev/null 2>&amp;1 &amp;&amp; echo "OK \$d" || echo "DENIED \$d"; done</string>
+  </array>
+  <key>StandardOutPath</key><string>$out</string>
+  <key>RunAtLoad</key><false/>
+</dict></plist>
+PLIST
+
+  launchctl bootout "$AGENT_UI/$label" 2>/dev/null || true
+  launchctl bootstrap "$AGENT_UI" "$plist" 2>/dev/null || {
+    rm -f "$plist"; return 0; }
+  launchctl kickstart -k "$AGENT_UI/$label" 2>/dev/null || true
+
+  # Bounded wait. A probe that never answered is reported as unknown, never as OK:
+  # silence here would recreate the exact fault being probed for.
+  local i=0
+  while [ "$i" -lt 30 ]; do
+    grep -qE '^(OK|DENIED) ' "$out" 2>/dev/null && break
+    i=$((i + 1)); sleep 0.5
+  done
+  launchctl bootout "$AGENT_UI/$label" 2>/dev/null || true
+  rm -f "$plist"
+
+  if ! grep -qE '^(OK|DENIED) ' "$out" 2>/dev/null; then
+    echo "  TCC: probe did not report; could not determine what the agents can read."
+    return 0
+  fi
+
+  local denied
+  denied=$(sed -n 's/^DENIED //p' "$out" | tr '\n' ' ')
+  if [ -z "$denied" ]; then
+    echo "  TCC: agents can read Documents/Desktop/Downloads."
+    return 0
+  fi
+
+  echo ""
+  echo "  TCC: the scheduled agents CANNOT read:$denied"
+  echo "       They will run, exit 0, and report nothing found there — which is what"
+  echo "       an empty machine looks like. Grant Full Disk Access to /bin/bash in"
+  echo "       System Settings > Privacy & Security > Full Disk Access, or keep any"
+  echo "       repository you want swept outside those directories."
+  echo ""
+}
+
+_cc_probe_tcc || true
+
 # ─── 6. Uninstall hint ────────────────────────────────────────────────────────
 
 echo "[6/6] Done."
