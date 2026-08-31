@@ -324,25 +324,32 @@ expect_yes "report-only bounds the scheduled agent's stdout log" \
 # same output and status as a machine with nothing to clean, while 34 GB of stale
 # worktrees sat under two roots the default never named.
 
+# Denial is simulated with a stubbed `find`, not with `chmod 000`. Run as UID 0 -
+# ordinary in container CI - mode bits deny nothing: `[ -r ]`, `[ -x ]` and `find` all
+# succeed, and both assertions below fail while the implementation is correct. A test
+# that only passes for unprivileged users is not a test of this code.
 BLIND_ROOT="$TMPDIR_ROOT/blindroots"
 mkdir -p "$BLIND_ROOT/denied"
-chmod 000 "$BLIND_ROOT/denied"
+FIND_STUB_WJ="$TMPDIR_ROOT/stub-find-wj"
+mkdir -p "$FIND_STUB_WJ"
+printf '#!/bin/sh\necho "find: permission denied" >&2\nexit 1\n' > "$FIND_STUB_WJ/find"
+chmod +x "$FIND_STUB_WJ/find"
 
 expect_yes "an absent root is a skip, not a failure" \
   bash -c 'CC_WJ_ROOT=/nope/does/not/exist bash "$1" >/dev/null 2>&1' _ "$ROOT_DIR/shell/worktree-janitor.sh"
 
-expect_no "a root that exists and cannot be read fails the run" \
-  bash -c 'CC_WJ_ROOT="$2/denied" bash "$1" >/dev/null 2>&1' _ "$ROOT_DIR/shell/worktree-janitor.sh" "$BLIND_ROOT"
+expect_no "a root that exists and cannot be listed fails the run" \
+  bash -c 'PATH="$3:$PATH" CC_WJ_ROOT="$2/denied" bash "$1" >/dev/null 2>&1' \
+    _ "$ROOT_DIR/shell/worktree-janitor.sh" "$BLIND_ROOT" "$FIND_STUB_WJ"
 
 expect_yes "a denied root says so rather than reporting an empty scan" \
-  bash -c 'CC_WJ_ROOT="$2/denied" bash "$1" 2>&1 | grep -q "cannot be read"' \
-    _ "$ROOT_DIR/shell/worktree-janitor.sh" "$BLIND_ROOT"
+  bash -c 'out=$(PATH="$3:$PATH" CC_WJ_ROOT="$2/denied" bash "$1" 2>&1); printf "%s\\n" "$out" | grep -q "could not be listed\\|cannot be read"' \
+    _ "$ROOT_DIR/shell/worktree-janitor.sh" "$BLIND_ROOT" "$FIND_STUB_WJ"
 
 expect_yes "roots are plural" \
   bash -c 'CC_WJ_ROOT="/nope/a:/nope/b" bash "$1" 2>&1 | grep -q "/nope/a,/nope/b"' \
     _ "$ROOT_DIR/shell/worktree-janitor.sh"
 
-chmod 755 "$BLIND_ROOT/denied"
 
 # ─── A detached HEAD is the one removal this script cannot undo ───────────────
 #

@@ -45,10 +45,21 @@ done
 # did its parent shell. `comm` carries only the executable name, so a process
 # that talks about systemd no longer impersonates it.
 _uid=$(id -u 2>/dev/null)
+#
+# argv is excluded from the inventory entirely, and asked per candidate afterwards.
+# A process controls its own argv, embedded newlines included, so a row of
+# `<live-pid> <uid> systemd --user` inside somebody's arguments forges a line in this
+# very listing - and every child of that forged PID then passes the orphan filter
+# below and is killed. The authoritative pass reads only pid, uid and comm, none of
+# which a process can choose; `--user` is then confirmed by asking about that one PID.
 if [ "$(uname -s 2>/dev/null)" = Linux ]; then
-  _systemd_user_pids=$(ps -eo pid=,uid=,comm=,args= 2>/dev/null \
-    | awk -v uid="$_uid" '$2 == uid && $3 == "systemd" && /--user/ {print $1}' \
-    | tr '\n' ' ')
+  _systemd_user_pids=""
+  for _cand in $(ps -eo pid=,uid=,comm= 2>/dev/null \
+                 | awk -v uid="$_uid" '$2 == uid && $3 == "systemd" {print $1}'); do
+    case "$(ps -o args= -p "$_cand" 2>/dev/null)" in
+      *--user*) _systemd_user_pids="$_systemd_user_pids$_cand " ;;
+    esac
+  done
 else
   _systemd_user_pids=""
 fi

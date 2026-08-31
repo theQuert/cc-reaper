@@ -267,9 +267,12 @@ echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs whitelisted MC
 # it work and never learns the agent cannot. That disagreement is the whole reason
 # this is invisible without a probe.
 #
-# The grant is a GUI action nobody can automate. That is the argument for naming it,
-# not for staying quiet: an agent that cannot read half its inventory otherwise
-# reports exactly what a clean machine reports.
+# Reported, not recommended. No agent this installer schedules reads these paths -
+# they work under ~/Library and /private/tmp - so telling an operator to grant
+# /bin/bash Full Disk Access would hand every bash script on the machine access to all
+# protected user data while enabling no sweep that exists. What the probe is for is
+# the operator who later schedules something of their own over ~/Documents: that run
+# would exit 0 reporting nothing found, which is what an empty machine looks like.
 _cc_probe_tcc() {
   command -v launchctl >/dev/null 2>&1 || return 0
   [ "$(uname -s 2>/dev/null)" = Darwin ] || return 0
@@ -353,11 +356,17 @@ PLIST
   fi
 
   echo ""
-  echo "  TCC: the scheduled agents CANNOT read:$denied"
-  echo "       They will run, exit 0, and report nothing found there — which is what"
-  echo "       an empty machine looks like. Grant Full Disk Access to /bin/bash in"
-  echo "       System Settings > Privacy & Security > Full Disk Access, or keep any"
-  echo "       repository you want swept outside those directories."
+  echo "  TCC: from a LaunchAgent, this machine cannot read:$denied"
+  echo "       Nothing installed here reads them today - resource-watch, disk-check,"
+  echo "       weekly-clean and guard work under ~/Library and /private/tmp, and"
+  echo "       worktree-janitor is manual by design for exactly this reason."
+  echo "       It matters if you schedule a sweep of your own over those paths: it"
+  echo "       would run, exit 0, and report nothing found, which is what an empty"
+  echo "       machine looks like."
+  echo "       Granting Full Disk Access to /bin/bash would fix that and would also"
+  echo "       give EVERY bash script on this machine access to all protected user"
+  echo "       data. Keep the repositories you want swept outside those directories"
+  echo "       instead, unless you have a reason to accept that trade."
   echo ""
 }
 

@@ -141,11 +141,29 @@ _cc_reaper_is_direct_cleanup_protected() {
 _CC_REAPER_ORPHAN_PPIDS=""
 _cc_reaper_orphan_ppids() {
   if [ -z "$_CC_REAPER_ORPHAN_PPIDS" ]; then
-    local uid="" systemd_user_pids=""
+    local uid="" systemd_user_pids="" cand=""
     uid=$(id -u 2>/dev/null)
-    systemd_user_pids=$(ps -eo pid=,uid=,command= 2>/dev/null \
-      | awk -v uid="$uid" '$2 == uid && /systemd --user/ {print $1}' \
-      | tr '\n' ' ')
+    # Two faults the hook beside this already fixed, and this copy still had.
+    #
+    # Matching `/systemd --user/` against the whole COMMAND put every process that
+    # merely mentions the string into the orphan-parent set - a shell running
+    # `echo "... systemd --user ..."`, a grep for it, this function's own ancestor -
+    # and every child of such a process then passes the orphan filter and is killed.
+    # On macOS, which has no systemd at all, that is reachable with one echo.
+    #
+    # And argv is chosen by the process. An embedded newline turns a line of
+    # `<live-pid> <uid> systemd --user` inside somebody's arguments into a forged row
+    # of this very listing. So the authoritative pass reads pid, uid and `comm` -
+    # none of which a process picks - and `--user` is confirmed by asking about that
+    # one PID afterwards.
+    if [ "$(uname -s 2>/dev/null)" = Linux ]; then
+      for cand in $(ps -eo pid=,uid=,comm= 2>/dev/null \
+                    | awk -v uid="$uid" '$2 == uid && $3 == "systemd" {print $1}'); do
+        case "$(ps -o args= -p "$cand" 2>/dev/null)" in
+          *--user*) systemd_user_pids="$systemd_user_pids$cand " ;;
+        esac
+      done
+    fi
     systemd_user_pids=${systemd_user_pids% }
     if [ -n "$systemd_user_pids" ]; then
       _CC_REAPER_ORPHAN_PPIDS="1 $systemd_user_pids"
