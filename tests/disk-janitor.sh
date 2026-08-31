@@ -953,6 +953,21 @@ collects_with_trailing_slash() {
 }
 expect_yes "a root spelled with a trailing slash still finds its children" \
   collects_with_trailing_slash
+
+# A root that is a SYMLINK to the real directory - which is what `/tmp` is on macOS,
+# and the spelling most people would configure. `find` defaults to `-P` and will not
+# descend one named on the command line: every check passed and the listing came back
+# empty, so the report said there was nothing there.
+TMPT_LINK="$SANDBOX/tmproot-link"
+ln -sfn "$TMPT" "$TMPT_LINK"
+collects_through_symlink() {
+  local out
+  out="$(bash -c 'source "$1" >/dev/null 2>&1
+    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 _cc_dj_stale_tmp_dirs' \
+    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT_LINK" 2>/dev/null | tr '\0' '\n')"
+  printf '%s\n' "$out" | grep -qF -- "stale-checkout"
+}
+expect_yes "a symlinked root is followed, not silently skipped" collects_through_symlink
 expect_no  "an old container with a live child is NOT collected" collects "live-container"
 expect_no  "a registered linked worktree is never collected"    collects "linked-worktree"
 expect_no  "a plain clone is never collected"                   collects "plain-clone"
@@ -1092,12 +1107,16 @@ mkdir -p "$NL_DIR"
 mkfile_kb "$NL_DIR/blob" "$FIXTURE_KB"
 age_tree "$NL_DIR"
 only_absolute_children() {
-  local l tmpf
+  local l tmpf root_real
+  # The enumerator resolves its root before enumerating - it has to, or a symlinked
+  # `/tmp` yields nothing - so the paths it emits are in resolved form and comparing
+  # them against the unresolved `$TMPT` fails on spelling rather than on substance.
+  root_real="$( (cd -P "$TMPT" && pwd) )"
   tmpf="$(mktemp)" || return 1
   enumerate > "$tmpf"
   while IFS= read -r -d '' l; do
     [ -n "$l" ] || continue
-    case "$l" in "$TMPT"/*) ;; *) rm -f "$tmpf"; return 1 ;; esac
+    case "$l" in "$root_real"/*) ;; *) rm -f "$tmpf"; return 1 ;; esac
   done < "$tmpf"
   rm -f "$tmpf"
 }

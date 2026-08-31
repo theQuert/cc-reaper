@@ -426,7 +426,13 @@ _cc_dj_stale_tmp_dirs() {
     # The root listing also gets the same treatment as everything else here: a `find`
     # that fails produces no directories, and "no directories" is indistinguishable
     # from "nothing to clean" unless somebody says so.
+    # Resolved, and the resolved form is what gets enumerated. `find` defaults to
+    # `-P` and will not descend a symlink named on the command line, so a configured
+    # `/tmp` - which IS a symlink to `/private/tmp` on macOS, and the spelling most
+    # people would use - passed every directory check and then produced an empty
+    # listing. The report said there was nothing there. There was 7.9 GB.
     root_real="$( (cd -P "$root" 2>/dev/null && pwd) || echo "$root" )"
+    root="$root_real"
     listing="$(mktemp "${TMPDIR:-/tmp}/cc-dj-list.XXXXXX")" || {
       echo "disk-janitor: could not create a work file, scanned nothing: $root" >&2
       continue
