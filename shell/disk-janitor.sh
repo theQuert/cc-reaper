@@ -390,6 +390,12 @@ _cc_dj_stale_tmp_dirs() {
 
   for root in ${roots[@]+"${roots[@]}"}; do
     [ -n "$root" ] || continue
+    # Trailing slashes off, `/` kept. `find` emits children as `<root>/name` with a
+    # single separator, so a configured `/private/tmp/` made the direct-child pattern
+    # `/private/tmp//*` and every candidate was silently skipped - the report went
+    # quiet for a root that was perfectly fine, which is the failure this whole file
+    # is about.
+    while [ "${root%/}" != "$root" ] && [ "$root" != "/" ]; do root="${root%/}"; done
     if [ ! -d "$root" ] || [ ! -r "$root" ]; then
       echo "disk-janitor: temp root unusable, scanned nothing: $root" >&2
       continue

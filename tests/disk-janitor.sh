@@ -940,6 +940,19 @@ collects() {
 }
 
 expect_yes "a large stale checkout is collected"                collects "stale-checkout"
+
+# The same root, spelled with a trailing slash. `find` emits `<root>/name`, so an
+# unnormalised `<root>/` made the direct-child pattern `<root>//*` and every
+# candidate was skipped without a word.
+collects_with_trailing_slash() {
+  local out
+  out="$(bash -c 'source "$1" >/dev/null 2>&1
+    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 _cc_dj_stale_tmp_dirs' \
+    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT/" 2>/dev/null | tr '\0' '\n')"
+  printf '%s\n' "$out" | grep -qF -- "stale-checkout"
+}
+expect_yes "a root spelled with a trailing slash still finds its children" \
+  collects_with_trailing_slash
 expect_no  "an old container with a live child is NOT collected" collects "live-container"
 expect_no  "a registered linked worktree is never collected"    collects "linked-worktree"
 expect_no  "a plain clone is never collected"                   collects "plain-clone"
