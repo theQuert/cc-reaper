@@ -839,21 +839,38 @@ expect_no "dependencies: a run missing python3 does not report skipped=0" \
 # is a symlink into another repository on at least one machine, and installing here
 # silently modified that checkout - twice, the second time after the drift it caused
 # had already been found.
+# `launchctl` is stubbed, not just `HOME`. Overriding HOME alone does not isolate
+# the launchd domain: `bootout`/`bootstrap` are addressed as `gui/<uid>/<label>`, so
+# this test tore down the developer's REAL agents and replaced them with ones
+# pointing into a temporary home - which the sandbox then deleted. Measured on the
+# reporting host: after two runs, `gui/501/com.cc-reaper.disk-check` was loaded
+# against `/var/folders/.../inst-home/.cc-reaper/disk-janitor.sh`, a path that no
+# longer existed. The test that proves an installer does not damage things outside
+# its target must not damage things outside its target.
 INST_HOME="$SANDBOX/inst-home"
 mkdir -p "$INST_HOME/.claude/hooks"
+LC_STUB="$SANDBOX/stub-launchctl"
+mkdir -p "$LC_STUB"
+printf '#!/bin/sh\nexit 0\n' > "$LC_STUB/launchctl"
+chmod +x "$LC_STUB/launchctl"
+
 REAL_HOOK="$SANDBOX/other-repo-hook.sh"
 printf '#!/bin/sh\n# the other repository owns this\n' > "$REAL_HOOK"
 ln -sf "$REAL_HOOK" "$INST_HOME/.claude/hooks/stop-cleanup-orphans.sh"
 BEFORE_SUM="$(shasum "$REAL_HOOK" | cut -d" " -f1)"
-printf 'b\n' | env HOME="$INST_HOME" bash "$ROOT_DIR/install.sh" >/dev/null 2>&1 || true
+INST_OUT="$(printf 'b\n' | env PATH="$LC_STUB:$PATH" HOME="$INST_HOME" \
+  bash "$ROOT_DIR/install.sh" 2>&1 || true)"
 AFTER_SUM="$(shasum "$REAL_HOOK" | cut -d" " -f1)"
 
 expect_yes "install does not write through a symlinked stop-hook path" \
   bash -c '[ "$1" = "$2" ]' _ "$BEFORE_SUM" "$AFTER_SUM"
 
 expect_yes "install says why it left the symlink alone" \
-  bash -c 'printf "b\n" | env HOME="$1" bash "$2" 2>&1 | grep -q "is a symlink to"' \
-    _ "$INST_HOME" "$ROOT_DIR/install.sh"
+  bash -c 'printf "%s\n" "$1" | grep -q "is a symlink to"' _ "$INST_OUT"
+
+# The stub is the point, so prove it was actually the thing standing in.
+expect_yes "the installer under test really used the stubbed launchctl" \
+  bash -c 'command -v launchctl >/dev/null && [ -x "$1/launchctl" ]' _ "$LC_STUB"
 
 printf "\n# Test group: stale temp checkouts\n"
 

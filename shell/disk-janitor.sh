@@ -95,6 +95,11 @@ export PATH
 # five dead targets survived weeks of weekly runs.
 CC_DJ_RAN=0
 CC_DJ_SKIPPED=0
+# Reset per run alongside the other two - see `_cc_dj_clean`. Initialised only at
+# load time, one failure made every later `_cc_dj_clean` in the same shell report
+# FAILED>0 and return non-zero with nothing wrong, which is how a real signal turns
+# into one nobody reads.
+CC_DJ_FAILED=0
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -272,12 +277,10 @@ _cc_dj_du_bytes() {
   fi
 }
 
-# Targets that ran, and targets that FAILED. `_cc_dj_clean_target` logs a non-zero
-# return and then returns success itself, because for a cache target "rc may be fine"
-# is genuinely true. It is not true of the stale-temp scan, where non-zero means the
-# scan was blind - so the count is kept and reaches the run's own exit status.
-CC_DJ_FAILED=0
-
+# `_cc_dj_clean_target` logs a non-zero return and then returns success itself,
+# because for a cache target "rc may be fine" is genuinely true. It is not true of
+# the stale-temp scan, where non-zero means the scan was blind - so CC_DJ_FAILED
+# counts it and the count reaches the run's own exit status.
 _cc_dj_clean_target() {
   local label="$1"
   shift
@@ -541,12 +544,29 @@ _cc_dj_clean_stale_tmp_dirs() {
   # `_cc_dj_clean_target` reports a target that returned 0 as done. That is the
   # false-success shape this whole target was added to remove, so a blind scan
   # returns nonzero and is counted as a failure rather than a completion.
-  CC_DJ_TMP_BLIND_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-dj-blind.XXXXXX")" || CC_DJ_TMP_BLIND_FILE=""
+  # A marker we cannot create is not a marker that records nothing - it is a run
+  # that cannot report being blind at all. With TMPDIR unwritable or full, every
+  # `mktemp` in the enumerator fails too, the scan sees nothing, and without this
+  # the target logs "no stale temp checkouts" and returns success having looked at
+  # precisely zero directories.
+  if ! CC_DJ_TMP_BLIND_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-dj-blind.XXXXXX")"; then
+    CC_DJ_TMP_BLIND_FILE=""
+    _cc_dj_log "clean: cannot create a work file; the stale-temp scan did not run"
+    return 1
+  fi
   while IFS= read -r -d '' d; do
     [ -n "$d" ] || continue
     n=$(( n + 1 ))
     if [ "$CC_DJ_TMP_DELETE" = 1 ]; then
       _cc_dj_clean_dir "stale temp checkout $(basename "$d")" "$d"
+      # `_cc_dj_clean_dir` ignores `rm -rf`'s status and ends on a successful log
+      # call, so a removal blocked by permissions or lost to a race was reported as
+      # done. Checked here rather than there, because for a rebuildable cache the
+      # existing behaviour is fine and for somebody's abandoned work it is not.
+      if [ -e "$d" ]; then
+        _cc_dj_log "clean: FAILED to remove ${d} — it is still there"
+        rc=1
+      fi
     else
       # Counted and named, never removed. A target that reports what it would have
       # done is still doing its job here: the finding was that nobody was looking at
@@ -697,6 +717,7 @@ _cc_dj_clean() {
   # the accounting added to make a skipped run legible would itself become wrong.
   CC_DJ_RAN=0
   CC_DJ_SKIPPED=0
+  CC_DJ_FAILED=0
   local free_before free_after
   free_before="$(_cc_dj_free_pct)"
   _cc_dj_log "clean: starting — disk free=${free_before}%"
