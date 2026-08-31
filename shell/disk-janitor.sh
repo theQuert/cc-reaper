@@ -35,6 +35,16 @@ CC_DJ_DISK_MIN_PCT="${CC_DJ_DISK_MIN_PCT:-15}"
 CC_DJ_COOLDOWN_SECS="${CC_DJ_COOLDOWN_SECS:-3600}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
 CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
+# Abandoned scratch checkouts under the shared temp directory. Agents and review
+# sessions copy or clone a repository there and nothing ever revisits it; measured
+# 2026-08-31 on one host, twelve of them between 484 MB and 1.3 GB, 5.7 GB in total,
+# the oldest three days untouched. macOS does not clear `/private/tmp` on any
+# schedule a developer machine reaches - the periodic scripts are off by default and
+# the boot-time sweep does not run on a host that stays up.
+CC_DJ_TMP_DIRS="${CC_DJ_TMP_DIRS:-/private/tmp}"
+CC_DJ_TMP_AGE_DAYS="${CC_DJ_TMP_AGE_DAYS:-3}"
+# Below this a directory is not worth the risk of being wrong about it.
+CC_DJ_TMP_MIN_MB="${CC_DJ_TMP_MIN_MB:-100}"
 
 # launchd hands an agent PATH=/usr/bin:/bin:/usr/sbin:/sbin and nothing more unless the
 # plist sets it, while Homebrew and Docker Desktop install outside that set. Resolving
@@ -215,6 +225,11 @@ _cc_dj_check() {
     done <<< "$snapshots"
   fi
 
+  # Reported on every check, not only below threshold. This is the one target whose
+  # contents are somebody's abandoned work rather than a rebuildable cache, so the
+  # operator gets to see it accumulating well before free space forces the question.
+  _cc_dj_report_stale_tmp_dirs
+
   if [ "$free_pct" -lt "$CC_DJ_DISK_MIN_PCT" ]; then
     _cc_dj_log "check: BELOW threshold — free=${free_pct}% < ${CC_DJ_DISK_MIN_PCT}%"
     if [ -n "$snapshots" ]; then
@@ -265,6 +280,78 @@ _cc_dj_clean_target() {
   else
     _cc_dj_log "clean: target '${label}' returned non-zero (rc=${rc}, may be fine, freed=${freed})"
   fi
+}
+
+# KiB, the unit the size floor is expressed in. `_cc_dj_du_bytes` exists but prints
+# "?" on failure, and "?" in an arithmetic comparison is a syntax error, not a skip.
+_cc_dj_du_kib() {
+  du -sk "$1" 2>/dev/null | awk '{print $1; found=1} END {if (!found) print 0}'
+}
+
+# Emit one path per line: a directory directly under a temp root that is stale, large,
+# unheld, and not something git still points at. Every gate is a reason to *skip*,
+# because the failure mode here is deleting work, not leaving a cache behind - so the
+# report and the clean share this one enumerator and no skip is silent.
+#
+# Deliberately not matched by name. A name pattern would have to guess which prefixes
+# agents use, and the twelve found here shared no prefix at all.
+_cc_dj_stale_tmp_dirs() {
+  local root d d_real held min_kb age
+  age="$CC_DJ_TMP_AGE_DAYS"
+  min_kb=$(( CC_DJ_TMP_MIN_MB * 1024 ))
+  # One lsof for the whole root rather than one per directory: `lsof +D` walks the
+  # tree, and per-directory it is quadratic on exactly the hosts that need this most.
+  # A failed lsof yields no lines, and no lines must not read as "nothing is held" -
+  # that is the one conclusion authorising deletion - so failure skips the root.
+  for root in $(printf '%s' "$CC_DJ_TMP_DIRS" | tr ':' ' '); do
+    [ -d "$root" ] && [ -r "$root" ] || continue
+    if ! held="$(lsof -Fn +D "$root" 2>/dev/null | sed -n 's/^n//p')"; then
+      _cc_dj_skip "stale temp checkouts under $root (lsof could not report open files)"
+      continue
+    fi
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      # A gitfile, not a directory, means a linked worktree: its repository still has a
+      # record pointing here, and removing the tree behind git's back leaves that record
+      # dangling. Those belong to worktree-janitor, which knows how to retire one.
+      [ -f "$d/.git" ] && continue
+      # Anything a live process has open, including the session scratchpads every
+      # running agent writes into.
+      #
+      # Compared through `cd -P`, because the two sides do not agree on the spelling
+      # of the same path: on macOS lsof reports `/private/var/folders/...` while find
+      # yields the `/var/folders/...` symlink it was given, and `/private/tmp` against
+      # `/tmp` is the same trap. A prefix match on the raw strings never fires, so
+      # every held directory reads as unheld - which is the one answer that authorises
+      # deletion.
+      d_real="$( (cd -P "$d" 2>/dev/null && pwd) || echo "$d" )"
+      printf '%s\n' "$held" | grep -q "^$d_real\(/\|$\)" && continue
+      [ "$(_cc_dj_du_kib "$d")" -ge "$min_kb" ] 2>/dev/null || continue
+      echo "$d"
+    done < <(find "$root" -maxdepth 1 -mindepth 1 -type d -mtime +"$age" 2>/dev/null)
+  done
+}
+
+_cc_dj_report_stale_tmp_dirs() {
+  local d n=0 kb=0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    n=$(( n + 1 )); kb=$(( kb + $(_cc_dj_du_kib "$d") ))
+    _cc_dj_log "check: stale temp checkout ${d} ($(_cc_dj_du_bytes "$d") bytes)"
+  done < <(_cc_dj_stale_tmp_dirs)
+  [ "$n" -gt 0 ] && _cc_dj_log "check: ${n} stale temp checkout(s), $(( kb / 1024 )) MB — run disk-janitor --clean"
+  return 0
+}
+
+_cc_dj_clean_stale_tmp_dirs() {
+  local d n=0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    _cc_dj_clean_dir "stale temp checkout $(basename "$d")" "$d"
+    n=$(( n + 1 ))
+  done < <(_cc_dj_stale_tmp_dirs)
+  [ "$n" -eq 0 ] && _cc_dj_log "clean: no stale temp checkouts older than ${CC_DJ_TMP_AGE_DAYS}d over ${CC_DJ_TMP_MIN_MB}MB"
+  return 0
 }
 
 _cc_dj_clean_dir() {
@@ -437,6 +524,15 @@ _cc_dj_clean() {
   else
     _cc_dj_skip "bun pm cache rm (bun not found)"
   fi
+
+  # -- stale scratch checkouts under the shared temp directory ------------------
+  #
+  # Unlike every other target here this one is not a named cache with a documented
+  # rebuild command, so it earns its place through the gates in the enumerator rather
+  # than through a path constant: stale by mtime, over a size floor, no open handle,
+  # and not a registered git worktree. `_cc_dj_clean_target` is used so a failure is
+  # counted rather than swallowed.
+  _cc_dj_clean_target "stale temp checkouts" _cc_dj_clean_stale_tmp_dirs
 
   # -- Spotify cache ----------------------------------------------------------
   local spotify_cache="$HOME/Library/Caches/com.spotify.client"

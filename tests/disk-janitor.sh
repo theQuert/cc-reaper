@@ -802,6 +802,59 @@ expect_no "dependencies: a run missing python3 does not report skipped=0" \
   bash -c 'grep "clean: finished" "$1" | grep -q "skipped=0"' _ "$NOPY_LOG"
 
 # ---------------------------------------------------------------------------
+# Stale temp checkouts: every gate is a reason to SKIP
+# ---------------------------------------------------------------------------
+#
+# This is the only target here whose contents are somebody's abandoned work rather
+# than a rebuildable cache, so being wrong deletes work. Measured 2026-08-31 on one
+# host: twelve scratch checkouts, 484 MB to 1.3 GB, 5.7 GB in total, and no janitor
+# looked at /private/tmp at all.
+
+printf "\n# Test group: stale temp checkouts\n"
+
+TMPT="$SANDBOX/tmproot"
+mkdir -p "$TMPT"
+
+# Big and old: the one thing that should be collected.
+mkdir -p "$TMPT/stale-checkout"
+mkfile_kb() { dd if=/dev/zero of="$1" bs=1024 count="$2" >/dev/null 2>&1; }
+mkfile_kb "$TMPT/stale-checkout/blob" 204800
+touch -t 202001010000 "$TMPT/stale-checkout"
+
+# Old and big, but a registered linked worktree: git still points at it.
+mkdir -p "$TMPT/linked-worktree"
+mkfile_kb "$TMPT/linked-worktree/blob" 204800
+echo "gitdir: /somewhere/.git/worktrees/x" > "$TMPT/linked-worktree/.git"
+touch -t 202001010000 "$TMPT/linked-worktree"
+
+# Old but small: below the floor, not worth being wrong about.
+mkdir -p "$TMPT/tiny"
+mkfile_kb "$TMPT/tiny/blob" 16
+touch -t 202001010000 "$TMPT/tiny"
+
+# Big but fresh.
+mkdir -p "$TMPT/fresh"
+mkfile_kb "$TMPT/fresh/blob" 204800
+
+enumerate() {
+  bash -c 'source "$1" >/dev/null 2>&1
+           CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=100 _cc_dj_stale_tmp_dirs' \
+    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT"
+}
+
+collects() { enumerate | grep -q "$1"; }
+
+expect_yes "a large stale checkout is collected"            collects "stale-checkout"
+expect_no  "a registered linked worktree is never collected" collects "linked-worktree"
+expect_no  "a directory under the size floor is not collected" collects "/tiny$"
+expect_no  "a freshly touched directory is not collected"    collects "/fresh$"
+
+exec 9<"$TMPT/stale-checkout/blob"
+expect_no "a directory a live process holds open is not collected" collects "stale-checkout"
+exec 9<&-
+
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 rm -rf "$SANDBOX"

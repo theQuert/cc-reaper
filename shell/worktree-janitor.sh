@@ -27,8 +27,18 @@ EOF
 
 # ─── Config defaults ──────────────────────────────────────────────────────────
 
+# Colon-separated, because one root was never enough and the single default was
+# wrong on the machine that reported this: `~/Documents/GitHub` did not exist, so
+# discovery found no repositories, said "no repos found", and exited 0 - the same
+# output and the same status as a machine with nothing to clean. 34 GB of stale
+# worktrees sat under `~/Documents` and `~/GitHub` throughout.
+_cc_wj_roots() {
+  printf '%s\n' "${CC_WJ_ROOT:-$HOME/Documents/GitHub:$HOME/GitHub:$HOME/Documents}" | tr ':' '\n'
+}
+
+# Back-compat for anything sourcing the old single-root helper.
 _cc_wj_root() {
-  echo "${CC_WJ_ROOT:-$HOME/Documents/GitHub}"
+  _cc_wj_roots | head -1
 }
 
 _cc_wj_log() {
@@ -85,18 +95,44 @@ _cc_wj_log_write() {
 # ─── Repo discovery ───────────────────────────────────────────────────────────
 
 # Emit one path per line: each directory directly under root that is a git repo
-_cc_wj_discover_repos() {
+# Sets CC_WJ_BLIND=1 when a configured root exists but cannot be read. A root that
+# is simply absent is not an error - a default list naming three plausible locations
+# will always miss some - but one that is there and denied means this run swept less
+# than it was asked to, and that has to reach the exit status. Under launchd on macOS
+# the usual cause is TCC: `~/Documents`, `~/Desktop` and `~/Downloads` need a Full
+# Disk Access grant for the program in the plist, and without it every call is denied
+# while the run still reports normally.
+# Emit one line per configured root that exists and cannot be read. A root that is
+# simply absent is not an error - a default list naming three plausible locations will
+# always miss some - but one that is there and denied means this run swept less than it
+# was asked to. Under launchd on macOS the usual cause is TCC: `~/Documents`,
+# `~/Desktop` and `~/Downloads` need a Full Disk Access grant for the program in the
+# plist, and without it every call is denied while the run reports normally.
+#
+# Called from `_cc_wj_run` rather than reported by `_cc_wj_discover_repos`: that one is
+# consumed through a process substitution, so a flag it sets is set in a child and the
+# caller never sees it.
+_cc_wj_unreadable_roots() {
   local root
-  root=$(_cc_wj_root)
-  if [ ! -d "$root" ]; then
-    return
-  fi
-  # Use find at depth 1: repos have a .git entry (file for worktrees, dir for real repos)
-  find "$root" -maxdepth 1 -mindepth 1 -type d | while IFS= read -r d; do
-    if [ -e "$d/.git" ]; then
-      echo "$d"
-    fi
-  done
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    [ -d "$root" ] || continue
+    { [ -r "$root" ] && [ -x "$root" ]; } || echo "$root"
+  done < <(_cc_wj_roots)
+}
+
+_cc_wj_discover_repos() {
+  local root d
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    [ -d "$root" ] && [ -r "$root" ] && [ -x "$root" ] || continue
+    # Use find at depth 1: repos have a .git entry (file for worktrees, dir for real repos)
+    find "$root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | while IFS= read -r d; do
+      if [ -e "$d/.git" ]; then
+        echo "$d"
+      fi
+    done
+  done < <(_cc_wj_roots)
 }
 
 # ─── Active-process detection ─────────────────────────────────────────────────
@@ -268,6 +304,7 @@ _cc_wj_classify() {
   local dirty="$2"    # integer or "MISSING"
   local active="$3"   # "yes" or "no"
   local lsof_ok="$4"  # "yes" or "no" — "no" means lsof failed → conservative
+  local branch="${5:-}"      # branch name, or "(detached)" — "" keeps the old behaviour
 
   if [ "$dirty" = "MISSING" ]; then
     echo "KEEP(missing-dir)"
@@ -286,6 +323,16 @@ _cc_wj_classify() {
 
   if [ "$active" = "yes" ]; then
     echo "KEEP(active-session)"
+    return
+  fi
+
+  # Removal takes the checkout and leaves the branch, so commits on a branch survive
+  # it whether or not a remote has them - unpushed is not the hazard here. A detached
+  # HEAD is: nothing references those commits once the worktree is gone, and the next
+  # gc takes them. This script never deletes branches, so that is the single case
+  # where its one irreversible action is actually irreversible.
+  if [ "$branch" = "(detached)" ]; then
+    echo "KEEP(detached-head)"
     return
   fi
 
@@ -409,6 +456,16 @@ _cc_wj_run() {
     esac
   done
 
+  # Asked once, before discovery, so the reason a scan came back empty is on the
+  # record next to the emptiness rather than inferred from it.
+  local blind=0 blind_root
+  while IFS= read -r blind_root; do
+    [ -n "$blind_root" ] || continue
+    echo "worktree-janitor: root exists but cannot be read, scanned nothing: $blind_root" >&2
+    echo "worktree-janitor:   (under launchd, a path in ~/Documents, ~/Desktop or ~/Downloads needs Full Disk Access)" >&2
+    blind=1
+  done < <(_cc_wj_unreadable_roots)
+
   # Determine repo list
   local repos=()
   if [ "${#explicit_repos[@]}" -gt 0 ]; then
@@ -420,7 +477,10 @@ _cc_wj_run() {
   fi
 
   if [ "${#repos[@]}" -eq 0 ]; then
-    echo "worktree-janitor: no repos found under $(_cc_wj_root)" >&2
+    echo "worktree-janitor: no repos found under $(_cc_wj_roots | paste -sd, -)" >&2
+    # Blind is not idle, and the two used to print the same line and return the same
+    # status. A scheduled run leaves nothing behind but that status.
+    [ "$blind" -eq 1 ] && return 1
     return 0
   fi
 
@@ -505,7 +565,7 @@ _cc_wj_run() {
       fi
 
       local classification
-      classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$lsof_ok")
+      classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$lsof_ok" "$branch")
 
       printf "  WORKTREE  %s\n" "$wt_path"
       printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s\n" \
@@ -581,6 +641,11 @@ _cc_wj_run() {
   if [ "$apply" -eq 1 ] && [ "$total_reclaimed" -gt 0 ]; then
     _cc_wj_maybe_notify "$total_reclaimed"
   fi
+
+  # Finding repositories under one root does not make a denial on another harmless:
+  # the worktrees under the denied one were never even listed.
+  [ "$blind" -eq 1 ] && return 1
+  return 0
 }
 
 # ─── Entry point ─────────────────────────────────────────────────────────────

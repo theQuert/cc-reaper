@@ -316,6 +316,61 @@ HOME="$WJ_HOME" PATH="$STUBS_IDLE:$PATH" \
 expect_yes "report-only bounds the scheduled agent's stdout log" \
   bash -c '[ "$(wc -c < "$1")" -le 1048576 ]' _ "$BIG_LOG"
 
+
+# ─── Blind roots, and the difference between absent and denied ────────────────
+#
+# The reported failure: the single default root `~/Documents/GitHub` did not exist on
+# the host, so discovery found nothing, printed "no repos found" and exited 0 - the
+# same output and status as a machine with nothing to clean, while 34 GB of stale
+# worktrees sat under two roots the default never named.
+
+BLIND_ROOT="$TMPDIR_ROOT/blindroots"
+mkdir -p "$BLIND_ROOT/denied"
+chmod 000 "$BLIND_ROOT/denied"
+
+expect_yes "an absent root is a skip, not a failure" \
+  bash -c 'CC_WJ_ROOT=/nope/does/not/exist bash "$1" >/dev/null 2>&1' _ "$ROOT_DIR/shell/worktree-janitor.sh"
+
+expect_no "a root that exists and cannot be read fails the run" \
+  bash -c 'CC_WJ_ROOT="$2/denied" bash "$1" >/dev/null 2>&1' _ "$ROOT_DIR/shell/worktree-janitor.sh" "$BLIND_ROOT"
+
+expect_yes "a denied root says so rather than reporting an empty scan" \
+  bash -c 'CC_WJ_ROOT="$2/denied" bash "$1" 2>&1 | grep -q "cannot be read"' \
+    _ "$ROOT_DIR/shell/worktree-janitor.sh" "$BLIND_ROOT"
+
+expect_yes "roots are plural" \
+  bash -c 'CC_WJ_ROOT="/nope/a:/nope/b" bash "$1" 2>&1 | grep -q "/nope/a,/nope/b"' \
+    _ "$ROOT_DIR/shell/worktree-janitor.sh"
+
+chmod 755 "$BLIND_ROOT/denied"
+
+# ─── A detached HEAD is the one removal this script cannot undo ───────────────
+#
+# Removal takes the checkout and leaves the branch, so commits on a branch survive it
+# whether or not a remote has them. On a detached HEAD nothing references them
+# afterwards. The push state was already measured and printed here, and then never
+# consulted by the classifier.
+
+# `expect_yes` runs its command in this shell, so the classifier is sourced once here
+# and called directly - no subshell to lose the function in.
+# shellcheck source=../shell/worktree-janitor.sh
+source "$ROOT_DIR/shell/worktree-janitor.sh"
+
+classify_is() {
+  local branch="$1" want="$2" got
+  got="$(_cc_wj_classify /wt 0 no yes "$branch")"
+  [ "$got" = "$want" ] || { printf "       got %s, want %s\n" "$got" "$want" >&2; return 1; }
+}
+
+expect_yes "a detached HEAD is kept" \
+  classify_is "(detached)" "KEEP(detached-head)"
+
+expect_yes "a clean idle branch is still removable" \
+  classify_is "task/x" "REMOVABLE"
+
+expect_yes "an unpushed branch is still removable — the branch keeps the commits" \
+  classify_is "task/unpushed" "REMOVABLE"
+
 # ─── Final result ─────────────────────────────────────────────────────────────
 
 if [ "$failures" -gt 0 ]; then
