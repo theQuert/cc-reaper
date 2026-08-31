@@ -493,14 +493,8 @@ expect_yes "directory targets report a du size and a measured delta separately" 
   ' _ "$SANDBOX/dj-nobun.log"
 
 expect_yes "skip accounting: a skipped run names the fact on its final line" \
-  bash -c 'grep -q "SKIPPED=" "$1" && grep -q "a skipped or failed target cleaned nothing" "$1"' \
+  bash -c 'grep -q "SKIPPED=" "$1" && grep -q "a skipped target cleaned nothing" "$1"' \
     _ "$SANDBOX/dj-nobun.log"
-
-# FAILED is on the same line for the same reason SKIPPED is: a target that returned
-# non-zero was logged and then forgotten, so a blind stale-temp scan reached the
-# summary as a completed run and the process exited 0.
-expect_yes "failure accounting: the final line carries a FAILED count" \
-  bash -c 'grep -q "FAILED=" "$1" || grep -q "failed=0" "$1"' _ "$SANDBOX/dj-nobun.log"
 
 expect_yes "freed bytes: no target reports an unknown" \
   bash -c '! grep -q "freed=?" "$1"' _ "$SANDBOX/dj-nobun.log"
@@ -1097,57 +1091,11 @@ only_absolute_children() {
 expect_yes "a newline in a name cannot produce a candidate outside the root" \
   only_absolute_children
 
-# ── a blind scan is a failed target, not a completed one ─────────────────────
-#
-# "Nothing to clean" and "could not look" produce the same empty list, and
-# `_cc_dj_clean_target` calls a target that returned 0 done.
-clean_rc_with_broken_lsof() {
-  PATH="$LSOF_STUB:$PATH" bash -c 'source "$1" >/dev/null 2>&1
-    CC_DJ_LOG="$3/blind-clean.log" CC_DJ_STATE_DIR="$3/state" \
-    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 CC_DJ_TMP_DELETE=0 \
-    _cc_dj_clean_stale_tmp_dirs >/dev/null 2>&1' \
-    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT" "$SANDBOX"
-}
-expect_no "a clean whose scan went blind does not report success" clean_rc_with_broken_lsof
+# The two blind-clean assertions that stood here went with the deletion path they
+# guarded: `_cc_dj_clean_stale_tmp_dirs` no longer exists, and `--check` reports
+# rather than returning a status for anyone to act on. The enumerator gates they
+# exercised are still covered above, from the reporting side.
 
-clean_rc_normal() {
-  bash -c 'source "$1" >/dev/null 2>&1
-    CC_DJ_LOG="$3/ok-clean.log" CC_DJ_STATE_DIR="$3/state" \
-    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 CC_DJ_TMP_DELETE=0 \
-    _cc_dj_clean_stale_tmp_dirs >/dev/null 2>&1' \
-    _ "$ROOT_DIR/shell/disk-janitor.sh" "$TMPT" "$SANDBOX"
-}
-expect_yes "a clean that scanned successfully still reports success" clean_rc_normal
-
-# ── deletion is opt-in; the report is not ────────────────────────────────────
-#
-# Every other --clean target is a named cache at a known path. This one is a
-# heuristic over a world-writable directory, so the unattended weekly agent reports
-# and does not remove unless an operator says otherwise.
-OPTIN_ROOT="$SANDBOX/optin-root"
-dj_clean_tmp() {   # <CC_DJ_TMP_DELETE value>
-  bash -c 'source "$1" >/dev/null 2>&1
-    CC_DJ_LOG="$4/clean.log" CC_DJ_STATE_DIR="$4/state" \
-    CC_DJ_TMP_DIRS="$2" CC_DJ_TMP_AGE_DAYS=3 CC_DJ_TMP_MIN_MB=1 CC_DJ_TMP_DELETE="$3" \
-    _cc_dj_clean_stale_tmp_dirs' \
-    _ "$ROOT_DIR/shell/disk-janitor.sh" "$OPTIN_ROOT" "$1" "$SANDBOX" 2>&1
-}
-
-# Its own victim, in its own root: the opt-in case really removes, and pointing it at
-# a shared fixture pulled the ground out from under every later assertion.
-mkdir -p "$OPTIN_ROOT/victim"
-mkfile_kb "$OPTIN_ROOT/victim/blob" "$FIXTURE_KB"
-age_tree "$OPTIN_ROOT/victim"
-VICTIM="$OPTIN_ROOT/victim"
-out_default="$(dj_clean_tmp 0)"
-expect_yes "the default clean reports rather than removes" \
-  bash -c '[ -d "$1" ]' _ "$VICTIM"
-expect_yes "and says how to enable removal" \
-  bash -c 'printf "%s\n" "$1" | grep -q "CC_DJ_TMP_DELETE=1"' _ "$out_default"
-
-out_optin="$(dj_clean_tmp 1)"
-expect_no "the opt-in clean does remove" \
-  bash -c '[ -d "$1" ]' _ "$VICTIM"
 
 expect_no  "a find that fails yields no deletion candidates" broken_find_collects_something
 expect_yes "a find that fails says why it kept them"         broken_find_explains

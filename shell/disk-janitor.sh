@@ -54,7 +54,19 @@ CC_DJ_TMP_MIN_MB="${CC_DJ_TMP_MIN_MB:-100}"
 # directory, an archive, a database, a mounted data directory all satisfy it. So the
 # default is the half that cannot be wrong - say what is there, let a human decide -
 # and the weekly unattended agent never deletes here unless told to.
-CC_DJ_TMP_DELETE="${CC_DJ_TMP_DELETE:-0}"
+# This target REPORTS and never removes, and there is no flag to change that.
+#
+# Every other `--clean` target is a named cache at a known path whose owner documents
+# how to rebuild it. `/private/tmp` is a heuristic over a world-writable directory,
+# and age plus size plus "no open handle" does not establish that something is an
+# abandoned checkout - an old application directory, an archive, a database, a
+# mounted data directory all satisfy it.
+#
+# A deletion path was written, gated behind an opt-in, then removed. It produced
+# three CRITICAL review findings and most of the rest; roughly 300 lines existed to
+# make safe a code path that was off by default; and it reclaimed nothing on the host
+# that motivated it - the 5.7 GB found there was removed by hand, after reading the
+# report. Seeing the accumulation is the half with no failure mode.
 
 # launchd hands an agent PATH=/usr/bin:/bin:/usr/sbin:/sbin and nothing more unless the
 # plist sets it, while Homebrew and Docker Desktop install outside that set. Resolving
@@ -99,10 +111,6 @@ CC_DJ_SKIPPED=0
 # load time, one failure made every later `_cc_dj_clean` in the same shell report
 # FAILED>0 and return non-zero with nothing wrong, which is how a real signal turns
 # into one nobody reads.
-CC_DJ_FAILED=0
-# Targets whose non-zero return means something went wrong rather than "may be fine".
-# Space-delimited labels, matched exactly as passed to `_cc_dj_clean_target`.
-CC_DJ_STRICT_TARGETS="stale-temp-checkouts"
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -282,8 +290,6 @@ _cc_dj_du_bytes() {
 
 # `_cc_dj_clean_target` logs a non-zero return and then returns success itself,
 # because for a cache target "rc may be fine" is genuinely true. It is not true of
-# the stale-temp scan, where non-zero means the scan was blind - so CC_DJ_FAILED
-# counts it and the count reaches the run's own exit status.
 _cc_dj_clean_target() {
   local label="$1"
   shift
@@ -301,7 +307,6 @@ _cc_dj_clean_target() {
     _cc_dj_log "clean: target '${label}' done (freed=${freed})"
   else
     _cc_dj_log "clean: target '${label}' returned non-zero (rc=${rc}, may be fine, freed=${freed})"
-    CC_DJ_FAILED=$(( CC_DJ_FAILED + 1 ))
   fi
 }
 
@@ -370,11 +375,6 @@ _cc_dj_any_bare_parent() {
   return 1
 }
 
-# Set when a run of the enumerator could not scan something it was asked to scan.
-# A file rather than a variable: the enumerator is consumed through a process
-# substitution, so anything it assigns is assigned in a child and lost.
-CC_DJ_TMP_BLIND_FILE=""
-
 _cc_dj_stale_tmp_dirs() {
   local root root_real d d_parent d_real held cwd recent listing repo_hit head_hits min_kb age roots=()
   age="$CC_DJ_TMP_AGE_DAYS"
@@ -391,12 +391,10 @@ _cc_dj_stale_tmp_dirs() {
   for root in ${roots[@]+"${roots[@]}"}; do
     [ -n "$root" ] || continue
     if [ ! -d "$root" ] || [ ! -r "$root" ]; then
-      [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
       echo "disk-janitor: temp root unusable, scanned nothing: $root" >&2
       continue
     fi
     if ! _cc_dj_lsof_usable; then
-      [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
       echo "disk-janitor: lsof cannot report open files; skipped $root rather than assume nothing is held" >&2
       continue
     fi
@@ -424,12 +422,10 @@ _cc_dj_stale_tmp_dirs() {
     # from "nothing to clean" unless somebody says so.
     root_real="$( (cd -P "$root" 2>/dev/null && pwd) || echo "$root" )"
     listing="$(mktemp "${TMPDIR:-/tmp}/cc-dj-list.XXXXXX")" || {
-      [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
       echo "disk-janitor: could not create a work file, scanned nothing: $root" >&2
       continue
     }
     if ! find "$root" -maxdepth 1 -mindepth 1 -type d -print0 >"$listing" 2>/dev/null; then
-      [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
       echo "disk-janitor: could not list temp root, scanned nothing: $root" >&2
       rm -f "$listing"
       continue
@@ -457,8 +453,7 @@ _cc_dj_stale_tmp_dirs() {
       # every check. A find that FAILS keeps the candidate, for the same reason as
       # everywhere else in this function.
       if ! repo_hit="$(find "$d" -maxdepth 3 -name .git -print -quit 2>/dev/null)"; then
-        [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
-      echo "disk-janitor: could not scan for git repositories, kept: $d" >&2
+        echo "disk-janitor: could not scan for git repositories, kept: $d" >&2
         continue
       fi
       [ -n "$repo_hit" ] && continue
@@ -478,13 +473,11 @@ _cc_dj_stale_tmp_dirs() {
       # substitution strips NULs, and `-print` alone lets a path split itself so the
       # confirmation runs against fragments rather than against the repository.
       head_hits="$(mktemp "${TMPDIR:-/tmp}/cc-dj-heads.XXXXXX")" || {
-        [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
-        echo "disk-janitor: could not create a work file, kept: $d" >&2
+          echo "disk-janitor: could not create a work file, kept: $d" >&2
         continue
       }
       if ! find "$d" -maxdepth 4 -type f -name HEAD -print0 >"$head_hits" 2>/dev/null; then
-        [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
-        echo "disk-janitor: could not scan for bare repositories, kept: $d" >&2
+          echo "disk-janitor: could not scan for bare repositories, kept: $d" >&2
         rm -f "$head_hits"
         continue
       fi
@@ -511,8 +504,7 @@ _cc_dj_stale_tmp_dirs() {
       # not evidence that the tree is idle, and this is the check standing between a
       # live tree and `rm -rf`.
       if ! recent="$(find "$d" -mtime -"$age" -print -quit 2>/dev/null)"; then
-        [ -n "$CC_DJ_TMP_BLIND_FILE" ] && echo x >> "$CC_DJ_TMP_BLIND_FILE"
-      echo "disk-janitor: could not test staleness, kept: $d" >&2
+        echo "disk-janitor: could not test staleness, kept: $d" >&2
         continue
       fi
       [ -n "$recent" ] && continue
@@ -525,9 +517,9 @@ _cc_dj_stale_tmp_dirs() {
       # but `*` and an unmatched `[` fail toward deleting.
       # A name lsof would escape cannot be checked against its inventory, so it is
       # never cleared. macOS lsof reports `weird<LF>name` as the eight characters
-      # `weird\nname`, so the comparison below never matches the real path - which
-      # reads as "nothing holds this" and, with CC_DJ_TMP_DELETE=1, removes a tree
-      # somebody has open. Not being able to prove a tree unheld has to mean keeping.
+      # `weird\nname`, so the comparison below never matches the real path and the
+      # directory reads as unheld. Nothing is deleted here any more, but a report
+      # that names a tree somebody is actively using is a report people stop reading.
       case "$d" in
         *[$'\n\t\r\\']*)
           echo "disk-janitor: name cannot be matched against lsof output, kept: $d" >&2
@@ -559,55 +551,8 @@ _cc_dj_report_stale_tmp_dirs() {
     n=$(( n + 1 )); kb=$(( kb + $(_cc_dj_du_kib "$d") ))
     _cc_dj_log "check: stale temp checkout ${d} ($(_cc_dj_du_bytes "$d") bytes)"
   done < <(_cc_dj_stale_tmp_dirs)
-  [ "$n" -gt 0 ] && _cc_dj_log "check: ${n} stale temp checkout(s), $(( kb / 1024 )) MB — run disk-janitor --clean"
+  [ "$n" -gt 0 ] && _cc_dj_log "check: ${n} stale temp checkout(s), $(( kb / 1024 )) MB — review them and remove by hand; --clean does not touch these"
   return 0
-}
-
-_cc_dj_clean_stale_tmp_dirs() {
-  local d n=0 rc=0
-  # "Nothing to clean" and "could not look" produce the same empty list, and
-  # `_cc_dj_clean_target` reports a target that returned 0 as done. That is the
-  # false-success shape this whole target was added to remove, so a blind scan
-  # returns nonzero and is counted as a failure rather than a completion.
-  # A marker we cannot create is not a marker that records nothing - it is a run
-  # that cannot report being blind at all. With TMPDIR unwritable or full, every
-  # `mktemp` in the enumerator fails too, the scan sees nothing, and without this
-  # the target logs "no stale temp checkouts" and returns success having looked at
-  # precisely zero directories.
-  if ! CC_DJ_TMP_BLIND_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-dj-blind.XXXXXX")"; then
-    CC_DJ_TMP_BLIND_FILE=""
-    _cc_dj_log "clean: cannot create a work file; the stale-temp scan did not run"
-    return 1
-  fi
-  while IFS= read -r -d '' d; do
-    [ -n "$d" ] || continue
-    n=$(( n + 1 ))
-    if [ "$CC_DJ_TMP_DELETE" = 1 ]; then
-      _cc_dj_clean_dir "stale temp checkout $(basename "$d")" "$d"
-      # `_cc_dj_clean_dir` ignores `rm -rf`'s status and ends on a successful log
-      # call, so a removal blocked by permissions or lost to a race was reported as
-      # done. Checked here rather than there, because for a rebuildable cache the
-      # existing behaviour is fine and for somebody's abandoned work it is not.
-      if [ -e "$d" ]; then
-        _cc_dj_log "clean: FAILED to remove ${d} — it is still there"
-        rc=1
-      fi
-    else
-      # Counted and named, never removed. A target that reports what it would have
-      # done is still doing its job here: the finding was that nobody was looking at
-      # /private/tmp at all, and looking is the part that has no failure mode.
-      _cc_dj_log "clean: would remove ${d} ($(_cc_dj_du_bytes "$d") bytes) — set CC_DJ_TMP_DELETE=1 to enable"
-    fi
-  done < <(_cc_dj_stale_tmp_dirs)
-  if [ -n "$CC_DJ_TMP_BLIND_FILE" ] && [ -s "$CC_DJ_TMP_BLIND_FILE" ]; then
-    _cc_dj_log "clean: stale-temp scan was incomplete — see stderr for which roots"
-    rc=1
-  elif [ "$n" -eq 0 ]; then
-    _cc_dj_log "clean: no stale temp checkouts older than ${CC_DJ_TMP_AGE_DAYS}d over ${CC_DJ_TMP_MIN_MB}MB"
-  fi
-  [ -n "$CC_DJ_TMP_BLIND_FILE" ] && rm -f "$CC_DJ_TMP_BLIND_FILE"
-  CC_DJ_TMP_BLIND_FILE=""
-  return "$rc"
 }
 
 _cc_dj_clean_dir() {
@@ -742,7 +687,6 @@ _cc_dj_clean() {
   # the accounting added to make a skipped run legible would itself become wrong.
   CC_DJ_RAN=0
   CC_DJ_SKIPPED=0
-  CC_DJ_FAILED=0
   local free_before free_after
   free_before="$(_cc_dj_free_pct)"
   _cc_dj_log "clean: starting — disk free=${free_before}%"
@@ -781,15 +725,6 @@ _cc_dj_clean() {
   else
     _cc_dj_skip "bun pm cache rm (bun not found)"
   fi
-
-  # -- stale scratch checkouts under the shared temp directory ------------------
-  #
-  # Unlike every other target here this one is not a named cache with a documented
-  # rebuild command, so it earns its place through the gates in the enumerator rather
-  # than through a path constant: stale by mtime, over a size floor, no open handle,
-  # and not a registered git worktree. `_cc_dj_clean_target` is used so a failure is
-  # counted rather than swallowed.
-  _cc_dj_clean_target "stale-temp-checkouts" _cc_dj_clean_stale_tmp_dirs
 
   # -- Spotify cache ----------------------------------------------------------
   local spotify_cache="$HOME/Library/Caches/com.spotify.client"
@@ -865,16 +800,11 @@ _cc_dj_clean() {
   # The counts are on this line because their absence is what let five dead targets run
   # weekly for weeks: a clean that skipped most of its work and one that did all of it
   # both ended on "clean: finished - disk free=16%".
-  # FAILED joins them for the same reason. A target that returned non-zero was
-  # logged and then forgotten, so a blind stale-temp scan - one that could not read a
-  # root, or whose lsof or find failed - reached this line as a completed run and the
-  # process exited 0. Under launchd that status is the only thing anyone sees.
-  if [ "$CC_DJ_SKIPPED" -gt 0 ] || [ "$CC_DJ_FAILED" -gt 0 ]; then
-    _cc_dj_log "clean: finished — disk free=${free_after}% — ran=${CC_DJ_RAN} SKIPPED=${CC_DJ_SKIPPED} FAILED=${CC_DJ_FAILED} (a skipped or failed target cleaned nothing)"
+  if [ "$CC_DJ_SKIPPED" -gt 0 ]; then
+    _cc_dj_log "clean: finished — disk free=${free_after}% — ran=${CC_DJ_RAN} SKIPPED=${CC_DJ_SKIPPED} (a skipped target cleaned nothing)"
   else
-    _cc_dj_log "clean: finished — disk free=${free_after}% — ran=${CC_DJ_RAN} skipped=0 failed=0"
+    _cc_dj_log "clean: finished — disk free=${free_after}% — ran=${CC_DJ_RAN} skipped=0"
   fi
-  [ "$CC_DJ_FAILED" -eq 0 ]
 }
 
 # ---------------------------------------------------------------------------
