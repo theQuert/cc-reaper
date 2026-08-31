@@ -157,10 +157,20 @@ _cc_reaper_orphan_ppids() {
     # none of which a process picks - and `--user` is confirmed by asking about that
     # one PID afterwards.
     if [ "$(uname -s 2>/dev/null)" = Linux ]; then
+      local u c rest
       for cand in $(ps -eo pid=,uid=,comm= 2>/dev/null \
                     | awk -v uid="$uid" '$2 == uid && $3 == "systemd" {print $1}'); do
-        case "$(ps -o args= -p "$cand" 2>/dev/null)" in
-          *--user*) systemd_user_pids="$systemd_user_pids$cand " ;;
+        # uid, comm and args together, in ONE query. Asking only for args would trust
+        # a PID that had exited and been reused between the two calls: if the new
+        # occupant carries `--user` anywhere in its arguments it joins the
+        # orphan-parent set, and every child of it is then treated as an orphan.
+        u=""; c=""; rest=""
+        read -r u c rest <<EOF
+$(ps -o uid=,comm=,args= -p "$cand" 2>/dev/null)
+EOF
+        [ "$u" = "$uid" ] && [ "$c" = "systemd" ] || continue
+        case " $rest " in
+          *" --user"*) systemd_user_pids="$systemd_user_pids$cand " ;;
         esac
       done
     fi

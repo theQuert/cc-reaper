@@ -56,9 +56,20 @@ if [ "$(uname -s 2>/dev/null)" = Linux ]; then
   _systemd_user_pids=""
   for _cand in $(ps -eo pid=,uid=,comm= 2>/dev/null \
                  | awk -v uid="$_uid" '$2 == uid && $3 == "systemd" {print $1}'); do
-    case "$(ps -o args= -p "$_cand" 2>/dev/null)" in
-      *--user*) _systemd_user_pids="$_systemd_user_pids$_cand " ;;
-    esac
+    # uid, comm and args together, in ONE query. Asking only for args would trust a
+    # PID that had exited and been reused between the two calls: if the new occupant
+    # happens to carry `--user` anywhere in its arguments it joins the orphan-parent
+    # set, and every child of it then passes the orphan filter and is killed. The
+    # recheck costs one `ps` per candidate, and there is normally exactly one.
+    _u=""; _c=""; _rest=""
+    read -r _u _c _rest <<EOF
+$(ps -o uid=,comm=,args= -p "$_cand" 2>/dev/null)
+EOF
+    if [ "$_u" = "$_uid" ] && [ "$_c" = "systemd" ]; then
+      case " $_rest " in
+        *" --user"*) _systemd_user_pids="$_systemd_user_pids$_cand " ;;
+      esac
+    fi
   done
 else
   _systemd_user_pids=""
