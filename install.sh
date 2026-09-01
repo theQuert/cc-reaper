@@ -16,6 +16,29 @@ if [ -z "$HOME_DIR" ] || [ ! -d "$HOME_DIR" ]; then
   exit 1
 fi
 
+# An interrupted install must not read like a finished one.
+#
+# Measured 2026-09-01: a run that blocked at the daemon prompt had already updated the
+# shell functions and not the scripts, and its transcript - ending mid-step - looked
+# like any other. Only a byte comparison against the repository found it. This project's
+# own rule is that a deploy is not done until the running copy matches the build; the
+# installer was the one place not saying which it had achieved.
+_CC_INSTALL_COMPLETE=0
+_cc_install_epilogue() {
+  local rc=$?
+  if [ "$_CC_INSTALL_COMPLETE" -ne 1 ]; then
+    echo "" >&2
+    echo "=== cc-reaper: INSTALL DID NOT COMPLETE (exit $rc) ===" >&2
+    echo "  Scripts under $HOME_DIR/.cc-reaper may be a mix of versions." >&2
+    echo "  Nothing here is safe to treat as deployed. Re-run:  ./install.sh" >&2
+    echo "  Non-interactively:  CC_REAPER_DAEMON=b ./install.sh < /dev/null" >&2
+  fi
+  return $rc
+}
+trap _cc_install_epilogue EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
 # ─── Detect install vs update ────────────────────────────────────────────────
 IS_UPDATE=false
 if grep -q "claude-cleanup.sh" "$HOME_DIR/.zshrc" 2>/dev/null || \
@@ -147,14 +170,46 @@ echo "                       Requires: Homebrew or Cargo"
 echo "    b) LaunchAgent   — Zero-dependency macOS native (10-min interval, PPID=1 detection)"
 echo "                       Requires: nothing (built-in macOS)"
 echo ""
-printf "  Your choice [a/b] (default: b): "
-read -r DAEMON_CHOICE
-DAEMON_CHOICE="${DAEMON_CHOICE:-b}"
-while [ "$DAEMON_CHOICE" != "a" ] && [ "$DAEMON_CHOICE" != "b" ]; do
-  printf "  Invalid choice. Please enter 'a' or 'b' (default: b): "
+# A prompt is only a question if somebody can answer it.
+#
+# `read` on stdin that is an open pipe with nothing coming blocks forever, and every
+# agent harness and most CI runners hand a script exactly that. Measured 2026-09-01
+# deploying #23: the installer stopped here, having already updated the shell functions
+# and NOT the scripts under ~/.cc-reaper, and printed nothing to say so.
+#
+# The retry loop made it worse than a hang: `read` returning EOF leaves the variable
+# empty, the default makes it valid, and the loop exits - but a stdin that delivers
+# invalid lines forever is an infinite loop by construction. It is capped now.
+if [ -n "${CC_REAPER_DAEMON:-}" ]; then
+  DAEMON_CHOICE="$CC_REAPER_DAEMON"
+  echo "  Choice from CC_REAPER_DAEMON: $DAEMON_CHOICE"
+elif [ ! -t 0 ]; then
+  DAEMON_CHOICE=b
+  echo "  No terminal on stdin, so nothing can answer this. Taking the default: b (LaunchAgent)."
+  echo "  Set CC_REAPER_DAEMON=a to choose proc-janitor from a script."
+else
+  printf "  Your choice [a/b] (default: b): "
   read -r DAEMON_CHOICE
   DAEMON_CHOICE="${DAEMON_CHOICE:-b}"
-done
+  _cc_tries=0
+  while [ "$DAEMON_CHOICE" != "a" ] && [ "$DAEMON_CHOICE" != "b" ]; do
+    _cc_tries=$((_cc_tries + 1))
+    if [ "$_cc_tries" -ge 5 ]; then
+      echo "  Five invalid answers; taking the default: b (LaunchAgent)."
+      DAEMON_CHOICE=b
+      break
+    fi
+    printf "  Invalid choice. Please enter 'a' or 'b' (default: b): "
+    read -r DAEMON_CHOICE || DAEMON_CHOICE=b
+    DAEMON_CHOICE="${DAEMON_CHOICE:-b}"
+  done
+  unset _cc_tries
+fi
+case "$DAEMON_CHOICE" in
+  a|b) ;;
+  *) echo "  CC_REAPER_DAEMON=$DAEMON_CHOICE is not 'a' or 'b'; taking the default: b."
+     DAEMON_CHOICE=b ;;
+esac
 
 if [ "$DAEMON_CHOICE" = "a" ]; then
   # ─── proc-janitor path ───
@@ -427,3 +482,8 @@ echo "  ~/.cc-reaper/disk-janitor.sh --check           Read-only disk + snapshot
 echo "  ~/.cc-reaper/disk-janitor.sh --clean           Clean rebuildable caches now"
 echo "  ~/.cc-reaper/worktree-janitor.sh               Worktree report (dry-run)"
 echo "  ~/.cc-reaper/worktree-janitor.sh --apply       Remove clean idle worktrees"
+
+# The LAST line, not the last step. Anything that dies between the final step and here -
+# a banner that fails, a probe that aborts under `set -e` - is still an incomplete run,
+# and the epilogue must keep saying so.
+_CC_INSTALL_COMPLETE=1
