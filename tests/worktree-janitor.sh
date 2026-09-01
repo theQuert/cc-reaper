@@ -346,6 +346,25 @@ expect_yes "a denied root says so rather than reporting an empty scan" \
   bash -c 'out=$(PATH="$3:$PATH" CC_WJ_ROOT="$2/denied" bash "$1" 2>&1); printf "%s\\n" "$out" | grep -q "could not be listed\\|cannot be read"' \
     _ "$ROOT_DIR/shell/worktree-janitor.sh" "$BLIND_ROOT" "$FIND_STUB_WJ"
 
+# The wording, not just the fact. A denial that says "needs Full Disk Access" without
+# naming the binary is what sent a real grant to a terminal that already had one, while
+# the binary launchd spawns stayed absent from the TCC database - measured 2026-09-01.
+expect_yes "a denied root names the binary to grant, not a description" \
+  bash -c 'out=$(PATH="$3:$PATH" CC_WJ_ROOT="$2/denied" bash "$1" 2>&1);
+           printf "%s\\n" "$out" | grep -q "THIS binary: /" &&
+           printf "%s\\n" "$out" | grep -q "Cmd-Shift-G" &&
+           ! printf "%s\\n" "$out" | grep -q "the program in the plist"' \
+    _ "$ROOT_DIR/shell/worktree-janitor.sh" "$BLIND_ROOT" "$FIND_STUB_WJ"
+
+# The trade-off and the alternative travel with it, or the message reads as an
+# instruction to grant rather than a decision to make. install.sh has said both since it
+# was written; this is the copy the operator sees when it actually bites.
+expect_yes "a denied root carries the trade-off and the alternative" \
+  bash -c 'out=$(PATH="$3:$PATH" CC_WJ_ROOT="$2/denied" bash "$1" 2>&1);
+           printf "%s\\n" "$out" | grep -q "EVERY bash script" &&
+           printf "%s\\n" "$out" | grep -q "outside those three"' \
+    _ "$ROOT_DIR/shell/worktree-janitor.sh" "$BLIND_ROOT" "$FIND_STUB_WJ"
+
 expect_yes "roots are plural" \
   bash -c 'CC_WJ_ROOT="/nope/a:/nope/b" bash "$1" 2>&1 | grep -q "/nope/a,/nope/b"' \
     _ "$ROOT_DIR/shell/worktree-janitor.sh"

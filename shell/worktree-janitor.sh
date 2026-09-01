@@ -112,6 +112,28 @@ _cc_wj_log_write() {
 # Called from `_cc_wj_run` rather than reported by `_cc_wj_discover_repos`: that one is
 # consumed through a process substitution, so a flag it sets is set in a child and the
 # caller never sees it.
+# The binary that must hold the grant, named rather than described.
+#
+# TCC grants are per-EXECUTABLE, and the executable under launchd is the interpreter,
+# not this script: the plist runs `/bin/bash /path/to/worktree-janitor.sh`. Measured
+# 2026-09-01, in a sibling project whose message had this same shape: an operator
+# granted Full Disk Access in direct response to it and the grant landed on their
+# terminal and their editor - both of which already had it, neither of which is what
+# launchd spawns - while `/bin/bash` stayed absent from the TCC database entirely. The
+# next run printed the identical denial.
+#
+# `install.sh` has said the precise thing since it was written, including the trade-off
+# and the alternative it prefers. This is the message the operator sees at the moment
+# it actually bites, and it was the weaker of the two.
+_cc_wj_grant_target() {
+  local prog
+  prog="$(ps -o comm= -p $$ 2>/dev/null | sed 's/^-//')"
+  case "$prog" in
+    /*) printf '%s' "$prog" ;;
+    *)  printf '%s' "${BASH:-/bin/bash}" ;;
+  esac
+}
+
 _cc_wj_unreadable_roots() {
   local root
   while IFS= read -r root; do
@@ -544,7 +566,13 @@ _cc_wj_run() {
   while IFS= read -r blind_root; do
     [ -n "$blind_root" ] || continue
     echo "worktree-janitor: root exists but cannot be read, scanned nothing: $blind_root" >&2
-    echo "worktree-janitor:   (under launchd, a path in ~/Documents, ~/Desktop or ~/Downloads needs Full Disk Access)" >&2
+    echo "worktree-janitor:   under launchd, ~/Documents, ~/Desktop and ~/Downloads need a" >&2
+    echo "worktree-janitor:   Full Disk Access grant on THIS binary: $(_cc_wj_grant_target)" >&2
+    echo "worktree-janitor:   System Settings > Privacy & Security > Full Disk Access > + > Cmd-Shift-G." >&2
+    echo "worktree-janitor:   Granting it to your terminal or editor does nothing: launchd spawns the" >&2
+    echo "worktree-janitor:   binary above. Note this hands EVERY bash script on the machine access to" >&2
+    echo "worktree-janitor:   all protected user data - keeping swept repositories outside those three" >&2
+    echo "worktree-janitor:   directories avoids the grant entirely, and is what install.sh prefers." >&2
     blind=1
   done < <(_cc_wj_unreadable_roots)
   fi
