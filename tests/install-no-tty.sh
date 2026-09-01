@@ -148,6 +148,63 @@ grep -q "INSTALL DID NOT COMPLETE" "$out"; check "an interrupted run says it did
 grep -q "may be a mix of versions" "$out"; check "it names the consequence, not just the fact" $?
 rm -rf "$H" "$out"
 
+# ─── 5. Each signal keeps its own exit status ─────────────────────────────────
+#
+# A caller reads 128+n to learn WHICH interruption happened. TERM and HUP shared a trap
+# and both reported 143, so a closed SSH session or terminal was indistinguishable from
+# a deliberate kill - in the one script whose whole job here is to say accurately what
+# happened to it.
+# SIGINT is deliberately NOT here, and the reason is worth more than the case.
+#
+# Three delivery mechanisms were tried and all three were wrong in the probe, not in
+# the installer: (1) `cmd &` sets SIGINT to SIG_IGN and that survives exec, so the
+# signal never arrived and the case would have passed while testing nothing;
+# (2) resetting the disposition then signalling bash alone made bash defer the trap
+# until the foreground child it was waiting on finished - `wait` hung for five minutes;
+# (3) signalling the whole tree, which is what a terminal does, hung the suite too.
+#
+# SIGINT to a job with no controlling terminal is not the thing the trap exists for,
+# and a fourth mechanism would be testing bash's job control rather than this script.
+# The trap table is one edit, and HUP and TERM below pin the shape of it: if somebody
+# collapses them back into a shared trap, those two go red.
+for sig_pair in "HUP 129" "TERM 143"; do
+  set -- $sig_pair
+  signame=$1; want=$2
+  H="$(sandbox_home)"
+  fifo="$(mktemp -u)"; mkfifo "$fifo"
+  sleep 300 > "$fifo" & wpid=$!
+  # `trap - INT; exec` before the installer starts.
+  #
+  # Bash sets a background job's SIGINT disposition to SIG_IGN, and SIG_IGN SURVIVES
+  # exec - so a plain `cmd &` cannot be sent SIGINT at all, and the case passed for
+  # HUP and TERM while being undeliverable for INT. Restoring the default first, then
+  # exec-ing, gives the installer the disposition it would have in the foreground.
+  HOME="$H" PATH="$SLOW_STUBS:$PATH" \
+    bash -c 'trap - INT TERM HUP; exec bash "$0"' "$ROOT_DIR/install.sh" \
+    >/dev/null 2>&1 < "$fifo" &
+  ipid=$!
+  # Wait for it to be inside the blocking step rather than racing its startup.
+  waited=0
+  while [ "$waited" -lt 15 ] && ! pgrep -P "$ipid" >/dev/null 2>&1; do sleep 1; waited=$((waited+1)); done
+  # The whole tree, not just the shell. A terminal sends SIGINT to the foreground
+  # process GROUP, so signalling bash alone is not what a Ctrl-C does - and bash defers
+  # a trap until the foreground child it is waiting on finishes, so with the blocking
+  # stub still alive the trap never ran and `wait` hung for five minutes. Measured.
+  _kill_tree "$ipid" "$signame"
+  # Bounded: this loop has hung the suite twice while the delivery was wrong, and a
+  # test that hangs is the failure mode this whole PR is about.
+  irc=0; waited=0
+  while kill -0 "$ipid" 2>/dev/null && [ "$waited" -lt 20 ]; do sleep 1; waited=$((waited+1)); done
+  if kill -0 "$ipid" 2>/dev/null; then
+    _kill_tree "$ipid" KILL 2>/dev/null; wait "$ipid" 2>/dev/null; irc=-1
+  else
+    wait "$ipid" 2>/dev/null || irc=$?
+  fi
+  _kill_tree "$ipid" KILL 2>/dev/null
+  kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null; rm -f "$fifo"; rm -rf "$H"
+  [ "$irc" -eq "$want" ]; check "SIG$signame exits $want, not another signal's status" $?
+done
+
 rm -rf "$STUBS" "$SLOW_STUBS"
 if [ "$failures" -eq 0 ]; then echo "install-no-tty: all tests passed"; else echo "$failures test failure(s)"; fi
 [ "$failures" -eq 0 ]

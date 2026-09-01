@@ -36,8 +36,13 @@ _cc_install_epilogue() {
   return $rc
 }
 trap _cc_install_epilogue EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM HUP
+# One signal per status: 128+n, which is what a caller reads the exit code as.
+# Sharing a trap between TERM and HUP reported an SSH disconnect or a closed terminal
+# as 143 (SIGTERM), so the incomplete-install banner and anything watching the status
+# both named the wrong cause.
+trap 'exit 130' INT   # 128 + SIGINT(2)
+trap 'exit 143' TERM  # 128 + SIGTERM(15)
+trap 'exit 129' HUP   # 128 + SIGHUP(1)
 
 # ─── Detect install vs update ────────────────────────────────────────────────
 IS_UPDATE=false
