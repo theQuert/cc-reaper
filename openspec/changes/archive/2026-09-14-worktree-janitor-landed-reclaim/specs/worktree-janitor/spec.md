@@ -1,17 +1,4 @@
-# worktree-janitor Specification
-
-## Purpose
-
-Multi-repo git worktree inventory and gated removal: dual safety gate (dirty / active-process-cwd), dry-run by default, branches and commits never deleted.
-
-## Requirements
-
-### Requirement: Multi-repo worktree inventory
-The janitor SHALL discover git worktrees from a configurable repo list (default: every git repo directly under `~/Documents/GitHub/`) and classify each worktree as KEEP or REMOVABLE with a stated reason.
-
-#### Scenario: Inventory run
-- **WHEN** the janitor runs in report mode
-- **THEN** every non-primary worktree is listed with: dirty file count, branch, ahead-of-origin/main count, push state, active-process state, and final classification
+## MODIFIED Requirements
 
 ### Requirement: Dual safety gate for removal
 A worktree SHALL be classified REMOVABLE only when every gate below holds, and each gate
@@ -136,6 +123,8 @@ invocation without that opt-in SHALL run report mode.
 #### Scenario: Session mode without opt-in
 - **WHEN** `--session` runs and `CC_WJ_SESSION_APPLY` is unset or anything other than `1`
 - **THEN** it reports only, and names the value when one was set
+
+## ADDED Requirements
 
 ### Requirement: Repository-declared regenerable content
 The janitor SHALL read `.worktree-regenerable` from the fetched base branch - never from the
