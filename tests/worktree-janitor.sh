@@ -1363,7 +1363,8 @@ expect_yes "a non-terminal stdin without a cwd turns the session sweep into a re
 # Each applying sweep below would remove a fresh landed worktree if the session's own
 # checkout were not in doubt, so a kept one shows the sweep only reported.
 # A kept worktree alone would also pass for a sweep that died before judging anything, so
-# the sweep must also have ended and said why it only reported.
+# the sweep must also have ended - wait_session_end counts its own end line - and said why
+# it only reported.
 session_reports_for() {
   local name="$1" json="$2" why="$3" wt="$S_ROOT/wt-$1" section
   sgit worktree add -q "$wt" -b "r5-$name" origin/main 2>/dev/null
@@ -1374,7 +1375,6 @@ session_reports_for() {
   wait_session_end $((before_ends + 1)) || return 1
   section="$(awk -v n="$before_ends" '/session sweep ended/ { c++ } c >= n' "$S_LOG")"
   case "$section" in *"$why"*) ;; *) return 1 ;; esac
-  case "$section" in *"== worktree-janitor session sweep ended"*) ;; *) return 1 ;; esac
   test -d "$wt"
 }
 

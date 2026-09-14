@@ -33,4 +33,4 @@
 
 - [x] 6.1 Full `tests/worktree-janitor.sh` plus the repository's other suites, `bash -n`, `zsh -n`
 - [x] 6.2 Report mode against real repositories on this host, read-only apart from the base fetch
-- [ ] 6.3 Independent review of the candidate
+- [x] 6.3 Independent review of the candidate (six rounds; the last found only a redundant test assertion, removed)
