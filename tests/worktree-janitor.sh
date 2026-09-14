@@ -1027,31 +1027,32 @@ age_tree() {
   find "$gd" -exec touch -h -t 202001010000 {} + 2>/dev/null
 }
 
-# An lsof stub that spells names the way lsof does: bytes outside printable ASCII
-# become \xNN unless the scan runs in a UTF-8 locale, and a backslash is always doubled.
+# An lsof stub that spells names the way lsof can in any locale: every byte outside
+# printable ASCII escaped as \xNN, and a backslash doubled. Real lsof escapes U+200B,
+# U+200F, U+FEFF and U+0085 even under en_US.UTF-8, so no locale yields raw names.
 ESC_STUBS="$TMPDIR_ROOT/stubs-escape"
 mkdir -p "$ESC_STUBS"
 cat > "$ESC_STUBS/lsof" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in *" -d cwd "*) f="$LSOF_CWD_FILE" ;; *) f="$LSOF_OPEN_FILE" ;; esac
-case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
-  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) perl -pe 's/\\/\\\\/g' "$f" ;;
-  *) perl -pe 's/\\/\\\\/g; s/([^\x20-\x7e\n])/sprintf("\\x%02x", ord $1)/ge' "$f" ;;
-esac
+perl -pe 's/\\/\\\\/g; s/([^\x20-\x7e\n])/sprintf("\\x%02x", ord $1)/ge' "$f"
 STUB
 chmod +x "$ESC_STUBS/lsof"
 
 r2_wt "$R2_ROOT/專案-wt" cjk
 r2_wt "$R2_ROOT/back\\slash-wt" backslash
 r2_wt "$R2_ROOT/閒置-wt" cjk-idle
-printf 'p1\nn/\np55\nn%s\np56\nn%s\n' "$(phys "$R2_ROOT/專案-wt")" "$(phys "$R2_ROOT/back\\slash-wt")" > "$LSOF_CWD_FILE"
+ZW="$(printf 'zw\342\200\213x-wt')"
+r2_wt "$R2_ROOT/$ZW" zero-width
+printf 'p1\nn/\np55\nn%s\np56\nn%s\np57\nn%s/editor.swp\n' "$(phys "$R2_ROOT/專案-wt")" \
+  "$(phys "$R2_ROOT/back\\slash-wt")" "$(phys "$R2_ROOT/$ZW")" > "$LSOF_CWD_FILE"
 OUT_ESC="$TMPDIR_ROOT/out-escape.txt"
-LC_ALL=C PATH="$ESC_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$R2_PRIMARY" > "$OUT_ESC" 2>&1
+LC_ALL=en_US.UTF-8 PATH="$ESC_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$R2_PRIMARY" > "$OUT_ESC" 2>&1
 lsof_default
 
 # Found by review: lsof escapes these bytes, so a match against git's raw spelling of the
 # path finds no holder. The realistic locale for a hook or launchd is C.
-expect_yes "a held worktree with a non-ASCII path is kept when the caller's locale is C" \
+expect_yes "a held worktree with a non-ASCII path is kept" \
   file_after "$OUT_ESC" "專案-wt$" 2 "KEEP(active-session)"
 expect_yes "a held worktree whose path holds a backslash is kept" \
   file_after "$OUT_ESC" 'back\\slash-wt$' 2 "KEEP(active-session)"
@@ -1060,16 +1061,10 @@ expect_yes "a held worktree whose path holds a backslash is kept" \
 expect_yes "an unheld worktree with a non-ASCII path is still removable" \
   file_after "$OUT_ESC" "閒置-wt$" 2 "REMOVABLE"
 
-# With no UTF-8 locale to scan in, a non-ASCII path cannot be matched at all, so it is
-# never shown unheld - even when nothing holds it.
-NOLOC_STUBS="$TMPDIR_ROOT/stubs-nolocale"
-mkdir -p "$NOLOC_STUBS"
-printf '#!/bin/sh\nprintf "C\\nPOSIX\\n"\n' > "$NOLOC_STUBS/locale"
-chmod +x "$NOLOC_STUBS/locale"
-OUT_NOLOC="$TMPDIR_ROOT/out-nolocale.txt"
-LC_ALL=C PATH="$NOLOC_STUBS:$ESC_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$R2_PRIMARY" > "$OUT_NOLOC" 2>&1
-expect_yes "without a UTF-8 locale a non-ASCII path is never shown unheld" \
-  file_after "$OUT_NOLOC" "專案-wt$" 2 "KEEP(active-session)"
+# Found in review round 2: under a UTF-8 locale real lsof still escapes a zero-width
+# space, so a holder of this worktree matched nothing whatever locale the scan ran in.
+expect_yes "a held worktree whose path holds an invisible character is kept" \
+  bash -c 'grep -a -A 2 -- "zw.*x-wt$" "$1" | grep -q "KEEP(active-session)"' _ "$OUT_ESC"
 
 # A tab in the path would shift every field of the inventory line that carries it.
 r2_wt "$R2_ROOT/tab	wt" tabwt
@@ -1146,9 +1141,10 @@ STUB
 chmod +x "$ACT_STUBS/lsof"
 
 race_keeps() {
-  local name="$1" hours="$2" action="$3" wt="$IDLE_ROOT/race-$1" out
+  local name="$1" hours="$2" action="$3" setup="${4:-:}" wt="$IDLE_ROOT/race-$1" out
   _wj_idle --repo "$IDLE_PRIMARY" --apply >/dev/null 2>&1
   igit worktree add -q "$wt" -b "race-$name" origin/main 2>/dev/null
+  eval "${setup//@WT@/$wt}" >/dev/null 2>&1
   age_tree "$wt"
   : > "$ACT_COUNT"
   out="$TMPDIR_ROOT/out-race-$name.txt"
@@ -1160,7 +1156,7 @@ race_keeps() {
 expect_yes "untracked work written after the scan keeps the worktree" \
   race_keeps contents 0 'echo notes > "@WT@/notes.txt"'
 expect_yes "a file touched after the scan keeps the worktree" \
-  race_keeps idle 6 'echo later > "@WT@/second"; git -C "@WT@" update-index --assume-unchanged second'
+  race_keeps idle 6 'echo later > "@WT@/second"' 'git -C "@WT@" update-index --assume-unchanged second'
 expect_yes "a HEAD moved after the scan keeps the worktree" \
   race_keeps head 0 "git -C '@WT@' checkout -q --detach $I_FIRST"
 expect_yes "a lock taken after the scan keeps the worktree" \
@@ -1192,9 +1188,10 @@ expect_yes "and the run says why" \
   file_has "$OUT_NEG" "negation"
 
 class_dropped() {
-  [ -z "$(printf '[[:alpha:]][[:alpha:]]*\n' | _cc_wj_names_a_path 1)" ]
+  [ -z "$(printf '[[:alpha:]][[:alpha:]]*\n[!]][!]]*\n[]]x*\n*[!]]]*\n' | _cc_wj_names_a_path 1)" ] &&
+    [ "$(printf 'logs/*.log\nmodel/one-api.db\n' | _cc_wj_names_a_path 1 | wc -l | tr -d ' ')" = 2 ]
 }
-expect_yes "a pattern built from character classes names no path" class_dropped
+expect_yes "a pattern with any bracket expression names no path, and ordinary ones still do" class_dropped
 
 # ─── Sourced from zsh ─────────────────────────────────────────────────────────
 
@@ -1242,6 +1239,76 @@ expect_yes "the worktree named by the hook input's cwd is kept" \
   bash -c 'test -d "$1"' _ "$S_ROOT/wt-cwd"
 expect_yes "and its own sweep reports it as this session's" \
   last_sweep_says "wt-cwd" "KEEP(this-session)"
+
+# ─── Review round 3 ───────────────────────────────────────────────────────────
+
+# Hook input: an open pipe must not hold the SessionEnd hook for longer than the bounded
+# read, with or without perl.
+session_stdin_bounded() {
+  local start end
+  start=$(date +%s)
+  CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_OUTSIDE" \
+    PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session < <(sleep 8)
+  end=$(date +%s)
+  [ $((end - start)) -lt 5 ]
+}
+before_ends="$(grep -c 'session sweep ended' "$S_LOG" 2>/dev/null)"
+expect_yes "an open stdin pipe does not hold the session launcher" session_stdin_bounded
+wait_session_end $((before_ends + 1))
+
+# A cwd the parser cannot read means the session's own worktree is unknown: report only.
+sgit worktree add -q "$S_ROOT/wt-unparsed" -b unparsed origin/main 2>/dev/null
+before_ends="$(grep -c 'session sweep ended' "$S_LOG" 2>/dev/null)"
+printf '{"session_id":"x","cwd":"%s\\"quoted","reason":"exit"}\n' "$S_ROOT/wt-unparsed" |
+  CC_WJ_SESSION_APPLY=1 CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_PRIMARY" \
+  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session
+wait_session_end $((before_ends + 1))
+expect_yes "an unparseable hook cwd turns the session sweep into a report" \
+  bash -c 'test -d "$1"' _ "$S_ROOT/wt-unparsed"
+awk -v n="$before_ends" '/session sweep ended/ { c++ } c >= n' "$S_LOG" > "$TMPDIR_ROOT/unparsed-sweep.txt"
+expect_yes "and says why" file_has "$TMPDIR_ROOT/unparsed-sweep.txt" "cwd could not be parsed"
+
+# Names lsof spelled that could not be decoded: a non-ASCII or backslash path cannot be
+# matched, so it is held; a plain one is still matched honestly.
+UNDEC="$TMPDIR_ROOT/undecoded"
+mkdir -p "$UNDEC"
+printf '/elsewhere\n' > "$UNDEC/cwd"
+printf '/elsewhere/x\n' > "$UNDEC/open"
+expect_yes "undecoded names hold a non-ASCII path" _cc_wj_held "$UNDEC" "/nowhere/caf$(printf '\303\251')"
+expect_yes "undecoded names hold a backslash path" _cc_wj_held "$UNDEC" '/nowhere/a\b'
+expect_no "undecoded names do not hold a plain unmatched path" _cc_wj_held "$UNDEC" "/nowhere/plain"
+: > "$UNDEC/decoded"
+expect_no "decoded names do not hold a non-ASCII path nobody has" _cc_wj_held "$UNDEC" "/nowhere/caf$(printf '\303\251')"
+# lsof spells a control character as `^A`, which no decoding turns back into the byte.
+printf '/nowhere/a^Ab\n' >> "$UNDEC/cwd"
+expect_yes "a path with a control character is held even when names were decoded" \
+  _cc_wj_held "$UNDEC" "/nowhere/a$(printf '\001')b"
+
+# A git that cannot list worktrees - older than 2.36, or failing - is not an empty repository.
+REAL_GIT="$(command -v git)"
+GIT_STUBS="$TMPDIR_ROOT/stubs-git"
+mkdir -p "$GIT_STUBS"
+GIT_ARGS_LOG="$TMPDIR_ROOT/git-args.log"
+export GIT_ARGS_LOG REAL_GIT
+cat > "$GIT_STUBS/git" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GIT_ARGS_LOG"
+case " $* " in
+  *" worktree list "*) [ -n "${GIT_FAIL_LIST:-}" ] && { echo "error: unknown switch \`z'" >&2; exit 129; } ;;
+esac
+exec "$REAL_GIT" "$@"
+STUB
+chmod +x "$GIT_STUBS/git"
+: > "$GIT_ARGS_LOG"
+LIST_RC=0
+GIT_FAIL_LIST=1 PATH="$GIT_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$S_PRIMARY" > "$TMPDIR_ROOT/out-nolist.txt" 2>&1 || LIST_RC=$?
+expect_yes "a repository whose worktrees cannot be listed fails the run" test "$LIST_RC" -ne 0
+expect_yes "and is named" file_has "$TMPDIR_ROOT/out-nolist.txt" "could not list the worktrees of"
+
+# The report's fetch must not start git's automatic maintenance, whose gc prunes worktree
+# records - a removal in a mode that removes nothing.
+expect_yes "the base fetch disables automatic maintenance" \
+  bash -c 'grep " fetch " "$1" | grep -q -- "--no-auto-maintenance"' _ "$GIT_ARGS_LOG"
 
 # ─── Final result ─────────────────────────────────────────────────────────────
 

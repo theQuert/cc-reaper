@@ -31,9 +31,13 @@ commits are never deleted - only the working directory.
 - **WHEN** no process's cwd is inside the worktree but a process holds a file under it open
 - **THEN** it is classified KEEP with reason `active-session`
 
-#### Scenario: A path the holder scan cannot spell
-- **WHEN** a worktree's path, as git records it or resolved, contains a backslash or a control character, or a byte outside ASCII while no UTF-8 locale is available for the scan
-- **THEN** it is classified KEEP with reason `active-session`, because lsof escapes those bytes and a match against the raw path would find nothing
+#### Scenario: A path the holder scan escapes
+- **WHEN** lsof prints a name with its own escaping (`\xNN` for a byte it will not print, `\\` for a backslash)
+- **THEN** the scan decodes those escapes before matching, in every locale, so a held worktree whose path contains non-ASCII, invisible or format characters is matched and kept
+
+#### Scenario: A path the holder scan cannot decode
+- **WHEN** a worktree's path contains a control character, or contains a byte outside ASCII while the decoder is unavailable
+- **THEN** it is classified KEEP with reason `active-session`
 
 #### Scenario: A path the inventory cannot carry
 - **WHEN** a worktree's path contains a tab or a newline
@@ -102,7 +106,11 @@ invocation without that opt-in SHALL run report mode.
 
 #### Scenario: Default invocation
 - **WHEN** the janitor runs with no flags
-- **THEN** it prints the classification report and removes nothing; it MAY fetch the base branch into `refs/remotes/origin/<base>`
+- **THEN** it prints the classification report and removes nothing; it MAY fetch the base branch into `refs/remotes/origin/<base>`, with git's automatic maintenance disabled so the fetch cannot prune worktree records
+
+#### Scenario: Worktrees cannot be listed
+- **WHEN** `git worktree list --porcelain -z` fails for a repository - an unreadable repository, or git older than 2.36
+- **THEN** the run names the repository, lists nothing for it, and exits non-zero
 
 #### Scenario: Explicit apply
 - **WHEN** the user runs `worktree-janitor --apply`
@@ -134,8 +142,12 @@ git collapses is discounted when every file inside it (at most 200) is declared.
 - **THEN** it SHALL NOT discount anything
 
 #### Scenario: Pattern that names no path
-- **WHEN** a pattern containing a wildcard lacks two consecutive literal characters (`*`, `*.*`, `a*`), contains a POSIX character class (`[[:alpha:]]*`), or starts with `!`
+- **WHEN** a pattern containing a wildcard lacks two consecutive literal characters (`*`, `*.*`, `a*`), or contains a bracket expression of any kind (`[[:alpha:]]*`, `[!]][!]]*`)
 - **THEN** it is ignored and the run reports it as dropped
+
+#### Scenario: A declaration file with a negation
+- **WHEN** any line of `.worktree-regenerable` starts with `!`
+- **THEN** no line of the file is applied, and the run says the file uses an unsupported negation
 
 #### Scenario: Credential inside discounted content
 - **WHEN** a declared directory, at any depth outside `node_modules` and `site-packages`, or a built-in cache directory within two levels, holds a credential-shaped file (`.env`, `.env.*` except example/sample/template/dist, `*.pem`, `*.key`, `*.p12`, `*.keystore`, `id_rsa`, `id_ed25519`, `credentials.json`)
@@ -153,6 +165,10 @@ installed as a Claude Code SessionEnd hook.
 #### Scenario: Detaching
 - **WHEN** `--session` is invoked
 - **THEN** the invoking process exits 0 without waiting for the sweep, and the sweep runs in a new session whose process group is not the caller's
+
+#### Scenario: Hook input
+- **WHEN** the launcher's stdin is not a terminal
+- **THEN** it reads the hook input for at most two seconds; when the input names a `cwd` it cannot parse, the sweep reports only and says why
 
 #### Scenario: The session's own checkout
 - **WHEN** the session's project directory, or the `cwd` its SessionEnd hook input names, is at or under a linked worktree

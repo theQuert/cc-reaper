@@ -237,23 +237,28 @@ _cc_wj_discover_repos() {
 # live system has at least this shell's working directory in it, so no lines means the
 # scan saw nothing - which would otherwise read as permission to remove everything.
 #
-# In a UTF-8 locale when one exists, and the locale used is recorded in $1/locale. lsof
-# prints every byte its locale does not consider printable as `\xNN` - measured in the C
-# locale, which is what a hook or launchd usually inherits: `caf\xc3\xa9` - and a match
-# against git's raw spelling of the path then finds no holder at all.
-_cc_wj_utf8_locale() {
-  locale -a 2>/dev/null | grep -i -m 1 -E '^(C|en_US)\.utf-?8$'
-}
-
+# lsof prints a byte it will not print as `\xNN` and doubles a backslash. No locale avoids
+# that: in the C locale a hook inherits it spells `caf\xc3\xa9`, and even under en_US.UTF-8
+# it escapes U+200B, U+200F, U+FEFF and U+0085. So the scan runs in the C locale, where
+# every non-ASCII byte is escaped the same way, and the names are decoded back to raw bytes.
+# $1/decoded exists only when they were; without perl the names stay as lsof spelled them.
 _cc_wj_scan_holders() {
-  local dir="$1" loc
+  local dir="$1" f
   command -v lsof >/dev/null 2>&1 || return 1
-  loc="$(_cc_wj_utf8_locale)"
-  printf '%s' "$loc" > "$dir/locale"
-  _cc_wj_with_timeout 60 env LC_ALL="${loc:-C}" lsof -n -P -d cwd -Fn > "$dir/cwd.raw" 2>/dev/null || return 1
-  _cc_wj_with_timeout 120 env LC_ALL="${loc:-C}" lsof -n -P -Fn > "$dir/open.raw" 2>/dev/null || return 1
-  sed -n 's/^n//p' "$dir/cwd.raw" > "$dir/cwd"
-  sed -n 's/^n//p' "$dir/open.raw" > "$dir/open"
+  _cc_wj_with_timeout 60 env LC_ALL=C lsof -n -P -d cwd -Fn > "$dir/cwd.raw" 2>/dev/null || return 1
+  _cc_wj_with_timeout 120 env LC_ALL=C lsof -n -P -Fn > "$dir/open.raw" 2>/dev/null || return 1
+  rm -f "$dir/decoded"
+  if command -v perl >/dev/null 2>&1; then
+    for f in cwd open; do
+      LC_ALL=C perl -ne 'next unless s/^n//; s/\\(\\|x([0-9a-fA-F]{2}))/defined $2 ? chr(hex $2) : "\\"/ge; print' \
+        "$dir/$f.raw" > "$dir/$f" || return 1
+    done
+    : > "$dir/decoded"
+  else
+    for f in cwd open; do
+      sed -n 's/^n//p' "$dir/$f.raw" > "$dir/$f"
+    done
+  fi
   [ -s "$dir/cwd" ] && [ -s "$dir/open" ]
 }
 
@@ -261,21 +266,21 @@ _cc_wj_scan_holders() {
 # records the path a worktree was added with, lsof reports the physical one, and on macOS
 # those differ under /var and /tmp.
 #
-# A path lsof would not print the way git spells it counts as held, because no match is
-# possible: lsof doubles a backslash and escapes control characters in every locale, and
-# escapes every non-ASCII byte when no UTF-8 locale was available for the scan.
+# A path the scan cannot spell the way git does counts as held, because no match is
+# possible: lsof writes control characters in forms that are not decoded (`\n`, `^A`), and
+# when the names could not be decoded every non-ASCII byte and backslash is still escaped.
+# Compared byte for byte, so the caller's locale cannot change what matches.
 _cc_wj_held() {
   local dir="$1" wt="${2%/}" p
   for p in "$wt" "$(_cc_wj_realpath "$wt")"; do
     p="${p%/}"
     [ -n "$p" ] || continue
-    case "$p" in *\\*) return 0 ;; esac
     printf '%s' "$p" | LC_ALL=C grep -q '[[:cntrl:]]' && return 0
-    if [ ! -s "$dir/locale" ] && printf '%s' "$p" | LC_ALL=C grep -q '[^ -~]'; then
+    if [ ! -e "$dir/decoded" ] && printf '%s' "$p" | LC_ALL=C grep -qE '[^ -~]|\\'; then
       return 0
     fi
-    grep -qxF -- "$p" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
-    grep -qF -- "$p/" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
+    LC_ALL=C grep -qxF -- "$p" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
+    LC_ALL=C grep -qF -- "$p/" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
   done
   return 1
 }
@@ -432,10 +437,10 @@ _cc_wj_emit_wt_block() {
 _cc_wj_list_worktrees() {
   local repo="$1" sf rec wt_path="" branch="" block_index=0
 
-  sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-worktrees.XXXXXX")" || return
+  sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-worktrees.XXXXXX")" || return 1
   if ! git -C "$repo" worktree list --porcelain -z > "$sf" 2>/dev/null; then
     rm -f "$sf"
-    return
+    return 1
   fi
 
   # Records: `worktree <path>`, `HEAD <sha>`, `branch refs/heads/<name>` or `detached`,
@@ -601,15 +606,15 @@ LIST
 }
 
 # Print patterns from stdin that name a path ($1 = 1) or that do not ($1 = 0). A pattern
-# with a wildcard must spell two consecutive characters outside its wildcards and bracket
-# expressions: `*`, `*.*`, `*e*`, `a*` and `[!.]*` name nothing in particular and would
-# discount hand-written notes along with the logs. `*.o` and `db/*` pass, and a pattern
-# with no wildcard names exactly one path.
+# with a wildcard must spell two consecutive characters outside its wildcards: `*`, `*.*`,
+# `*e*` and `a*` name nothing in particular and would discount hand-written notes along
+# with the logs. `*.o` and `db/*` pass, and a pattern with no wildcard names one path.
+#
+# A bracket expression of any kind is dropped. Stripping brackets to count what is left
+# was bypassed twice: `[[:alpha:]][[:alpha:]]*` and `[!]][!]]*` each left two characters
+# behind and matched every longer path.
 _cc_wj_names_a_path() {
-  # A POSIX class leaves `]]` behind once its brackets are stripped, which counted as two
-  # literal characters: `[[:alpha:]][[:alpha:]]*` passed and matched every longer path.
-  awk -v want="$1" 'NF { s = $0; gsub(/\[[^]]*\]/, "", s)
-    ok = ($0 !~ /\[:/) && (($0 !~ /[*?[]/) || (s ~ /[^*?][^*?]/))
+  awk -v want="$1" 'NF { ok = ($0 !~ /\[/) && (($0 !~ /[*?]/) || ($0 ~ /[^*?][^*?]/))
     if (ok == want) print }'
 }
 
@@ -742,7 +747,9 @@ _cc_wj_prepare_base() {
     return 1
   fi
   _CC_WJ_BASE="$base"
-  if ! _cc_wj_with_timeout 60 git -C "$repo" fetch --quiet --no-tags origin \
+  # Without automatic maintenance: the gc a fetch may start prunes worktree records, and
+  # this runs in report mode too.
+  if ! _cc_wj_with_timeout 60 git -C "$repo" fetch --quiet --no-tags --no-auto-maintenance origin \
        "+refs/heads/${base}:refs/remotes/origin/${base}" >/dev/null 2>&1; then
     _CC_WJ_BASE_WHY="origin/$base could not be fetched"
     return 1
@@ -1216,7 +1223,12 @@ KEEP
     # Collected to completion before anything is judged. Read as it is produced, the
     # producer runs `git -C <next worktree> status` while the loop scans for holders, and
     # the janitor's own git then holds the next worktree it is about to judge.
-    _cc_wj_list_worktrees "$repo" > "$work/inventory"
+    if ! _cc_wj_list_worktrees "$repo" > "$work/inventory"; then
+      echo "worktree-janitor: could not list the worktrees of $repo (git 2.36 or newer is required); judged nothing in it"
+      skipped=1
+      [ -n "$lock" ] && _cc_wj_unlock "$lock"
+      continue
+    fi
 
     while IFS=$'\t' read -r wt_path branch dirty ahead push_state pins; do
 
@@ -1434,20 +1446,26 @@ _cc_wj_session() {
     return 1
   fi
   if [ "${CC_WJ_DETACHED:-}" != "1" ]; then
-    local log script input="" hook_cwd=""
+    local log script input="" hook_cwd="" unparsed=""
     # A SessionEnd hook receives JSON on stdin, and its `cwd` is where the session stood -
     # which need not be CLAUDE_PROJECT_DIR when it worked in a linked worktree. Read only
-    # from a pipe or file, and bounded, so a terminal invocation does not wait for input.
+    # from a pipe or file, for at most two seconds, so neither a terminal nor a pipe left
+    # open holds the session's exit. A `cwd` the parser cannot read - an escaped quote -
+    # leaves the session's own worktree unknown, so that sweep only reports.
     if [ ! -t 0 ]; then
-      input="$(_cc_wj_with_timeout 5 cat 2>/dev/null)"
+      IFS= read -r -t 2 -d '' input || true
       hook_cwd="$(printf '%s\n' "$input" |
         sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' | head -n 1)"
+      if [ -z "$hook_cwd" ] && printf '%s' "$input" | grep -q '"cwd"'; then
+        unparsed=1
+      fi
     fi
     log="${CC_WJ_SESSION_LOG:-$HOME/.cc-reaper/logs/worktree-janitor-session.log}"
     mkdir -p "$(dirname "$log")" 2>/dev/null
     _cc_wj_bound_log "$log"
     script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    export CC_WJ_DETACHED=1 CC_WJ_SESSION_DIR="${CLAUDE_PROJECT_DIR:-$PWD}" CC_WJ_SESSION_CWD="$hook_cwd"
+    export CC_WJ_DETACHED=1 CC_WJ_SESSION_DIR="${CLAUDE_PROJECT_DIR:-$PWD}" CC_WJ_SESSION_CWD="$hook_cwd" \
+      CC_WJ_SESSION_CWD_UNPARSED="$unparsed"
     if command -v perl >/dev/null 2>&1; then
       perl -MPOSIX -e 'pipe(my $r, my $w) or exit 1; defined(my $p = fork) or exit 1;
         if ($p) { close $w; my $done = <$r>; exit 0 }
@@ -1483,6 +1501,10 @@ _cc_wj_session() {
       '') ;;
       *) echo "worktree-janitor: CC_WJ_SESSION_APPLY=${CC_WJ_SESSION_APPLY} is not 1; reporting only" ;;
     esac
+    if [ -n "${CC_WJ_SESSION_CWD_UNPARSED:-}" ]; then
+      echo "worktree-janitor: the hook input's cwd could not be parsed, so this session's worktree is unknown; reporting only"
+      apply_flag=""
+    fi
     # Out of every worktree, so this sweep's own working directory holds none of them.
     cd / || true
     CC_WJ_KEEP_PATH="$dir${cwd:+

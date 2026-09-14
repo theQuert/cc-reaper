@@ -17,7 +17,7 @@ A worktree may go only when **all** of these hold, and a check that cannot run k
 | Gate | Question | Why the obvious version is not enough |
 |---|---|---|
 | Contents | Does `git status --porcelain --ignored` show only things a command rebuilds? | Plain `--porcelain` hides ignored files, and removal deletes them: a `.env`, a local database, proof logs. |
-| Holders | Does any process have its cwd in the worktree, **or any file in it open**? | A session edits a task worktree through `git -C` and absolute paths while its own cwd is elsewhere. A cwd-only check sees nobody. And lsof escapes bytes its locale cannot print (`caf\xc3\xa9` in the C locale a hook inherits), so scan in a UTF-8 locale and treat a path lsof would spell differently as held. |
+| Holders | Does any process have its cwd in the worktree, **or any file in it open**? | A session edits a task worktree through `git -C` and absolute paths while its own cwd is elsewhere. A cwd-only check sees nobody. And lsof escapes names: `\xNN` for a byte it will not print, `\\` for a backslash. No locale avoids it - under en_US.UTF-8 it still escapes a zero-width space - so scan with `LC_ALL=C`, decode the escapes back to bytes, and compare byte for byte. A path with a control character cannot be matched that way; count it as held. |
 | Landed | Has the work reached the **freshly fetched** base branch? | "Clean" says nothing about "finished". And in a squash-merging repository a landed branch is never an ancestor of its base. |
 | Idle | Was nothing in the worktree, **or its `HEAD`, `index` and `logs/`**, modified within the last N hours? | Clean, unheld and landed are all true one minute after a commit, and a `git switch` touches only the administrative files. Use `find -H`: BSD find does not follow a worktree path that is a symlink. Run your own `git status` with `--no-optional-locks`, or it rewrites the index you are judging. |
 | Git's own state | Is the worktree locked, or does it hold a populated submodule? | `git worktree lock` is an explicit request to keep, and Claude Code locks the worktrees it creates for agents. A submodule's dirty state is invisible to the outer status. |
@@ -36,7 +36,8 @@ only copy of sixty files of work is also "not merged".
 
 Against a base fetched in the same run, through an explicit refspec
 (`+refs/heads/main:refs/remotes/origin/main`) so a custom `remote.origin.fetch` cannot leave
-the ref you compare against stale. Any one of three proofs is enough:
+the ref you compare against stale, and with `--no-auto-maintenance`: the gc a fetch may start
+prunes worktree records, which is a removal even in a run that promised to remove nothing. Any one of three proofs is enough:
 
 1. **Ancestor** — `git merge-base --is-ancestor HEAD origin/main`. Covers merge commits and
    fast-forwards. Reclaims nothing in a squash-merging repository.
@@ -89,7 +90,8 @@ Three rules make this safe:
   content disposable on its way to being deleted.
 - **Reject patterns that name nothing in particular.** A wildcard pattern must spell two
   consecutive literal characters: `*`, `*.*` and `a*` are dropped and reported, and so is any
-  POSIX character class (`[[:alpha:]][[:alpha:]]*` otherwise passes and matches everything).
+  bracket expression. Counting what is left after stripping brackets was bypassed twice:
+  `[[:alpha:]][[:alpha:]]*` and `[!]][!]]*` both pass that count and match everything.
 - **It is a shell glob, not a .gitignore.** `*` matches across `/`, and there is no negation. A
   file containing a `!` line is not applied at all: dropping only that line would still delete
   the file its author meant to protect.
@@ -115,7 +117,9 @@ separate investigation to find the 0-byte log that was holding 45 worktrees.
 - **Under a per-repository lock**, so a session-end sweep and a manual run do not race. Record
   the holder's full command line with its pid; a name match mistakes a recycled pid for a sweep.
 - **Keeping the session's own checkout** - both `CLAUDE_PROJECT_DIR` and the `cwd` in the hook's
-  JSON input, since a session that worked in a linked worktree may report either.
+  JSON input, since a session that worked in a linked worktree may report either. Read that
+  input with a short bound (`read -t 2`), and when it names a `cwd` you cannot parse, only
+  report: the one worktree you must not touch is then unknown.
 - **With every external command bounded** — `lsof`, `git fetch`, `gh` — by a timeout that kills
   the process group. `gh` ignores `SIGALRM` and `lsof` resets its own alarms.
 
