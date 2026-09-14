@@ -168,7 +168,7 @@ installed as a Claude Code SessionEnd hook.
 
 #### Scenario: Hook input
 - **WHEN** the launcher's stdin is not a terminal
-- **THEN** it reads the hook input until end of input or a two-second stall, keeping what arrived before a stall; unless the input contains exactly one `"cwd"` whose value parses, the sweep reports only and says why
+- **THEN** it reads the hook input until end of input or a two-second stall, keeping what arrived before a stall and at most 8192 characters; unless the input fits that bound and contains exactly one `"cwd"` whose value parses to an absolute path that still resolves, the sweep reports only and says why
 
 #### Scenario: The session's own checkout
 - **WHEN** the session's project directory, or the `cwd` its SessionEnd hook input names, is at or under a linked worktree

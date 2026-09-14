@@ -1355,6 +1355,45 @@ wait_session_end $((before_ends + 1))
 expect_yes "a non-terminal stdin without a cwd turns the session sweep into a report" \
   bash -c 'test -d "$1"' _ "$S_ROOT/wt-silent"
 
+# ─── Review round 5 ───────────────────────────────────────────────────────────
+
+# Each applying sweep below would remove a fresh landed worktree if the session's own
+# checkout were not in doubt, so a kept one shows the sweep only reported.
+session_reports_for() {
+  local name="$1" json="$2" wt="$S_ROOT/wt-$1"
+  sgit worktree add -q "$wt" -b "r5-$name" origin/main 2>/dev/null
+  before_ends="$(grep -c 'session sweep ended' "$S_LOG" 2>/dev/null)"
+  printf '%s\n' "${json//@WT@/$wt}" |
+    CC_WJ_SESSION_APPLY=1 CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_PRIMARY" \
+    PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session
+  wait_session_end $((before_ends + 1))
+  test -d "$wt"
+}
+
+in_dir() { (cd "$1" && shift && "$@"); }
+
+# A relative cwd resolves against whatever directory the launcher happens to stand in -
+# here a directory that exists and covers no worktree, so it would pass for a real cwd.
+expect_yes "a relative hook cwd turns the session sweep into a report" \
+  in_dir "$S_ROOT" session_reports_for relative '{"cwd":"."}'
+
+# The session stood in a directory it deleted before exiting: its worktree is still its own.
+expect_yes "a hook cwd that no longer exists turns the session sweep into a report" \
+  session_reports_for gone '{"cwd":"@WT@/build-deleted"}'
+
+# Input longer than a SessionEnd payload is not read to the end: bash 3.2 appends each
+# character in quadratic time and 70K bytes took 77 seconds, past the hook's deadline.
+# The cwd comes first, so what is cut off is where a second "cwd" would have been seen.
+long_input_bounded() {
+  local pad start end
+  pad="$(printf '%09000d' 0)"
+  start=$(date +%s)
+  session_reports_for long "{\"cwd\":\"$S_PRIMARY\",\"pad\":\"$pad\"}" || return 1
+  end=$(date +%s)
+  [ $((end - start)) -lt 20 ]
+}
+expect_yes "hook input past the size bound is not trusted" long_input_bounded
+
 # ─── Final result ─────────────────────────────────────────────────────────────
 
 if [ "$failures" -gt 0 ]; then

@@ -327,7 +327,8 @@ echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
 echo "  worktree-janitor: manual — run '~/.cc-reaper/worktree-janitor.sh' (report), add --apply to clean"
 echo "                    not scheduled: a LaunchAgent has no TCC access to ~/Documents, measured 2026-08-30"
 echo "                    or as a SessionEnd hook: \"\$HOME\"/.cc-reaper/worktree-janitor.sh --session"
-echo "                    (reports only unless CC_WJ_SESSION_APPLY=1; see docs/worktree-reclamation.md)"
+echo "                    (reports only unless CC_WJ_SESSION_APPLY=1 and the hook input names a cwd;"
+echo "                     see docs/worktree-reclamation.md)"
 echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs whitelisted MCP pinned >80% CPU for >60 min)"
 
 # ─── 5b. TCC probe ────────────────────────────────────────────────────────────

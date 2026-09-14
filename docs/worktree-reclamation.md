@@ -119,8 +119,8 @@ separate investigation to find the 0-byte log that was holding 45 worktrees.
 - **Keeping the session's own checkout** - both `CLAUDE_PROJECT_DIR` and the `cwd` in the hook's
   JSON input, since a session that worked in a linked worktree may report either. Bound the
   read, but not with bash 3.2's `read -t -d ''`, which discards everything it read when it
-  times out on a pipe left open. Unless exactly one `cwd` parses, only report: the one
-  worktree you must not touch is then unknown.
+  times out on a pipe left open. Unless exactly one `cwd` parses to an absolute path that
+  still resolves, only report: the one worktree you must not touch is then unknown.
 - **With every external command bounded** — `lsof`, `git fetch`, `gh` — by a timeout that kills
   the process group. `gh` ignores `SIGALRM` and `lsof` resets its own alarms.
 

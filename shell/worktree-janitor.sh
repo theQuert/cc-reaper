@@ -1454,14 +1454,18 @@ _cc_wj_session() {
     #
     # One character at a time, each read bounded, so a pipe left open costs two seconds and
     # what arrived before it stalled is kept: bash 3.2 discards everything a timed-out
-    # `read -d ''` had read. Without exactly one `"cwd"` that parses - none read, an escaped
-    # quote, or a second one nested in the input - the session's own worktree is unknown,
-    # and that sweep only reports.
+    # `read -d ''` had read. Without exactly one `"cwd"` that parses to an absolute path -
+    # none read, an escaped quote, a second one nested in the input, or input past the
+    # bound - the session's own worktree is unknown, and that sweep only reports.
+    #
+    # The bound is 8192 characters, where a SessionEnd payload is a few hundred: bash 3.2
+    # appends in quadratic time, and 70K bytes took 77 seconds, past the hook's deadline.
     if [ ! -t 0 ]; then
       local c rest
-      while [ "${#input}" -lt 65536 ] && IFS= read -r -d '' -n 1 -t 2 c; do
+      while [ "${#input}" -lt 8192 ] && IFS= read -r -d '' -n 1 -t 2 c; do
         input="$input$c"
       done
+      [ "${#input}" -lt 8192 ] || input=""
       case "$input" in
         *'"cwd"'*)
           rest="${input#*\"cwd\"}"
@@ -1471,7 +1475,7 @@ _cc_wj_session() {
                  sed -n '1s/^[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')" ;;
           esac ;;
       esac
-      [ -n "$hook_cwd" ] || unparsed=1
+      case "$hook_cwd" in /*) ;; *) unparsed=1 ;; esac
     fi
     log="${CC_WJ_SESSION_LOG:-$HOME/.cc-reaper/logs/worktree-janitor-session.log}"
     mkdir -p "$(dirname "$log")" 2>/dev/null
@@ -1516,6 +1520,11 @@ _cc_wj_session() {
     esac
     if [ -n "${CC_WJ_SESSION_CWD_UNPARSED:-}" ]; then
       echo "worktree-janitor: no cwd could be parsed from the hook input, so this session's worktree is unknown; reporting only"
+      apply_flag=""
+    elif [ -n "${CC_WJ_SESSION_CWD:-}" ] && [ -z "$cwd" ]; then
+      # A session that deleted the directory it stood in still owns the worktree around it,
+      # and a path that no longer resolves cannot be kept by comparison.
+      echo "worktree-janitor: the hook input's cwd ${CC_WJ_SESSION_CWD} does not resolve, so this session's worktree is unknown; reporting only"
       apply_flag=""
     fi
     # Out of every worktree, so this sweep's own working directory holds none of them.
