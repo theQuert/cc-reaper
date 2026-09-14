@@ -12,6 +12,7 @@ cc-reaper is a shell-based utility that cleans up orphan Claude Code processes (
 - `hooks/stop-cleanup-orphans.sh` — Claude Code Stop hook; kills orphans using orphan-parent filtering (only truly orphaned processes — reparented to PID 1, or on Linux to the user's `systemd --user` manager)
 - `shell/claude-cleanup.sh` — Shell functions: `claude-cleanup` (kill orphans), `claude-ram` (RAM report), `claude-fd` (FD usage report), `claude-sessions` (session list), `claude-guard` (auto-reaper with RSS/FD threshold + idle detection)
 - `shell/cc-monitor.sh` — Read-only heat attribution monitor (`cc-monitor`, `cc-monitor --apply`)
+- `shell/worktree-janitor.sh` — Worktree inventory and gated removal (clean, unheld, landed, idle); `--session` for a SessionEnd hook. The method is in `docs/worktree-reclamation.md`
 - `proc-janitor/config.toml` — Daemon config with target patterns, whitelist, and grace period settings
 - `launchd/` — macOS LaunchAgent scripts for zero-dependency background monitoring
 - `tests/` — Lightweight bash validation scripts (mocked ps/kill for isolated testing)
@@ -98,6 +99,7 @@ bash tests/cc-monitor-optimize.sh      # Validate cc-monitor optimization menu l
 bash tests/cc-monitor-runaway.sh       # Validate runaway protected process detection
 bash tests/guard-session-detect.sh     # Validate session detection + guard phases under bash and zsh
 bash tests/protection-classes.sh       # Validate protection classes, runaway selection/signalling, tree RSS
+bash tests/worktree-janitor.sh         # Validate worktree gates, landing proofs, declarations, session mode, lock
 bash -n shell/claude-cleanup.sh        # Syntax check
 bash -n shell/cc-monitor.sh            # Syntax check
 bash -n hooks/stop-cleanup-orphans.sh  # Syntax check
