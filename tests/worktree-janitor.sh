@@ -298,7 +298,7 @@ expect_no "apply: wt-clean directory removed" \
   test -d "$WT_CLEAN"
 
 # 6b: residue worktree removed via force-fallback
-expect_no "apply: wt-residue directory removed (force-fallback)" \
+expect_no "apply: wt-residue directory removed with its ignored cache" \
   test -d "$WT_RESIDUE"
 
 # 6c: prune ran — removed worktrees absent from list
@@ -645,6 +645,10 @@ lgit config "url.$L_ORIGIN.insteadOf" https://github.com/acme/demo.git
 # the head SHA would stop matching here too.
 cat > "$STUBS_IDLE/gh" <<'STUB'
 #!/usr/bin/env bash
+# Each record: <commit asked about> <that PR's head sha> <merge sha> <base>. The endpoint
+# returns every PR associated with the commit; the stub then applies whichever conditions
+# the caller's --jq filter actually states, so a filter that stops comparing the head or
+# the base lets the wrong PR through here exactly as it would against GitHub.
 [ -s "$GH_PULLS_FILE" ] || exit 1
 host="" endpoint="" jq=""
 while [ $# -gt 0 ]; do
@@ -657,16 +661,18 @@ while [ $# -gt 0 ]; do
 done
 [ "$host" = github.com ] || exit 1
 sha="${endpoint#repos/acme/demo/commits/}"; sha="${sha%/pulls}"
-while read -r head merge base; do
-  [ "$head" = "$sha" ] || continue
-  case "$jq" in *".head.sha == \"$sha\""*) ;; *) continue ;; esac
-  case "$jq" in *".base.ref == \"$base\""*) echo "$merge" ;; esac
+while read -r asked head merge base; do
+  [ "$asked" = "$sha" ] || continue
+  case "$jq" in *'.head.sha == '*) case "$jq" in *".head.sha == \"$head\""*) ;; *) continue ;; esac ;; esac
+  case "$jq" in *'.base.ref == '*) case "$jq" in *".base.ref == \"$base\""*) ;; *) continue ;; esac ;; esac
+  echo "$merge"
 done < "$GH_PULLS_FILE"
 STUB
 chmod +x "$STUBS_IDLE/gh"
-printf '%s %s main\n' "$PR_HEAD" "$PR_MERGE" > "$GH_PULLS_FILE"
-# A merged PR for pr-other's branch name, recorded at a head that is not pr-other's HEAD.
-printf '%s %s main\n' "0000000000000000000000000000000000000000" "$PR_MERGE" >> "$GH_PULLS_FILE"
+printf '%s %s %s main\n' "$PR_HEAD" "$PR_HEAD" "$PR_MERGE" > "$GH_PULLS_FILE"
+# pr-other's commit is associated with a merged PR whose head later moved past it.
+printf '%s %s %s main\n' "$(git -C "$L_ROOT/wt-pr-other" rev-parse HEAD)" \
+  "2222222222222222222222222222222222222222" "$PR_MERGE" >> "$GH_PULLS_FILE"
 
 OUT_L="$TMPDIR_ROOT/out-landed.txt"
 _wj_idle --repo "$L_PRIMARY" > "$OUT_L"
@@ -687,7 +693,7 @@ expect_yes "a PR recorded at a different head does not count" \
   file_after "$OUT_L" "wt-pr-other$" 2 "KEEP(unlanded)"
 
 # The PR proof must not outlive the base: the merge commit has to be on what was fetched.
-printf '%s %s main\n' "$PR_HEAD" "1111111111111111111111111111111111111111" > "$GH_PULLS_FILE"
+printf '%s %s %s main\n' "$PR_HEAD" "$PR_HEAD" "1111111111111111111111111111111111111111" > "$GH_PULLS_FILE"
 OUT_L2="$TMPDIR_ROOT/out-landed2.txt"
 _wj_idle --repo "$L_PRIMARY" > "$OUT_L2"
 expect_yes "a merged PR whose merge commit is not on the base does not count" \
@@ -748,7 +754,7 @@ git init -q --bare "$C_ORIGIN" -b main
 git clone -q "$C_ORIGIN" "$C_PRIMARY" 2>/dev/null
 cgit() { git -C "$C_PRIMARY" -c user.email=t@t -c user.name=t "$@"; }
 printf 'logs/\nnotes.txt\nbuild/\nnode_modules/\n' > "$C_PRIMARY/.gitignore"
-printf '# runtime output\nlogs/*.log   # the API opens this on import\n/build/\n*\n' \
+printf '# runtime output\nlogs/*.log   # the API opens this on import\n/build/\n*\n[[:alpha:]][[:alpha:]]*\n' \
   > "$C_PRIMARY/.worktree-regenerable"
 echo x > "$C_PRIMARY/README"
 cgit add -A; cgit commit -qm base; cgit push -q origin main
@@ -883,7 +889,7 @@ session_returns_first() {
   local start end
   start=$(date +%s)
   CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_ROOT/wt-mine" \
-    PATH="$SLOW_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --session
+    PATH="$SLOW_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --session </dev/null
   end=$(date +%s)
   [ $((end - start)) -lt 3 ]
 }
@@ -910,14 +916,14 @@ expect_yes "without opt-in the session sweep only reports" \
   bash -c 'grep -q "dry-run" "$1" && [ -d "$2" ]' _ "$S_LOG" "$S_ROOT/wt-done"
 
 CC_WJ_SESSION_APPLY=yes CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_ROOT/wt-mine" \
-  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session
+  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session </dev/null
 wait_session_end 2
 expect_yes "a truthy-looking value is not consent" \
   bash -c 'grep -q "CC_WJ_SESSION_APPLY=yes is not 1; reporting only" "$1" && [ -d "$2" ]' \
     _ "$S_LOG" "$S_ROOT/wt-done"
 
 CC_WJ_SESSION_APPLY=1 CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_ROOT/wt-mine" \
-  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session
+  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session </dev/null
 wait_session_end 3
 expect_no "with CC_WJ_SESSION_APPLY=1 a landed idle worktree is removed" \
   test -d "$S_ROOT/wt-done"
@@ -926,7 +932,7 @@ expect_yes "the session's own checkout is kept" \
 
 S_OUTSIDE="$TMPDIR_ROOT/not-a-repo"
 mkdir -p "$S_OUTSIDE"
-CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_OUTSIDE" PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session
+CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_OUTSIDE" PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session </dev/null
 wait_session_end 4
 expect_yes "a session outside any repository sweeps nothing and says so" \
   file_has "$S_LOG" "is not inside a git repository; swept nothing"
@@ -938,12 +944,24 @@ S_LOCK="$(git -C "$S_PRIMARY" rev-parse --path-format=absolute --git-common-dir)
 # A live holder that is this script by name.
 bash -c 'exec -a worktree-janitor-holder sleep 30' &
 HOLDER=$!
-mkdir -p "$S_LOCK"; echo "$HOLDER" > "$S_LOCK/pid"
+sleep 0.3
+mkdir -p "$S_LOCK"; echo "$HOLDER" > "$S_LOCK/pid"; ps -o command= -p "$HOLDER" > "$S_LOCK/cmd"
 OUT_LOCK="$TMPDIR_ROOT/out-lock.txt"
-_wj_idle --repo "$S_PRIMARY" --apply > "$OUT_LOCK"
+LOCK_RC=0
+PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$S_PRIMARY" --apply > "$OUT_LOCK" 2>&1 || LOCK_RC=$?
+expect_yes "a run that skipped a locked repository exits non-zero" test "$LOCK_RC" -ne 0
 expect_yes "a live sweep's lock blocks removal" \
   bash -c 'grep -q "another worktree-janitor sweep (pid [0-9]*) holds" "$1" && [ -d "$2" ]' \
     _ "$OUT_LOCK" "$S_ROOT/wt-locked"
+# A live pid that no longer runs the command recorded with it is not a sweep.
+echo "bash /somewhere/worktree-janitor.sh --apply" > "$S_LOCK/cmd"
+OUT_LOCK_REUSED="$TMPDIR_ROOT/out-lock-reused.txt"
+_wj_idle --repo "$S_PRIMARY" > /dev/null
+PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$S_PRIMARY" --apply > "$OUT_LOCK_REUSED" 2>&1
+expect_no "a live pid recorded with another command does not hold the lock" \
+  test -d "$S_ROOT/wt-locked"
+sgit worktree add -q "$S_ROOT/wt-locked" -b locked2 origin/main 2>/dev/null
+mkdir -p "$S_LOCK"; echo "$HOLDER" > "$S_LOCK/pid"; ps -o command= -p "$HOLDER" > "$S_LOCK/cmd"
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 OUT_LOCK2="$TMPDIR_ROOT/out-lock2.txt"
 _wj_idle --repo "$S_PRIMARY" --apply > "$OUT_LOCK2"
@@ -984,6 +1002,246 @@ PATH="$RACE_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$S_PRIMARY" --apply > "$
 expect_yes "a holder that appears after the scan keeps the worktree" \
   bash -c 'grep -q "entered or changed between the scan and the removal" "$1" && [ -d "$2" ]' \
     _ "$OUT_RACE" "$S_ROOT/wt-entered"
+
+
+# ─── Review round 2: what the first candidate could not see ───────────────────
+
+R2_ROOT="$TMPDIR_ROOT/r2"
+mkdir -p "$R2_ROOT"
+R2_ORIGIN="$R2_ROOT/origin.git"
+R2_PRIMARY="$R2_ROOT/primary"
+git init -q --bare "$R2_ORIGIN" -b main
+git clone -q "$R2_ORIGIN" "$R2_PRIMARY" 2>/dev/null
+r2git() { git -C "$R2_PRIMARY" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$R2_PRIMARY/README"; r2git add README; r2git commit -qm base
+echo y > "$R2_PRIMARY/second"; r2git add second; r2git commit -qm second; r2git push -q origin main
+R2_FIRST="$(r2git rev-parse HEAD~1)"
+r2_wt() { r2git worktree add -q "$1" -b "$2" origin/main 2>/dev/null; }
+
+# Old, as far as every mtime the idle gate reads is concerned: the tree and the
+# worktree's git administrative files.
+age_tree() {
+  local gd
+  find -H "$1" -exec touch -h -t 202001010000 {} + 2>/dev/null
+  gd="$(git -C "$1" rev-parse --absolute-git-dir)"
+  find "$gd" -exec touch -h -t 202001010000 {} + 2>/dev/null
+}
+
+# An lsof stub that spells names the way lsof does: bytes outside printable ASCII
+# become \xNN unless the scan runs in a UTF-8 locale, and a backslash is always doubled.
+ESC_STUBS="$TMPDIR_ROOT/stubs-escape"
+mkdir -p "$ESC_STUBS"
+cat > "$ESC_STUBS/lsof" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *" -d cwd "*) f="$LSOF_CWD_FILE" ;; *) f="$LSOF_OPEN_FILE" ;; esac
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) perl -pe 's/\\/\\\\/g' "$f" ;;
+  *) perl -pe 's/\\/\\\\/g; s/([^\x20-\x7e\n])/sprintf("\\x%02x", ord $1)/ge' "$f" ;;
+esac
+STUB
+chmod +x "$ESC_STUBS/lsof"
+
+r2_wt "$R2_ROOT/專案-wt" cjk
+r2_wt "$R2_ROOT/back\\slash-wt" backslash
+r2_wt "$R2_ROOT/閒置-wt" cjk-idle
+printf 'p1\nn/\np55\nn%s\np56\nn%s\n' "$(phys "$R2_ROOT/專案-wt")" "$(phys "$R2_ROOT/back\\slash-wt")" > "$LSOF_CWD_FILE"
+OUT_ESC="$TMPDIR_ROOT/out-escape.txt"
+LC_ALL=C PATH="$ESC_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$R2_PRIMARY" > "$OUT_ESC" 2>&1
+lsof_default
+
+# Found by review: lsof escapes these bytes, so a match against git's raw spelling of the
+# path finds no holder. The realistic locale for a hook or launchd is C.
+expect_yes "a held worktree with a non-ASCII path is kept when the caller's locale is C" \
+  file_after "$OUT_ESC" "專案-wt$" 2 "KEEP(active-session)"
+expect_yes "a held worktree whose path holds a backslash is kept" \
+  file_after "$OUT_ESC" 'back\\slash-wt$' 2 "KEEP(active-session)"
+# The other direction: scanned in a UTF-8 locale, a non-ASCII path nobody holds is
+# matched as the name it is, and is not kept merely for being non-ASCII.
+expect_yes "an unheld worktree with a non-ASCII path is still removable" \
+  file_after "$OUT_ESC" "閒置-wt$" 2 "REMOVABLE"
+
+# With no UTF-8 locale to scan in, a non-ASCII path cannot be matched at all, so it is
+# never shown unheld - even when nothing holds it.
+NOLOC_STUBS="$TMPDIR_ROOT/stubs-nolocale"
+mkdir -p "$NOLOC_STUBS"
+printf '#!/bin/sh\nprintf "C\\nPOSIX\\n"\n' > "$NOLOC_STUBS/locale"
+chmod +x "$NOLOC_STUBS/locale"
+OUT_NOLOC="$TMPDIR_ROOT/out-nolocale.txt"
+LC_ALL=C PATH="$NOLOC_STUBS:$ESC_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$R2_PRIMARY" > "$OUT_NOLOC" 2>&1
+expect_yes "without a UTF-8 locale a non-ASCII path is never shown unheld" \
+  file_after "$OUT_NOLOC" "專案-wt$" 2 "KEEP(active-session)"
+
+# A tab in the path would shift every field of the inventory line that carries it.
+r2_wt "$R2_ROOT/tab	wt" tabwt
+OUT_TAB="$TMPDIR_ROOT/out-tab.txt"
+_wj_idle --repo "$R2_PRIMARY" > "$OUT_TAB"
+expect_yes "a worktree whose path holds a tab is KEEP(unsafe-path)" \
+  file_after "$OUT_TAB" "tab?wt$" 2 "KEEP(unsafe-path)"
+OUT_TAB_APPLY="$TMPDIR_ROOT/out-tab-apply.txt"
+_wj_idle --repo "$R2_PRIMARY" --apply > "$OUT_TAB_APPLY"
+expect_yes "and is never removed" test -d "$R2_ROOT/tab	wt"
+
+# ─── Idle, measured where the work actually happens ──────────────────────────
+
+IDLE_ROOT="$TMPDIR_ROOT/idle"
+mkdir -p "$IDLE_ROOT"
+IDLE_ORIGIN="$IDLE_ROOT/origin.git"
+IDLE_PRIMARY="$IDLE_ROOT/primary"
+git init -q --bare "$IDLE_ORIGIN" -b main
+git clone -q "$IDLE_ORIGIN" "$IDLE_PRIMARY" 2>/dev/null
+igit() { git -C "$IDLE_PRIMARY" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$IDLE_PRIMARY/README"; igit add README; igit commit -qm base
+echo y > "$IDLE_PRIMARY/second"; igit add second; igit commit -qm second; igit push -q origin main
+I_FIRST="$(igit rev-parse HEAD~1)"
+
+# The positive control: old everywhere, so it is idle - and it stays idle although the
+# janitor runs `git status` in it, which must not rewrite the index it is about to judge.
+igit worktree add -q "$IDLE_ROOT/wt-old" -b old origin/main 2>/dev/null
+age_tree "$IDLE_ROOT/wt-old"
+
+# Every file old, but a branch switched a minute ago: only the git administrative files
+# say so.
+igit worktree add -q "$IDLE_ROOT/wt-switched" -b switched origin/main 2>/dev/null
+age_tree "$IDLE_ROOT/wt-switched"
+git -C "$IDLE_ROOT/wt-switched" switch -q -c switched-again
+
+# Moved to another disk and linked back: git records the link.
+igit worktree add -q "$IDLE_ROOT/wt-linked" -b linked origin/main 2>/dev/null
+mv "$IDLE_ROOT/wt-linked" "$IDLE_ROOT/elsewhere"
+ln -s "$IDLE_ROOT/elsewhere" "$IDLE_ROOT/wt-linked"
+age_tree "$IDLE_ROOT/wt-linked"
+echo fresh > "$IDLE_ROOT/elsewhere/fresh.txt"
+echo 'fresh.txt' >> "$(git -C "$IDLE_ROOT/elsewhere" rev-parse --absolute-git-dir)/info/exclude" 2>/dev/null ||
+  { mkdir -p "$(git -C "$IDLE_ROOT/elsewhere" rev-parse --git-common-dir)/info" &&
+    echo 'fresh.txt' >> "$(git -C "$IDLE_ROOT/elsewhere" rev-parse --git-common-dir)/info/exclude"; }
+touch -h -t 202001010000 "$IDLE_ROOT/wt-linked"
+
+OUT_IDLE="$TMPDIR_ROOT/out-idle.txt"
+CC_WJ_IDLE_HOURS=6 CC_WJ_REGENERABLE_FILES="fresh.txt" _wj_idle --repo "$IDLE_PRIMARY" > "$OUT_IDLE"
+expect_yes "an old, landed, clean worktree is idle after the janitor's own git status" \
+  file_after "$OUT_IDLE" "wt-old$" 2 "REMOVABLE"
+expect_yes "a branch switched a minute ago is not idle" \
+  file_after "$OUT_IDLE" "wt-switched$" 2 "KEEP(recent-activity)"
+expect_yes "a worktree reached through a symlink is examined through the link" \
+  file_after "$OUT_IDLE" "wt-linked$" 2 "KEEP(recent-activity)"
+
+# ─── The re-check before removal asks every question again ───────────────────
+#
+# One stub, one action: its first open-file listing reports nobody, and on the second -
+# the one taken right before removal - it runs $RACE_ACTION and still reports nobody.
+ACT_STUBS="$TMPDIR_ROOT/stubs-act"
+mkdir -p "$ACT_STUBS"
+ACT_COUNT="$TMPDIR_ROOT/act-count"
+export ACT_COUNT
+cat > "$ACT_STUBS/lsof" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" -d cwd "*) printf 'p1\nn/\n' ;;
+  *)
+    echo x >> "$ACT_COUNT"
+    [ "$(wc -l < "$ACT_COUNT")" -eq 2 ] && eval "$RACE_ACTION" >/dev/null 2>&1
+    printf 'p1\nn/dev/null\n' ;;
+esac
+STUB
+chmod +x "$ACT_STUBS/lsof"
+
+race_keeps() {
+  local name="$1" hours="$2" action="$3" wt="$IDLE_ROOT/race-$1" out
+  _wj_idle --repo "$IDLE_PRIMARY" --apply >/dev/null 2>&1
+  igit worktree add -q "$wt" -b "race-$name" origin/main 2>/dev/null
+  age_tree "$wt"
+  : > "$ACT_COUNT"
+  out="$TMPDIR_ROOT/out-race-$name.txt"
+  RACE_ACTION="${action//@WT@/$wt}" CC_WJ_IDLE_HOURS="$hours" \
+    PATH="$ACT_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$IDLE_PRIMARY" --apply > "$out" 2>&1
+  grep -q "entered or changed between the scan and the removal" "$out" && [ -d "$wt" ]
+}
+
+expect_yes "untracked work written after the scan keeps the worktree" \
+  race_keeps contents 0 'echo notes > "@WT@/notes.txt"'
+expect_yes "a file touched after the scan keeps the worktree" \
+  race_keeps idle 6 'echo later > "@WT@/second"; git -C "@WT@" update-index --assume-unchanged second'
+expect_yes "a HEAD moved after the scan keeps the worktree" \
+  race_keeps head 0 "git -C '@WT@' checkout -q --detach $I_FIRST"
+expect_yes "a lock taken after the scan keeps the worktree" \
+  race_keeps lock 0 'git -C "@WT@" worktree lock "@WT@"'
+
+# ─── Git state that cannot be read ────────────────────────────────────────────
+
+git_keep_unknown() { [ "$(_cc_wj_git_keep "$TMPDIR_ROOT/not-a-repo")" = "unknown" ]; }
+expect_yes "a git state probe that fails answers unknown, not clean" git_keep_unknown
+
+# ─── A negation or a character class in a declaration ────────────────────────
+
+NEG_ROOT="$TMPDIR_ROOT/negation"
+mkdir -p "$NEG_ROOT"
+git init -q --bare "$NEG_ROOT/origin.git" -b main
+git clone -q "$NEG_ROOT/origin.git" "$NEG_ROOT/primary" 2>/dev/null
+ngit() { git -C "$NEG_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+printf 'logs/\n' > "$NEG_ROOT/primary/.gitignore"
+# Written the way a .gitignore author writes it: everything in logs, except the notes.
+printf 'logs\n!logs/keep.md\n' > "$NEG_ROOT/primary/.worktree-regenerable"
+ngit add -A; ngit commit -qm base; ngit push -q origin main
+ngit worktree add -q "$NEG_ROOT/wt-neg" -b neg origin/main 2>/dev/null
+mkdir -p "$NEG_ROOT/wt-neg/logs"; echo keep > "$NEG_ROOT/wt-neg/logs/keep.md"
+OUT_NEG="$TMPDIR_ROOT/out-negation.txt"
+_wj_idle --repo "$NEG_ROOT/primary" > "$OUT_NEG"
+expect_yes "a declaration file with a negation is not applied at all" \
+  file_after "$OUT_NEG" "wt-neg$" 2 "KEEP(unrebuildable=1)"
+expect_yes "and the run says why" \
+  file_has "$OUT_NEG" "negation"
+
+class_dropped() {
+  [ -z "$(printf '[[:alpha:]][[:alpha:]]*\n' | _cc_wj_names_a_path 1)" ]
+}
+expect_yes "a pattern built from character classes names no path" class_dropped
+
+# ─── Sourced from zsh ─────────────────────────────────────────────────────────
+
+if command -v zsh >/dev/null 2>&1; then
+  # `$base:r` is a zsh modifier: "+refs/heads/$base:refs/..." fetched `mainefs/...`.
+  zsh_fetches_base() {
+    zsh -c 'source "$1" >/dev/null 2>&1; _cc_wj_prepare_base "$2" >/dev/null 2>&1; [ "$_CC_WJ_BASE_OK" = 1 ]' \
+      _ "$WJ" "$IDLE_PRIMARY"
+  }
+  expect_yes "sourced from zsh, the base branch fetches" zsh_fetches_base
+  zsh_report_is_clean() {
+    local out
+    out="$(CC_WJ_KEEP_PATH=/nonexistent PATH="$STUBS_IDLE:$PATH" \
+      zsh -c 'source "$1" >/dev/null 2>&1; _cc_wj_run --repo "$2"' _ "$WJ" "$IDLE_PRIMARY" 2>&1)"
+    # More than one worktree, or there is no second pass to print on.
+    [ "$(printf '%s\n' "$out" | grep -c '^  WORKTREE')" -ge 2 ] || return 1
+    # Positive control: the report ran and reached its summary.
+    printf '%s\n' "$out" | grep -q '^Summary:' || return 1
+    ! printf '%s\n' "$out" | grep -q '^[a-z_]*='
+  }
+  expect_yes "sourced from zsh, the report prints no stray variable assignments" zsh_report_is_clean
+  zsh_session_refuses() {
+    local out
+    out="$(zsh -c 'source "$1" >/dev/null 2>&1; _cc_wj_run --session' _ "$WJ" 2>&1 </dev/null)"
+    printf '%s\n' "$out" | grep -q "requires bash"
+  }
+  expect_yes "sourced from zsh, --session refuses rather than exec a wrong path" zsh_session_refuses
+fi
+
+# ─── The session's cwd comes from its hook input too ─────────────────────────
+
+sgit worktree add -q "$S_ROOT/wt-cwd" -b cwd origin/main 2>/dev/null
+before_ends="$(grep -c 'session sweep ended' "$S_LOG" 2>/dev/null)"
+printf '{"session_id":"x","hook_event_name":"SessionEnd","cwd":"%s","reason":"exit"}\n' "$S_ROOT/wt-cwd" |
+  CC_WJ_SESSION_APPLY=1 CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_PRIMARY" \
+  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session
+wait_session_end $((before_ends + 1))
+last_sweep_says() {
+  local section
+  section="$(awk -v n="$before_ends" '/session sweep ended/ { c++ } c >= n' "$S_LOG")"
+  printf '%s\n' "$section" | grep -A 2 -- "$1\$" > "$TMPDIR_ROOT/last-sweep.txt"
+  grep -q -- "$2" "$TMPDIR_ROOT/last-sweep.txt"
+}
+expect_yes "the worktree named by the hook input's cwd is kept" \
+  bash -c 'test -d "$1"' _ "$S_ROOT/wt-cwd"
+expect_yes "and its own sweep reports it as this session's" \
+  last_sweep_says "wt-cwd" "KEEP(this-session)"
 
 # ─── Final result ─────────────────────────────────────────────────────────────
 

@@ -236,11 +236,22 @@ _cc_wj_discover_repos() {
 # The status is lsof's, not the formatter's, and an empty listing is a failure: every
 # live system has at least this shell's working directory in it, so no lines means the
 # scan saw nothing - which would otherwise read as permission to remove everything.
+#
+# In a UTF-8 locale when one exists, and the locale used is recorded in $1/locale. lsof
+# prints every byte its locale does not consider printable as `\xNN` - measured in the C
+# locale, which is what a hook or launchd usually inherits: `caf\xc3\xa9` - and a match
+# against git's raw spelling of the path then finds no holder at all.
+_cc_wj_utf8_locale() {
+  locale -a 2>/dev/null | grep -i -m 1 -E '^(C|en_US)\.utf-?8$'
+}
+
 _cc_wj_scan_holders() {
-  local dir="$1"
+  local dir="$1" loc
   command -v lsof >/dev/null 2>&1 || return 1
-  _cc_wj_with_timeout 60 lsof -n -P -d cwd -Fn > "$dir/cwd.raw" 2>/dev/null || return 1
-  _cc_wj_with_timeout 120 lsof -n -P -Fn > "$dir/open.raw" 2>/dev/null || return 1
+  loc="$(_cc_wj_utf8_locale)"
+  printf '%s' "$loc" > "$dir/locale"
+  _cc_wj_with_timeout 60 env LC_ALL="${loc:-C}" lsof -n -P -d cwd -Fn > "$dir/cwd.raw" 2>/dev/null || return 1
+  _cc_wj_with_timeout 120 env LC_ALL="${loc:-C}" lsof -n -P -Fn > "$dir/open.raw" 2>/dev/null || return 1
   sed -n 's/^n//p' "$dir/cwd.raw" > "$dir/cwd"
   sed -n 's/^n//p' "$dir/open.raw" > "$dir/open"
   [ -s "$dir/cwd" ] && [ -s "$dir/open" ]
@@ -249,11 +260,20 @@ _cc_wj_scan_holders() {
 # Whether a scan in $1 names worktree $2, or anything under it, by either spelling: git
 # records the path a worktree was added with, lsof reports the physical one, and on macOS
 # those differ under /var and /tmp.
+#
+# A path lsof would not print the way git spells it counts as held, because no match is
+# possible: lsof doubles a backslash and escapes control characters in every locale, and
+# escapes every non-ASCII byte when no UTF-8 locale was available for the scan.
 _cc_wj_held() {
   local dir="$1" wt="${2%/}" p
   for p in "$wt" "$(_cc_wj_realpath "$wt")"; do
     p="${p%/}"
     [ -n "$p" ] || continue
+    case "$p" in *\\*) return 0 ;; esac
+    printf '%s' "$p" | LC_ALL=C grep -q '[[:cntrl:]]' && return 0
+    if [ ! -s "$dir/locale" ] && printf '%s' "$p" | LC_ALL=C grep -q '[^ -~]'; then
+      return 0
+    fi
     grep -qxF -- "$p" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
     grep -qF -- "$p/" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
   done
@@ -264,12 +284,23 @@ _cc_wj_held() {
 
 # yes, no, or unknown: whether nothing under $1 was modified within $2 hours. A `find`
 # that fails - an unreadable directory inside the tree - is unknown, not idle.
+#
+# `-H`, because BSD find does not follow a symlink given as its starting point: a worktree
+# moved to another disk and linked back read as untouched however recently it was written.
+# The worktree's `HEAD`, `index` and `logs/` too, because a `git switch` or an empty commit
+# changes only those. The janitor's own `git status` runs without optional locks, so it
+# does not rewrite the index it is about to judge.
 _cc_wj_idle() {
-  local wt="$1" hours="$2" recent
+  local wt="$1" hours="$2" recent gd f
   # No window at all. Asked of find, `-mmin -0` still matches a file written in the same
   # second the scan started, whose age rounds below zero.
   [ "$hours" -eq 0 ] && { echo yes; return; }
-  if ! recent="$(find "$wt" -mmin "-$((hours * 60))" -print -quit 2>/dev/null)"; then
+  gd="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" || { echo unknown; return; }
+  set -- "$wt"
+  for f in HEAD index logs; do
+    [ -e "$gd/$f" ] && set -- "$@" "$gd/$f"
+  done
+  if ! recent="$(find -H "$@" -mmin "-$((hours * 60))" -print -quit 2>/dev/null)"; then
     echo unknown
   elif [ -n "$recent" ]; then
     echo no
@@ -282,12 +313,12 @@ _cc_wj_idle() {
 _cc_wj_realpath() {
   local p="$1"
   if [ -d "$p" ]; then
-    (cd -P "$p" 2>/dev/null && pwd) || echo "$p"
+    (builtin cd -P -- "$p" >/dev/null 2>&1 && pwd -P) || echo "$p"
   else
     local dir base
     dir=$(dirname "$p")
     base=$(basename "$p")
-    echo "$(cd -P "$dir" 2>/dev/null && pwd)/$base"
+    echo "$(builtin cd -P -- "$dir" >/dev/null 2>&1 && pwd -P)/$base"
   fi
 }
 
@@ -356,7 +387,16 @@ _cc_wj_emit_wt_block() {
   # First block (index 0) is the primary worktree — skip it
   [ "$bidx" -eq 0 ] && return
 
-  local dirty ahead push_state remote_sha pins pin_summary more
+  local dirty ahead push_state remote_sha pins pin_summary more shown
+  # A tab or newline in the path would shift or split the inventory line that carries it.
+  # Such a worktree is shown with `?` in place of those bytes and never judged, so the
+  # altered spelling never reaches a removal.
+  case "$wt" in
+    *$'\t'*|*$'\n'*)
+      shown="${wt//$'\t'/?}"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n" "${shown//$'\n'/?}" "${br:-?}" "UNSAFE-PATH" "?" "no_remote" "-"
+      return ;;
+  esac
   if [ ! -d "$wt" ]; then
     printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$wt" "${br:-?}" "MISSING" "?" "no_remote" "-"
   else
@@ -387,46 +427,34 @@ _cc_wj_emit_wt_block() {
 
 # For a given repo path, print one line per non-primary worktree:
 #   <wt_path> TAB <branch> TAB <dirty> TAB <ahead> TAB <push_state> TAB <pins>
+#
+# Read with `-z`, so a path containing a newline arrives whole rather than cut short.
 _cc_wj_list_worktrees() {
-  local repo="$1"
+  local repo="$1" sf rec wt_path="" branch="" block_index=0
 
-  # git worktree list --porcelain output:
-  #   worktree <path>
-  #   HEAD <sha>
-  #   branch refs/heads/<name>   (or "detached")
-  #   (blank line)
-  # The last block may not have a trailing blank line.
-  local raw
-  raw=$(git -C "$repo" worktree list --porcelain 2>/dev/null) || return
+  sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-worktrees.XXXXXX")" || return
+  if ! git -C "$repo" worktree list --porcelain -z > "$sf" 2>/dev/null; then
+    rm -f "$sf"
+    return
+  fi
 
-  # Use a block_index counter so only the very first block (index 0) is skipped.
-  local wt_path="" branch="" block_index=0
-
-  while IFS= read -r line; do
-    case "$line" in
+  # Records: `worktree <path>`, `HEAD <sha>`, `branch refs/heads/<name>` or `detached`,
+  # optional `bare`/`locked`/`prunable`, then an empty record ending the block. Only the
+  # very first block (index 0) - the primary worktree - is skipped.
+  while IFS= read -r -d '' rec; do
+    case "$rec" in
       "worktree "*)
-        # Starting a new block — first emit any pending block (handles no trailing newline)
         if [ -n "$wt_path" ]; then
           _cc_wj_emit_wt_block "$wt_path" "$branch" "$block_index"
           block_index=$((block_index + 1))
         fi
-        wt_path="${line#worktree }"
+        wt_path="${rec#worktree }"
         branch=""
         ;;
-      "HEAD "*)
-        : # ignore sha line
-        ;;
-      "branch "*)
-        branch="${line#branch refs/heads/}"
-        ;;
-      "detached")
-        branch="(detached)"
-        ;;
-      "bare")
-        branch="(bare)"
-        ;;
+      "branch "*) branch="${rec#branch refs/heads/}" ;;
+      detached) branch="(detached)" ;;
+      bare) branch="(bare)" ;;
       "")
-        # End of a worktree block
         if [ -n "$wt_path" ]; then
           _cc_wj_emit_wt_block "$wt_path" "$branch" "$block_index"
           block_index=$((block_index + 1))
@@ -435,9 +463,9 @@ _cc_wj_list_worktrees() {
         fi
         ;;
     esac
-  done <<< "$raw"
+  done < "$sf"
+  rm -f "$sf"
 
-  # Handle final block if no trailing blank line
   if [ -n "$wt_path" ]; then
     _cc_wj_emit_wt_block "$wt_path" "$branch" "$block_index"
   fi
@@ -578,8 +606,10 @@ LIST
 # discount hand-written notes along with the logs. `*.o` and `db/*` pass, and a pattern
 # with no wildcard names exactly one path.
 _cc_wj_names_a_path() {
+  # A POSIX class leaves `]]` behind once its brackets are stripped, which counted as two
+  # literal characters: `[[:alpha:]][[:alpha:]]*` passed and matched every longer path.
   awk -v want="$1" 'NF { s = $0; gsub(/\[[^]]*\]/, "", s)
-    ok = ($0 !~ /[*?[]/) || (s ~ /[^*?][^*?]/)
+    ok = ($0 !~ /\[:/) && (($0 !~ /[*?[]/) || (s ~ /[^*?][^*?]/))
     if (ok == want) print }'
 }
 
@@ -604,7 +634,10 @@ _cc_wj_pins() {
   local wt="$1" sf rec code rest base skip_next=0 drc
   sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-status.XXXXXX")" || {
     _cc_wj_pin '??' "(no temporary file to read its status into)"; return 1; }
-  if ! git -C "$wt" status --porcelain --ignored -z > "$sf" 2>/dev/null; then
+  # No optional locks, so a user's concurrent commit never meets this scan's index.lock
+  # and the index the idle gate reads is not rewritten; no fsmonitor, so no daemon starts
+  # inside the worktree and shows up as its holder.
+  if ! git --no-optional-locks -c core.fsmonitor=false -C "$wt" status --porcelain --ignored -z > "$sf" 2>/dev/null; then
     rm -f "$sf"
     _cc_wj_pin '??' "(git status failed)"
     return 1
@@ -710,19 +743,26 @@ _cc_wj_prepare_base() {
   fi
   _CC_WJ_BASE="$base"
   if ! _cc_wj_with_timeout 60 git -C "$repo" fetch --quiet --no-tags origin \
-       "+refs/heads/$base:refs/remotes/origin/$base" >/dev/null 2>&1; then
+       "+refs/heads/${base}:refs/remotes/origin/${base}" >/dev/null 2>&1; then
     _CC_WJ_BASE_WHY="origin/$base could not be fetched"
     return 1
   fi
   _CC_WJ_BASE_OK=1
 
-  # Written the way a .gitignore is: `/logs/` means `logs`. `#` starts a comment at the
-  # start of a line and after whitespace, so `logs  # runtime` does not declare a path
-  # nobody has.
-  all="$(git -C "$repo" show "refs/remotes/origin/$base:.worktree-regenerable" 2>/dev/null |
+  # A leading or trailing `/` is dropped, so `/logs/` means `logs`. `#` starts a comment at
+  # the start of a line and after whitespace, so `logs  # runtime` does not declare a path
+  # nobody has. These are shell globs, not .gitignore patterns: `*` matches across `/`.
+  all="$(git -C "$repo" show "refs/remotes/origin/${base}:.worktree-regenerable" 2>/dev/null |
          sed -e 's/^[[:space:]]*#.*//' -e 's/[[:space:]][[:space:]]*#.*$//' \
              -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
              -e 's#^/*##' -e 's#/*$##')"
+  # A negation cannot be honoured - a case glob has no "except" - and dropping just that
+  # line would widen what the rest of the file discounts: `logs` then `!logs/keep.md`
+  # still deletes the file its author protected. So the whole file is set aside.
+  if printf '%s\n' "$all" | grep -q '^!'; then
+    echo "worktree-janitor: $repo: .worktree-regenerable on origin/$base uses a negation (!), which is not supported; none of it was applied"
+    return 0
+  fi
   _CC_WJ_DECLARED="$(printf '%s\n' "$all" | _cc_wj_names_a_path 1)"
   dropped="$(printf '%s\n' "$all" | _cc_wj_names_a_path 0 | tr '\n' ' ')"
   [ -n "$dropped" ] &&
@@ -815,8 +855,8 @@ MERGES
 # checkout - carries state the outer status does not show, and removal refuses it without
 # force.
 _cc_wj_git_keep() {
-  local wt="$1" gitdir rec
-  gitdir="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
+  local wt="$1" gitdir rec sf
+  gitdir="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" || { echo unknown; return 0; }
   if [ -e "$gitdir/locked" ]; then
     echo locked
     return 0
@@ -825,11 +865,19 @@ _cc_wj_git_keep() {
     echo submodule
     return 0
   fi
+  # Into a file, so an index that cannot be listed is told apart from one with no gitlinks.
+  sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-stage.XXXXXX")" || { echo unknown; return 0; }
+  if ! git -C "$wt" ls-files --stage -z > "$sf" 2>/dev/null; then
+    rm -f "$sf"
+    echo unknown
+    return 0
+  fi
   while IFS= read -r -d '' rec; do
     case "$rec" in
-      160000\ *) [ -e "$wt/${rec#*$'\t'}/.git" ] && { echo submodule; return 0; } ;;
+      160000\ *) [ -e "$wt/${rec#*$'\t'}/.git" ] && { rm -f "$sf"; echo submodule; return 0; } ;;
     esac
-  done < <(git -C "$wt" ls-files --stage -z 2>/dev/null)
+  done < "$sf"
+  rm -f "$sf"
   return 0
 }
 
@@ -935,8 +983,10 @@ _cc_wj_maybe_notify() {
 
 # ─── Removal ──────────────────────────────────────────────────────────────────
 
-# Remove a single worktree; force-fallback if clean-but-ignored-residue.
-# Returns the path of the repo owning this worktree (for prune afterwards).
+# Remove a single worktree, never with force. Ignored residue does not stop a plain
+# removal; what does - an untracked file, a lock, a submodule appearing in the moment
+# before - is exactly what force would destroy, and a status check that failed used to read
+# as "nothing there" and authorise it.
 _cc_wj_remove_worktree() {
   local repo="$1"
   local wt_path="$2"
@@ -944,22 +994,11 @@ _cc_wj_remove_worktree() {
   _cc_wj_log_write "removing worktree: $wt_path (repo: $repo)"
 
   if git -C "$repo" worktree remove "$wt_path" 2>/dev/null; then
-    _cc_wj_log_write "removed (normal): $wt_path"
+    _cc_wj_log_write "removed: $wt_path"
     return 0
   fi
 
-  # Normal remove failed. Re-check dirty status — if still empty (residue is
-  # untracked/ignored like node_modules), use --force.
-  local recheck
-  recheck=$(git -C "$wt_path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-  if [ "$recheck" -eq 0 ] 2>/dev/null; then
-    if git -C "$repo" worktree remove --force "$wt_path" 2>/dev/null; then
-      _cc_wj_log_write "removed (force, ignored residue): $wt_path"
-      return 0
-    fi
-  fi
-
-  _cc_wj_log_write "FAILED to remove: $wt_path"
+  _cc_wj_log_write "FAILED to remove (git refused): $wt_path"
   return 1
 }
 
@@ -972,24 +1011,35 @@ _cc_wj_remove_worktree() {
 #
 # A holder counts only while its pid is alive and still this script - a pid the kernel
 # has handed to something else is not a sweep - and not for more than an hour, because
-# nothing a sweep does takes that long and deferring to a hung one would mean the
-# repository is never swept again.
+# nothing a sweep does takes that long - it refreshes the lock on every removal - and
+# deferring to a hung one would mean the repository is never swept again.
 #
 # ponytail: taking over a dead holder's lock is check-then-act, so two sweeps that find
 # the same dead holder in the same instant can both proceed. git's own locks bound what
 # that costs - one of two concurrent removals fails and is reported - so the lock is a
 # de-duplication of work, not the thing standing between a worktree and its deletion.
+_cc_wj_lock_write() {
+  echo "$$" > "$1/pid"
+  ps -o command= -p "$$" > "$1/cmd" 2>/dev/null
+}
+
 _cc_wj_lock() {
-  local lock="$1" holder live=0
+  local lock="$1" holder recorded live=0
   if mkdir "$lock" 2>/dev/null; then
-    echo "$$" > "$lock/pid"
+    _cc_wj_lock_write "$lock"
     return 0
   fi
   holder="$(cat "$lock/pid" 2>/dev/null)"
-  if [ -n "$holder" ] && ps -p "$holder" -o command= 2>/dev/null | grep -q 'worktree-janitor'; then
+  recorded="$(cat "$lock/cmd" 2>/dev/null)"
+  # Alive and still running the command recorded when it took the lock. Matching on a name
+  # instead took over a sweep started through a symlink, and kept a pid the kernel had
+  # handed to anything whose command line happened to contain it.
+  if [ -n "$holder" ] && [ -n "$recorded" ] &&
+     [ "$(ps -o command= -p "$holder" 2>/dev/null)" = "$recorded" ]; then
     live=1
-  elif [ -z "$holder" ] && [ -z "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
-    live=1   # a sweep between its mkdir and its pid write
+  elif { [ -z "$holder" ] || [ -z "$recorded" ]; } &&
+       [ -z "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+    live=1   # a sweep between its mkdir and its writes
   fi
   if [ "$live" -eq 1 ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
     echo "worktree-janitor: pid ${holder:-?} has held $lock for over 60 minutes; taking it over"
@@ -999,18 +1049,18 @@ _cc_wj_lock() {
     echo "worktree-janitor: another worktree-janitor sweep${holder:+ (pid $holder)} holds $lock; removed nothing in this repository"
     return 1
   fi
-  rm -f "$lock/pid"
+  rm -f "$lock/pid" "$lock/cmd"
   rmdir "$lock" 2>/dev/null
   if ! mkdir "$lock" 2>/dev/null; then
     echo "worktree-janitor: the sweep lock $lock could not be taken; removed nothing in this repository"
     return 1
   fi
-  echo "$$" > "$lock/pid"
+  _cc_wj_lock_write "$lock"
 }
 
 # Released only while it is still ours: after a takeover it belongs to somebody else.
 _cc_wj_unlock() {
-  [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] && rm -f "$1/pid" && rmdir "$1" 2>/dev/null
+  [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] && rm -f "$1/pid" "$1/cmd" && rmdir "$1" 2>/dev/null
   return 0
 }
 
@@ -1129,10 +1179,21 @@ _cc_wj_run() {
 
   # The checkout the calling session stands in, kept whatever else is true of it:
   # `claude --resume` expects to find it.
-  local keep_path=""
-  [ -n "${CC_WJ_KEEP_PATH:-}" ] && keep_path="$(_cc_wj_realpath "$CC_WJ_KEEP_PATH")"
+  # Newline-separated: a session supplies both its project directory and the cwd its hook
+  # input names, and either may be the linked worktree it worked in.
+  local keep_paths=""
+  if [ -n "${CC_WJ_KEEP_PATH:-}" ]; then
+    while IFS= read -r kp; do
+      [ -n "$kp" ] && keep_paths="$keep_paths$(_cc_wj_realpath "$kp")"$'\n'
+    done <<KEEP
+$CC_WJ_KEEP_PATH
+KEEP
+  fi
 
-  local repo lock
+  local repo lock skipped=0
+  # Declared once, outside the loop: zsh prints the value of an already-set local that is
+  # declared again.
+  local active landed idle classification wt_phys git_keep head0 bytes kp
   for repo in "${repos[@]}"; do
     if [ ! -d "$repo" ]; then
       continue
@@ -1145,7 +1206,7 @@ _cc_wj_run() {
     lock=""
     if [ "$apply" -eq 1 ]; then
       lock="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/cc-reaper-worktree-janitor.lock"
-      _cc_wj_lock "$lock" || continue
+      _cc_wj_lock "$lock" || { skipped=1; continue; }
     fi
 
     if ! _cc_wj_prepare_base "$repo"; then
@@ -1159,6 +1220,14 @@ _cc_wj_run() {
 
     while IFS=$'\t' read -r wt_path branch dirty ahead push_state pins; do
 
+      if [ "$dirty" = "UNSAFE-PATH" ]; then
+        printf "  WORKTREE  %s\n" "$wt_path"
+        printf "    branch=%s  dirty=?  active=n/a\n" "$branch"
+        printf "    classification: KEEP(unsafe-path)  [a tab or newline in the path; review it by hand]\n"
+        total_kept=$((total_kept + 1))
+        continue
+      fi
+
       # Handle missing dir
       if [ "$dirty" = "MISSING" ]; then
         printf "  WORKTREE  %s\n" "$wt_path"
@@ -1171,14 +1240,16 @@ _cc_wj_run() {
         continue
       fi
 
-      local active="no"
+      active="no"
       if [ "$LSOF_OK" = "no" ] || _cc_wj_held "$work" "$wt_path"; then
         active="yes"
       fi
 
       # Asked only of a worktree the cheaper gates have not already kept: the landed proofs
       # may reach the network, and the idle walk costs seconds on a tree with node_modules.
-      local landed="-" idle="-"
+      landed="-"
+      idle="-"
+      head0="$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)"
       if [ "$dirty" = "0" ] && [ "$active" = "no" ]; then
         landed="$(_cc_wj_landed "$wt_path")"
         case "$landed" in
@@ -1186,15 +1257,24 @@ _cc_wj_run() {
         esac
       fi
 
-      local classification="" wt_phys
-      if [ -n "$keep_path" ]; then
+      classification=""
+      if [ -n "$keep_paths" ]; then
         wt_phys="$(_cc_wj_realpath "$wt_path")"
-        case "$keep_path/" in "${wt_phys%/}"/*) classification="KEEP(this-session)" ;; esac
+        while IFS= read -r kp; do
+          [ -n "$kp" ] || continue
+          case "$kp/" in "${wt_phys%/}"/*) classification="KEEP(this-session)" ;; esac
+        done <<KEEP
+$keep_paths
+KEEP
       fi
-      local git_keep=""
+      git_keep=""
       if [ -z "$classification" ]; then
         git_keep="$(_cc_wj_git_keep "$wt_path")"
-        [ -n "$git_keep" ] && classification="KEEP($git_keep)"
+        case "$git_keep" in
+          '') ;;
+          unknown) classification="KEEP(git-state-unknown)" ;;
+          *) classification="KEEP($git_keep)" ;;
+        esac
       fi
       [ -n "$classification" ] ||
         classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle")
@@ -1234,18 +1314,22 @@ _cc_wj_run() {
             fi
             if _cc_wj_held "$work" "$wt_path" ||
                [ "$(_cc_wj_undiscounted_count "$wt_path")" != "0" ] ||
-               [ "$(_cc_wj_idle "$wt_path" "$idle_hours")" != "yes" ]; then
+               [ "$(_cc_wj_idle "$wt_path" "$idle_hours")" != "yes" ] ||
+               [ -z "$head0" ] ||
+               [ "$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)" != "$head0" ] ||
+               [ -n "$(_cc_wj_git_keep "$wt_path")" ]; then
               printf "    → kept: it was entered or changed between the scan and the removal\n"
               total_kept=$((total_kept + 1))
               continue
             fi
             # Measure disk usage before removal
-            local bytes=0
+            bytes=0
             bytes=$(du -sk "$wt_path" 2>/dev/null | awk '{print $1 * 1024}') || bytes=0
             if _cc_wj_remove_worktree "$repo" "$wt_path"; then
               total_removed=$((total_removed + 1))
               total_reclaimed=$((total_reclaimed + bytes))
               printf "    → removed (%s bytes reclaimed)\n" "$bytes"
+              [ -n "$lock" ] && touch "$lock" 2>/dev/null
               # Queue prune for this repo
               prune_repos+=("$repo")
             else
@@ -1308,8 +1392,10 @@ _cc_wj_run() {
   fi
 
   # Finding repositories under one root does not make a denial on another harmless:
-  # the worktrees under the denied one were never even listed.
+  # the worktrees under the denied one were never even listed. A repository skipped for a
+  # held lock was not swept either.
   [ "$blind" -eq 1 ] && return 1
+  [ "$skipped" -eq 1 ] && return 1
   return 0
 }
 
@@ -1341,13 +1427,27 @@ _cc_wj_gib() {
 # anything before this mode existed, and installing the hook should not change that
 # without a decision.
 _cc_wj_session() {
+  # The launcher re-executes this file by the path bash knows it by; another shell that
+  # sourced it has no such path.
+  if [ -z "${BASH_VERSION:-}" ]; then
+    echo "worktree-janitor: --session requires bash; run the script rather than sourcing it" >&2
+    return 1
+  fi
   if [ "${CC_WJ_DETACHED:-}" != "1" ]; then
-    local log script
+    local log script input="" hook_cwd=""
+    # A SessionEnd hook receives JSON on stdin, and its `cwd` is where the session stood -
+    # which need not be CLAUDE_PROJECT_DIR when it worked in a linked worktree. Read only
+    # from a pipe or file, and bounded, so a terminal invocation does not wait for input.
+    if [ ! -t 0 ]; then
+      input="$(_cc_wj_with_timeout 5 cat 2>/dev/null)"
+      hook_cwd="$(printf '%s\n' "$input" |
+        sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' | head -n 1)"
+    fi
     log="${CC_WJ_SESSION_LOG:-$HOME/.cc-reaper/logs/worktree-janitor-session.log}"
     mkdir -p "$(dirname "$log")" 2>/dev/null
     _cc_wj_bound_log "$log"
     script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    export CC_WJ_DETACHED=1 CC_WJ_SESSION_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+    export CC_WJ_DETACHED=1 CC_WJ_SESSION_DIR="${CLAUDE_PROJECT_DIR:-$PWD}" CC_WJ_SESSION_CWD="$hook_cwd"
     if command -v perl >/dev/null 2>&1; then
       perl -MPOSIX -e 'pipe(my $r, my $w) or exit 1; defined(my $p = fork) or exit 1;
         if ($p) { close $w; my $done = <$r>; exit 0 }
@@ -1361,9 +1461,13 @@ _cc_wj_session() {
     return 0
   fi
 
-  local dir common main apply_flag="" t0 free0 rc=0
+  local dir cwd common main apply_flag="" t0 free0 rc=0
   dir="${CC_WJ_SESSION_DIR:-$PWD}"
-  dir="$(cd "$dir" 2>/dev/null && pwd -P)" || dir="${CC_WJ_SESSION_DIR:-$PWD}"
+  dir="$(builtin cd -P -- "$dir" >/dev/null 2>&1 && pwd -P)" || dir="${CC_WJ_SESSION_DIR:-$PWD}"
+  cwd=""
+  [ -n "${CC_WJ_SESSION_CWD:-}" ] && cwd="$(builtin cd -P -- "$CC_WJ_SESSION_CWD" >/dev/null 2>&1 && pwd -P)"
+  # The repository is the one the session actually stood in, when its hook input said.
+  [ -n "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 && dir="$cwd"
   t0="$(date +%s)"
   free0="$(_cc_wj_free_kb)"
   echo "== worktree-janitor session sweep $(date '+%Y-%m-%dT%H:%M:%S%z') $dir (pid $$)"
@@ -1381,7 +1485,9 @@ _cc_wj_session() {
     esac
     # Out of every worktree, so this sweep's own working directory holds none of them.
     cd / || true
-    CC_WJ_KEEP_PATH="$dir" _cc_wj_run --repo "$main" $apply_flag || rc=$?
+    CC_WJ_KEEP_PATH="$dir${cwd:+
+$cwd}${CC_WJ_SESSION_DIR:+
+$CC_WJ_SESSION_DIR}" _cc_wj_run --repo "$main" $apply_flag || rc=$?
   fi
   echo "== worktree-janitor session sweep ended $(date '+%Y-%m-%dT%H:%M:%S%z') elapsed=$(( $(date +%s) - t0 ))s free_before=$(_cc_wj_gib "$free0") free_after=$(_cc_wj_gib "$(_cc_wj_free_kb)") status=$rc"
   return 0

@@ -12,7 +12,9 @@ commits are never deleted - only the working directory.
 3. **Landed:** against a base branch fetched during this run, HEAD is an ancestor, or merging
    HEAD into the base produces the base's own tree, or a merged pull request whose head is
    HEAD and whose base is the base branch has a merge commit contained in the fetched base.
-4. **Idle:** nothing under the worktree was modified within `CC_WJ_IDLE_HOURS` hours.
+4. **Idle:** nothing under the worktree - followed through a symlinked worktree path - and
+   none of its git administrative files (`HEAD`, `index`, `logs/`) was modified within
+   `CC_WJ_IDLE_HOURS` hours.
 5. **Detached:** a detached HEAD is additionally landed by ancestry.
 6. **Not locked, no populated submodule:** `git worktree lock` is an explicit request to keep
    a worktree, and a populated submodule carries state the outer status does not show.
@@ -29,13 +31,25 @@ commits are never deleted - only the working directory.
 - **WHEN** no process's cwd is inside the worktree but a process holds a file under it open
 - **THEN** it is classified KEEP with reason `active-session`
 
+#### Scenario: A path the holder scan cannot spell
+- **WHEN** a worktree's path, as git records it or resolved, contains a backslash or a control character, or a byte outside ASCII while no UTF-8 locale is available for the scan
+- **THEN** it is classified KEEP with reason `active-session`, because lsof escapes those bytes and a match against the raw path would find nothing
+
+#### Scenario: A path the inventory cannot carry
+- **WHEN** a worktree's path contains a tab or a newline
+- **THEN** it is classified KEEP with reason `unsafe-path` and never removed
+
 #### Scenario: A holder scan cannot run
 - **WHEN** `lsof` is absent, fails, or returns no lines for either scan
 - **THEN** every worktree is classified KEEP with reason `active-session`
 
 #### Scenario: Recently modified worktree
-- **WHEN** a clean, unheld, landed worktree contains a file modified within `CC_WJ_IDLE_HOURS`
+- **WHEN** a clean, unheld, landed worktree contains a file modified within `CC_WJ_IDLE_HOURS`, or its `HEAD`, `index` or `logs/` changed within it
 - **THEN** it is classified KEEP with reason `recent-activity`
+
+#### Scenario: Worktree reached through a symlink
+- **WHEN** the path git records for a worktree is a symlink to its directory
+- **THEN** the idle test examines the directory the link names
 
 #### Scenario: Idle window malformed
 - **WHEN** `CC_WJ_IDLE_HOURS` is not a whole number below 100000
@@ -69,9 +83,17 @@ commits are never deleted - only the working directory.
 - **WHEN** a worktree's git directory has a `modules` directory, or a gitlink in its index points at a checked-out path
 - **THEN** it is classified KEEP with reason `submodule`
 
+#### Scenario: Git state cannot be read
+- **WHEN** the worktree's git directory cannot be resolved or its index cannot be listed
+- **THEN** it is classified KEEP with reason `git-state-unknown`
+
+#### Scenario: Changed between the scan and the removal
+- **WHEN** a REMOVABLE worktree, immediately before removal, is held, holds undiscounted content, is no longer idle, has a different HEAD, or has become locked or gained a submodule
+- **THEN** it is kept and the report says it changed between the scan and the removal
+
 #### Scenario: Clean idle worktree
 - **WHEN** every gate holds
-- **THEN** it is classified REMOVABLE, the report shows which landed proof held, and removal uses `git worktree remove` (falling back to `--force` only when the residue is ignored), followed by `git worktree prune`
+- **THEN** it is classified REMOVABLE, the report shows which landed proof held, and removal uses `git worktree remove` without `--force`, followed by `git worktree prune`; a removal git refuses is reported and the worktree kept
 
 ### Requirement: Dry-run by default
 The janitor SHALL default to report-only mode; deletion SHALL occur only with an explicit
@@ -99,8 +121,8 @@ invocation without that opt-in SHALL run report mode.
 ### Requirement: Repository-declared regenerable content
 The janitor SHALL read `.worktree-regenerable` from the fetched base branch - never from the
 worktree being judged - and discount ignored entries it declares. One pattern per line,
-repository-relative, shell glob, `#` comments at line start or after whitespace, leading and
-trailing `/` ignored. A declared directory covers everything below it; an ignored directory
+repository-relative, shell glob in which `*` also matches `/`, `#` comments at line start or
+after whitespace, leading and trailing `/` ignored. Negation (`!`) is not supported. A declared directory covers everything below it; an ignored directory
 git collapses is discounted when every file inside it (at most 200) is declared.
 
 #### Scenario: Declared byproduct
@@ -112,7 +134,7 @@ git collapses is discounted when every file inside it (at most 200) is declared.
 - **THEN** it SHALL NOT discount anything
 
 #### Scenario: Pattern that names no path
-- **WHEN** a pattern containing a wildcard lacks two consecutive literal characters (`*`, `*.*`, `a*`)
+- **WHEN** a pattern containing a wildcard lacks two consecutive literal characters (`*`, `*.*`, `a*`), contains a POSIX character class (`[[:alpha:]]*`), or starts with `!`
 - **THEN** it is ignored and the run reports it as dropped
 
 #### Scenario: Credential inside discounted content
@@ -133,12 +155,12 @@ installed as a Claude Code SessionEnd hook.
 - **THEN** the invoking process exits 0 without waiting for the sweep, and the sweep runs in a new session whose process group is not the caller's
 
 #### Scenario: The session's own checkout
-- **WHEN** the session's project directory is at or under a linked worktree
+- **WHEN** the session's project directory, or the `cwd` its SessionEnd hook input names, is at or under a linked worktree
 - **THEN** that worktree is classified KEEP with reason `this-session`
 
 #### Scenario: Concurrent sweeps
 - **WHEN** a removal sweep of a repository starts while another live `worktree-janitor` holds that repository's lock
-- **THEN** it removes nothing and logs that another sweep holds the lock; a lock whose pid is dead or not a `worktree-janitor` process, or held for more than 60 minutes, is taken over
+- **THEN** it removes nothing in that repository, logs that another sweep holds the lock, and the run exits non-zero; a lock whose pid is dead or no longer runs the command that took it, or untouched for more than 60 minutes, is taken over, and a sweep refreshes its lock on every removal
 
 #### Scenario: Run record
 - **WHEN** a session sweep runs

@@ -17,12 +17,12 @@ A worktree may go only when **all** of these hold, and a check that cannot run k
 | Gate | Question | Why the obvious version is not enough |
 |---|---|---|
 | Contents | Does `git status --porcelain --ignored` show only things a command rebuilds? | Plain `--porcelain` hides ignored files, and removal deletes them: a `.env`, a local database, proof logs. |
-| Holders | Does any process have its cwd in the worktree, **or any file in it open**? | A session edits a task worktree through `git -C` and absolute paths while its own cwd is elsewhere. A cwd-only check sees nobody. |
+| Holders | Does any process have its cwd in the worktree, **or any file in it open**? | A session edits a task worktree through `git -C` and absolute paths while its own cwd is elsewhere. A cwd-only check sees nobody. And lsof escapes bytes its locale cannot print (`caf\xc3\xa9` in the C locale a hook inherits), so scan in a UTF-8 locale and treat a path lsof would spell differently as held. |
 | Landed | Has the work reached the **freshly fetched** base branch? | "Clean" says nothing about "finished". And in a squash-merging repository a landed branch is never an ancestor of its base. |
-| Idle | Was nothing in the worktree modified within the last N hours? | Clean, unheld and landed are all true one minute after a commit. |
+| Idle | Was nothing in the worktree, **or its `HEAD`, `index` and `logs/`**, modified within the last N hours? | Clean, unheld and landed are all true one minute after a commit, and a `git switch` touches only the administrative files. Use `find -H`: BSD find does not follow a worktree path that is a symlink. Run your own `git status` with `--no-optional-locks`, or it rewrites the index you are judging. |
 | Git's own state | Is the worktree locked, or does it hold a populated submodule? | `git worktree lock` is an explicit request to keep, and Claude Code locks the worktrees it creates for agents. A submodule's dirty state is invisible to the outer status. |
 
-Then remove the worktree and **leave the branch**. The branch is the claim: if the judgement
+Then remove the worktree, **without `--force`**, and **leave the branch**. What stops a plain removal - an untracked file, a lock, a submodule - is exactly what force would destroy. The branch is the claim: if the judgement
 was wrong, `git worktree add <path> <branch>` brings the checkout back.
 
 ### Clean and merged is not unused
@@ -88,7 +88,11 @@ Three rules make this safe:
   worktree benefits the moment the declaration lands, and a branch cannot declare its own
   content disposable on its way to being deleted.
 - **Reject patterns that name nothing in particular.** A wildcard pattern must spell two
-  consecutive literal characters: `*`, `*.*` and `a*` are dropped and reported.
+  consecutive literal characters: `*`, `*.*` and `a*` are dropped and reported, and so is any
+  POSIX character class (`[[:alpha:]][[:alpha:]]*` otherwise passes and matches everything).
+- **It is a shell glob, not a .gitignore.** `*` matches across `/`, and there is no negation. A
+  file containing a `!` line is not applied at all: dropping only that line would still delete
+  the file its author meant to protect.
 - **A declaration does not cover a credential.** A declared directory is still searched for
   credential-shaped files (`.env`, `*.pem`, `*.key`, `id_rsa`, …), because builds copy them
   into their output; so is a cache directory, two levels deep, because that is where people
@@ -108,7 +112,10 @@ separate investigation to find the 0-byte log that was holding 45 worktrees.
   repository took 258. Fork, `setsid()` in the child, then let the parent exit — in that
   order, or an orphan reaper running beside the hook can see the sweep as an orphan still in
   the session's process group and kill it.
-- **Under a per-repository lock**, so a session-end sweep and a manual run do not race.
+- **Under a per-repository lock**, so a session-end sweep and a manual run do not race. Record
+  the holder's full command line with its pid; a name match mistakes a recycled pid for a sweep.
+- **Keeping the session's own checkout** - both `CLAUDE_PROJECT_DIR` and the `cwd` in the hook's
+  JSON input, since a session that worked in a linked worktree may report either.
 - **With every external command bounded** — `lsof`, `git fetch`, `gh` — by a timeout that kills
   the process group. `gh` ignores `SIGALRM` and `lsof` resets its own alarms.
 
@@ -160,5 +167,7 @@ Each was observed on a real machine, and each produced output that looked like a
 - **Delete branches**, or **commit uncommitted work** to preserve it. A dirty worktree is kept.
 - **See edits hidden by `assume-unchanged` or `skip-worktree`**, or dirty state inside a
   submodule configured `ignore=all`. Git's status omits both, and so does removal's check.
+- **See holders lsof cannot**: another user's processes, or a container or VM using the
+  worktree through a bind mount. Stop those before sweeping, or keep such worktrees locked.
 - **Notice a moved default branch.** The base comes from `origin/HEAD` as the clone recorded
   it; set `CC_WJ_BASE_BRANCH` if the trunk has changed since.
