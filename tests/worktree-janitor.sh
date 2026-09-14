@@ -922,8 +922,9 @@ expect_yes "a truthy-looking value is not consent" \
   bash -c 'grep -q "CC_WJ_SESSION_APPLY=yes is not 1; reporting only" "$1" && [ -d "$2" ]' \
     _ "$S_LOG" "$S_ROOT/wt-done"
 
-CC_WJ_SESSION_APPLY=1 CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_ROOT/wt-mine" \
-  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session </dev/null
+printf '{"session_id":"x","cwd":"%s"}\n' "$S_ROOT/wt-mine" |
+  CC_WJ_SESSION_APPLY=1 CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_ROOT/wt-mine" \
+  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session
 wait_session_end 3
 expect_no "with CC_WJ_SESSION_APPLY=1 a landed idle worktree is removed" \
   test -d "$S_ROOT/wt-done"
@@ -1035,6 +1036,7 @@ mkdir -p "$ESC_STUBS"
 cat > "$ESC_STUBS/lsof" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in *" -d cwd "*) f="$LSOF_CWD_FILE" ;; *) f="$LSOF_OPEN_FILE" ;; esac
+[ -n "${LSOF_LOCALE_LOG:-}" ] && printf '%s\n' "${LC_ALL-unset}" >> "$LSOF_LOCALE_LOG"
 perl -pe 's/\\/\\\\/g; s/([^\x20-\x7e\n])/sprintf("\\x%02x", ord $1)/ge' "$f"
 STUB
 chmod +x "$ESC_STUBS/lsof"
@@ -1047,7 +1049,13 @@ r2_wt "$R2_ROOT/$ZW" zero-width
 printf 'p1\nn/\np55\nn%s\np56\nn%s\np57\nn%s/editor.swp\n' "$(phys "$R2_ROOT/專案-wt")" \
   "$(phys "$R2_ROOT/back\\slash-wt")" "$(phys "$R2_ROOT/$ZW")" > "$LSOF_CWD_FILE"
 OUT_ESC="$TMPDIR_ROOT/out-escape.txt"
-LC_ALL=en_US.UTF-8 PATH="$ESC_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$R2_PRIMARY" > "$OUT_ESC" 2>&1
+LSOF_LOCALE_LOG="$TMPDIR_ROOT/lsof-locale.log"
+LSOF_LOCALE_LOG="$LSOF_LOCALE_LOG" LC_ALL=en_US.UTF-8 PATH="$ESC_STUBS:$STUBS_IDLE:$PATH" \
+  bash "$WJ" --repo "$R2_PRIMARY" > "$OUT_ESC" 2>&1
+# In a double-byte locale such as ja_JP.SJIS lsof leaves `\` undoubled after a lead byte,
+# and the decoded name no longer matches. Found in review round 3.
+expect_yes "both holder scans run in the C locale whatever the caller's" \
+  bash -c '[ "$(sort -u "$1")" = C ] && [ "$(wc -l < "$1" | tr -d " ")" = 2 ]' _ "$LSOF_LOCALE_LOG"
 lsof_default
 
 # Found by review: lsof escapes these bytes, so a match against git's raw spelling of the
@@ -1188,7 +1196,7 @@ expect_yes "and the run says why" \
   file_has "$OUT_NEG" "negation"
 
 class_dropped() {
-  [ -z "$(printf '[[:alpha:]][[:alpha:]]*\n[!]][!]]*\n[]]x*\n*[!]]]*\n' | _cc_wj_names_a_path 1)" ] &&
+  [ -z "$(printf '[[:alpha:]][[:alpha:]]*\n[!]][!]]*\n[]]x*\n*[!]]]*\n(*|ab)\n(|ab)*\nab^*\nab~x*\n<1->ab*\n' | _cc_wj_names_a_path 1)" ] &&
     [ "$(printf 'logs/*.log\nmodel/one-api.db\n' | _cc_wj_names_a_path 1 | wc -l | tr -d ' ')" = 2 ]
 }
 expect_yes "a pattern with any bracket expression names no path, and ordinary ones still do" class_dropped
@@ -1266,7 +1274,7 @@ wait_session_end $((before_ends + 1))
 expect_yes "an unparseable hook cwd turns the session sweep into a report" \
   bash -c 'test -d "$1"' _ "$S_ROOT/wt-unparsed"
 awk -v n="$before_ends" '/session sweep ended/ { c++ } c >= n' "$S_LOG" > "$TMPDIR_ROOT/unparsed-sweep.txt"
-expect_yes "and says why" file_has "$TMPDIR_ROOT/unparsed-sweep.txt" "cwd could not be parsed"
+expect_yes "and says why" file_has "$TMPDIR_ROOT/unparsed-sweep.txt" "no cwd could be parsed from the hook input"
 
 # Names lsof spelled that could not be decoded: a non-ASCII or backslash path cannot be
 # matched, so it is held; a plain one is still matched honestly.
@@ -1309,6 +1317,43 @@ expect_yes "and is named" file_has "$TMPDIR_ROOT/out-nolist.txt" "could not list
 # records - a removal in a mode that removes nothing.
 expect_yes "the base fetch disables automatic maintenance" \
   bash -c 'grep " fetch " "$1" | grep -q -- "--no-auto-maintenance"' _ "$GIT_ARGS_LOG"
+
+# ─── Review round 4 ───────────────────────────────────────────────────────────
+
+# bash 3.2's `read -t` discards what it read when it times out, so a hook that writes its
+# JSON and leaves the pipe open delivered no cwd - and the session's worktree lost its keep.
+sgit worktree add -q "$S_ROOT/wt-open" -b open-pipe origin/main 2>/dev/null
+before_ends="$(grep -c 'session sweep ended' "$S_LOG" 2>/dev/null)"
+{ printf '{"session_id":"x","cwd":"%s","reason":"exit"}\n' "$S_ROOT/wt-open"; sleep 4; } |
+  CC_WJ_SESSION_APPLY=1 CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_PRIMARY" \
+  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session
+wait_session_end $((before_ends + 1))
+awk -v n="$before_ends" '/session sweep ended/ { c++ } c >= n' "$S_LOG" > "$TMPDIR_ROOT/open-sweep.txt"
+expect_yes "hook input written to a pipe left open still keeps its cwd" \
+  bash -c 'test -d "$1"' _ "$S_ROOT/wt-open"
+expect_yes "and that cwd was read, not lost to a timeout" \
+  bash -c '! grep -q "no cwd could be parsed" "$1" && grep -A 2 -- "wt-open\$" "$1" | grep -q "KEEP(this-session)"' \
+    _ "$TMPDIR_ROOT/open-sweep.txt"
+
+# The parser took the last "cwd" in the input, so a nested one replaced the top-level cwd,
+# non-empty, and nothing flagged it. Which one is top-level cannot be told without parsing
+# JSON, so two of them - in either order - are not trusted.
+sgit worktree add -q "$S_ROOT/wt-twice" -b twice origin/main 2>/dev/null
+before_ends="$(grep -c 'session sweep ended' "$S_LOG" 2>/dev/null)"
+printf '{"extra":{"cwd":"%s"},"cwd":"%s"}\n' "$S_PRIMARY" "$S_ROOT/wt-twice" |
+  CC_WJ_SESSION_APPLY=1 CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_PRIMARY" \
+  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session
+wait_session_end $((before_ends + 1))
+expect_yes "hook input naming cwd twice is not trusted" bash -c 'test -d "$1"' _ "$S_ROOT/wt-twice"
+
+# Hook input that could not be read at all is not a session without a worktree of its own.
+sgit worktree add -q "$S_ROOT/wt-silent" -b silent origin/main 2>/dev/null
+before_ends="$(grep -c 'session sweep ended' "$S_LOG" 2>/dev/null)"
+CC_WJ_SESSION_APPLY=1 CC_WJ_SESSION_LOG="$S_LOG" CLAUDE_PROJECT_DIR="$S_PRIMARY" \
+  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session </dev/null
+wait_session_end $((before_ends + 1))
+expect_yes "a non-terminal stdin without a cwd turns the session sweep into a report" \
+  bash -c 'test -d "$1"' _ "$S_ROOT/wt-silent"
 
 # ─── Final result ─────────────────────────────────────────────────────────────
 

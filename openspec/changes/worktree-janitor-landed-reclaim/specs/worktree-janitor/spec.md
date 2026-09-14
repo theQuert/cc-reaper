@@ -142,7 +142,7 @@ git collapses is discounted when every file inside it (at most 200) is declared.
 - **THEN** it SHALL NOT discount anything
 
 #### Scenario: Pattern that names no path
-- **WHEN** a pattern containing a wildcard lacks two consecutive literal characters (`*`, `*.*`, `a*`), or contains a bracket expression of any kind (`[[:alpha:]]*`, `[!]][!]]*`)
+- **WHEN** a pattern containing a wildcard lacks two consecutive literal characters (`*`, `*.*`, `a*`), or contains any character other than letters, digits, `.`, `_`, `/`, `+`, `@`, `-`, space, `*` and `?` - a bracket expression (`[!]][!]]*`) or alternation (`(*|ab)`)
 - **THEN** it is ignored and the run reports it as dropped
 
 #### Scenario: A declaration file with a negation
@@ -168,7 +168,7 @@ installed as a Claude Code SessionEnd hook.
 
 #### Scenario: Hook input
 - **WHEN** the launcher's stdin is not a terminal
-- **THEN** it reads the hook input for at most two seconds; when the input names a `cwd` it cannot parse, the sweep reports only and says why
+- **THEN** it reads the hook input until end of input or a two-second stall, keeping what arrived before a stall; unless the input contains exactly one `"cwd"` whose value parses, the sweep reports only and says why
 
 #### Scenario: The session's own checkout
 - **WHEN** the session's project directory, or the `cwd` its SessionEnd hook input names, is at or under a linked worktree

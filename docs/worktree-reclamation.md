@@ -89,9 +89,9 @@ Three rules make this safe:
   worktree benefits the moment the declaration lands, and a branch cannot declare its own
   content disposable on its way to being deleted.
 - **Reject patterns that name nothing in particular.** A wildcard pattern must spell two
-  consecutive literal characters: `*`, `*.*` and `a*` are dropped and reported, and so is any
-  bracket expression. Counting what is left after stripping brackets was bypassed twice:
-  `[[:alpha:]][[:alpha:]]*` and `[!]][!]]*` both pass that count and match everything.
+  consecutive literal characters: `*`, `*.*` and `a*` are dropped and reported. Allow only
+  plain name characters plus `*` and `?`: counting literals around richer syntax was bypassed
+  by `[[:alpha:]][[:alpha:]]*`, `[!]][!]]*` and, in zsh, `(*|ab)` - each matches everything.
 - **It is a shell glob, not a .gitignore.** `*` matches across `/`, and there is no negation. A
   file containing a `!` line is not applied at all: dropping only that line would still delete
   the file its author meant to protect.
@@ -117,9 +117,10 @@ separate investigation to find the 0-byte log that was holding 45 worktrees.
 - **Under a per-repository lock**, so a session-end sweep and a manual run do not race. Record
   the holder's full command line with its pid; a name match mistakes a recycled pid for a sweep.
 - **Keeping the session's own checkout** - both `CLAUDE_PROJECT_DIR` and the `cwd` in the hook's
-  JSON input, since a session that worked in a linked worktree may report either. Read that
-  input with a short bound (`read -t 2`), and when it names a `cwd` you cannot parse, only
-  report: the one worktree you must not touch is then unknown.
+  JSON input, since a session that worked in a linked worktree may report either. Bound the
+  read, but not with bash 3.2's `read -t -d ''`, which discards everything it read when it
+  times out on a pipe left open. Unless exactly one `cwd` parses, only report: the one
+  worktree you must not touch is then unknown.
 - **With every external command bounded** — `lsof`, `git fetch`, `gh` — by a timeout that kills
   the process group. `gh` ignores `SIGALRM` and `lsof` resets its own alarms.
 

@@ -610,11 +610,12 @@ LIST
 # `*e*` and `a*` name nothing in particular and would discount hand-written notes along
 # with the logs. `*.o` and `db/*` pass, and a pattern with no wildcard names one path.
 #
-# A bracket expression of any kind is dropped. Stripping brackets to count what is left
-# was bypassed twice: `[[:alpha:]][[:alpha:]]*` and `[!]][!]]*` each left two characters
-# behind and matched every longer path.
+# Only plain names and the wildcards `*` and `?` are accepted; any other glob syntax is
+# dropped. Counting literal characters around it was bypassed three times: bracket
+# expressions (`[[:alpha:]][[:alpha:]]*`, `[!]][!]]*`) and, sourced into zsh where the
+# match uses glob_subst, alternation (`(*|ab)`) all matched every path.
 _cc_wj_names_a_path() {
-  awk -v want="$1" 'NF { ok = ($0 !~ /\[/) && (($0 !~ /[*?]/) || ($0 ~ /[^*?][^*?]/))
+  awk -v want="$1" 'NF { ok = ($0 ~ /^[A-Za-z0-9._\/*?+@ -]+$/) && (($0 !~ /[*?]/) || ($0 ~ /[^*?][^*?]/))
     if (ok == want) print }'
 }
 
@@ -1449,16 +1450,28 @@ _cc_wj_session() {
     local log script input="" hook_cwd="" unparsed=""
     # A SessionEnd hook receives JSON on stdin, and its `cwd` is where the session stood -
     # which need not be CLAUDE_PROJECT_DIR when it worked in a linked worktree. Read only
-    # from a pipe or file, for at most two seconds, so neither a terminal nor a pipe left
-    # open holds the session's exit. A `cwd` the parser cannot read - an escaped quote -
-    # leaves the session's own worktree unknown, so that sweep only reports.
+    # from a pipe or file, so a terminal invocation does not wait for input.
+    #
+    # One character at a time, each read bounded, so a pipe left open costs two seconds and
+    # what arrived before it stalled is kept: bash 3.2 discards everything a timed-out
+    # `read -d ''` had read. Without exactly one `"cwd"` that parses - none read, an escaped
+    # quote, or a second one nested in the input - the session's own worktree is unknown,
+    # and that sweep only reports.
     if [ ! -t 0 ]; then
-      IFS= read -r -t 2 -d '' input || true
-      hook_cwd="$(printf '%s\n' "$input" |
-        sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' | head -n 1)"
-      if [ -z "$hook_cwd" ] && printf '%s' "$input" | grep -q '"cwd"'; then
-        unparsed=1
-      fi
+      local c rest
+      while [ "${#input}" -lt 65536 ] && IFS= read -r -d '' -n 1 -t 2 c; do
+        input="$input$c"
+      done
+      case "$input" in
+        *'"cwd"'*)
+          rest="${input#*\"cwd\"}"
+          case "$rest" in
+            *'"cwd"'*) ;;
+            *) hook_cwd="$(printf '%s\n' "$rest" |
+                 sed -n '1s/^[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')" ;;
+          esac ;;
+      esac
+      [ -n "$hook_cwd" ] || unparsed=1
     fi
     log="${CC_WJ_SESSION_LOG:-$HOME/.cc-reaper/logs/worktree-janitor-session.log}"
     mkdir -p "$(dirname "$log")" 2>/dev/null
@@ -1502,7 +1515,7 @@ _cc_wj_session() {
       *) echo "worktree-janitor: CC_WJ_SESSION_APPLY=${CC_WJ_SESSION_APPLY} is not 1; reporting only" ;;
     esac
     if [ -n "${CC_WJ_SESSION_CWD_UNPARSED:-}" ]; then
-      echo "worktree-janitor: the hook input's cwd could not be parsed, so this session's worktree is unknown; reporting only"
+      echo "worktree-janitor: no cwd could be parsed from the hook input, so this session's worktree is unknown; reporting only"
       apply_flag=""
     fi
     # Out of every worktree, so this sweep's own working directory holds none of them.
