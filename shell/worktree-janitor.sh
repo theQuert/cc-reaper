@@ -14,14 +14,23 @@ Inventory and optionally remove stale git worktrees across local repos.
 Options:
   --apply             Remove REMOVABLE worktrees (default: report only)
   --repo <path>       Scan only this repo (repeatable; replaces auto-discovery)
+  --session           Sweep the repository of CLAUDE_PROJECT_DIR, detached (SessionEnd hook)
   -h, --help          Show this help
 
 Environment:
   CC_WJ_ROOT              Root directory to discover repos under (default: ~/Documents/GitHub)
   CC_WJ_LOG               Log file path (default: ~/.cc-reaper/logs/worktree-janitor.log)
   CC_WJ_STATE_DIR         State directory for cooldown files (default: ~/.cc-reaper/state)
+  CC_WJ_IDLE_HOURS        Keep a worktree modified within this many hours (default: 6)
   CC_WJ_NOTIFY_MIN_GB     Disk savings threshold in GB to trigger notification (default: 1)
   CC_WJ_COOLDOWN_SECS     Notification cooldown in seconds (default: 3600)
+  CC_WJ_BASE_BRANCH       Integration branch (default: origin's default branch)
+  CC_WJ_SESSION_APPLY     Set to 1 to let --session remove (default: report only)
+  CC_WJ_SESSION_LOG       --session log (default: ~/.cc-reaper/logs/worktree-janitor-session.log)
+
+A worktree is removable only when it holds nothing a command cannot rebuild, no process
+has it as a working directory or holds a file in it, its work has landed on the fetched
+base branch, and nothing in it changed within CC_WJ_IDLE_HOURS. Branches are never deleted.
 EOF
 }
 
@@ -59,6 +68,53 @@ _cc_wj_cooldown_secs() {
   local v="${CC_WJ_COOLDOWN_SECS:-3600}"
   echo "$v" | grep -qE '^[0-9]+$' || v=3600
   echo "$v"
+}
+
+# How long a worktree must sit untouched before it may go. Clean, unheld and landed are
+# all true of a worktree somebody committed to a minute ago from another directory.
+#
+# Validated rather than defaulted. A malformed duration makes `find` fail, a failed find
+# prints nothing, and nothing reads exactly like "nothing was touched" - the companion
+# reclaimer in theQuert/skills sat on `off` for a week while 78 worktrees accumulated.
+# Five digits at most, because `find -mmin` on a sixteen-digit count wraps.
+_cc_wj_idle_hours() {
+  local v="${CC_WJ_IDLE_HOURS:-6}"
+  case "$v" in
+    ''|*[!0-9]*|??????*) return 1 ;;
+  esac
+  echo $((10#$v))
+}
+
+# Run a command under a time bound that ends its whole process group; exit 124 on expiry.
+#
+# `alarm; exec` bounds nothing that matters here: `gh` is a Go binary that ignores
+# SIGALRM, and lsof sets alarms of its own that replace an inherited one. So the command
+# runs as a child in its own process group while perl keeps the clock. The group is what
+# is signalled - and signalled again after the child exits - because a grandchild still
+# holding the output pipe keeps `$(...)` waiting after its parent is gone. TERM, INT and
+# HUP are passed on, since a signal to the caller's group no longer reaches the command.
+# Without perl the command runs unbounded.
+_cc_wj_with_timeout() {
+  local secs="$1"; shift
+  command -v perl >/dev/null 2>&1 || { "$@"; return; }
+  perl -MPOSIX=:sys_wait_h -e '
+    my $secs = shift;
+    defined(my $pid = fork) or exit 125;
+    if (!$pid) { setpgrp(0, 0); exec @ARGV or POSIX::_exit(127) }
+    my $end = sub {
+      my $code = shift;
+      kill "TERM", -$pid;
+      for (1 .. 20) { last if waitpid($pid, WNOHANG) > 0; select undef, undef, undef, 0.1 }
+      kill "KILL", -$pid; waitpid $pid, 0; exit $code };
+    $SIG{ALRM} = sub { $end->(124) };
+    $SIG{TERM} = sub { $end->(143) };
+    $SIG{INT}  = sub { $end->(130) };
+    $SIG{HUP}  = sub { $end->(129) };
+    alarm $secs;
+    waitpid $pid, 0;
+    my $rc = WIFEXITED($?) ? WEXITSTATUS($?) : 128 + WTERMSIG($?);
+    kill "KILL", -$pid;
+    exit $rc;' "$secs" "$@"
 }
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -164,13 +220,62 @@ _cc_wj_discover_repos() {
   done < <(_cc_wj_roots)
 }
 
-# ─── Active-process detection ─────────────────────────────────────────────────
+# ─── Holders ──────────────────────────────────────────────────────────────────
 
-# Emit PIDs (one per line) of candidate processes that might own a worktree cwd
-_cc_wj_candidate_pids() {
-  pgrep -f 'claude|codex|node|bun' 2>/dev/null || true
-  # Also check interactive shells
-  pgrep -f 'bash|zsh|fish' 2>/dev/null || true
+# Scan every process's working directory and every open file on the machine, once, into
+# $1/cwd and $1/open as one path per line. Fails when either scan fails or comes back
+# empty.
+#
+# Every process, not a `pgrep` subset: a session editing a task worktree through
+# `git -C` and absolute paths has its own cwd in the primary checkout, and an editor or a
+# dev server holding files in the worktree was never on the list. Open files, not only
+# cwds, for the same reason. One machine-wide listing rather than `lsof +D` per worktree:
+# `+D` walks the tree it is given, and a worktree with `node_modules` is a quarter of a
+# million files.
+#
+# The status is lsof's, not the formatter's, and an empty listing is a failure: every
+# live system has at least this shell's working directory in it, so no lines means the
+# scan saw nothing - which would otherwise read as permission to remove everything.
+_cc_wj_scan_holders() {
+  local dir="$1"
+  command -v lsof >/dev/null 2>&1 || return 1
+  _cc_wj_with_timeout 60 lsof -n -P -d cwd -Fn > "$dir/cwd.raw" 2>/dev/null || return 1
+  _cc_wj_with_timeout 120 lsof -n -P -Fn > "$dir/open.raw" 2>/dev/null || return 1
+  sed -n 's/^n//p' "$dir/cwd.raw" > "$dir/cwd"
+  sed -n 's/^n//p' "$dir/open.raw" > "$dir/open"
+  [ -s "$dir/cwd" ] && [ -s "$dir/open" ]
+}
+
+# Whether a scan in $1 names worktree $2, or anything under it, by either spelling: git
+# records the path a worktree was added with, lsof reports the physical one, and on macOS
+# those differ under /var and /tmp.
+_cc_wj_held() {
+  local dir="$1" wt="${2%/}" p
+  for p in "$wt" "$(_cc_wj_realpath "$wt")"; do
+    p="${p%/}"
+    [ -n "$p" ] || continue
+    grep -qxF -- "$p" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
+    grep -qF -- "$p/" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# ─── Idleness ─────────────────────────────────────────────────────────────────
+
+# yes, no, or unknown: whether nothing under $1 was modified within $2 hours. A `find`
+# that fails - an unreadable directory inside the tree - is unknown, not idle.
+_cc_wj_idle() {
+  local wt="$1" hours="$2" recent
+  # No window at all. Asked of find, `-mmin -0` still matches a file written in the same
+  # second the scan started, whose age rounds below zero.
+  [ "$hours" -eq 0 ] && { echo yes; return; }
+  if ! recent="$(find "$wt" -mmin "-$((hours * 60))" -print -quit 2>/dev/null)"; then
+    echo unknown
+  elif [ -n "$recent" ]; then
+    echo no
+  else
+    echo yes
+  fi
 }
 
 # Resolve a path through symlinks using POSIX cd -P (no external deps).
@@ -251,19 +356,24 @@ _cc_wj_emit_wt_block() {
   # First block (index 0) is the primary worktree — skip it
   [ "$bidx" -eq 0 ] && return
 
-  local dirty ahead push_state remote_sha
+  local dirty ahead push_state remote_sha pins pin_summary more
   if [ ! -d "$wt" ]; then
-    printf "%s\t%s\t%s\t%s\t%s\n" "$wt" "${br:-?}" "MISSING" "?" "no_remote"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$wt" "${br:-?}" "MISSING" "?" "no_remote" "-"
   else
-    # `--ignored`, because `git worktree remove` deletes ignored content along with
-    # the checkout and plain `--porcelain` cannot see any of it. Without this the
-    # "dirty" gate was blind to exactly the files nothing can rebuild - a `.env`, a
-    # key, a local database - while reporting the worktree as clean.
-    #
-    # Discounting is then what keeps the gate usable rather than absolute: measured
-    # on the reporting host, 28 of 29 otherwise-removable worktrees carried ignored
-    # content and every one of them was a package or build cache.
-    dirty=$(_cc_wj_undiscounted_count "$wt")
+    # `--ignored`, because a removal deletes ignored content along with the checkout and
+    # plain `--porcelain` cannot see any of it. The entries are named, not only counted:
+    # on 2026-09-11 45 worktrees were kept by a handful of log files that took a separate
+    # investigation to find, because the report said only how many.
+    pins="$(_cc_wj_pins "$wt")"
+    if [ -z "$pins" ]; then
+      dirty=0
+      pin_summary="-"
+    else
+      dirty="$(printf '%s\n' "$pins" | wc -l | tr -d ' ')"
+      pin_summary="$(printf '%s\n' "$pins" | head -n 3 | awk '{ printf "%s%s", (NR > 1 ? "; " : ""), $0 }')"
+      more=$((dirty - 3))
+      [ "$more" -gt 0 ] && pin_summary="$pin_summary (+$more more)"
+    fi
     # Resolve remote SHA once; pass to both helpers to avoid double rev-parse
     remote_sha=""
     if [ -n "${br:-}" ] && [ "$br" != "(detached)" ]; then
@@ -271,12 +381,12 @@ _cc_wj_emit_wt_block() {
     fi
     ahead=$(_cc_wj_ahead_count "$wt" "${br:-}" "$remote_sha")
     push_state=$(_cc_wj_push_state "$wt" "${br:-}" "$remote_sha")
-    printf "%s\t%s\t%s\t%s\t%s\n" "$wt" "${br:-?}" "$dirty" "$ahead" "$push_state"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$wt" "${br:-?}" "$dirty" "$ahead" "$push_state" "$pin_summary"
   fi
 }
 
 # For a given repo path, print one line per non-primary worktree:
-#   <wt_path> TAB <branch> TAB <dirty> TAB <ahead> TAB <push_state>
+#   <wt_path> TAB <branch> TAB <dirty> TAB <ahead> TAB <push_state> TAB <pins>
 _cc_wj_list_worktrees() {
   local repo="$1"
 
@@ -357,79 +467,423 @@ CC_WJ_REGENERABLE="${CC_WJ_REGENERABLE:-node_modules .next .turbo .parcel-cache 
 # directory-keyed list can never reach either.
 CC_WJ_REGENERABLE_FILES="${CC_WJ_REGENERABLE_FILES:-next-env.d.ts tsconfig.tsbuildinfo .eslintcache}"
 
-# Count the entries a removal would destroy that nothing is known to rebuild.
-# A `git status` that FAILS is not a clean worktree: read into a variable so an
-# unreadable repository is distinguishable from an empty one, and answered with a
-# count that keeps the worktree rather than with zero.
-_cc_wj_undiscounted_count() {
-  # `wt_status`, not `status`: this file advertises itself as sourceable, and in zsh
-  # `status` is READ-ONLY. `local status` aborts the function before git runs, the
-  # dirty field comes back empty, the tab-separated inventory line shifts by one -
-  # and `--apply` then classifies a worktree holding ignored local data as REMOVABLE
-  # and reaches the force-removal fallback. The trap is in CLAUDE.md; this is what it
-  # looks like when it fires.
-  local wt="$1" wt_status line rest base n=0
-  wt_status="$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" || { echo 1; return; }
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in
-      '!! '*) ;;
-      *) n=$((n + 1)); continue ;;   # tracked change or untracked file: real work
-    esac
-    rest="${line#!! }"
-    rest="${rest%/}"
-    base="${rest##*/}"
-    case "$line" in
-      *'/') case " $CC_WJ_REGENERABLE " in *" $base "*) continue ;; esac ;;
+# Credential-shaped names. Discounting a directory says everything below it is
+# machine-owned, which is true of a package tree and not of the `.env` somebody parked
+# inside one: porcelain collapses the directory to one line, so no name inside it is
+# ever seen unless something looks.
+_cc_wj_sensitive_name() {
+  case "$1" in
+    .env.example|.env.sample|.env.template|.env.dist) return 1 ;;
+    .env|.env.*|*.pem|*.key|*.p12|*.keystore|id_rsa|id_ed25519|credentials.json) return 0 ;;
+  esac
+  return 1
+}
+
+# A credential-shaped file under $1 - to depth $2, or at any depth outside the package
+# trees inside it when $2 is empty (every virtualenv ships certifi's `cacert.pem` five
+# levels down). A `find` that FAILS answers like one that found something: an unreadable
+# directory is not evidence that nothing is there.
+_cc_wj_find_credential() {
+  local dir="$1" depth="${2:-}" hit
+  set -- \( -type f -o -type l \) \
+         ! -name '.env.example' ! -name '.env.sample' \
+         ! -name '.env.template' ! -name '.env.dist' \( \
+         -name '.env' -o -name '.env.*' -o -name '*.pem' -o -name '*.key' -o \
+         -name '*.p12' -o -name '*.keystore' -o -name 'id_rsa' -o \
+         -name 'id_ed25519' -o -name 'credentials.json' \
+         \) -print -quit
+  if [ -n "$depth" ]; then
+    hit="$(find "$dir" -maxdepth "$depth" "$@" 2>/dev/null)" || return 0
+  else
+    hit="$(find "$dir" -type d \( -name node_modules -o -name site-packages \) -prune \
+             -o "$@" 2>/dev/null)" || return 0
+  fi
+  [ -n "$hit" ]
+}
+
+# Patterns the repository declares regenerable in `.worktree-regenerable` on its fetched
+# base, newline-separated; set per repository by `_cc_wj_prepare_base`.
+#
+# The lists above are this tool's knowledge, and a tool installed for every repository
+# cannot know that one API opens `data/parsed/logs/api.log` at import or that one test
+# suite leaves `model/one-api.db` behind. Measured 2026-09-11 in the repository this was
+# built for: 45 landed worktrees and 35 GB kept by files like those, none of them named.
+# Read from the base rather than the worktree, so every existing worktree benefits the
+# moment a declaration lands, and so a branch cannot declare its own content disposable
+# on the way to having it deleted.
+_CC_WJ_DECLARED=""
+
+# Whether repository-relative path $1 is declared. Unquoted patterns on purpose - they
+# are globs, and `$pat/*` lets a declared directory cover what is inside it. zsh does not
+# treat an expanded parameter as a pattern unless told to.
+_cc_wj_declared() {
+  local p="$1" pat
+  [ -n "$_CC_WJ_DECLARED" ] || return 1
+  [ -n "${ZSH_VERSION:-}" ] && setopt local_options glob_subst
+  while IFS= read -r pat; do
+    [ -n "$pat" ] || continue
+    # shellcheck disable=SC2254
+    case "$p" in $pat|$pat/*) return 0 ;; esac
+  done <<DECL
+$_CC_WJ_DECLARED
+DECL
+  return 1
+}
+
+# A declared ignored directory: 0 disposable, 1 not declared, 2 declared but holding a
+# credential-shaped file. A build copies `.env` into its output at whatever depth it
+# likes, so a declared directory is searched to the bottom, package trees aside.
+_cc_wj_declared_dir() {
+  local wt="$1" d="$2"
+  [ -n "$_CC_WJ_DECLARED" ] || return 1
+  if _cc_wj_declared "$d"; then
+    _cc_wj_find_credential "$wt/$d" && return 2
+    return 0
+  fi
+  _cc_wj_declared_contents "$wt" "$d"
+}
+
+# git collapses a wholly ignored directory to one `!! dir/` entry, so a declaration naming
+# files inside it - `logs/*.log` inside `logs/` - never meets a name it can match. Such a
+# directory is disposable when every non-directory in it is declared and none is
+# credential-shaped. Walked only when some pattern could name a path below it, and never
+# past 200 files: a directory holding more is not a log directory, whatever the patterns
+# say.
+_cc_wj_declared_contents() {
+  local wt="$1" d="$2" list f n=0
+  # `p == ""` spelled out: index() of an empty string is 1 in BSD awk and 0 in gawk.
+  printf '%s\n' "$_CC_WJ_DECLARED" | awk -v d="$d/" '{
+      p = $0; i = match(p, /[*?[]/); if (i) p = substr(p, 1, i - 1)
+      if (p == "" || index(d, p) == 1 || index(p, d) == 1) f = 1
+    } END { exit !f }' || return 1
+  # A walk that fails is not a walk that found nothing.
+  list="$(find "$wt/$d" ! -type d -print 2>/dev/null)" || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    # A name containing a newline arrives as fragments; a fragment proves nothing.
+    case "$f" in "$wt/$d/"*) ;; *) return 1 ;; esac
+    n=$((n + 1))
+    [ "$n" -le 200 ] || return 1
+    _cc_wj_sensitive_name "${f##*/}" && return 2
+    _cc_wj_declared "${f#"$wt/"}" || return 1
+  done <<LIST
+$list
+LIST
+  return 0
+}
+
+# Print patterns from stdin that name a path ($1 = 1) or that do not ($1 = 0). A pattern
+# with a wildcard must spell two consecutive characters outside its wildcards and bracket
+# expressions: `*`, `*.*`, `*e*`, `a*` and `[!.]*` name nothing in particular and would
+# discount hand-written notes along with the logs. `*.o` and `db/*` pass, and a pattern
+# with no wildcard names exactly one path.
+_cc_wj_names_a_path() {
+  awk -v want="$1" 'NF { s = $0; gsub(/\[[^]]*\]/, "", s)
+    ok = ($0 !~ /[*?[]/) || (s ~ /[^*?][^*?]/)
+    if (ok == want) print }'
+}
+
+# One report line for an entry that keeps the worktree. Tabs and newlines in a name would
+# break the inventory line that carries it, so they are shown as `?`.
+_cc_wj_pin() {
+  local line="$1 $2"
+  line="${line//$'\t'/?}"
+  printf '%s\n' "${line//$'\n'/?}"
+}
+
+# Print every entry a removal would destroy that nothing is known to rebuild, one per
+# line as `<porcelain code> <path>`. When the status cannot be read, print one line
+# saying so and fail: an unreadable repository must not read as a clean one.
+#
+# Read with `-z` from a file. Without `-z` git C-quotes any path that is not plain ASCII,
+# and `[ -L "$wt/$rest" ]` then probes a name that does not exist; command substitution
+# would strip the NULs `-z` produces. The file also keeps git's exit status apart from
+# the loop's. Nothing here is named `status` or `path`: both are reserved in zsh, and
+# this file is sourceable.
+_cc_wj_pins() {
+  local wt="$1" sf rec code rest base skip_next=0 drc
+  sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-status.XXXXXX")" || {
+    _cc_wj_pin '??' "(no temporary file to read its status into)"; return 1; }
+  if ! git -C "$wt" status --porcelain --ignored -z > "$sf" 2>/dev/null; then
+    rm -f "$sf"
+    _cc_wj_pin '??' "(git status failed)"
+    return 1
+  fi
+  while IFS= read -r -d '' rec; do
+    if [ "$skip_next" -eq 1 ]; then skip_next=0; continue; fi
+    [ -n "$rec" ] || continue
+    code="${rec:0:2}"
+    rest="${rec:3}"
+    # A rename or copy is followed by a second record holding its source path.
+    case "$code" in R?|?R|C?|?C) skip_next=1 ;; esac
+    if [ "$code" != '!!' ]; then
+      _cc_wj_pin "$code" "$rest"   # tracked change or untracked entry: real work
+      continue
+    fi
+    case "$rest" in
+      */)
+        rest="${rest%/}"
+        base="${rest##*/}"
+        case " $CC_WJ_REGENERABLE " in
+          *" $base "*)
+            # Two levels down is where a person parks something in a cache; a scan to the
+            # bottom of `node_modules` costs seconds per worktree.
+            _cc_wj_find_credential "$wt/$rest" 2 &&
+              _cc_wj_pin '!!' "$rest/ (holds a credential-shaped file)"
+            continue ;;
+        esac
+        drc=0
+        _cc_wj_declared_dir "$wt" "$rest" || drc=$?
+        case "$drc" in
+          0) ;;
+          2) _cc_wj_pin '!!' "$rest/ (declared, but holds a credential-shaped file)" ;;
+          *) _cc_wj_pin '!!' "$rest/" ;;
+        esac
+        ;;
       *)
+        # No trailing slash: an ignored file, or a symlink - git marks a link to a
+        # directory the same way. Removing a link to a cache removes nothing it names.
+        base="${rest##*/}"
         if [ -L "$wt/$rest" ]; then
           case " $CC_WJ_REGENERABLE " in *" $base "*) continue ;; esac
         fi
-        case " $CC_WJ_REGENERABLE_FILES " in *" $base "*) continue ;; esac ;;
+        case " $CC_WJ_REGENERABLE_FILES " in *" $base "*) continue ;; esac
+        if _cc_wj_declared "$rest" && ! _cc_wj_sensitive_name "$base"; then
+          continue
+        fi
+        _cc_wj_pin '!!' "$rest"
+        ;;
     esac
-    n=$((n + 1))
-  done <<EOF
-$wt_status
-EOF
-  echo "$n"
+  done < "$sf"
+  rm -f "$sf"
+  return 0
+}
+
+# Count the entries a removal would destroy that nothing is known to rebuild.
+_cc_wj_undiscounted_count() {
+  local out
+  out="$(_cc_wj_pins "$1")"
+  if [ -z "$out" ]; then
+    echo 0
+  else
+    printf '%s\n' "$out" | wc -l | tr -d ' '
+  fi
+}
+
+# ─── Base branch and landing ─────────────────────────────────────────────────
+
+# Set per repository by `_cc_wj_prepare_base`: the integration branch, whether it was
+# fetched during this run, and why not.
+_CC_WJ_BASE=""
+_CC_WJ_BASE_OK=0
+_CC_WJ_BASE_WHY=""
+
+# Resolve and fetch the base branch of repository $1, then read its declarations.
+#
+# Fetched, in report mode too, because `merge-base --is-ancestor` contacts nothing: a
+# stale tracking ref makes a unique HEAD look landed after a force-push, and everything
+# merged since the last fetch look unlanded. Into the fully qualified ref through an
+# explicit refspec, because `git fetch origin <branch>` honours `remote.origin.fetch` and
+# a custom one would update some other ref while this one stayed stale.
+#
+# `origin/HEAD` is what the clone recorded; without one the remote is asked. A guess of
+# `main` is never made: in a repository whose trunk is not main nothing would be an
+# ancestor, and the run would report normally while reclaiming nothing.
+_cc_wj_prepare_base() {
+  local repo="$1" base="${CC_WJ_BASE_BRANCH:-}" all dropped
+  _CC_WJ_BASE=""; _CC_WJ_BASE_OK=0; _CC_WJ_BASE_WHY=""; _CC_WJ_DECLARED=""
+  if ! git -C "$repo" config --get remote.origin.url >/dev/null 2>&1; then
+    _CC_WJ_BASE_WHY="it has no origin remote"
+    return 1
+  fi
+  if [ -z "$base" ]; then
+    base="$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"
+    base="${base#origin/}"
+  fi
+  if [ -z "$base" ]; then
+    base="$(_cc_wj_with_timeout 30 git -C "$repo" ls-remote --symref origin HEAD 2>/dev/null |
+            awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')"
+  fi
+  if [ -z "$base" ]; then
+    _CC_WJ_BASE_WHY="origin's default branch could not be resolved"
+    return 1
+  fi
+  _CC_WJ_BASE="$base"
+  if ! _cc_wj_with_timeout 60 git -C "$repo" fetch --quiet --no-tags origin \
+       "+refs/heads/$base:refs/remotes/origin/$base" >/dev/null 2>&1; then
+    _CC_WJ_BASE_WHY="origin/$base could not be fetched"
+    return 1
+  fi
+  _CC_WJ_BASE_OK=1
+
+  # Written the way a .gitignore is: `/logs/` means `logs`. `#` starts a comment at the
+  # start of a line and after whitespace, so `logs  # runtime` does not declare a path
+  # nobody has.
+  all="$(git -C "$repo" show "refs/remotes/origin/$base:.worktree-regenerable" 2>/dev/null |
+         sed -e 's/^[[:space:]]*#.*//' -e 's/[[:space:]][[:space:]]*#.*$//' \
+             -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+             -e 's#^/*##' -e 's#/*$##')"
+  _CC_WJ_DECLARED="$(printf '%s\n' "$all" | _cc_wj_names_a_path 1)"
+  dropped="$(printf '%s\n' "$all" | _cc_wj_names_a_path 0 | tr '\n' ' ')"
+  [ -n "$dropped" ] &&
+    echo "worktree-janitor: $repo: ignoring .worktree-regenerable pattern(s) on origin/$base that name no path: $dropped"
+  return 0
+}
+
+# How the work in worktree $1 reached the base: ancestor, content, pr - or no, or
+# unfetched when the base was not fetched this run.
+_cc_wj_landed() {
+  local wt="$1" ref
+  [ "$_CC_WJ_BASE_OK" -eq 1 ] || { echo unfetched; return; }
+  ref="refs/remotes/origin/$_CC_WJ_BASE"
+  if git -C "$wt" merge-base --is-ancestor HEAD "$ref" 2>/dev/null; then
+    echo ancestor
+  elif _cc_wj_landed_by_content "$wt" "$ref"; then
+    echo content
+  elif _cc_wj_landed_by_pr "$wt" "$ref"; then
+    echo pr
+  else
+    echo no
+  fi
+}
+
+# Merging HEAD into the base would change nothing. Ancestry misses every squash merge and
+# every rebase that left a local HEAD behind while its change landed; in a repository that
+# squash-merges, an ancestry-only test reclaims nothing while reporting normally.
+# Three-way rather than a comparison of the files the branch touched, so later edits on
+# the base to other lines of those files do not turn landed work back into unlanded work.
+# A conflict, unrelated history, or a git older than 2.38 fails, and failing keeps.
+_cc_wj_landed_by_content() {
+  local wt="$1" ref="$2" base_tree merged
+  base_tree="$(git -C "$wt" rev-parse "$ref^{tree}" 2>/dev/null)" || return 1
+  merged="$(git -C "$wt" merge-tree --write-tree "$ref" HEAD 2>/dev/null)" || return 1
+  [ -n "$base_tree" ] && [ "${merged%%$'\n'*}" = "$base_tree" ]
+}
+
+# A merged pull request whose head is THIS commit, into the base branch, whose merge
+# commit is still on the base just fetched.
+#
+# Asked by commit, not branch name: names get reused, and a branch listing needs a limit
+# that makes it a subset. The head SHA is compared again because the commit's PR list
+# includes a PR whose head later moved past it. The merge commit is checked against the
+# fetched base because a merged PR is history and a force-push can undo it. The repository
+# is named from `remote.origin.url` - the configured URL, not the `insteadOf` rewrite -
+# rather than left to gh, which would honour $GH_REPO and let another repository's merged
+# PR authorise this removal.
+_cc_wj_landed_by_pr() {
+  local wt="$1" ref="$2" head url host slug rest merges mc
+  command -v gh >/dev/null 2>&1 || return 1
+  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)" || return 1
+  url="$(git -C "$wt" config --get remote.origin.url 2>/dev/null)" || return 1
+  url="${url%.git}"
+  # URL form before SCP form: an https URL contains both a colon and slashes.
+  case "$url" in
+    *://*)
+      rest="${url#*://}"; rest="${rest#*@}"
+      host="${rest%%/*}"; host="${host%%:*}"
+      slug="${rest#*/}" ;;
+    *:*)
+      host="${url%%:*}"; host="${host##*@}"
+      slug="${url#*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$slug" in */*) ;; *) return 1 ;; esac
+  [ -n "$host" ] || return 1
+  merges="$(_cc_wj_with_timeout 30 gh api --hostname "$host" "repos/$slug/commits/$head/pulls" \
+     --paginate \
+     --jq ".[] | select(.merged_at != null and .base.ref == \"$_CC_WJ_BASE\" and .head.sha == \"$head\") | .merge_commit_sha" \
+     2>/dev/null)" || return 1
+  [ -n "$merges" ] || return 1
+  while IFS= read -r mc; do
+    [ -n "$mc" ] || continue
+    git -C "$wt" merge-base --is-ancestor "$mc" "$ref" 2>/dev/null && return 0
+  done <<MERGES
+$merges
+MERGES
+  return 1
+}
+
+# ─── What git itself protects ─────────────────────────────────────────────────
+
+# Print `locked` or `submodule` when git's own state says to keep worktree $1, nothing
+# otherwise.
+#
+# A lock is an explicit request: `git worktree lock`, and Claude Code locks every agent
+# worktree it creates. Measured 2026-09-14 on a real repository: one such worktree,
+# landed, clean and idle, was otherwise classified REMOVABLE. A populated submodule - a
+# `modules` directory in the worktree's git directory, or a gitlink whose path holds a
+# checkout - carries state the outer status does not show, and removal refuses it without
+# force.
+_cc_wj_git_keep() {
+  local wt="$1" gitdir rec
+  gitdir="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
+  if [ -e "$gitdir/locked" ]; then
+    echo locked
+    return 0
+  fi
+  if [ -d "$gitdir/modules" ]; then
+    echo submodule
+    return 0
+  fi
+  while IFS= read -r -d '' rec; do
+    case "$rec" in
+      160000\ *) [ -e "$wt/${rec#*$'\t'}/.git" ] && { echo submodule; return 0; } ;;
+    esac
+  done < <(git -C "$wt" ls-files --stage -z 2>/dev/null)
+  return 0
 }
 
 # ─── Classification ───────────────────────────────────────────────────────────
 
-# Print KEEP(<reason>) or REMOVABLE
+# Print KEEP(<reason>) or REMOVABLE. Every gate that was not shown to hold keeps: an empty
+# argument is a question nobody answered, never a yes.
 _cc_wj_classify() {
   local wt_path="$1"
   local dirty="$2"    # integer or "MISSING"
   local active="$3"   # "yes" or "no"
-  local lsof_ok="$4"  # "yes" or "no" — "no" means lsof failed → conservative
-  local branch="${5:-}"      # branch name, or "(detached)" — "" keeps the old behaviour
+  local lsof_ok="$4"  # "yes" or "no" — "no" means a holder scan failed
+  local branch="${5:-}"  # branch name, or "(detached)"
+  local landed="${6:-}"  # ancestor | content | pr | no | unfetched
+  local idle="${7:-}"    # yes | no | unknown
 
   if [ "$dirty" = "MISSING" ]; then
     echo "KEEP(missing-dir)"
     return
   fi
 
-  if [ "$lsof_ok" = "no" ]; then
+  if [ "$lsof_ok" != "yes" ]; then
     echo "KEEP(active-session)"
     return
   fi
 
-  if [ "$dirty" -gt 0 ] 2>/dev/null; then
+  # Exactly `0`, not "not greater than zero": an empty or garbled count is what a failed
+  # read looks like, and `[ "" -gt 0 ]` is false.
+  if [ "$dirty" != "0" ]; then
     echo "KEEP(unrebuildable=$dirty)"
     return
   fi
 
-  if [ "$active" = "yes" ]; then
+  if [ "$active" != "no" ]; then
     echo "KEEP(active-session)"
     return
   fi
 
-  # Removal takes the checkout and leaves the branch, so commits on a branch survive
-  # it whether or not a remote has them - unpushed is not the hazard here. A detached
-  # HEAD is: nothing references those commits once the worktree is gone, and the next
-  # gc takes them. This script never deletes branches, so that is the single case
-  # where its one irreversible action is actually irreversible.
-  if [ "$branch" = "(detached)" ]; then
+  case "$landed" in
+    ancestor|content|pr) ;;
+    unfetched) echo "KEEP(base-unfetched)"; return ;;
+    *) echo "KEEP(unlanded)"; return ;;
+  esac
+
+  case "$idle" in
+    yes) ;;
+    no) echo "KEEP(recent-activity)"; return ;;
+    *) echo "KEEP(idle-unknown)"; return ;;
+  esac
+
+  # Removal takes the checkout and leaves the branch, so a branch's commits survive it.
+  # A detached HEAD's do not: nothing references them once the worktree is gone. Landed by
+  # ancestry puts them on the base; landed by content or PR puts only their change there.
+  if [ "$branch" = "(detached)" ] && [ "$landed" != "ancestor" ]; then
     echo "KEEP(detached-head)"
     return
   fi
@@ -509,6 +963,57 @@ _cc_wj_remove_worktree() {
   return 1
 }
 
+# ─── Sweep lock ───────────────────────────────────────────────────────────────
+
+# One removal sweep per repository. Every session end can start a sweep that outlives
+# it, and a manual `--apply` can start another; two sweeps deciding about the same
+# worktree race each other into git's own locks. The lock lives in the repository's
+# common git directory, so every clone path to the same repository shares it.
+#
+# A holder counts only while its pid is alive and still this script - a pid the kernel
+# has handed to something else is not a sweep - and not for more than an hour, because
+# nothing a sweep does takes that long and deferring to a hung one would mean the
+# repository is never swept again.
+#
+# ponytail: taking over a dead holder's lock is check-then-act, so two sweeps that find
+# the same dead holder in the same instant can both proceed. git's own locks bound what
+# that costs - one of two concurrent removals fails and is reported - so the lock is a
+# de-duplication of work, not the thing standing between a worktree and its deletion.
+_cc_wj_lock() {
+  local lock="$1" holder live=0
+  if mkdir "$lock" 2>/dev/null; then
+    echo "$$" > "$lock/pid"
+    return 0
+  fi
+  holder="$(cat "$lock/pid" 2>/dev/null)"
+  if [ -n "$holder" ] && ps -p "$holder" -o command= 2>/dev/null | grep -q 'worktree-janitor'; then
+    live=1
+  elif [ -z "$holder" ] && [ -z "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+    live=1   # a sweep between its mkdir and its pid write
+  fi
+  if [ "$live" -eq 1 ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
+    echo "worktree-janitor: pid ${holder:-?} has held $lock for over 60 minutes; taking it over"
+    live=0
+  fi
+  if [ "$live" -eq 1 ]; then
+    echo "worktree-janitor: another worktree-janitor sweep${holder:+ (pid $holder)} holds $lock; removed nothing in this repository"
+    return 1
+  fi
+  rm -f "$lock/pid"
+  rmdir "$lock" 2>/dev/null
+  if ! mkdir "$lock" 2>/dev/null; then
+    echo "worktree-janitor: the sweep lock $lock could not be taken; removed nothing in this repository"
+    return 1
+  fi
+  echo "$$" > "$lock/pid"
+}
+
+# Released only while it is still ours: after a takeover it belongs to somebody else.
+_cc_wj_unlock() {
+  [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] && rm -f "$1/pid" && rmdir "$1" 2>/dev/null
+  return 0
+}
+
 # ─── Main report/apply logic ─────────────────────────────────────────────────
 
 _cc_wj_run() {
@@ -542,6 +1047,10 @@ _cc_wj_run() {
         explicit_repos+=("$1")
         shift
         ;;
+      --session)
+        _cc_wj_session
+        return $?
+        ;;
       -h|--help)
         _cc_wj_usage
         return 0
@@ -553,6 +1062,12 @@ _cc_wj_run() {
         ;;
     esac
   done
+
+  local idle_hours
+  if ! idle_hours="$(_cc_wj_idle_hours)"; then
+    echo "worktree-janitor: CC_WJ_IDLE_HOURS=${CC_WJ_IDLE_HOURS:-} is not a whole number of hours below 100000; scanned and removed nothing" >&2
+    return 2
+  fi
 
   # Asked once, before discovery, so the reason a scan came back empty is on the
   # record next to the emptiness rather than inferred from it.
@@ -601,40 +1116,23 @@ _cc_wj_run() {
   local total_reclaimed=0
   local prune_repos=()
 
-  # Collect active process cwds ONCE per run. A per-pid lsof loop both
-  # misreads vanished-pid exits as failures (pgrep->lsof race marks EVERY
-  # worktree active) and costs O(worktrees x pids). Batched: vanished pids
-  # are simply absent from output -- they cannot hold a cwd.
-  # Dedup raw cwd paths before realpath to avoid redundant symlink resolution
-  # (a per-pid lsof loop misread vanished-pid exits as failures, marking EVERY
-  # worktree active).
-  local ACTIVE_CWDS="" LSOF_OK="yes"
-  if ! command -v lsof >/dev/null 2>&1; then
+  # Holder scans, taken once per run into files and taken again right before each removal.
+  local work LSOF_OK="yes"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/cc-wj.XXXXXX")" || {
+    echo "worktree-janitor: no temporary directory for the process scan; scanned and removed nothing" >&2
+    return 1
+  }
+  if ! _cc_wj_scan_holders "$work"; then
     LSOF_OK="no"
-  else
-    local _pids _csv _out _line _exit=0
-    _pids=$(_cc_wj_candidate_pids | sort -un)
-    if [ -n "$_pids" ]; then
-      _csv=$(printf '%s\n' "$_pids" | paste -sd, -)
-      _out=$(lsof -p "$_csv" -a -d cwd -Fn 2>/dev/null) || _exit=$?
-      if [ -z "$_out" ] && [ "$_exit" -ne 0 ]; then
-        LSOF_OK="no"  # lsof produced nothing and errored -- cannot trust it
-      else
-        # Collect raw n-lines, sort -u to dedup before calling realpath on each
-        local _raw_cwds=""
-        while IFS= read -r _line; do
-          case "$_line" in
-            n*) _raw_cwds="${_raw_cwds}${_line#n}"$'\n' ;;
-          esac
-        done <<< "$_out"
-        while IFS= read -r _line; do
-          [ -z "$_line" ] && continue
-          ACTIVE_CWDS="${ACTIVE_CWDS}$(_cc_wj_realpath "$_line")"$'\n'
-        done <<< "$(printf '%s' "$_raw_cwds" | sort -u)"
-      fi
-    fi
+    echo "worktree-janitor: the process scan failed or saw nothing, so no worktree can be shown unheld" >&2
   fi
 
+  # The checkout the calling session stands in, kept whatever else is true of it:
+  # `claude --resume` expects to find it.
+  local keep_path=""
+  [ -n "${CC_WJ_KEEP_PATH:-}" ] && keep_path="$(_cc_wj_realpath "$CC_WJ_KEEP_PATH")"
+
+  local repo lock
   for repo in "${repos[@]}"; do
     if [ ! -d "$repo" ]; then
       continue
@@ -644,7 +1142,22 @@ _cc_wj_run() {
       continue
     fi
 
-    while IFS=$'\t' read -r wt_path branch dirty ahead push_state; do
+    lock=""
+    if [ "$apply" -eq 1 ]; then
+      lock="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/cc-reaper-worktree-janitor.lock"
+      _cc_wj_lock "$lock" || continue
+    fi
+
+    if ! _cc_wj_prepare_base "$repo"; then
+      echo "worktree-janitor: $repo: $_CC_WJ_BASE_WHY, so no worktree in it can be shown landed"
+    fi
+
+    # Collected to completion before anything is judged. Read as it is produced, the
+    # producer runs `git -C <next worktree> status` while the loop scans for holders, and
+    # the janitor's own git then holds the next worktree it is about to judge.
+    _cc_wj_list_worktrees "$repo" > "$work/inventory"
+
+    while IFS=$'\t' read -r wt_path branch dirty ahead push_state pins; do
 
       # Handle missing dir
       if [ "$dirty" = "MISSING" ]; then
@@ -658,35 +1171,74 @@ _cc_wj_run() {
         continue
       fi
 
-      # Determine active-cwd status from the precomputed set
-      local active="no" lsof_ok="$LSOF_OK"
-      if [ "$LSOF_OK" = "no" ]; then
-        active="yes"  # conservative: lsof unavailable or untrustworthy
-      elif [ -n "$ACTIVE_CWDS" ]; then
-        local wt_norm cwd
-        wt_norm=$(_cc_wj_realpath "$wt_path")
-        wt_norm="${wt_norm%/}"
-        while IFS= read -r cwd; do
-          [ -z "$cwd" ] && continue
-          cwd="${cwd%/}"
-          case "$cwd" in
-            "$wt_norm"|"$wt_norm"/*) active="yes"; break ;;
-          esac
-        done <<< "$ACTIVE_CWDS"
+      local active="no"
+      if [ "$LSOF_OK" = "no" ] || _cc_wj_held "$work" "$wt_path"; then
+        active="yes"
       fi
 
-      local classification
-      classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$lsof_ok" "$branch")
+      # Asked only of a worktree the cheaper gates have not already kept: the landed proofs
+      # may reach the network, and the idle walk costs seconds on a tree with node_modules.
+      local landed="-" idle="-"
+      if [ "$dirty" = "0" ] && [ "$active" = "no" ]; then
+        landed="$(_cc_wj_landed "$wt_path")"
+        case "$landed" in
+          ancestor|content|pr) idle="$(_cc_wj_idle "$wt_path" "$idle_hours")" ;;
+        esac
+      fi
+
+      local classification="" wt_phys
+      if [ -n "$keep_path" ]; then
+        wt_phys="$(_cc_wj_realpath "$wt_path")"
+        case "$keep_path/" in "${wt_phys%/}"/*) classification="KEEP(this-session)" ;; esac
+      fi
+      local git_keep=""
+      if [ -z "$classification" ]; then
+        git_keep="$(_cc_wj_git_keep "$wt_path")"
+        [ -n "$git_keep" ] && classification="KEEP($git_keep)"
+      fi
+      [ -n "$classification" ] ||
+        classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle")
 
       printf "  WORKTREE  %s\n" "$wt_path"
-      printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s\n" \
-        "$branch" "$dirty" "$ahead" "$push_state" "$active"
+      printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s  landed=%s  idle=%s\n" \
+        "$branch" "$dirty" "$ahead" "$push_state" "$active" "$landed" "$idle"
       printf "    classification: %s\n" "$classification"
+      if [ "$dirty" != "0" ] && [ "${pins:--}" != "-" ]; then
+        printf "    kept by: %s\n" "$pins"
+        case "$pins" in
+          *'!! '*)
+            printf "    if a command rebuilds an ignored entry, list it in .worktree-regenerable on origin/%s\n" \
+              "${_CC_WJ_BASE:-<default branch>}" ;;
+        esac
+      fi
+      case "$classification" in
+        KEEP\(base-unfetched\)) printf "    %s\n" "$_CC_WJ_BASE_WHY" ;;
+        KEEP\(idle-unknown\)) printf "    the idle test could not read the whole tree\n" ;;
+        KEEP\(locked\))
+          printf "    lock reason: %s\n" \
+            "$(head -n 1 "$(git -C "$wt_path" rev-parse --absolute-git-dir 2>/dev/null)/locked" 2>/dev/null)" ;;
+      esac
 
       case "$classification" in
         REMOVABLE)
           total_removable=$((total_removable + 1))
           if [ "$apply" -eq 1 ]; then
+            # Everything above was decided from scans taken before the loop began, and
+            # another session can have entered this worktree or written into it since.
+            # Asked again against fresh scans, immediately before the one irreversible step.
+            if ! _cc_wj_scan_holders "$work"; then
+              LSOF_OK="no"
+              printf "    → kept: the process scan failed right before removal\n"
+              total_kept=$((total_kept + 1))
+              continue
+            fi
+            if _cc_wj_held "$work" "$wt_path" ||
+               [ "$(_cc_wj_undiscounted_count "$wt_path")" != "0" ] ||
+               [ "$(_cc_wj_idle "$wt_path" "$idle_hours")" != "yes" ]; then
+              printf "    → kept: it was entered or changed between the scan and the removal\n"
+              total_kept=$((total_kept + 1))
+              continue
+            fi
             # Measure disk usage before removal
             local bytes=0
             bytes=$(du -sk "$wt_path" 2>/dev/null | awk '{print $1 * 1024}') || bytes=0
@@ -707,9 +1259,11 @@ _cc_wj_run() {
           ;;
       esac
 
-    done < <(_cc_wj_list_worktrees "$repo")
+    done < "$work/inventory"
 
+    [ -n "$lock" ] && _cc_wj_unlock "$lock"
   done
+  rm -rf "$work"
 
   # Run git worktree prune on repos that had removals or missing dirs (deduped).
   #
@@ -756,6 +1310,80 @@ _cc_wj_run() {
   # Finding repositories under one root does not make a denial on another harmless:
   # the worktrees under the denied one were never even listed.
   [ "$blind" -eq 1 ] && return 1
+  return 0
+}
+
+# ─── Session mode ─────────────────────────────────────────────────────────────
+
+_cc_wj_free_kb() { df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 + 0 }'; }
+_cc_wj_gib() {
+  case "$1" in
+    ''|*[!0-9]*) printf '?' ;;
+    *) awk -v k="$1" 'BEGIN { printf "%.1fGiB", k / 1048576 }' ;;
+  esac
+}
+
+# `--session`: the inventory for the repository a Claude Code session stood in, meant to
+# run as a SessionEnd hook.
+#
+# Why a session and not a schedule: a LaunchAgent cannot read `~/Documents`, measured
+# 2026-08-30, which is why the inventory was never scheduled. A session's processes run
+# with the grant its terminal holds.
+#
+# Why detached: every SessionEnd hook shares one deadline of at most 60 seconds, and a
+# sweep of a large repository measured 258. So the hook starts the sweep in a new session
+# and returns at once. perl forks in the foreground and the child calls setsid() before
+# the parent exits - the other order leaves a moment in which the sweep is an orphan still
+# in the session's process group, which is precisely what an orphan reaper running beside
+# this hook at session end kills.
+#
+# It reports unless CC_WJ_SESSION_APPLY is exactly `1`. An unattended run never removed
+# anything before this mode existed, and installing the hook should not change that
+# without a decision.
+_cc_wj_session() {
+  if [ "${CC_WJ_DETACHED:-}" != "1" ]; then
+    local log script
+    log="${CC_WJ_SESSION_LOG:-$HOME/.cc-reaper/logs/worktree-janitor-session.log}"
+    mkdir -p "$(dirname "$log")" 2>/dev/null
+    _cc_wj_bound_log "$log"
+    script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    export CC_WJ_DETACHED=1 CC_WJ_SESSION_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+    if command -v perl >/dev/null 2>&1; then
+      perl -MPOSIX -e 'pipe(my $r, my $w) or exit 1; defined(my $p = fork) or exit 1;
+        if ($p) { close $w; my $done = <$r>; exit 0 }
+        close $r; POSIX::setsid(); close $w; exec @ARGV or exit 127' \
+        "${BASH:-/bin/bash}" "$script" --session </dev/null >>"$log" 2>&1
+    elif command -v setsid >/dev/null 2>&1; then
+      setsid -f "${BASH:-/bin/bash}" "$script" --session </dev/null >>"$log" 2>&1
+    else
+      nohup "${BASH:-/bin/bash}" "$script" --session </dev/null >>"$log" 2>&1 &
+    fi
+    return 0
+  fi
+
+  local dir common main apply_flag="" t0 free0 rc=0
+  dir="${CC_WJ_SESSION_DIR:-$PWD}"
+  dir="$(cd "$dir" 2>/dev/null && pwd -P)" || dir="${CC_WJ_SESSION_DIR:-$PWD}"
+  t0="$(date +%s)"
+  free0="$(_cc_wj_free_kb)"
+  echo "== worktree-janitor session sweep $(date '+%Y-%m-%dT%H:%M:%S%z') $dir (pid $$)"
+  common="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  if [ -z "$common" ]; then
+    echo "worktree-janitor: $dir is not inside a git repository; swept nothing"
+  elif [ "$(basename "$common")" != ".git" ]; then
+    echo "worktree-janitor: $dir belongs to a repository without a primary checkout ($common); swept nothing"
+  else
+    main="$(dirname "$common")"
+    case "${CC_WJ_SESSION_APPLY-}" in
+      1) apply_flag="--apply" ;;
+      '') ;;
+      *) echo "worktree-janitor: CC_WJ_SESSION_APPLY=${CC_WJ_SESSION_APPLY} is not 1; reporting only" ;;
+    esac
+    # Out of every worktree, so this sweep's own working directory holds none of them.
+    cd / || true
+    CC_WJ_KEEP_PATH="$dir" _cc_wj_run --repo "$main" $apply_flag || rc=$?
+  fi
+  echo "== worktree-janitor session sweep ended $(date '+%Y-%m-%dT%H:%M:%S%z') elapsed=$(( $(date +%s) - t0 ))s free_before=$(_cc_wj_gib "$free0") free_after=$(_cc_wj_gib "$(_cc_wj_free_kb)") status=$rc"
   return 0
 }
 

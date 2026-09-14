@@ -14,6 +14,8 @@ commits are never deleted - only the working directory.
    HEAD and whose base is the base branch has a merge commit contained in the fetched base.
 4. **Idle:** nothing under the worktree was modified within `CC_WJ_IDLE_HOURS` hours.
 5. **Detached:** a detached HEAD is additionally landed by ancestry.
+6. **Not locked, no populated submodule:** `git worktree lock` is an explicit request to keep
+   a worktree, and a populated submodule carries state the outer status does not show.
 
 #### Scenario: Dirty worktree
 - **WHEN** a worktree has any uncommitted, untracked, or undiscounted ignored entry
@@ -58,6 +60,14 @@ commits are never deleted - only the working directory.
 #### Scenario: Detached HEAD landed by content only
 - **WHEN** a detached HEAD is landed by content or PR but not by ancestry
 - **THEN** it is classified KEEP with reason `detached-head`
+
+#### Scenario: Locked worktree
+- **WHEN** a worktree's git directory holds a `locked` file - as Claude Code's own agent worktrees do
+- **THEN** it is classified KEEP with reason `locked`, whatever the other gates say
+
+#### Scenario: Populated submodule
+- **WHEN** a worktree's git directory has a `modules` directory, or a gitlink in its index points at a checked-out path
+- **THEN** it is classified KEEP with reason `submodule`
 
 #### Scenario: Clean idle worktree
 - **WHEN** every gate holds
