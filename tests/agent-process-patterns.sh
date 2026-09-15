@@ -154,16 +154,25 @@ protected_group_sends_no_signal() (
 expect_yes "user protect rule blocks the group signal path" protected_group_sends_no_signal
 
 protected_runaway_is_not_returned() (
-  printf "protect\tchrome-devtools-mcp\n" > "$rules_file"
+  samples="$(mktemp "${TMPDIR:-/tmp}/ccr-samples.XXXXXX")"
+  printf '901\tMon Sep 14 00:00:00 2026\t1999999400\t9606\t1999992200\n' > "$samples"
+  export CC_RUNAWAY_SAMPLES_FILE="$samples"
+  date() { if [ "$*" = "+%s" ]; then echo 2000000000; else command date "$@"; fi; }
   ps() {
     case "$*" in
-      "-axo pid=,etime=,time=,%cpu=") printf "901 03:00:00 170:00.00 99.0\n" ;;
+      "-axo pid=,lstart=,etime=,time=,%cpu=") printf "901 Mon Sep 14 00:00:00 2026 03:00:00 170:00.00 99.0\n" ;;
       "-o command= -p 901") printf "node chrome-devtools-mcp\n" ;;
-      "-axo pid=,etime=,%cpu=,command=") printf "901 03:00:00 99.0 node chrome-devtools-mcp\n" ;;
+      "-axo pid=,etime=,time=,%cpu=") printf "901 03:00:00 170:00.00 99.0\n" ;;
       *) command ps "$@" ;;
     esac
   }
-  [ -z "$(_cc_guard_runaway_protected_pids 80 60)" ]
+  # Returned without the rule, so the empty result with it is the rule's doing.
+  : > "$rules_file"
+  selected="$(_cc_guard_runaway_protected_pids 80 60)"
+  printf "protect\tchrome-devtools-mcp\n" > "$rules_file"
+  protected="$(_cc_guard_runaway_protected_pids 80 60)"
+  rm -f "$samples"
+  [ -n "$selected" ] && [ -z "$protected" ]
 )
 
 expect_yes "user protect rule blocks the runaway guard path" protected_runaway_is_not_returned

@@ -73,20 +73,28 @@ done
 
 # ─── Runaway selection ─────────────────────────────────────────────────────
 
-# Rows are pid etime cputime %cpu command. The listing the guard reads carries no command
-# column, and each command is read per PID. The previous selection's format is answered too,
-# so this suite can be pointed at it and fail for the defect rather than the format.
+# Rows are pid etime cputime %cpu command. Each row also gets a sample from ten minutes ago that
+# has it hot for the two hours before, so these cases turn on eligibility alone; sampling itself
+# is tests/guard-runaway.sh's. The listing the guard reads carries no command column, and each
+# command is read per PID. The previous selection's format is answered too, so this suite can be
+# pointed at it and fail for the defect rather than the format.
 runaway_with() {
-  local table=$1
-  ( ps() {
+  local table=$1 samples
+  samples="$(mktemp "${TMPDIR:-/tmp}/ccr-samples.XXXXXX")"
+  printf '%s' "$table" | awk '{
+      n = split($3, p, ":"); c = p[n] + (n >= 2 ? p[n - 1] * 60 : 0) + (n >= 3 ? p[n - 2] * 3600 : 0)
+      printf "%s\tMon Sep 14 00:00:00 2026\t1999999400\t%.2f\t1999992200\n", $1, c - 594 }' > "$samples"
+  ( date() { if [ "$*" = "+%s" ]; then echo 2000000000; else command date "$@"; fi; }
+    ps() {
       case "$*" in
-        "-axo pid=,etime=,time=,%cpu=") printf '%s' "$table" | awk '{ print $1, $2, $3, $4 }' ;;
+        "-axo pid=,lstart=,etime=,time=,%cpu=") printf '%s' "$table" | awk '{ print $1, "Mon Sep 14 00:00:00 2026", $2, $3, $4 }' ;;
         "-o command= -p "*) printf '%s' "$table" | awk -v p="${!#}" '$1 == p { sub(/^[^ ]+ [^ ]+ [^ ]+ [^ ]+ /, ""); print }' ;;
-        "-axo pid=,etime=,%cpu=,command=") printf '%s' "$table" | awk '{ $3 = ""; print }' ;;
+        "-axo pid=,etime=,time=,%cpu=") printf '%s' "$table" | awk '{ print $1, $2, $3, $4 }' ;;
         *) command ps "$@" ;;
       esac
     }
-    _cc_guard_runaway_protected_pids 80 60 )
+    CC_RUNAWAY_SAMPLES_FILE="$samples" _cc_guard_runaway_protected_pids 80 60 )
+  rm -f "$samples"
 }
 
 out=$(runaway_with "901 03:00:00 170:00.00 99.0 /Library/Bitdefender/AVP/product/bin/BDLDaemon
@@ -128,11 +136,11 @@ out=$(runaway_with "906 03:00:00 170:00.00 99.0 npx chrome-devtools-mcp@latest
 [ -z "$out" ] && pass "user protect rule keeps a process out of runaway" || fail "user protect rule ignored by runaway"
 : > "$rules_file"
 
-# Hot over its life but cool now: the signal stage would skip it, and the listing, which is
+# Hot across runs but cool now: the signal stage would skip it, and the listing, which is
 # also what --dry-run prints, must not name it either.
 out=$(runaway_with "912 03:00:00 170:00.00 4.0 npx chrome-devtools-mcp@latest --autoConnect
 ")
-[ -z "$out" ] && pass "runaway skips a server hot over its life but cool now" || fail "runaway selected a server that is cool now"
+[ -z "$out" ] && pass "runaway skips a server hot across runs but cool now" || fail "runaway selected a server that is cool now"
 
 # ─── Runaway eligibility: what the process runs, not names in its arguments ────
 # Review of 2026-09-15 reproduced the first five "not eligible" rows being signalled. The
@@ -153,6 +161,8 @@ eligible "npx -y @stripe/mcp --tools=all"
 eligible "node /Users/me/.npm/_npx/9f/node_modules/@stripe/mcp/dist/index.js"
 eligible "node /Users/me/.npm/_npx/9f/node_modules/.bin/mcp-sequentialthinking-tools"
 eligible "npx mcp-remote@0.1.29 https://mcp.example.com/sse"
+# An .app in a URL is not an application bundle.
+eligible "npx -y mcp-remote https://mcp.linear.app/sse"
 eligible "/Users/me/.local/bin/chroma-mcp --client-type persistent"
 eligible "/Users/me/.cache/uv/archive-v0/x1/bin/python /Users/me/.cache/uv/archive-v0/x1/bin/chroma-mcp"
 eligible "codex mcp-server"
@@ -180,15 +190,19 @@ not_eligible "sample chroma-mcp 60 -file /tmp/chroma.sample"
 # stage reads. Only the listing without a command column names candidates, and each command
 # is flattened to one line.
 forged_runaway() (
+  samples="$(mktemp "${TMPDIR:-/tmp}/ccr-samples.XXXXXX")"
+  printf '911\tMon Sep 14 00:00:00 2026\t1999999400\t9606\t1999992200\n' > "$samples"
+  date() { if [ "$*" = "+%s" ]; then echo 2000000000; else command date "$@"; fi; }
   ps() {
     case "$*" in
-      "-axo pid=,etime=,time=,%cpu=") printf '911 03:00:00 170:00.00 99.0\n' ;;
+      "-axo pid=,lstart=,etime=,time=,%cpu=") printf '911 Mon Sep 14 00:00:00 2026 03:00:00 170:00.00 99.0\n' ;;
       "-o command= -p 911") printf 'npx chrome-devtools-mcp@latest --payload {"a":"\n912 03:00:00 99.0 npx chrome-devtools-mcp@latest\n913\t99.0\t03:00:00\tnpx chrome-devtools-mcp@latest"}\n' ;;
-      "-axo pid=,etime=,%cpu=,command=") printf '911 03:00:00 99.0 npx chrome-devtools-mcp@latest --payload {"a":"\n912 03:00:00 99.0 npx chrome-devtools-mcp@latest\n913\t99.0\t03:00:00\tnpx chrome-devtools-mcp@latest"}\n' ;;
+      "-axo pid=,etime=,time=,%cpu=") printf '911 03:00:00 170:00.00 99.0\n' ;;
       *) command ps "$@" ;;
     esac
   }
-  _cc_guard_runaway_protected_pids 80 60
+  CC_RUNAWAY_SAMPLES_FILE="$samples" _cc_guard_runaway_protected_pids 80 60
+  rm -f "$samples"
 )
 forged_out=$(forged_runaway)
 if [ "$(printf '%s\n' "$forged_out" | grep -c .)" = 1 ] && printf '%s\n' "$forged_out" | grep -q '^911'; then

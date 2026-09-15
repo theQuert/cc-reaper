@@ -838,9 +838,9 @@ _claude_pgid_kill() {
 # node_modules. No other argument counts. Review reproduced substring matching selecting a
 # session whose --settings named claude-mem, a subagent whose --mcp-config named context7, and
 # test runs under directories named after servers. `codex mcp-server` is the one Codex form
-# that is an MCP server, and anything inside an .app bundle is the application's. claude-mem's
-# worker is protected but not listed: its process form was never observed, and a guess here is
-# a kill path.
+# that is an MCP server, and anything run from inside an .app bundle is the application's.
+# claude-mem's worker is protected but not listed: its process form was never observed, and a
+# guess here is a kill path.
 _cc_reaper_mcp_server_program() {
   printf '%s\n' '
     function known(s) {
@@ -859,7 +859,6 @@ _cc_reaper_mcp_server_program() {
       return 0
     }
     NR == 1 {
-      if (index($0, ".app/")) exit 1
       i = 1
       b = $1
       sub(/.*\//, "", b)
@@ -869,6 +868,8 @@ _cc_reaper_mcp_server_program() {
         i = 2
         while (i <= NF && ($i ~ /^-/ || $i ~ /^(exec|x|dlx|run|tool)$/)) i++
       }
+      # What runs from inside an .app bundle is that application; an .app in a URL is not.
+      if (index($1, ".app/") || index($i, ".app/")) exit 1
       b = $i
       sub(/.*\//, "", b)
       if (b == "codex" || b == "codex.js") exit (($(i + 1) == "mcp-server") ? 0 : 1)
@@ -887,35 +888,59 @@ _cc_guard_runaway_eligible() {
   printf '%s\n' "$cmd" | awk "$(_cc_reaper_mcp_server_program)"
 }
 
-# Print TSV (pid, cpu, etime, command) for runaway-eligible processes at least min_minutes old
-# whose CPU time is at least cpu_threshold percent of that elapsed time, and whose %cpu is at or
-# above it now. `ps %cpu` decays over about a minute, so it says a process is hot now; the CPU
-# time says it has been. The signal stage re-checks.
+# Print TSV (pid, cpu, etime, command) for runaway-eligible processes that have stayed hot for at
+# least min_minutes and are at or above cpu_threshold %cpu now.
+#
+# "Stayed hot" is measured across claude-guard's runs. Each run samples the CPU time of every
+# process hot at that moment. An interval of at least a minute since the previous sample extends
+# the process's streak only if the process used at least cpu_threshold percent of it; a cooler
+# interval, a run that finds it below the threshold, or an interval over 20 minutes starts the
+# streak over. CPU time sums threads, so inside a long interval a multi-threaded server could idle
+# for long and still average hot. Review found both simpler measures wrong: `ps %cpu` decays over
+# about a minute, and a lifetime average of CPU time let a multi-threaded server busy in its first
+# minutes qualify on any later burst while a stall late in a long life was never caught.
+#
+# Samples are keyed by PID and start time, read under LC_ALL=C and TZ=UTC so the guard agent and
+# an interactive shell write the same keys, and a reused PID starts fresh. With record=1 this
+# run's samples replace the file; a dry run or a listing leaves it alone. A lost or unwritable
+# file only restarts streaks.
+#
+# ponytail: one samples file, last writer wins - overlapping runs can drop each other's samples,
+# which only restarts streaks. Lock it if runs ever overlap routinely.
 #
 # Candidates come from a listing without a command column, and each command is read per PID and
 # flattened to one line, so argument text shaped like a row or a record adds no PID - the seam
 # session detection already uses.
-#
-# ponytail: a lifetime average dilutes a stall that starts late in a long life - a server idle
-# for a day, then pinned for an hour, averages about 4% and is never selected; cc-monitor still
-# reports it. Upgrade path: keep each run's CPU time per pid and start time under
-# ~/.cc-reaper/state and measure the last CC_RUNAWAY_MIN minutes.
 _cc_guard_runaway_protected_pids() {
-  local cpu_threshold=$1 min_minutes=$2 pid etime cputime cpu cmd
-  ps -axo pid=,etime=,time=,%cpu= 2>/dev/null | awk -v cpu="$cpu_threshold" -v min="$((min_minutes * 60))" '
-    function secs(t,   n, p, d, s) {
-      d = 0
-      if (index(t, "-")) { split(t, p, "-"); d = p[1]; t = p[2] }
-      n = split(t, p, ":")
-      s = p[n] + 0
-      if (n >= 2) s += p[n - 1] * 60
-      if (n >= 3) s += p[n - 2] * 3600
-      return s + d * 86400
-    }
-    { e = secs($2); c = secs($3) }
-    $4 + 0 >= cpu + 0 && e >= min + 0 && e > 0 && c * 100 >= cpu * e
-  ' | while read -r pid etime cputime cpu; do
-    [ -z "$pid" ] && continue
+  local cpu_threshold=$1 min_minutes=$2 record=${3:-0} now samples tmp="" pid etime cpu cmd
+  now=$(date +%s)
+  samples=${CC_RUNAWAY_SAMPLES_FILE:-$HOME/.cc-reaper/state/runaway-samples.tsv}
+  if [ "$record" = 1 ] && mkdir -p "${samples%/*}" 2>/dev/null; then
+    tmp=$(mktemp "$samples.XXXXXX" 2>/dev/null) || tmp=""
+  fi
+  LC_ALL=C TZ=UTC ps -axo pid=,lstart=,etime=,time=,%cpu= 2>/dev/null |
+    awk -v now="$now" -v cpu="$cpu_threshold" -v min="$min_minutes" -v samples="$samples" -v out="$tmp" '
+      function secs(t,   n, p, s) {
+        n = split(t, p, ":")
+        s = p[n] + 0
+        if (n >= 2) s += p[n - 1] * 60
+        if (n >= 3) s += p[n - 2] * 3600
+        return s
+      }
+      BEGIN {
+        while ((getline line < samples) > 0)
+          if (split(line, f, "\t") == 5) { k = f[1] "\t" f[2]; at[k] = f[3]; used[k] = f[4]; since[k] = f[5] }
+      }
+      NF == 9 && $9 + 0 >= cpu + 0 {
+        key = $1 "\t" $2 " " $3 " " $4 " " $5 " " $6
+        c = secs($8)
+        if (!(key in at)) { t = now; u = c; h = now }
+        else if (now - at[key] < 60) { t = at[key]; u = used[key]; h = since[key] }
+        else if (now - at[key] > 1200) { t = now; u = c; h = now }
+        else { t = now; u = c; h = ((c - used[key]) * 100 >= cpu * (now - at[key])) ? since[key] : now }
+        if (out != "") printf "%s\t%d\t%.2f\t%d\n", key, t, u, h > out
+        if (t - h >= min * 60) print $1, $7, $9
+      }' | while read -r pid etime cpu; do
     cmd=$(ps -o command= -p "$pid" 2>/dev/null | tr '\n' ' ')
     cmd=${cmd% }
     # Immutable processes - system scanners, cc-reaper itself, ordinary Chrome - never
@@ -924,6 +949,7 @@ _cc_guard_runaway_protected_pids() {
     _cc_guard_runaway_eligible "$cmd" || continue
     printf "%s\t%s\t%s\t%s\n" "$pid" "$cpu" "$etime" "$cmd"
   done
+  if [ -n "$tmp" ]; then mv -f "$tmp" "$samples" 2>/dev/null || rm -f "$tmp"; fi
 }
 
 # Automatic session guard: kills bloated (RSS threshold) and idle sessions
@@ -957,6 +983,9 @@ claude-guard() {
   fi
   echo "$runaway_cpu" | grep -qE '^[0-9]+([.][0-9]+)?$' || runaway_cpu=80
   echo "$runaway_min" | grep -qE '^[0-9]+$' || runaway_min=60
+  # Zero would make every process hot, or every hot process a runaway on its first sample.
+  awk -v x="$runaway_cpu" 'BEGIN { exit !(x + 0 > 0) }' || runaway_cpu=80
+  [ "$runaway_min" -gt 0 ] || runaway_min=60
   echo "$runaway_grace" | grep -qE '^[0-9]+$' || runaway_grace=5
 
   echo "=== Claude Guard ==="
@@ -966,9 +995,12 @@ claude-guard() {
   # ─── Phase 0.5: Runaway protected processes ───────────────────────────
   if [ "$runaway_disable" != "1" ]; then
     local runaway_lines=""
-    runaway_lines=$(_cc_guard_runaway_protected_pids "$runaway_cpu" "$runaway_min")
+    # A dry run reads the samples and records none.
+    local runaway_record=1
+    $dry_run && runaway_record=0
+    runaway_lines=$(_cc_guard_runaway_protected_pids "$runaway_cpu" "$runaway_min" "$runaway_record")
     if [ -n "$runaway_lines" ]; then
-      echo "  --- Runaway protected processes (CPU time >= ${runaway_cpu}% of >= ${runaway_min} min alive) ---"
+      echo "  --- Runaway protected processes (CPU >= ${runaway_cpu}% across runs for >= ${runaway_min} min) ---"
       printf '%s\n' "$runaway_lines" | awk -F '\t' '
         { printf "  PID %-7s  CPU %6s%%  ETIME %-14s  %s\n", $1, $2, $3, substr($4, 1, 80) }
       '
@@ -977,9 +1009,9 @@ claude-guard() {
       else
         echo "  Sending SIGTERM in ${runaway_grace} seconds (Ctrl+C to abort)..."
         sleep "$runaway_grace"
-        # Selection measured each PID's life. After a pause it is read again, and signalled
-        # only if it still runs the command it was selected for, is still eligible, and is
-        # still over the threshold now.
+        # Selection measured each PID across runs. After a pause it is read again, and
+        # signalled only if it still runs the command it was selected for, is still eligible,
+        # and is still over the threshold now.
         sleep 3
         local rkilled=0 rfreed_kb=0 rnow_cmd="" rnow_cpu="" rrss=""
         while IFS=$'\t' read -r rpid rcpu retime rrest; do
