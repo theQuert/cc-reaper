@@ -119,10 +119,15 @@ echo "\$*" >> "$OSASCRIPT_CAPTURE"
 STUB
 chmod +x "$FAKE_BIN/osascript"
 
-# docker stub
+# docker stub. Dangling images exist, so a clean that removes them has ids to pass to
+# `rmi` - with none listed, a removal would never be attempted and its absence would
+# prove nothing.
 cat > "$FAKE_BIN/docker" <<STUB
 #!/usr/bin/env bash
 echo "\$*" >> "$DOCKER_CAPTURE"
+case "\$1 \$2" in
+  "images -f") printf 'aaa111\nbbb222\n' ;;
+esac
 STUB
 chmod +x "$FAKE_BIN/docker"
 
@@ -302,6 +307,9 @@ expect_yes "clean: bun called" \
 
 expect_yes "clean: docker called" \
   test -s "$DOCKER_CAPTURE"
+
+expect_no "clean: nothing that removes an image or volume reaches docker" \
+  grep -qE '^(rmi|image rm|image prune|system prune|volume rm|volume prune)' "$DOCKER_CAPTURE"
 
 expect_yes "clean: log contains freed= bytes entry" \
   grep -q 'freed=' "$SANDBOX/dj.log"
@@ -634,8 +642,6 @@ expect_yes "report: dangling images are counted and the review command is named"
   bash -c 'out="$(env PATH="$1:$2" DJ="$3" /bin/bash -c '"'"'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_report_dangling'"'"')" || exit 1
            printf "%s" "$out" | grep -q "2 dangling images" &&
            printf "%s" "$out" | grep -q "docker images -f dangling=true"' _ "$DOCKREP" "$SAFE_SYS_PATH" "$DJ"
-expect_no "report: nothing that removes an image reaches docker" \
-  grep -qE '^(rmi|image rm|image prune|system prune)' "$DOCKREP_CALLS"
 
 # ---------------------------------------------------------------------------
 # TEST 12: an inventory that failed is not an empty inventory
