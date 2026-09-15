@@ -19,7 +19,8 @@ bad() { printf "not ok - %s\n" "$1"; failures=$((failures + 1)); }
 check() { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cc-install-rc.XXXXXX")"
-cleanup() { chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"; }
+# chmod -N too: a scenario below gives an rc file, and so its backup, an ACL that denies delete.
+cleanup() { chmod -R -N "$WORK" 2>/dev/null; chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 STUBS="$WORK/stubs"
@@ -126,12 +127,25 @@ backup="$(ls "$H"/.zshrc.cc-reaper-backup-* 2>/dev/null | head -1)"
 check "one backup, identical to the rc file before the run" $?
 
 # ─── Stale and current lines together ─────────────────────────────────────────
+# The installer never removes a line: removing one can change what the lines around it mean.
 H="$(sandbox_home)"
 printf '%s\n%s\n%s\n' "$want_cleanup" 'source "/gone/worktree/shell/claude-cleanup.sh"' "$want_monitor" > "$H/.zshrc"
+cp "$H/.zshrc" "$H/original"
 install_into "$H"
 completed "$H"; check "an install over mixed lines completes" $?
-[ "$(count_line "$H/.zshrc" "$want_cleanup")" = 1 ] && ! grep -q '/gone/worktree' "$H/.zshrc"
-check "a stale line beside the current one is removed" $?
+cmp -s "$H/.zshrc" "$H/original"; check "a stale line beside the current one is left in place" $?
+grep -qF 'remove: source "/gone/worktree/shell/claude-cleanup.sh"' "$H/install.out"
+check "and the installer prints it for removal" $?
+
+# ─── The current line, commented out ──────────────────────────────────────────
+# Somebody turned it off; an update does not turn it back on.
+H="$(sandbox_home)"
+printf '# %s\n%s\n' "$want_cleanup" "$want_monitor" > "$H/.zshrc"
+cp "$H/.zshrc" "$H/original"
+install_into "$H"
+completed "$H"; check "an install over a commented-out current line completes" $?
+cmp -s "$H/.zshrc" "$H/original"; check "a commented-out current line stays off" $?
+grep -q 'commented out' "$H/install.out"; check "and the installer says it left it off" $?
 
 # ─── A commented-out stale line ───────────────────────────────────────────────
 H="$(sandbox_home)"
@@ -161,16 +175,46 @@ completed "$H"; check "an install over an rc file without a final newline comple
 [ "$(count_line "$H/.zshrc" "$want_cleanup")" = 1 ] && [ "$(count_line "$H/.zshrc" "$want_monitor")" = 1 ]
 check "an appended line starts on its own line" $?
 
-# ─── A stale line beside a line the installer did not write ───────────────────
+# ─── A stale line beside lines the installer did not write ────────────────────
+# Review found the stale line removed here. Beside an alias that only names the script that
+# left nothing sourcing it, and under an `if` it left the block empty.
+for other in '. /gone/other/shell/claude-cleanup.sh' "alias cc-edit='vim ~/.cc-reaper/claude-cleanup.sh'"; do
+  H="$(sandbox_home)"
+  printf '%s\n' 'if [ -n "$ZSH_VERSION" ]; then' 'source "/gone/worktree/shell/claude-cleanup.sh"' 'fi' "$other" "$want_monitor" > "$H/.zshrc"
+  cp "$H/.zshrc" "$H/original"
+  install_into "$H"
+  completed "$H"; check "an install over a stale line beside '${other:0:24}' completes" $?
+  cmp -s "$H/.zshrc" "$H/original" && [ "$(backups "$H")" = 0 ]
+  check "the rc file is left unchanged, with no backup taken" $?
+  grep -q 'left unchanged' "$H/install.out" && grep -qF -- "$other" "$H/install.out" &&
+    grep -qF 'remove: source "/gone/worktree/shell/claude-cleanup.sh"' "$H/install.out" &&
+    grep -qF "$want_cleanup" "$H/install.out"
+  check "and the installer prints the other line and the change to make by hand" $?
+done
+
+# ─── Two stale lines ──────────────────────────────────────────────────────────
 H="$(sandbox_home)"
-printf '%s\n' 'source "/gone/worktree/shell/claude-cleanup.sh"' '. /gone/other/shell/claude-cleanup.sh' > "$H/.zshrc"
+printf '%s\n' '[ -d /gone ] &&' 'source "/gone/a/shell/claude-cleanup.sh"' 'source "/gone/b/shell/claude-cleanup.sh"' "$want_monitor" > "$H/.zshrc"
+cp "$H/.zshrc" "$H/original"
 install_into "$H"
-completed "$H"; check "an install over a stale line beside a hand-written one completes" $?
-! grep -q '/gone/worktree' "$H/.zshrc" && grep -qxF '. /gone/other/shell/claude-cleanup.sh' "$H/.zshrc" &&
-  [ "$(count_line "$H/.zshrc" "$want_cleanup")" = 0 ]
-check "the stale line is removed, the hand-written one kept, and nothing added beside it" $?
-grep -q 'left unchanged' "$H/install.out" && grep -qF '. /gone/other/shell/claude-cleanup.sh' "$H/install.out"
-check "and the installer names the hand-written line" $?
+completed "$H"; check "an install over two stale lines completes" $?
+cmp -s "$H/.zshrc" "$H/original"; check "two stale lines are left in place" $?
+grep -qF 'remove: source "/gone/a/shell/claude-cleanup.sh"' "$H/install.out" &&
+  grep -qF 'remove: source "/gone/b/shell/claude-cleanup.sh"' "$H/install.out"
+check "and the installer prints both for removal" $?
+
+# ─── An ACL that denies deleting the rewritten copy ───────────────────────────
+# cp -p carries the rc file's ACL to the copy, so the rename fails and, unless the ACL is
+# dropped, the copy of the rc file cannot be removed.
+H="$(sandbox_home)"
+printf '%s\n%s\n' 'source "/gone/worktree/shell/claude-cleanup.sh"' "$want_monitor" > "$H/.zshrc"
+cp "$H/.zshrc" "$H/original"
+chmod +a "everyone deny delete" "$H/.zshrc"
+install_into "$H"
+completed "$H"; check "an install over an rc file whose ACL denies delete completes" $?
+cmp -s "$H/.zshrc" "$H/original" && [ -z "$(ls -a "$H" | grep '^\.zshrc\.cc-reaper\.')" ]
+check "the rc file is left unchanged, and no copy of it is left behind" $?
+grep -qF "$want_cleanup" "$H/install.out"; check "and the installer prints the change to make by hand" $?
 
 # ─── No rc file yet ───────────────────────────────────────────────────────────
 H="$(sandbox_home)"
