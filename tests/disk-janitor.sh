@@ -121,12 +121,14 @@ chmod +x "$FAKE_BIN/osascript"
 
 # docker stub. Dangling images exist, so a clean that removes them has ids to pass to
 # `rmi` - with none listed, a removal would never be attempted and its absence would
-# prove nothing.
+# prove nothing. For the same reason a volume with a docker-generated-looking name is
+# listed and no container uses it: the volume report reaches a volume it could name.
 cat > "$FAKE_BIN/docker" <<STUB
 #!/usr/bin/env bash
 echo "\$*" >> "$DOCKER_CAPTURE"
 case "\$1 \$2" in
   "images -f") printf 'aaa111\nbbb222\n' ;;
+  "volume ls") echo dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd ;;
 esac
 STUB
 chmod +x "$FAKE_BIN/docker"
@@ -313,6 +315,11 @@ expect_yes "clean: docker called" \
 # may reach docker.
 expect_no "clean: docker receives only the read-only calls the reports make" \
   grep -vqE '^(info|images -f dangling=true -q|volume ls --format .+|ps -aq|inspect .+)$' "$DOCKER_CAPTURE"
+
+# The allowlist proves something only if the volume report got as far as a volume it could
+# have removed: it asks for containers only once it has one.
+expect_yes "clean: the volume report looked for containers using the listed volume" \
+  grep -qx 'ps -aq' "$DOCKER_CAPTURE"
 
 expect_yes "clean: log contains freed= bytes entry" \
   grep -q 'freed=' "$SANDBOX/dj.log"
@@ -668,6 +675,15 @@ expect_no "inventory: a failing 'docker images' is not 'no dangling images'" \
 expect_no "inventory: a failing 'docker volume ls' is not 'no volumes'" \
   env PATH="$DEADD:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
     'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_report_dead_anon_volumes >/dev/null 2>&1'
+
+# And each says so, rather than failing in silence.
+expect_yes "inventory: a failing 'docker images' reports that nothing was examined" \
+  env PATH="$DEADD:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_report_dangling 2>/dev/null | grep -q "nothing examined"'
+
+expect_yes "inventory: a failing 'docker volume ls' reports that nothing was examined" \
+  env PATH="$DEADD:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_report_dead_anon_volumes 2>/dev/null | grep -q "nothing examined"'
 
 # ---------------------------------------------------------------------------
 # TEST 13: an unreadable container inventory must not authorise removal
