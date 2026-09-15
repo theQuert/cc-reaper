@@ -69,9 +69,13 @@ point anywhere else. No outcome of rc configuration SHALL stop the rest of the i
 - **WHEN** the rc file mentions `claude-cleanup.sh` in an uncommented line the installer did not generate
 - **THEN** `install.sh` SHALL leave the line unchanged, SHALL NOT add a second line for that script, and SHALL print the line it left alone
 
-#### Scenario: An rc file that cannot be rewritten in place
-- **WHEN** the rc file needs a repair and is a symlink, has more than one hard link, or cannot be read or written
-- **THEN** `install.sh` SHALL leave it unchanged, SHALL print the replacement to make by hand, and SHALL complete the installation
+#### Scenario: An rc file that cannot be changed in place
+- **WHEN** the rc file needs any change and is a symlink, has more than one hard link, or cannot be read or written
+- **THEN** `install.sh` SHALL leave it unchanged, not even appending to it, SHALL print the change to make by hand, and SHALL complete the installation
+
+#### Scenario: The backup cannot be written
+- **WHEN** the rc file needs a change and its backup cannot be written
+- **THEN** `install.sh` SHALL leave it unchanged, SHALL print the change to make by hand, and SHALL complete the installation
 
 #### Scenario: Repeated install
 - **WHEN** `install.sh` runs twice
@@ -132,7 +136,7 @@ Runaway selection SHALL exclude processes classified `immutable`. A stuck system
 NOT be signalled by cc-reaper under any threshold. Runaway selection SHALL also exclude
 applications (a command inside an `.app` bundle), development servers and process managers, even
 though they classify `shared`: each is something a person is using, and the phase runs unattended.
-cc-monitor SHALL still report them.
+cc-monitor SHALL still report them, and SHALL NOT name claude-guard as the remedy for one.
 
 #### Scenario: Security software is stuck hot
 - **WHEN** `Bitdefender` sustains CPU ≥ `CC_RUNAWAY_CPU` for etime ≥ `CC_RUNAWAY_MIN`
@@ -149,6 +153,10 @@ cc-monitor SHALL still report them.
 #### Scenario: Development server is stuck hot
 - **WHEN** a `node … next dev-server` or `pm2` process meets the thresholds
 - **THEN** it SHALL NOT be selected or signalled
+
+#### Scenario: cc-monitor reports a stuck application
+- **WHEN** cc-monitor reports `cmux.app` or a `next dev-server` as a runaway
+- **THEN** its suggested action SHALL say that claude-guard will not reap it
 
 ### Requirement: Runaway signals the process it selected
 When the runaway phase selects a PID, the signal stage SHALL signal that PID even when its class
@@ -170,3 +178,121 @@ or its siblings, whatever their class.
 #### Scenario: User protect rule still wins
 - **WHEN** a user `protect` rule covers a process that meets the runaway thresholds
 - **THEN** it SHALL NOT be selected or signalled
+
+### Requirement: Protection covers the matched process, not its descendants
+Every protection test SHALL be applied to a process's own command line. Ancestry SHALL NOT be consulted: it neither protects a process nor exposes one. A process whose command matches a protected pattern is exempt no matter who spawned it, and a process spawned by a protected application gains no protection from that parent.
+
+Losing a parent's protection is not the same as becoming reapable. A process is reaped only when it also satisfies a path's own eligibility test — a family predicate, a user `cleanup` rule, or membership in an orphaned group. A helper matching none of those is left alone however detached and stale it is.
+
+This is deliberate. A protected application's leaked helpers are exactly what cc-reaper exists to reclaim: they carry no marker of their parent, and once detached and past `CC_AGENT_STALE_MINUTES` they are indistinguishable from any other orphaned MCP server. Extending protection along the parent chain would place a leaking app's garbage permanently out of reach, leaving no recovery short of quitting the app.
+
+Protection itself comes from the single classification in "One protection classification owns all three paths". The paths differ only in eligibility and in how they treat the `shared` class, never in what they consider protected.
+
+Candidacy for **pattern-based** cleanup is decided first-match against the process's own command line:
+
+1. **Immutable** — system processes, cc-reaper's own scripts and app binary, ordinary Chrome, and Codex UI helpers. No user rule can override this rung.
+2. **User `protect` rule** — exempt. Outranks a `cleanup` rule for the same process.
+3. **User `cleanup` rule** — reapable once detached and stale, **overriding built-in protection**. This is how a user reclaims a shared service the built-in whitelist would otherwise spare.
+4. **Built-in protected pattern** — exempt.
+5. **Family matchers** — agent browser, Puppeteer Chrome, Codex, and agent MCP.
+
+"cc-reaper's own scripts and app binary" means processes whose command matches `claude-cleanup.sh`, `cc-monitor.sh`, or the `CCReaper` binary — not everything cc-reaper spawned, since this rung matches commands rather than walking the tree.
+
+The eligibility test is **not** shared across those rungs. Once a rung claims a process, that rung's own predicate decides:
+
+| Rung | Eligible when |
+|---|---|
+| User `cleanup` rule | detached **and** stale — an orphan parent alone is not enough |
+| Agent browser, Puppeteer Chrome | orphan parent **or** stale — an old process still attached to a terminal qualifies |
+| Codex, agent MCP | orphan parent **or** (detached **and** stale) |
+
+An orphaned parent is therefore sufficient on its own for the two family rungs, however young the process: a ten-second-old agent-browser reparented to PID 1 is already a candidate. It is not sufficient for a user `cleanup` rule, which always requires age as well.
+
+#### Scenario: Unmatched helper spawned by a protected application
+- **WHEN** a protected application has spawned a helper that matches no protected pattern, no agent family, and no user `cleanup` rule, and no orphaned group covers it
+- **THEN** it SHALL NOT be reaped even when detached and long-running, because losing the parent's protection does not by itself make a process eligible
+
+#### Scenario: Freshly orphaned agent browser
+- **WHEN** an agent-browser process has been reparented to an orphan parent ten seconds ago
+- **THEN** it SHALL be a candidate, because the orphan parent alone satisfies that family's predicate
+
+#### Scenario: Old agent browser still attached to a terminal
+- **WHEN** an agent-browser process has a living parent, holds a terminal, and is older than `CC_AGENT_STALE_MINUTES`
+- **THEN** it SHALL be a candidate, because that family's predicate accepts staleness without requiring detachment
+
+#### Scenario: Old agent MCP still attached to a terminal
+- **WHEN** an agent-MCP process has a living parent, holds a terminal, and is older than `CC_AGENT_STALE_MINUTES`
+- **THEN** it SHALL NOT be a candidate, because that family requires detachment alongside staleness
+
+#### Scenario: Freshly orphaned process under a user cleanup rule
+- **WHEN** a user `cleanup` rule covers a process that was reparented to an orphan parent ten seconds ago
+- **THEN** it SHALL NOT be a candidate, because a user rule requires staleness as well
+
+#### Scenario: Live descendant of a protected application
+- **WHEN** a `shared` application has spawned MCP servers that are still attached to it and below the stale threshold, and no orphaned group covers them
+- **THEN** they SHALL NOT be signalled, because they satisfy no family predicate on their own merits
+
+#### Scenario: Leaked descendant of a protected application
+- **WHEN** a `shared` application has leaked `npx`-spawned MCP servers that are detached, older than `CC_AGENT_STALE_MINUTES`, and whose **own** command lines match no protected pattern
+- **THEN** they SHALL be reaped, because a leaked helper carries no marker of its parent and is indistinguishable from any other orphan
+
+#### Scenario: Leaked descendant is itself a shared service
+- **WHEN** the leaked descendant classifies as `shared`
+- **AND** no user rule covers it
+- **THEN** it SHALL be exempt and survive; ancestry neither condemns nor saves it
+
+#### Scenario: Reaping a leaked descendant does not disturb the application
+- **WHEN** those leaked helpers are reaped
+- **THEN** the whitelisted application itself SHALL remain running
+
+#### Scenario: User cleanup rule overrides built-in protection
+- **WHEN** a user `cleanup` rule covers a built-in protected service such as `chrome-devtools-mcp`, and the process is detached and stale
+- **THEN** pattern-based cleanup SHALL reap it, because a user rule is evaluated before the built-in whitelist
+
+#### Scenario: User protect rule outranks a user cleanup rule
+- **WHEN** both a `protect` and a `cleanup` rule match the same process
+- **THEN** it SHALL be exempt
+
+#### Scenario: No user rule can reach an immutable process
+- **WHEN** a user `cleanup` rule matches a system process such as `WindowServer`, one of cc-reaper's own scripts, ordinary Chrome, or a Codex UI helper
+- **THEN** it SHALL still be exempt from pattern-based cleanup, because immutability is evaluated before any user rule
+
+#### Scenario: Child spawned by cc-reaper with an unrelated command
+- **WHEN** a process cc-reaper started is detached and stale, and its own command line matches an agent family or a user `cleanup` rule
+- **THEN** it SHALL be reapable, because self-immutability matches commands rather than walking the tree
+
+#### Scenario: Group member that is not itself stale
+- **WHEN** an orphaned Claude or Codex process group is reaped, and one member is recent and still attached but matches no immutable pattern, no built-in protected pattern, and no user `protect` rule
+- **THEN** it SHALL be signalled on group membership alone
+
+#### Scenario: User cleanup rule during process-group cleanup
+- **WHEN** a user `cleanup` rule names a built-in protected service that is a member of an orphaned group
+- **THEN** that member SHALL still be spared, because the `cleanup` override applies to pattern-based candidacy only
+
+#### Scenario: Protected application is stuck hot
+- **WHEN** a `shared` application such as `ChatGPT.app` or `cmux.app` meets the runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` over etime ≥ `CC_RUNAWAY_MIN`)
+- **THEN** the runaway phase SHALL NOT select or signal it, because signalling an application ends the work running inside it
+- **AND** a `shared` MCP server meeting the same thresholds SHALL be signalled, alone, if it is still over the threshold when re-checked
+
+#### Scenario: User protect rule during the runaway phase
+- **WHEN** a process covered by a user `protect` rule meets the runaway thresholds
+- **THEN** it SHALL NOT be selected, because a user rule outranks the built-in exception
+
+### Requirement: claude-guard reaps stuck protected processes
+The system SHALL detect runaway protected processes (sustained high CPU over a long elapsed time) and SHALL terminate them after an explicit grace window, treating them as a distinct phase before existing FD-leak / bloated / idle phases.
+
+#### Scenario: Runaway protected process detected
+- **WHEN** `claude-guard` runs and one or more protected processes meet runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` percent over etime ≥ `CC_RUNAWAY_MIN` minutes; defaults 80 and 60)
+- **THEN** claude-guard SHALL print a "Runaway protected processes" section listing each PID, command, CPU, and etime, SHALL wait `CC_RUNAWAY_GRACE_SEC` seconds (default 5) for the user to Ctrl+C, AND SHALL then re-check each PID and send a termination signal to each one that passes, to that PID alone and never to its process group.
+
+#### Scenario: --dry-run preserves runaway protected processes
+- **WHEN** `claude-guard --dry-run` runs and runaway processes are detected
+- **THEN** claude-guard SHALL print the runaway list and the actions it would take, but SHALL NOT send any signals.
+
+#### Scenario: Runaway phase is opt-out
+- **WHEN** the user sets `CC_RUNAWAY_DISABLE=1`
+- **THEN** claude-guard SHALL skip the runaway phase entirely and proceed directly to the FD-leak / bloated / idle phases as before.
+
+#### Scenario: No runaway candidates
+- **WHEN** no protected process meets the runaway thresholds
+- **THEN** claude-guard SHALL skip the runaway phase silently and continue with the existing phases.

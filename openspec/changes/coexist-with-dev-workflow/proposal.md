@@ -47,14 +47,14 @@ on its last run.
 - **BREAKING (behavior):** claude-guard's runaway phase signals only the PID it selected. It
   re-reads that PID after at least three seconds and signals only if it is still the same command
   and still hot. It never selects an application, a development server or a process manager;
-  cc-monitor still reports those.
+  cc-monitor still reports those, and no longer names claude-guard as the remedy for them.
 - `install.sh`:
   - Sources the deployed copies under `~/.cc-reaper/`, guarded.
   - Repairs lines in its old generated shape and removes them when the current line already
     exists.
   - Backs the rc file up before any change.
-  - Never renames over a symlinked, hard-linked, unreadable or unwritable rc file; it prints the
-    change instead.
+  - Never changes a symlinked, hard-linked, unreadable or unwritable rc file, not even by
+    appending; it prints the change instead.
   - Never stops the installation over rc configuration.
   - Deploys every script by temporary file and rename.
 - `disk-janitor --clean` reports dangling docker images and removes none.
@@ -74,10 +74,11 @@ on its last run.
 ## Impact
 
 - **Code:** `launchd/cc-reaper-monitor.sh`, `shell/claude-cleanup.sh` (runaway phase),
-  `install.sh`, `shell/disk-janitor.sh`, `hooks/stop-cleanup-orphans.sh` (comment only).
+  `shell/cc-monitor.sh` (runaway suggested action), `install.sh`, `shell/disk-janitor.sh`,
+  `hooks/stop-cleanup-orphans.sh` (comment only).
 - **Tests:** new `tests/monitor-selection.sh`, `tests/guard-runaway.sh` and
-  `tests/install-rc-source.sh`; updated `tests/protection-classes.sh` and
-  `tests/disk-janitor.sh`.
+  `tests/install-rc-source.sh`; updated `tests/protection-classes.sh`,
+  `tests/cc-monitor-runaway.sh` and `tests/disk-janitor.sh`.
 - **Docs:** README, CHANGELOG, CLAUDE.md.
 - **Rollback:** revert the merge commit. Deployed copies are replaced by rename, with the
   previous versions kept under `~/.cc-reaper/state/`, and the rc backup is

@@ -38,7 +38,8 @@ properties made it dangerous beside interactive work.
 - **It selected applications and dev servers.** On the audited host it signalled `ChatGPT.app`
   and `cmux.app`, the terminal the sessions run in. An `.app` bundle, a development server or a
   process manager is something a person is using. The phase now leaves them to cc-monitor's
-  report, which names them with a kill line for a human.
+  report, which names them with a kill line for a human and no longer suggests claude-guard for
+  them.
 
 Protection classes stay the single owner of "how protected". Runaway eligibility is `shared`
 minus those three user-facing kinds, expressed in one helper.
@@ -62,9 +63,10 @@ A shell started before step 5 of an interrupted install prints nothing.
   change of any kind in the run, so the backup is always the pre-run file.
 - **How a rewrite is written.** To a temporary file in the same directory with the original
   mode, then renamed.
-- **When a rename would do harm, or cannot work.** A symlink (a dotfiles checkout), a file with
-  more than one hard link, or an unreadable or unwritable file is not rewritten. The installer
-  prints the exact replacement.
+- **When a change would do harm, or cannot work.** A symlink (a dotfiles checkout), a file with
+  more than one hard link, or an unreadable or unwritable file is not changed at all - not even
+  appended to, since an append writes into whatever the link points at. The installer prints the
+  exact change.
 - **Failure.** rc configuration never stops the installer: a failed step prints what to do and
   the installation continues.
 
@@ -89,5 +91,7 @@ same way it already handles unreferenced volumes.
 - **A stuck shared MCP server runs up to `CC_RUNAWAY_MIN` before it is signalled.** Accepted.
 - **A stuck application or dev server is never signalled automatically.** Accepted.
   cc-monitor's runaway section names it with a kill line.
+- **A symlinked or hard-linked rc file gets no lines, even on a fresh install.** Accepted: the
+  installer prints the two lines to add, and the file stays the dotfiles checkout's to change.
 - **A hand-written rc line in the installer's exact shape is rewritten.** Mitigated: a backup,
   and the replaced line is printed.
