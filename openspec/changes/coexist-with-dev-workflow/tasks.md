@@ -43,14 +43,14 @@
 
 ## 7. Review round 3
 
-- [ ] 7.1 Red-verify the guard: a multi-threaded server busy early, a first sample, a reused PID, a short streak, a sample under a minute old, a burst after an idle interval and a streak across a 25-minute gap are signalled, and a stall late in a long life is not; zero thresholds select an idle server; an `.app` URL makes mcp-remote ineligible
-- [ ] 7.2 Runaway selection from CPU-time samples kept across runs, keyed by PID and start time under `LC_ALL=C TZ=UTC`; an interval over 20 minutes starts a streak over; a dry run records nothing
-- [ ] 7.3 `CC_RUNAWAY_CPU` and `CC_RUNAWAY_MIN` must be positive, as in cc-monitor
-- [ ] 7.4 `.app` bundles judged on the executable and the runner's operand only
-- [ ] 7.5 Red-verify the installer: a stale line beside an alias, beside the current line, or doubled is removed; a commented-out current line is turned back on; an ACL that denies delete leaves a copy of the rc file behind
-- [ ] 7.6 Installer: one stale line with nothing else naming the script is replaced in place, anything else is left unchanged with the change printed, and no line is ever removed; a commented-out current line stays off; a failed rename drops the copy's ACL before removing it
-- [ ] 7.7 disk-janitor tests: an unreferenced anonymous volume in the clean run, so the allowlist sees the volume report; the failed inventories' "nothing examined" message
-- [ ] 7.8 Design, proposal and docs: sampling and its delay replace the lifetime average; the installer never removes a line; cc-monitor names claude-guard only for a known shared MCP server; the rollback note matches what install.sh keeps
+- [x] 7.1 Red-verify the guard: a multi-threaded server busy early, a first sample, a reused PID, a short streak, a sample under a minute old, a burst after an idle interval and a streak across a 25-minute gap are signalled, and a stall late in a long life is not; zero thresholds select an idle server; an `.app` URL makes mcp-remote ineligible
+- [x] 7.2 Runaway selection from CPU-time samples kept across runs, keyed by PID and start time under `LC_ALL=C TZ=UTC`; an interval over 20 minutes starts a streak over; a dry run records nothing
+- [x] 7.3 `CC_RUNAWAY_CPU` and `CC_RUNAWAY_MIN` must be positive, as in cc-monitor
+- [x] 7.4 `.app` bundles judged on the executable and the runner's operand only
+- [x] 7.5 Red-verify the installer: a stale line beside an alias, beside the current line, or doubled is removed; a commented-out current line is turned back on; an ACL that denies delete leaves a copy of the rc file behind
+- [x] 7.6 Installer: one stale line with nothing else naming the script is replaced in place, anything else is left unchanged with the change printed, and no line is ever removed; a commented-out current line stays off; a failed rename drops the copy's ACL before removing it
+- [x] 7.7 disk-janitor tests: an unreferenced anonymous volume in the clean run, so the allowlist sees the volume report; the failed inventories' "nothing examined" message
+- [x] 7.8 Design, proposal and docs: sampling and its delay replace the lifetime average; the installer never removes a line; cc-monitor names claude-guard only for a known shared MCP server; the rollback note matches what install.sh keeps
 
 ## 8. Delivery
 
