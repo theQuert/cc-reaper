@@ -479,6 +479,11 @@ expect_no "docker: no 'prune' invocation survives outside comments" \
 expect_no "docker: no volume removal survives outside comments" \
   bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -q "volume rm"' _ "$DJ"
 
+# On a host shared with CI runner slots and other sessions' stacks, a dangling image is
+# somebody else's build. Reported like volumes, never removed.
+expect_no "docker: no image removal survives outside comments" \
+  bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -qE "(^|[^[:alnum:]_])(rmi|image rm)([^[:alnum:]_]|$)"' _ "$DJ"
+
 # A directory target reports both numbers: `du` for how large it was, and the volume
 # delta for how much came back. They diverge when a process holds a deleted file open,
 # and reporting only `du` overstates the saving - the failure this accounting exists to
@@ -589,35 +594,28 @@ expect_yes "units: _cc_dj_free_kb agrees with df -Pk, not df -P" \
     awk -v a="$mine" -v b="$real" "BEGIN{ d=(a>b?a-b:b-a); exit !(b>0 && d/b < 0.01) }"
   ' _ "$DJ"
 
-# A docker command that fails must not be logged as a target that succeeded: that is the
-# exact observability fault this change exists to remove, reintroduced one layer down.
-DOCKFAIL="$SANDBOX/bin-dockfail"
-mkdir -p "$DOCKFAIL"
-cat > "$DOCKFAIL/docker" <<'STUB'
+# Dangling images are counted and named for review; nothing is sent to docker that
+# removes one. The stub records every call, so a removal cannot hide behind its output.
+DOCKREP="$SANDBOX/bin-dockreport"
+mkdir -p "$DOCKREP"
+DOCKREP_CALLS="$SANDBOX/dockreport_calls"
+: > "$DOCKREP_CALLS"
+cat > "$DOCKREP/docker" <<STUB
 #!/bin/bash
-case "$1 $2" in
-  "images -f") echo deadbeef ;;
-  "rmi "*|"rmi") echo "Error response from daemon: conflict: unable to delete" >&2; exit 1 ;;
+echo "\$*" >> "$DOCKREP_CALLS"
+case "\$1 \$2" in
+  "images -f") printf 'deadbeef\ncafebabe\ndeadbeef\n' ;;
   *) exit 0 ;;
 esac
 STUB
-chmod +x "$DOCKFAIL/docker"
+chmod +x "$DOCKREP/docker"
 
-expect_no "status: a failing docker rmi does not return success" \
-  env PATH="$DOCKFAIL:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
-    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rmi_dangling >/dev/null 2>&1'
-
-cat > "$DOCKFAIL/docker" <<'STUB'
-#!/bin/bash
-case "$1 $2" in
-  "images -f") echo deadbeef ;;
-  "rmi "*|"rmi") echo "Deleted: deadbeef"; exit 0 ;;
-  *) exit 0 ;;
-esac
-STUB
-expect_yes "status: a succeeding docker rmi returns success" \
-  env PATH="$DOCKFAIL:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
-    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rmi_dangling >/dev/null 2>&1'
+expect_yes "report: dangling images are counted and the review command is named" \
+  bash -c 'out="$(env PATH="$1:$2" DJ="$3" /bin/bash -c '"'"'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_report_dangling'"'"')" || exit 1
+           printf "%s" "$out" | grep -q "2 dangling images" &&
+           printf "%s" "$out" | grep -q "docker images -f dangling=true"' _ "$DOCKREP" "$SAFE_SYS_PATH" "$DJ"
+expect_no "report: nothing that removes an image reaches docker" \
+  grep -qE '^(rmi|image rm|image prune|system prune)' "$DOCKREP_CALLS"
 
 # ---------------------------------------------------------------------------
 # TEST 12: an inventory that failed is not an empty inventory
@@ -636,7 +634,7 @@ chmod +x "$DEADD/docker"
 
 expect_no "inventory: a failing 'docker images' is not 'no dangling images'" \
   env PATH="$DEADD:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
-    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_rmi_dangling >/dev/null 2>&1'
+    'source "$DJ" >/dev/null 2>&1; _cc_dj_docker_report_dangling >/dev/null 2>&1'
 
 expect_no "inventory: a failing 'docker volume ls' is not 'no volumes'" \
   env PATH="$DEADD:$SAFE_SYS_PATH" DJ="$DJ" /bin/bash -c \
