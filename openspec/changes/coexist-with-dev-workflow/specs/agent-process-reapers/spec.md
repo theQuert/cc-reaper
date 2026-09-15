@@ -19,7 +19,7 @@ shared MCP service SHALL be left to claude-guard's runaway phase.
 
 #### Scenario: Stuck shared MCP server
 - **WHEN** a PPID=1 `npx chrome-devtools-mcp` sustains CPU at or above `CC_RUNAWAY_CPU`
-- **THEN** the monitor SHALL NOT signal it, and claude-guard's runaway phase SHALL select it once it has averaged `CC_RUNAWAY_CPU` over a life of at least `CC_RUNAWAY_MIN` minutes, and signal it if it is still over the threshold when re-checked
+- **THEN** the monitor SHALL NOT signal it, and claude-guard's runaway phase SHALL select it once it has stayed over `CC_RUNAWAY_CPU` for `CC_RUNAWAY_MIN` minutes across its runs, and signal it if it is still over the threshold when re-checked
 
 ### Requirement: Runaway re-checks before signalling
 Before signalling a selected PID, the runaway phase SHALL wait at least three seconds and read
@@ -46,8 +46,10 @@ first word that is neither an option nor a subcommand does - compared whole, as 
 any version dropped, a program in a `bin` directory, or a package directory under `node_modules`.
 No other argument SHALL make a process eligible, so a name inside a JSON payload, a path to a
 checkout named after a server, and an argument of a Claude or Codex CLI do not; `codex mcp-server`
-is the one Codex form that is an MCP server. A command inside an `.app` bundle belongs to the
-application and SHALL NOT be eligible. Candidate PIDs SHALL come from a process listing that
+is the one Codex form that is an MCP server. A process run from inside an `.app` bundle - its
+executable, or what its runner runs - belongs to the application and SHALL NOT be eligible; an
+`.app` elsewhere in its arguments, such as in a URL, does not count. Candidate PIDs SHALL come
+from a process listing that
 carries no argument text, with each command read per PID as one line, so no argument can add a
 candidate. cc-monitor SHALL name claude-guard as the remedy for a runaway only when it is
 eligible by the same test.
@@ -76,29 +78,69 @@ eligible by the same test.
 - **WHEN** `npx -y @supabase/mcp-server-supabase@0.5.10`, `npm exec mcp-sequentialthinking-tools` or `uvx chroma-mcp` meets the runaway thresholds
 - **THEN** it SHALL be selected
 
-### Requirement: Runaway is measured over the process's life
-The runaway phase SHALL select a process only when its elapsed time is at least `CC_RUNAWAY_MIN`
-minutes and the CPU time it has used is at least `CC_RUNAWAY_CPU` percent of that elapsed time.
-`ps %cpu` decays over about a minute, so a reading, or two a few seconds apart, SHALL NOT stand in
-for time spent hot; it only confirms, at the re-check, that the process is still hot.
-
-#### Scenario: A burst in a long-lived server
-- **WHEN** a shared MCP server two days old, which has used one hour of CPU time, reads 99% during a burst
-- **THEN** it SHALL NOT be selected
-
-#### Scenario: A server pinned for most of its life
-- **WHEN** a shared MCP server three hours old has used more than 80% of that time as CPU time and reads over the threshold
+#### Scenario: A URL on an .app domain
+- **WHEN** `npx -y mcp-remote https://mcp.linear.app/sse` meets the runaway thresholds
 - **THEN** it SHALL be selected
 
-#### Scenario: A hot server younger than the floor
-- **WHEN** a shared MCP server thirty minutes old has been pinned for all of them
+### Requirement: Runaway is measured across guard runs
+The runaway phase SHALL select a process only after it has stayed hot for at least
+`CC_RUNAWAY_MIN` minutes, measured across claude-guard's runs. Each run SHALL record, for every
+process at or above `CC_RUNAWAY_CPU` %cpu, the CPU time it has used, keyed by PID and process
+start time. An interval of at least a minute since the previous sample SHALL extend the
+process's hot streak only when the CPU time used in it is at least `CC_RUNAWAY_CPU` percent of
+the interval; otherwise the streak SHALL start over, as it SHALL for a process below the
+threshold at a run or across an interval longer than 20 minutes, inside whose average an idle
+stretch could hide. A lifetime average of CPU time, or `ps %cpu` alone, SHALL NOT stand in for
+the streak. A dry run SHALL record nothing. A `CC_RUNAWAY_CPU` or `CC_RUNAWAY_MIN` that is not a
+positive number SHALL be replaced by its default.
+
+#### Scenario: Stuck for an hour after a long idle life
+- **WHEN** a shared MCP server a day old, whose lifetime average is 5%, has used at least 80% of every interval between samples for the last 65 minutes and reads over the threshold
+- **THEN** it SHALL be selected
+
+#### Scenario: Busy early, then a burst
+- **WHEN** a multi-threaded server used 56 minutes of CPU time in its first minutes, then idled, and reads 95% at a run 65 minutes after it started
+- **THEN** it SHALL NOT be selected, because the interval since its previous sample was not hot
+
+#### Scenario: A burst after an idle interval
+- **WHEN** a server two days old, pinned for most of them, used 2% of the interval since its previous sample and reads 99% now
+- **THEN** it SHALL NOT be selected, and its streak SHALL start over
+
+#### Scenario: First sample
+- **WHEN** a hot shared MCP server has no earlier sample
+- **THEN** it SHALL NOT be selected, and a sample SHALL be recorded
+
+#### Scenario: A reused PID
+- **WHEN** the sample recorded for a PID carries a different process start time
+- **THEN** that sample SHALL NOT count toward the process now holding the PID
+
+#### Scenario: Runs less than a minute apart
+- **WHEN** claude-guard runs less than a minute after a process's previous sample
+- **THEN** that sample SHALL be kept unchanged, and the streak SHALL be judged as of it
+
+#### Scenario: A long gap between runs
+- **WHEN** the previous sample of a hot shared MCP server is 25 minutes old, however hot the interval
+- **THEN** its streak SHALL start over, and it SHALL NOT be selected
+
+#### Scenario: A streak shorter than the floor
+- **WHEN** a shared MCP server has been hot for 55 minutes across runs
 - **THEN** it SHALL NOT be selected
+
+#### Scenario: Dry run
+- **WHEN** `claude-guard --dry-run` runs
+- **THEN** it SHALL NOT change the recorded samples
+
+#### Scenario: Zero thresholds
+- **WHEN** `CC_RUNAWAY_CPU` and `CC_RUNAWAY_MIN` are 0
+- **THEN** claude-guard SHALL use 80 and 60, and SHALL NOT select an idle server or one without a streak
 
 ### Requirement: Installed shell functions outlive the checkout
 `install.sh` SHALL configure the shell rc file to source the deployed copies of
 `claude-cleanup.sh` and `cc-monitor.sh` under `~/.cc-reaper/`. Each line SHALL be guarded, so a
-missing file produces no output. An update SHALL repair lines the installer generated earlier that
-point anywhere else. No outcome of rc configuration SHALL stop the rest of the installation.
+missing file produces no output. An update SHALL repair a line the installer generated earlier that
+points anywhere else, and SHALL change the rc file only where the result is certain: it SHALL
+never remove a line, since removing one can change what the lines around it mean. No outcome of
+rc configuration SHALL stop the rest of the installation.
 
 #### Scenario: Fresh install
 - **WHEN** `install.sh` runs against an rc file that sources neither script
@@ -114,11 +156,27 @@ point anywhere else. No outcome of rc configuration SHALL stop the rest of the i
 
 #### Scenario: Stale and current lines both present
 - **WHEN** the rc file contains the guarded line and a stale installer line for the same script
-- **THEN** the stale line SHALL be removed and the guarded line SHALL appear exactly once
+- **THEN** `install.sh` SHALL leave the rc file unchanged and SHALL print the stale line to remove
 
 #### Scenario: Stale line commented out
-- **WHEN** the only mention of a script is a commented-out line
+- **WHEN** the only mention of a script is a commented-out stale line
 - **THEN** `install.sh` SHALL add the guarded line, because a comment sources nothing
+
+#### Scenario: Current line commented out
+- **WHEN** the only mention of a script is the guarded line, commented out
+- **THEN** `install.sh` SHALL leave it commented out and SHALL NOT add the guarded line
+
+#### Scenario: A line that only names the script, beside a stale line
+- **WHEN** an uncommented line such as `alias cc-edit='vim ~/.cc-reaper/claude-cleanup.sh'` sits beside a stale line
+- **THEN** `install.sh` SHALL leave the rc file unchanged and SHALL print the change to make by hand
+
+#### Scenario: More than one stale line
+- **WHEN** the rc file has two stale lines for the same script
+- **THEN** `install.sh` SHALL leave the rc file unchanged and SHALL print both lines to remove
+
+#### Scenario: A rewrite that cannot be renamed into place
+- **WHEN** the rewritten copy cannot replace the rc file, as when the file's ACL denies delete
+- **THEN** the rc file SHALL be unchanged, no copy of it SHALL remain, and `install.sh` SHALL print the change to make by hand
 
 #### Scenario: Line in another shape
 - **WHEN** the rc file mentions `claude-cleanup.sh` in an uncommented line the installer did not generate
@@ -126,7 +184,7 @@ point anywhere else. No outcome of rc configuration SHALL stop the rest of the i
 
 #### Scenario: Line in another shape beside a stale line
 - **WHEN** the rc file has both a stale installer line and a line in another shape for `claude-cleanup.sh`
-- **THEN** `install.sh` SHALL remove the stale line, SHALL leave the other line unchanged and print it, and SHALL NOT add the guarded line
+- **THEN** `install.sh` SHALL leave the rc file unchanged, and SHALL print the other line, the stale line to remove, and the guarded line to add unless the other line sources the script
 
 #### Scenario: No rc file yet
 - **WHEN** the rc file does not exist
@@ -176,7 +234,7 @@ Each path SHALL apply the class as follows:
 |---|---|---|---|
 | Pattern-based cleanup | never | exempt, unless a user `cleanup` rule covers it | family predicates decide |
 | Process-group cleanup | never | skipped | signalled on membership |
-| Runaway selection | never selected | selected only when the process is itself a known shared MCP server that has averaged over the threshold for its life; applications, development servers and process managers never are | not selected - the phase only considers protected processes |
+| Runaway selection | never selected | selected only when the process is itself a known shared MCP server that has stayed over the threshold for `CC_RUNAWAY_MIN` minutes across guard runs; applications, development servers and process managers never are | not selected - the phase only considers protected processes |
 | Runaway signalling | n/a | signalled, for the selected PID only; no other process is signalled | n/a |
 
 A user `protect` rule SHALL exempt a process on every path, and SHALL outrank a user `cleanup`
@@ -345,7 +403,7 @@ An orphaned parent is therefore sufficient on its own for the two family rungs, 
 The system SHALL detect runaway protected processes (sustained high CPU over a long elapsed time) and SHALL terminate them after an explicit grace window, treating them as a distinct phase before existing FD-leak / bloated / idle phases.
 
 #### Scenario: Runaway protected process detected
-- **WHEN** `claude-guard` runs and one or more protected processes meet the runaway thresholds (CPU time of at least `CC_RUNAWAY_CPU` percent of an elapsed time of at least `CC_RUNAWAY_MIN` minutes; defaults 80 and 60)
+- **WHEN** `claude-guard` runs and one or more protected processes meet the runaway thresholds (CPU time of at least `CC_RUNAWAY_CPU` percent of every interval between claude-guard runs, for at least `CC_RUNAWAY_MIN` minutes; defaults 80 and 60)
 - **THEN** claude-guard SHALL print a "Runaway protected processes" section listing each PID, command, CPU, and etime, SHALL wait `CC_RUNAWAY_GRACE_SEC` seconds (default 5) for the user to Ctrl+C, AND SHALL then re-check each PID and send a termination signal to each one that passes, to that PID alone and never to its process group.
 
 #### Scenario: --dry-run preserves runaway protected processes

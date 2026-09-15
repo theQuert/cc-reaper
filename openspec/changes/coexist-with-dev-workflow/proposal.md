@@ -28,7 +28,8 @@ and signalled `ChatGPT.app` with its Codex framework processes (reported "freed 
 `cmux.app` (etime 15 days, 80.8%), which is the terminal the Claude sessions run in. Review of
 the first fix found eligibility still a substring test over the whole command line: a Claude
 session whose `--settings` named `claude-mem`, or a test run under a directory named after a
-server, qualified.
+server, qualified. Review of the second found its lifetime CPU average let a multi-threaded
+server that was busy early qualify on a later burst.
 
 **Installed shell functions point at a checkout that no longer exists.** `install.sh` writes
 `source "$SCRIPT_DIR/shell/claude-cleanup.sh"`. Under a worktree-per-session workflow that
@@ -48,16 +49,17 @@ on its last run.
   `node …/index.js` MCP server or `npm exec @playwright/mcp`, and equally pytest, `codex exec`
   and `claude -p`.
 - **BREAKING (behavior):** claude-guard's runaway phase selects only a process that is itself a
-  known shared MCP server, never one whose arguments merely name one, and only when its CPU time
-  is at least `CC_RUNAWAY_CPU` percent of a life of at least `CC_RUNAWAY_MIN` minutes. It re-reads
+  known shared MCP server, never one whose arguments merely name one, and only once it has used
+  at least `CC_RUNAWAY_CPU` percent of every interval between guard runs for `CC_RUNAWAY_MIN`
+  minutes, from CPU-time samples kept in `~/.cc-reaper/state/`. It re-reads
   each PID after at least three seconds, signals only a PID still running the same command and
   still hot, and signals that PID alone. Applications, development servers and process managers
-  are never selected; cc-monitor still reports them, and names claude-guard only for what it
-  would select.
+  are never selected; cc-monitor still reports them, and names claude-guard only for a known
+  shared MCP server.
 - `install.sh`:
   - Sources the deployed copies under `~/.cc-reaper/`, guarded.
-  - Repairs lines in its old generated shape, and removes them when the current line or a line
-    in another shape already sources the script.
+  - Repairs a line in its old generated shape in place when nothing else names the script;
+    otherwise it changes nothing and prints the change, and it never removes a line.
   - Backs the rc file up before any change, keeps its mode, ACL and extended attributes on a
     rewrite, and creates a missing one without a backup.
   - Never changes a symlinked, hard-linked, unreadable or unwritable rc file, not even by
@@ -87,6 +89,6 @@ on its last run.
   `tests/install-rc-source.sh`; updated `tests/protection-classes.sh`,
   `tests/cc-monitor-runaway.sh` and `tests/disk-janitor.sh`.
 - **Docs:** README, CHANGELOG, CLAUDE.md.
-- **Rollback:** revert the merge commit. Deployed copies are replaced by rename, with the
-  previous versions kept under `~/.cc-reaper/state/`, and the rc backup is
-  `~/.zshrc.cc-reaper-backup-<timestamp>`.
+- **Rollback:** revert the merge commit and run `install.sh` again, which replaces each
+  deployed copy by rename and keeps no previous copy. The rc file is backed up as
+  `~/.zshrc.cc-reaper-backup-<timestamp>` before any change.
