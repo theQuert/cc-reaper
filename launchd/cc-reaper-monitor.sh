@@ -97,12 +97,15 @@ etime_to_seconds() {
 
   local a=0 b=0 c=0
   IFS=: read -r a b c <<< "$time_part"
+  # 10# forces base-10: bash treats leading-zero fields ("08", "09") as octal
+  # and aborts with "value too great for base", making is_stale_etime fail
+  # ("integer expression expected") and silently skipping that candidate.
   if [ -n "$c" ]; then
-    echo $((days * 86400 + a * 3600 + b * 60 + c))
+    echo $((10#$days * 86400 + 10#$a * 3600 + 10#$b * 60 + 10#$c))
   elif [ -n "$b" ]; then
-    echo $((days * 86400 + a * 60 + b))
+    echo $((10#$days * 86400 + 10#$a * 60 + 10#$b))
   else
-    echo $((days * 86400 + a))
+    echo $((10#$days * 86400 + 10#$a))
   fi
 }
 
