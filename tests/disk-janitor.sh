@@ -308,8 +308,11 @@ expect_yes "clean: bun called" \
 expect_yes "clean: docker called" \
   test -s "$DOCKER_CAPTURE"
 
-expect_no "clean: nothing that removes an image or volume reaches docker" \
-  grep -qE '^(rmi|image rm|image prune|system prune|volume rm|volume prune)' "$DOCKER_CAPTURE"
+# An allowlist, not a list of removal verbs: `image remove`, `builder prune` and
+# `container prune` all passed the old pattern. Only the read-only calls the reports make
+# may reach docker.
+expect_no "clean: docker receives only the read-only calls the reports make" \
+  grep -vqE '^(info|images -f dangling=true -q|volume ls --format .+|ps -aq|inspect .+)$' "$DOCKER_CAPTURE"
 
 expect_yes "clean: log contains freed= bytes entry" \
   grep -q 'freed=' "$SANDBOX/dj.log"
