@@ -159,7 +159,8 @@ _cc_monitor_runaway_cpu_threshold() {
 #
 # The killing path is deliberately not this one and deliberately not this number.
 # `_cc_guard_runaway_protected_pids` in claude-cleanup.sh carries its own CC_RUNAWAY_MIN
-# default of 60 and its own whitelist, and the guard agent SIGTERMs from there. Reporting
+# default of 60, measures CPU time over the whole life, and selects only known shared MCP
+# servers; the guard agent SIGTERMs from there. Reporting
 # earlier than the reaper acts is the intended asymmetry, not drift between two copies.
 _cc_monitor_runaway_min_threshold() {
   local v=${CC_RUNAWAY_MIN:-30}
@@ -215,6 +216,43 @@ _CC_MONITOR_SELF_LABEL_PATTERN="CCReaper\.app/Contents/MacOS/CCReaper|(^|/)CCRea
 _cc_monitor_is_protected_cmd() {
   local cmd=$1
   [[ $cmd =~ $_CC_MONITOR_PROTECTED_PATTERN ]]
+}
+
+# claude-guard's test for "this process is itself a known shared MCP server", byte-identical to
+# _cc_reaper_mcp_server_program in claude-cleanup.sh (tests/cc-monitor-runaway.sh compares them).
+_cc_monitor_mcp_server_program() {
+  printf '%s\n' '
+    function known(s) {
+      return s ~ /^(@supabase\/mcp-server-supabase|mcp-server-supabase|@stripe\/mcp|mcp-server-stripe|chroma-mcp|@upstash\/context7-mcp|context7-mcp|chrome-devtools-mcp|mcp-remote|mcp-sequentialthinking-tools|@modelcontextprotocol\/server-sequential-thinking|server-sequential-thinking)$/
+    }
+    # Whether one word names a known server: a package, any version dropped; a program in a
+    # bin directory; or a path into its package directory under node_modules.
+    function names(t,   m, c, j) {
+      if (t ~ /^@[^\/]+\/[^\/@]+@/) sub(/@[^@\/]*$/, "", t)
+      else if (t !~ /\// && t ~ /^[^@]+@/) sub(/@.*$/, "", t)
+      if (known(t)) return 1
+      m = split(t, c, "/")
+      if (m > 1 && (c[m - 1] == "bin" || c[m - 1] == ".bin") && known(c[m])) return 1
+      for (j = 1; j < m; j++)
+        if (c[j] == "node_modules" && (known(c[j + 1]) || known(c[j + 1] "/" c[j + 2]))) return 1
+      return 0
+    }
+    NR == 1 {
+      if (index($0, ".app/")) exit 1
+      i = 1
+      b = $1
+      sub(/.*\//, "", b)
+      # Through a package runner or interpreter, what runs is the first word that is neither
+      # an option nor a subcommand. No later argument identifies anything.
+      if (b ~ /^(node|npx|npm|pnpm|yarn|bun|bunx|deno|uv|uvx|pipx|python[0-9.]*)$/) {
+        i = 2
+        while (i <= NF && ($i ~ /^-/ || $i ~ /^(exec|x|dlx|run|tool)$/)) i++
+      }
+      b = $i
+      sub(/.*\//, "", b)
+      if (b == "codex" || b == "codex.js") exit (($(i + 1) == "mcp-server") ? 0 : 1)
+      exit (names($i) ? 0 : 1)
+    }'
 }
 
 _cc_monitor_is_agent_browser_cmd() {
@@ -452,17 +490,15 @@ _cc_monitor_action() {
     ASK_BEFORE_KILL:mcp)
       echo "Check which agent owns the MCP process before stopping it." ;;
     ASK_BEFORE_KILL:runaway)
-      # claude-guard reaps through its own protected-process whitelist, so suggesting it for
-      # a process that is not on that list names a remedy that does nothing. Since runaway is
-      # no longer a protected-only label, the suggestion has to be split the same way. Nor does
-      # it reap an application, a dev server or a process manager, protected or not: the same
-      # exclusion as _cc_guard_runaway_eligible in claude-cleanup.sh.
+      # claude-guard reaps a runaway only when the process is itself a known shared MCP server,
+      # so naming it for anything else names a remedy that does nothing. Since runaway is no
+      # longer a protected-only label, the suggestion is split three ways.
       if ! _cc_monitor_is_protected_cmd "$cmd"; then
         echo "Run 'kill $pid' if this is not doing work you need; claude-guard will not reap it, because it is not a protected process."
-      elif printf '%s\n' "$cmd" | grep -qE '\.app/|node.*(dev-server|http-server|next.*server)|pm2'; then
-        echo "Run 'kill $pid' if this is not doing work you need; claude-guard will not reap it, because it never signals an application, dev server or process manager."
+      elif ! printf '%s\n' "$cmd" | awk "$(_cc_monitor_mcp_server_program)"; then
+        echo "Run 'kill $pid' if this is not doing work you need; claude-guard will not reap it, because it reaps only shared MCP servers."
       else
-        echo "Run 'kill $pid' to terminate the stuck protected process, or 'claude-guard' to auto-reap runaway protected processes."
+        echo "Run 'kill $pid' to terminate the stuck MCP server, or 'claude-guard', which reaps one whose CPU time is over CC_RUNAWAY_CPU percent of its life."
       fi ;;
     DO_NOT_KILL:system)
       echo "Do not kill system/security/UI processes; reduce workload or wait for the system task to finish." ;;

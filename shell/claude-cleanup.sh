@@ -828,69 +828,110 @@ _claude_pgid_kill() {
   echo "$signalled $((freed_kb / 1024))"
 }
 
+# Whether a command line is itself a known shared MCP server, as an awk program that exits 0
+# when it is. cc-monitor.sh carries an identical copy, compared by tests/cc-monitor-runaway.sh,
+# so the monitor never names claude-guard as the remedy for a process the guard will not select.
+#
+# Identity comes from what the process runs: its executable or, through a package runner or
+# interpreter, the first word that is neither an option nor a subcommand - compared whole, as a
+# package with any version dropped, a program in a bin directory, or a package directory under
+# node_modules. No other argument counts. Review reproduced substring matching selecting a
+# session whose --settings named claude-mem, a subagent whose --mcp-config named context7, and
+# test runs under directories named after servers. `codex mcp-server` is the one Codex form
+# that is an MCP server, and anything inside an .app bundle is the application's. claude-mem's
+# worker is protected but not listed: its process form was never observed, and a guess here is
+# a kill path.
+_cc_reaper_mcp_server_program() {
+  printf '%s\n' '
+    function known(s) {
+      return s ~ /^(@supabase\/mcp-server-supabase|mcp-server-supabase|@stripe\/mcp|mcp-server-stripe|chroma-mcp|@upstash\/context7-mcp|context7-mcp|chrome-devtools-mcp|mcp-remote|mcp-sequentialthinking-tools|@modelcontextprotocol\/server-sequential-thinking|server-sequential-thinking)$/
+    }
+    # Whether one word names a known server: a package, any version dropped; a program in a
+    # bin directory; or a path into its package directory under node_modules.
+    function names(t,   m, c, j) {
+      if (t ~ /^@[^\/]+\/[^\/@]+@/) sub(/@[^@\/]*$/, "", t)
+      else if (t !~ /\// && t ~ /^[^@]+@/) sub(/@.*$/, "", t)
+      if (known(t)) return 1
+      m = split(t, c, "/")
+      if (m > 1 && (c[m - 1] == "bin" || c[m - 1] == ".bin") && known(c[m])) return 1
+      for (j = 1; j < m; j++)
+        if (c[j] == "node_modules" && (known(c[j + 1]) || known(c[j + 1] "/" c[j + 2]))) return 1
+      return 0
+    }
+    NR == 1 {
+      if (index($0, ".app/")) exit 1
+      i = 1
+      b = $1
+      sub(/.*\//, "", b)
+      # Through a package runner or interpreter, what runs is the first word that is neither
+      # an option nor a subcommand. No later argument identifies anything.
+      if (b ~ /^(node|npx|npm|pnpm|yarn|bun|bunx|deno|uv|uvx|pipx|python[0-9.]*)$/) {
+        i = 2
+        while (i <= NF && ($i ~ /^-/ || $i ~ /^(exec|x|dlx|run|tool)$/)) i++
+      }
+      b = $i
+      sub(/.*\//, "", b)
+      if (b == "codex" || b == "codex.js") exit (($(i + 1) == "mcp-server") ? 0 : 1)
+      exit (names($i) ? 0 : 1)
+    }'
+}
+
+# Whether the runaway phase may select a command line: a shared service by class, no user
+# `protect` rule, and itself a known shared MCP server. Applications, dev servers and process
+# managers classify shared too; none is an MCP server, and this phase runs unattended - on the
+# audited host it had signalled ChatGPT.app and cmux.app, the terminal the sessions ran in.
+_cc_guard_runaway_eligible() {
+  local cmd=$1
+  [ "$(_cc_reaper_protection_class "$cmd")" = shared ] || return 1
+  _cc_reaper_has_user_rule protect "$cmd" && return 1
+  printf '%s\n' "$cmd" | awk "$(_cc_reaper_mcp_server_program)"
+}
+
+# Print TSV (pid, cpu, etime, command) for runaway-eligible processes at least min_minutes old
+# whose CPU time is at least cpu_threshold percent of that elapsed time, and whose %cpu is at or
+# above it now. `ps %cpu` decays over about a minute, so it says a process is hot now; the CPU
+# time says it has been. The signal stage re-checks.
+#
+# Candidates come from a listing without a command column, and each command is read per PID and
+# flattened to one line, so argument text shaped like a row or a record adds no PID - the seam
+# session detection already uses.
+#
+# ponytail: a lifetime average dilutes a stall that starts late in a long life - a server idle
+# for a day, then pinned for an hour, averages about 4% and is never selected; cc-monitor still
+# reports it. Upgrade path: keep each run's CPU time per pid and start time under
+# ~/.cc-reaper/state and measure the last CC_RUNAWAY_MIN minutes.
+_cc_guard_runaway_protected_pids() {
+  local cpu_threshold=$1 min_minutes=$2 pid etime cputime cpu cmd
+  ps -axo pid=,etime=,time=,%cpu= 2>/dev/null | awk -v cpu="$cpu_threshold" -v min="$((min_minutes * 60))" '
+    function secs(t,   n, p, d, s) {
+      d = 0
+      if (index(t, "-")) { split(t, p, "-"); d = p[1]; t = p[2] }
+      n = split(t, p, ":")
+      s = p[n] + 0
+      if (n >= 2) s += p[n - 1] * 60
+      if (n >= 3) s += p[n - 2] * 3600
+      return s + d * 86400
+    }
+    { e = secs($2); c = secs($3) }
+    $4 + 0 >= cpu + 0 && e >= min + 0 && e > 0 && c * 100 >= cpu * e
+  ' | while read -r pid etime cputime cpu; do
+    [ -z "$pid" ] && continue
+    cmd=$(ps -o command= -p "$pid" 2>/dev/null | tr '\n' ' ')
+    cmd=${cmd% }
+    # Immutable processes - system scanners, cc-reaper itself, ordinary Chrome - never
+    # qualify, however hot: SIGTERM-ing security software or a Spotlight reindex costs more
+    # than the CPU it would reclaim.
+    _cc_guard_runaway_eligible "$cmd" || continue
+    printf "%s\t%s\t%s\t%s\n" "$pid" "$cpu" "$etime" "$cmd"
+  done
+}
+
 # Automatic session guard: kills bloated (RSS threshold) and idle sessions
 # Usage: claude-guard [--dry-run]
 # Config env vars:
 #   CC_MAX_SESSIONS  — max allowed sessions (default: 3)
 #   CC_IDLE_THRESHOLD — CPU% below which a session is idle (default: 1)
 #   CC_MAX_RSS_MB    — tree RSS threshold in MB; sessions exceeding this are killed (default: 4096)
-_cc_guard_etime_to_seconds() {
-  echo "${1// /}" | awk '
-    {
-      days=0
-      time_part=$0
-      if (index(time_part, "-") > 0) {
-        split(time_part, day_parts, "-")
-        days=day_parts[1]+0
-        time_part=day_parts[2]
-      }
-      split(time_part, parts, ":")
-      if (length(parts[3]) > 0) {
-        print days * 86400 + (parts[1]+0) * 3600 + (parts[2]+0) * 60 + (parts[3]+0)
-      } else if (length(parts[2]) > 0) {
-        print days * 86400 + (parts[1]+0) * 60 + (parts[2]+0)
-      } else {
-        print days * 86400 + (parts[1]+0)
-      }
-    }
-  '
-}
-
-# Whether a command line is something the runaway phase may select: a shared service,
-# not covered by a user `protect` rule, and not an application, a development server
-# or a process manager. Those classify shared, but each is something a person is using
-# and this phase runs unattended - on the audited host it had signalled ChatGPT.app and
-# cmux.app, the terminal the sessions ran in. cc-monitor still reports them.
-_cc_guard_runaway_eligible() {
-  local cmd=$1
-  [ "$(_cc_reaper_protection_class "$cmd")" = shared ] || return 1
-  _cc_reaper_has_user_rule protect "$cmd" && return 1
-  echo "$cmd" | grep -qE '\.app/|node.*(dev-server|http-server|next.*server)|pm2' && return 1
-  return 0
-}
-
-# Print TSV (pid, cpu, etime, command) for runaway-eligible processes at or above
-# cpu_threshold whose etime is at least min_minutes. One sample and an age: the signal
-# stage re-checks before acting on it.
-_cc_guard_runaway_protected_pids() {
-  local cpu_threshold=$1
-  local min_minutes=$2
-  local min_seconds=$((min_minutes * 60))
-  ps -axo pid=,etime=,%cpu=,command= 2>/dev/null | while read -r pid etime cpu rest; do
-    [ -z "$pid" ] && continue
-    # Only shared services are candidates. Immutable processes — system
-    # scanners, cc-reaper itself, ordinary Chrome — are never signalled, however
-    # hot they get: SIGTERM-ing security software or a Spotlight reindex costs
-    # more than the CPU it would reclaim.
-    _cc_guard_runaway_eligible "$rest" || continue
-    awk -v a="$cpu" -v b="$cpu_threshold" 'BEGIN { exit !(a+0 >= b+0) }' || continue
-    local secs=""
-    secs=$(_cc_guard_etime_to_seconds "$etime")
-    [ "$secs" -ge "$min_seconds" ] || continue
-    printf "%s\t%s\t%s\t%s\n" "$pid" "$cpu" "$etime" "$rest"
-  done
-}
-
 claude-guard() {
   local dry_run=false
   [ "${1:-}" = "--dry-run" ] && dry_run=true
@@ -927,7 +968,7 @@ claude-guard() {
     local runaway_lines=""
     runaway_lines=$(_cc_guard_runaway_protected_pids "$runaway_cpu" "$runaway_min")
     if [ -n "$runaway_lines" ]; then
-      echo "  --- Runaway protected processes (CPU >= ${runaway_cpu}% for >= ${runaway_min} min) ---"
+      echo "  --- Runaway protected processes (CPU time >= ${runaway_cpu}% of >= ${runaway_min} min alive) ---"
       printf '%s\n' "$runaway_lines" | awk -F '\t' '
         { printf "  PID %-7s  CPU %6s%%  ETIME %-14s  %s\n", $1, $2, $3, substr($4, 1, 80) }
       '
@@ -936,14 +977,14 @@ claude-guard() {
       else
         echo "  Sending SIGTERM in ${runaway_grace} seconds (Ctrl+C to abort)..."
         sleep "$runaway_grace"
-        # One sample and a process's age are not "hot for an hour". Each PID is read again
-        # after a pause, and signalled only if it still runs the command it was selected
-        # for, is still eligible, and is still over the threshold.
+        # Selection measured each PID's life. After a pause it is read again, and signalled
+        # only if it still runs the command it was selected for, is still eligible, and is
+        # still over the threshold now.
         sleep 3
         local rkilled=0 rfreed_kb=0 rnow_cmd="" rnow_cpu="" rrss=""
         while IFS=$'\t' read -r rpid rcpu retime rrest; do
           [ -z "$rpid" ] && continue
-          rnow_cmd=$(ps -o command= -p "$rpid" 2>/dev/null)
+          rnow_cmd=$(ps -o command= -p "$rpid" 2>/dev/null | tr '\n' ' ')
           if [ "$(printf '%s' "$rnow_cmd" | awk '{ $1 = $1 } 1')" != "$(printf '%s' "$rrest" | awk '{ $1 = $1 } 1')" ]; then
             echo "  PID $rpid no longer runs the selected command; not signalled."
             continue

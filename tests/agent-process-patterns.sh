@@ -156,11 +156,12 @@ expect_yes "user protect rule blocks the group signal path" protected_group_send
 protected_runaway_is_not_returned() (
   printf "protect\tchrome-devtools-mcp\n" > "$rules_file"
   ps() {
-    if [ "$*" = "-axo pid=,etime=,%cpu=,command=" ]; then
-      printf "901 03:00:00 99.0 node chrome-devtools-mcp\n"
-    else
-      command ps "$@"
-    fi
+    case "$*" in
+      "-axo pid=,etime=,time=,%cpu=") printf "901 03:00:00 170:00.00 99.0\n" ;;
+      "-o command= -p 901") printf "node chrome-devtools-mcp\n" ;;
+      "-axo pid=,etime=,%cpu=,command=") printf "901 03:00:00 99.0 node chrome-devtools-mcp\n" ;;
+      *) command ps "$@" ;;
+    esac
   }
   [ -z "$(_cc_guard_runaway_protected_pids 80 60)" ]
 )
