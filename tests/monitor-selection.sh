@@ -40,7 +40,7 @@ run_monitor() {
         "-o %cpu= -p "*) awk -v p="${!#}" '$1 == p { print $4 }' "$table" ;;
         "-o pgid= -p "*) awk -v p="${!#}" '$1 == p { print $1 + 100000 }' "$table" ;;
         "-eo pid,pgid,%cpu,%mem,command") awk '{ print $1, $1 + 100000, $4, $5, $7 }' "$table" ;;
-        *) return 0 ;;
+        *) printf '%s\n' "$*" >> "$tmp/unstubbed"; return 0 ;;
       esac
     }
     kill() {
@@ -58,25 +58,33 @@ run_monitor() {
 
 T="$tmp/table"
 cat > "$T" <<'EOF'
-501 1 ?? 99.0 1.0 10:16 /Users/me/.cache/uv/builds-v0/.tmpX/bin/python -m pytest paper3/tests -q -x --basetemp=/private/tmp/claude-501/-Users-me-GitHub-research/abc/scratchpad/pt
-502 1 ?? 99.0 1.0 16:08 /private/tmp/claude-501/-Users-me-GitHub-research/abc/scratchpad/sweep.sh --grid 40
-503 1 ?? 99.0 1.0 01:00:00 node /repo/node_modules/.bin/next dev-server --port 3000
-504 1 ?? 99.0 1.0 45:00 bun test --watch /Users/me/GitHub/app
-505 1 ?? 0.0 0.1 02:00:00 npm exec @cloudflare/mcp-server-cloudflare@latest
-506 1 ?? 99.0 1.0 03:00:00 npx chrome-devtools-mcp@latest --autoConnect
+950501 1 ?? 99.0 1.0 10:16 /Users/me/.cache/uv/builds-v0/.tmpX/bin/python -m pytest paper3/tests -q -x --basetemp=/private/tmp/claude-501/-Users-me-GitHub-research/abc/scratchpad/pt
+950502 1 ?? 99.0 1.0 16:08 /private/tmp/claude-501/-Users-me-GitHub-research/abc/scratchpad/sweep.sh --grid 40
+950503 1 ?? 99.0 1.0 01:00:00 node /repo/node_modules/.bin/next dev-server --port 3000
+950504 1 ?? 99.0 1.0 45:00 bun test --watch /Users/me/GitHub/app
+950505 1 ?? 0.0 0.1 02:00:00 npm exec @cloudflare/mcp-server-cloudflare@latest
+950506 1 ?? 99.0 1.0 03:00:00 npx chrome-devtools-mcp@latest --autoConnect
 EOF
 
 signalled="$(run_monitor "$T")"
 has() { printf '%s\n' "$signalled" | grep -qx "$1"; }
 
-has 501 && bad "a hot test run carrying a scratchpad path is not signalled" || ok "a hot test run carrying a scratchpad path is not signalled"
-has 502 && bad "a hot scratchpad script is not signalled" || ok "a hot scratchpad script is not signalled"
-has 503 && bad "a hot protected dev server is not signalled" || ok "a hot protected dev server is not signalled"
-has 504 && bad "a hot bun test watcher is not signalled" || ok "a hot bun test watcher is not signalled"
-has 505 && ok "an orphaned unprotected MCP server is still signalled by the family sweep" \
+has 950501 && bad "a hot test run carrying a scratchpad path is not signalled" || ok "a hot test run carrying a scratchpad path is not signalled"
+has 950502 && bad "a hot scratchpad script is not signalled" || ok "a hot scratchpad script is not signalled"
+has 950503 && bad "a hot protected dev server is not signalled" || ok "a hot protected dev server is not signalled"
+has 950504 && bad "a hot bun test watcher is not signalled" || ok "a hot bun test watcher is not signalled"
+has 950505 && ok "an orphaned unprotected MCP server is still signalled by the family sweep" \
   || bad "an orphaned unprotected MCP server is still signalled by the family sweep"
-has 506 && bad "a stuck shared MCP is left to claude-guard's runaway phase" \
+has 950506 && bad "a stuck shared MCP is left to claude-guard's runaway phase" \
   || ok "a stuck shared MCP is left to claude-guard's runaway phase"
+
+# A ps call this table does not answer returns nothing, which reads as "no process" -
+# a check that would pass for every future selector using another column set.
+if [ ! -s "$tmp/unstubbed" ]; then
+  ok "every ps call the monitor made is one the table answers"
+else
+  bad "unstubbed ps calls: $(tr '\n' ';' < "$tmp/unstubbed")"
+fi
 
 if grep -vE '^[[:space:]]*#' "$MON" | grep -q 'CC_RUNAWAY_ORPHAN_MIN_SEC'; then
   bad "no code reads CC_RUNAWAY_ORPHAN_MIN_SEC"
