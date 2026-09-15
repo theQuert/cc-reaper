@@ -1,8 +1,8 @@
 ## 1. Monitor selection
 
 - [x] 1.1 Red-verify against the current monitor: a hot PPID=1 pytest carrying a scratchpad path, and a hot PPID=1 protected dev server, are signalled
-- [x] 1.2 Remove the runaway-CPU override and `CC_RUNAWAY_ORPHAN_MIN_SEC`; the family sweep still signals an orphaned unprotected MCP server
-- [x] 1.3 README and CHANGELOG: the override is gone and stuck shared services belong to claude-guard
+- [x] 1.2 Remove the runaway-CPU override and `CC_RUNAWAY_ORPHAN_MIN_SEC`; the family sweep still signals an orphaned MCP server it names
+- [x] 1.3 README and CHANGELOG: the override is gone; name the coverage gap it leaves
 
 ## 2. Shell functions
 
@@ -20,8 +20,17 @@
 
 - [x] 4.1 Carry the documented tool-call process-group blind spot into the repository's hook (comment only)
 
-## 5. Delivery
+## 5. Review round 1
 
-- [x] 5.1 All suites, `bash -n`, `zsh -n`, `openspec validate --strict`
-- [ ] 5.2 Independent review
-- [ ] 5.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
+- [ ] 5.1 Red-verify the guard: a hot MCP server inside a live session's group gets the CLI, subagent and sibling signalled; an application and a dev server are selected; a cooled re-sample still signals
+- [ ] 5.2 Runaway phase: eligibility excludes `.app` bundles, dev servers and process managers; re-check command, eligibility and CPU after at least three seconds; signal the selected PID only; count deliveries
+- [ ] 5.3 Red-verify the installer: a read-only or unreadable rc stops the install; a hard link is broken; a backup taken after an append is not the pre-run file; a commented stale line blocks the current line; stale and current lines together leave the stale one
+- [ ] 5.4 Installer: backup before any change; manual path for symlink, hard link, unreadable, unwritable; print replaced lines; converge both states; never fail the install over rc configuration; deploy every script by rename
+- [ ] 5.5 Tests: docker removal asserted on the full `--clean` run with dangling ids present; installer exit status and banner checked; zsh stderr empty; sandboxes removed; monitor fixture PIDs above PID_MAX and unknown `ps` calls fail the suite
+- [ ] 5.6 Docs: CHANGELOG sections, README Option A runaway coverage, CLAUDE.md runaway row and specifics, installer guard echo
+
+## 6. Delivery
+
+- [ ] 6.1 All suites, `bash -n`, `zsh -n`, `openspec validate --strict`
+- [ ] 6.2 Independent review until no actionable findings
+- [ ] 6.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
