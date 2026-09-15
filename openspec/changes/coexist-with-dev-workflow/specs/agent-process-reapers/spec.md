@@ -19,7 +19,7 @@ shared MCP service SHALL be left to claude-guard's runaway phase.
 
 #### Scenario: Stuck shared MCP server
 - **WHEN** a PPID=1 `npx chrome-devtools-mcp` sustains CPU at or above `CC_RUNAWAY_CPU`
-- **THEN** the monitor SHALL NOT signal it, and claude-guard's runaway phase SHALL select it once its elapsed time reaches `CC_RUNAWAY_MIN` and its CPU is still over the threshold when re-sampled
+- **THEN** the monitor SHALL NOT signal it, and claude-guard's runaway phase SHALL select it once it has averaged `CC_RUNAWAY_CPU` over a life of at least `CC_RUNAWAY_MIN` minutes, and signal it if it is still over the threshold when re-checked
 
 ### Requirement: Runaway re-checks before signalling
 Before signalling a selected PID, the runaway phase SHALL wait at least three seconds and read
@@ -39,6 +39,61 @@ still classifies as a runaway-eligible service, and its CPU is still at or above
 - **WHEN** the selected MCP server is still at or above the threshold on the re-sample
 - **THEN** it SHALL be signalled and counted
 
+### Requirement: Runaway selects a shared MCP server by what it runs
+The runaway phase SHALL select a process only when the process itself is a known shared MCP
+server: its executable names one or, when its executable is a package runner or interpreter, the
+first word that is neither an option nor a subcommand does - compared whole, as a package with
+any version dropped, a program in a `bin` directory, or a package directory under `node_modules`.
+No other argument SHALL make a process eligible, so a name inside a JSON payload, a path to a
+checkout named after a server, and an argument of a Claude or Codex CLI do not; `codex mcp-server`
+is the one Codex form that is an MCP server. A command inside an `.app` bundle belongs to the
+application and SHALL NOT be eligible. Candidate PIDs SHALL come from a process listing that
+carries no argument text, with each command read per PID as one line, so no argument can add a
+candidate. cc-monitor SHALL name claude-guard as the remedy for a runaway only when it is
+eligible by the same test.
+
+#### Scenario: Session whose settings name a protected service
+- **WHEN** a terminal-attached `claude --session-id … --settings {…claude-mem…}` meets the runaway thresholds
+- **THEN** it SHALL NOT be selected or signalled
+
+#### Scenario: Subagent whose MCP configuration names a protected server
+- **WHEN** `claude --output-format stream-json … --mcp-config {"mcpServers":{"context7":…}}` meets the runaway thresholds
+- **THEN** it SHALL NOT be selected or signalled
+
+#### Scenario: Work in or under a directory named after a protected server
+- **WHEN** `node ~/GitHub/context7-docs-sync/node_modules/.bin/stryker run`, `python -m pytest ~/GitHub/chroma-mcp` or `uv run --directory ~/GitHub/chroma-mcp pytest` meets the runaway thresholds
+- **THEN** none SHALL be selected or signalled
+
+#### Scenario: Codex CLI configured with MCP servers
+- **WHEN** `codex --yolo -c mcp_servers.github.command=npx` meets the runaway thresholds
+- **THEN** it SHALL NOT be selected or signalled
+
+#### Scenario: Argument text shaped like a listing row
+- **WHEN** a hot shared MCP server's arguments contain a line shaped like a process listing row, or like the record the signal stage reads, naming another PID
+- **THEN** that PID SHALL NOT become a runaway candidate
+
+#### Scenario: Shared MCP server started through a package runner
+- **WHEN** `npx -y @supabase/mcp-server-supabase@0.5.10`, `npm exec mcp-sequentialthinking-tools` or `uvx chroma-mcp` meets the runaway thresholds
+- **THEN** it SHALL be selected
+
+### Requirement: Runaway is measured over the process's life
+The runaway phase SHALL select a process only when its elapsed time is at least `CC_RUNAWAY_MIN`
+minutes and the CPU time it has used is at least `CC_RUNAWAY_CPU` percent of that elapsed time.
+`ps %cpu` decays over about a minute, so a reading, or two a few seconds apart, SHALL NOT stand in
+for time spent hot; it only confirms, at the re-check, that the process is still hot.
+
+#### Scenario: A burst in a long-lived server
+- **WHEN** a shared MCP server two days old, which has used one hour of CPU time, reads 99% during a burst
+- **THEN** it SHALL NOT be selected
+
+#### Scenario: A server pinned for most of its life
+- **WHEN** a shared MCP server three hours old has used more than 80% of that time as CPU time and reads over the threshold
+- **THEN** it SHALL be selected
+
+#### Scenario: A hot server younger than the floor
+- **WHEN** a shared MCP server thirty minutes old has been pinned for all of them
+- **THEN** it SHALL NOT be selected
+
 ### Requirement: Installed shell functions outlive the checkout
 `install.sh` SHALL configure the shell rc file to source the deployed copies of
 `claude-cleanup.sh` and `cc-monitor.sh` under `~/.cc-reaper/`. Each line SHALL be guarded, so a
@@ -51,7 +106,7 @@ point anywhere else. No outcome of rc configuration SHALL stop the rest of the i
 
 #### Scenario: Stale line from a removed checkout
 - **WHEN** the rc file contains `source "/removed/worktree/shell/claude-cleanup.sh"` as a whole line
-- **THEN** `install.sh` SHALL replace that line with the guarded deployed-copy line, print the line it replaced, and leave every other line unchanged
+- **THEN** `install.sh` SHALL replace that line with the guarded deployed-copy line, print the line it replaced, leave every other line unchanged, and keep the file's mode and extended attributes
 
 #### Scenario: Backup precedes every change
 - **WHEN** `install.sh` changes the rc file in any way, by appending or by rewriting
@@ -68,6 +123,14 @@ point anywhere else. No outcome of rc configuration SHALL stop the rest of the i
 #### Scenario: Line in another shape
 - **WHEN** the rc file mentions `claude-cleanup.sh` in an uncommented line the installer did not generate
 - **THEN** `install.sh` SHALL leave the line unchanged, SHALL NOT add a second line for that script, and SHALL print the line it left alone
+
+#### Scenario: Line in another shape beside a stale line
+- **WHEN** the rc file has both a stale installer line and a line in another shape for `claude-cleanup.sh`
+- **THEN** `install.sh` SHALL remove the stale line, SHALL leave the other line unchanged and print it, and SHALL NOT add the guarded line
+
+#### Scenario: No rc file yet
+- **WHEN** the rc file does not exist
+- **THEN** `install.sh` SHALL create it with the guarded lines, and SHALL NOT back up the file it created
 
 #### Scenario: An rc file that cannot be changed in place
 - **WHEN** the rc file needs any change and is a symlink, has more than one hard link, or cannot be read or written
@@ -113,7 +176,7 @@ Each path SHALL apply the class as follows:
 |---|---|---|---|
 | Pattern-based cleanup | never | exempt, unless a user `cleanup` rule covers it | family predicates decide |
 | Process-group cleanup | never | skipped | signalled on membership |
-| Runaway selection | never selected | selected only when it is a shared MCP service; applications, development servers and process managers are never selected | not selected - the phase only considers protected processes |
+| Runaway selection | never selected | selected only when the process is itself a known shared MCP server that has averaged over the threshold for its life; applications, development servers and process managers never are | not selected - the phase only considers protected processes |
 | Runaway signalling | n/a | signalled, for the selected PID only; no other process is signalled | n/a |
 
 A user `protect` rule SHALL exempt a process on every path, and SHALL outrank a user `cleanup`
@@ -155,7 +218,7 @@ cc-monitor SHALL still report them, and SHALL NOT name claude-guard as the remed
 - **THEN** it SHALL NOT be selected or signalled
 
 #### Scenario: cc-monitor reports a stuck application
-- **WHEN** cc-monitor reports `cmux.app` or a `next dev-server` as a runaway
+- **WHEN** cc-monitor reports `cmux.app`, a `next dev-server` or a Claude session as a runaway
 - **THEN** its suggested action SHALL say that claude-guard will not reap it
 
 ### Requirement: Runaway signals the process it selected
@@ -282,7 +345,7 @@ An orphaned parent is therefore sufficient on its own for the two family rungs, 
 The system SHALL detect runaway protected processes (sustained high CPU over a long elapsed time) and SHALL terminate them after an explicit grace window, treating them as a distinct phase before existing FD-leak / bloated / idle phases.
 
 #### Scenario: Runaway protected process detected
-- **WHEN** `claude-guard` runs and one or more protected processes meet runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` percent over etime ≥ `CC_RUNAWAY_MIN` minutes; defaults 80 and 60)
+- **WHEN** `claude-guard` runs and one or more protected processes meet the runaway thresholds (CPU time of at least `CC_RUNAWAY_CPU` percent of an elapsed time of at least `CC_RUNAWAY_MIN` minutes; defaults 80 and 60)
 - **THEN** claude-guard SHALL print a "Runaway protected processes" section listing each PID, command, CPU, and etime, SHALL wait `CC_RUNAWAY_GRACE_SEC` seconds (default 5) for the user to Ctrl+C, AND SHALL then re-check each PID and send a termination signal to each one that passes, to that PID alone and never to its process group.
 
 #### Scenario: --dry-run preserves runaway protected processes
@@ -296,3 +359,31 @@ The system SHALL detect runaway protected processes (sustained high CPU over a l
 #### Scenario: No runaway candidates
 - **WHEN** no protected process meets the runaway thresholds
 - **THEN** claude-guard SHALL skip the runaway phase silently and continue with the existing phases.
+
+### Requirement: Runaway counters report deliveries
+The reaped count and freed total SHALL include only processes to which a signal was actually
+sent. A candidate that is not signalled, or whose signal fails, SHALL NOT be counted, SHALL NOT
+contribute to the freed total, and SHALL NOT raise a notification claiming it was reaped.
+
+The freed total SHALL be the resident size of each signalled PID, read just before its signal.
+No other process is signalled, so no other process's memory is counted.
+
+#### Scenario: Every candidate is signalled
+- **WHEN** two runaway candidates are selected and both are signalled
+- **THEN** the summary SHALL report two reaped
+
+#### Scenario: A candidate is exempted at the signal stage
+- **WHEN** a candidate is spared by a user `protect` rule discovered at the signal stage
+- **THEN** the summary SHALL NOT count it, and its RSS SHALL NOT be added to the freed total
+
+#### Scenario: Nothing is delivered
+- **WHEN** every candidate is spared at the signal stage
+- **THEN** the summary SHALL report zero reaped rather than a non-zero count
+
+#### Scenario: Runaway target has a spared descendant
+- **WHEN** a runaway target is signalled and another process in its process group, or below it, is not
+- **THEN** the freed total SHALL exclude that process's RSS
+
+#### Scenario: A signal that is not delivered
+- **WHEN** the signal to a selected PID fails because the process has already exited
+- **THEN** the summary SHALL NOT count it, and its RSS SHALL NOT be added to the freed total

@@ -25,7 +25,10 @@ it, because the signal stage walks the selected PID's process group. The phase s
 single CPU sample and uses process age as if it were time spent hot. It also selects
 applications and dev servers. The guard LaunchAgent on the audited host has already selected
 and signalled `ChatGPT.app` with its Codex framework processes (reported "freed ~2374 MB") and
-`cmux.app` (etime 15 days, 80.8%), which is the terminal the Claude sessions run in.
+`cmux.app` (etime 15 days, 80.8%), which is the terminal the Claude sessions run in. Review of
+the first fix found eligibility still a substring test over the whole command line: a Claude
+session whose `--settings` named `claude-mem`, or a test run under a directory named after a
+server, qualified.
 
 **Installed shell functions point at a checkout that no longer exists.** `install.sh` writes
 `source "$SCRIPT_DIR/shell/claude-cleanup.sh"`. Under a worktree-per-session workflow that
@@ -44,15 +47,19 @@ on its last run.
   predicate names is no longer reaped by any scheduled path. That includes a bare
   `node …/index.js` MCP server or `npm exec @playwright/mcp`, and equally pytest, `codex exec`
   and `claude -p`.
-- **BREAKING (behavior):** claude-guard's runaway phase signals only the PID it selected. It
-  re-reads that PID after at least three seconds and signals only if it is still the same command
-  and still hot. It never selects an application, a development server or a process manager;
-  cc-monitor still reports those, and no longer names claude-guard as the remedy for them.
+- **BREAKING (behavior):** claude-guard's runaway phase selects only a process that is itself a
+  known shared MCP server, never one whose arguments merely name one, and only when its CPU time
+  is at least `CC_RUNAWAY_CPU` percent of a life of at least `CC_RUNAWAY_MIN` minutes. It re-reads
+  each PID after at least three seconds, signals only a PID still running the same command and
+  still hot, and signals that PID alone. Applications, development servers and process managers
+  are never selected; cc-monitor still reports them, and names claude-guard only for what it
+  would select.
 - `install.sh`:
   - Sources the deployed copies under `~/.cc-reaper/`, guarded.
-  - Repairs lines in its old generated shape and removes them when the current line already
-    exists.
-  - Backs the rc file up before any change.
+  - Repairs lines in its old generated shape, and removes them when the current line or a line
+    in another shape already sources the script.
+  - Backs the rc file up before any change, keeps its mode, ACL and extended attributes on a
+    rewrite, and creates a missing one without a backup.
   - Never changes a symlinked, hard-linked, unreadable or unwritable rc file, not even by
     appending; it prints the change instead.
   - Never stops the installation over rc configuration.
