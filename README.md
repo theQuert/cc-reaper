@@ -90,7 +90,7 @@ source /path/to/cc-reaper/shell/claude-cleanup.sh
 source /path/to/cc-reaper/shell/cc-monitor.sh
 ```
 
-Source a checkout that stays put. `install.sh` sources the copies it deploys under `~/.cc-reaper/` instead, guarded with `[ -r ... ]`, because a checkout it ran from may be a task worktree that reclamation later removes - and then every new shell prints two `no such file or directory` errors and the commands are gone. On update it repairs a line it wrote earlier that points at a checkout, after backing the rc file up.
+Source a checkout that stays put. `install.sh` sources the copies it deploys under `~/.cc-reaper/` instead, guarded with `[ -r ... ]`, because a checkout it ran from may be a task worktree that reclamation later removes - and then every new shell prints two `no such file or directory` errors and the commands are gone. On update it replaces a line it wrote earlier that points at a checkout, after backing the rc file up. When anything else in the file names the script, or there is more than one such line, it changes nothing and prints the change to make by hand: it never removes a line, because that can change what the lines around it mean.
 
 Commands available after restart:
 
@@ -234,10 +234,11 @@ claude-guard --dry-run  # preview without killing
 | `CC_MAX_RSS_MB` | 4096 | Tree RSS threshold (MB); sessions exceeding this are killed regardless of activity |
 | `CC_MAX_FD` | 10000 | File descriptor threshold; sessions exceeding this are killed as FD-leak |
 | `CC_AGENT_STALE_MINUTES` | 360 | Age threshold for stale agent-browser, Puppeteer Chrome, and detached Codex/MCP cleanup |
-| `CC_RUNAWAY_CPU` | 80 | CPU% above which a process is treated as stuck/runaway (combined with `CC_RUNAWAY_MIN`). Shared by both tools; `claude-guard` measures it as CPU time over the process's whole life |
-| `CC_RUNAWAY_MIN` | **30** in `cc-monitor`, **60** in `claude-guard` | Minutes of elapsed time before a hot process is treated as runaway. The two defaults differ on purpose — the monitor only reports, the guard signals — and setting this env var overrides both at once |
+| `CC_RUNAWAY_CPU` | 80 | CPU% above which a process is treated as stuck/runaway (combined with `CC_RUNAWAY_MIN`). Shared by both tools; `claude-guard` measures it from CPU-time samples taken across its own runs |
+| `CC_RUNAWAY_MIN` | **30** in `cc-monitor`, **60** in `claude-guard` | Minutes a process must stay hot before it is treated as runaway: elapsed time in `cc-monitor`, time across its own runs in `claude-guard`. The two defaults differ on purpose — the monitor only reports, the guard signals — and setting this env var overrides both at once |
 | `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds `claude-guard` waits (Ctrl+C to abort) before SIGTERM-ing runaway protected processes |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip `claude-guard`'s runaway phase entirely |
+| `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks |
 
 Example: lower the thresholds for constrained machines:
 
@@ -366,7 +367,7 @@ Runaway is a claim about behaviour, so since 2026-08-30 **any** non-immutable pr
 | | threshold | acts on |
 |---|---|---|
 | `cc-monitor` (reports, never kills) | CPU ≥ `CC_RUNAWAY_CPU` (`80`) for ≥ `CC_RUNAWAY_MIN` minutes (**`30`**) | any non-immutable process |
-| `claude-guard` (SIGTERMs) | CPU time ≥ `CC_RUNAWAY_CPU` (`80`) percent of an elapsed time ≥ `CC_RUNAWAY_MIN` minutes (**`60`**), and still ≥ `CC_RUNAWAY_CPU` now and on a re-check | a process that is itself a known shared MCP server; never an application, dev server, process manager or session |
+| `claude-guard` (SIGTERMs) | ≥ `CC_RUNAWAY_CPU` (`80`) percent of every interval between its runs for ≥ `CC_RUNAWAY_MIN` minutes (**`60`**), and still ≥ `CC_RUNAWAY_CPU` now and on a re-check | a process that is itself a known shared MCP server; never an application, dev server, process manager or session |
 
 Reporting earlier than the reaper acts is the point: the report costs a line an operator ignores, while the old shared floor meant a stuck loop held a core for a full hour before it could be named. `claude-guard`'s selection is a separate implementation, with its own identity test, its own measure of heat and its own default.
 
@@ -380,13 +381,13 @@ Stuck/runaway processes:
 
 A process carrying an Always Protect user rule is still labelled a runaway; its suggested action stays the Always Protect wording.
 
-`claude-guard` adds a Phase 0.5 that reaps these PIDs after `CC_RUNAWAY_GRACE_SEC` (default 5) seconds, so you can `Ctrl+C` if the report surprises you. It selects a process only when the process itself is a known shared MCP server — its executable, or what `npx`, `npm exec`, `uvx`, `node` or `python` runs — never because a name appears in its arguments: a Claude session whose `--settings` mention `claude-mem`, or a test run in a directory named after a server, is not one. Heat is measured over the process's life: its CPU time must be at least `CC_RUNAWAY_CPU` percent of its elapsed time, because `ps %cpu` decays within about a minute and a routine burst in an old server would otherwise qualify. The cost is that a server idle for a day and then stuck for an hour is diluted and never reaped; `cc-monitor` still reports it. It signals each PID alone, never its process group: an MCP server started by a Claude CLI is in that CLI's group, and signalling the group ended the session. It first waits three more seconds and reads each PID again, skipping any that now runs a different command or has dropped below `CC_RUNAWAY_CPU`. Applications (anything inside an `.app` bundle), dev servers and process managers are never selected, though they are protected: on one host the guard had signalled ChatGPT.app and cmux.app, the terminal the sessions ran in.
+`claude-guard` adds a Phase 0.5 that reaps these PIDs after `CC_RUNAWAY_GRACE_SEC` (default 5) seconds, so you can `Ctrl+C` if the report surprises you. It selects a process only when the process itself is a known shared MCP server — its executable, or what `npx`, `npm exec`, `uvx`, `node` or `python` runs — never because a name appears in its arguments: a Claude session whose `--settings` mention `claude-mem`, or a test run in a directory named after a server, is not one. Heat is measured across the guard's own runs: each run records the CPU time of every process hot at that moment, and a process is selected once it has used at least `CC_RUNAWAY_CPU` percent of every interval between runs for `CC_RUNAWAY_MIN` minutes; a gap of more than 20 minutes between runs starts over, so this relies on the guard agent's 10-minute runs. `ps %cpu` alone decays within about a minute, so a routine burst would qualify, and a lifetime average of CPU time let a multi-threaded server that was busy early qualify on a later burst while a stall late in a long life never did. The cost is delay: with the agent's 10-minute interval a stall is reaped 60 to 70 minutes after a run first sees it, and `cc-monitor` reports it sooner. `--dry-run` records no samples. It signals each PID alone, never its process group: an MCP server started by a Claude CLI is in that CLI's group, and signalling the group ended the session. It first waits three more seconds and reads each PID again, skipping any that now runs a different command or has dropped below `CC_RUNAWAY_CPU`. Applications (anything run from inside an `.app` bundle), dev servers and process managers are never selected, though they are protected: on one host the guard had signalled ChatGPT.app and cmux.app, the terminal the sessions ran in.
 
 ```text
 === Claude Guard ===
   Config: max_sessions=3, idle_threshold=1%, max_rss=4096 MB, max_fd=10000, runaway=80%/60min
 
-  --- Runaway protected processes (CPU time >= 80% of >= 60 min alive) ---
+  --- Runaway protected processes (CPU >= 80% across runs for >= 60 min) ---
   PID 9594    CPU 102.7%  ETIME 09:07:51   uvx chroma-mcp --client-type persistent
   Sending SIGTERM in 5 seconds (Ctrl+C to abort)...
   Reaped 1 runaway protected process(es), freed ~340 MB
