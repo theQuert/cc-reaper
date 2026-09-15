@@ -159,7 +159,7 @@ _cc_monitor_runaway_cpu_threshold() {
 #
 # The killing path is deliberately not this one and deliberately not this number.
 # `_cc_guard_runaway_protected_pids` in claude-cleanup.sh carries its own CC_RUNAWAY_MIN
-# default of 60, measures CPU time over the whole life, and selects only known shared MCP
+# default of 60, measures CPU time across its own runs, and selects only known shared MCP
 # servers; the guard agent SIGTERMs from there. Reporting
 # earlier than the reaper acts is the intended asymmetry, not drift between two copies.
 _cc_monitor_runaway_min_threshold() {
@@ -209,7 +209,6 @@ _cc_monitor_mcp_server_program() {
       return 0
     }
     NR == 1 {
-      if (index($0, ".app/")) exit 1
       i = 1
       b = $1
       sub(/.*\//, "", b)
@@ -219,6 +218,8 @@ _cc_monitor_mcp_server_program() {
         i = 2
         while (i <= NF && ($i ~ /^-/ || $i ~ /^(exec|x|dlx|run|tool)$/)) i++
       }
+      # What runs from inside an .app bundle is that application; an .app in a URL is not.
+      if (index($1, ".app/") || index($i, ".app/")) exit 1
       b = $i
       sub(/.*\//, "", b)
       if (b == "codex" || b == "codex.js") exit (($(i + 1) == "mcp-server") ? 0 : 1)
@@ -469,7 +470,7 @@ _cc_monitor_action() {
       elif ! printf '%s\n' "$cmd" | awk "$(_cc_monitor_mcp_server_program)"; then
         echo "Run 'kill $pid' if this is not doing work you need; claude-guard will not reap it, because it reaps only shared MCP servers."
       else
-        echo "Run 'kill $pid' to terminate the stuck MCP server, or 'claude-guard', which reaps one whose CPU time is over CC_RUNAWAY_CPU percent of its life."
+        echo "Run 'kill $pid' to terminate the stuck MCP server, or 'claude-guard', which reaps one that stays over CC_RUNAWAY_CPU for CC_RUNAWAY_MIN minutes across its runs."
       fi ;;
     DO_NOT_KILL:system)
       echo "Do not kill system/security/UI processes; reduce workload or wait for the system task to finish." ;;
