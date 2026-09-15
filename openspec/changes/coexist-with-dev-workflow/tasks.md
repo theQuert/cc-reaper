@@ -30,8 +30,19 @@
 - [x] 5.6 Docs: CHANGELOG sections, README Option A runaway coverage, CLAUDE.md runaway row and specifics, installer guard echo
 - [x] 5.7 cc-monitor: the runaway suggested action names claude-guard only for what it can reap
 
-## 6. Delivery
+## 6. Review round 2
 
-- [ ] 6.1 All suites, `bash -n`, `zsh -n`, `openspec validate --strict`
-- [ ] 6.2 Independent review until no actionable findings
-- [ ] 6.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
+- [x] 6.1 Red-verify the guard: sessions, subagents, test runs and a Codex CLI whose arguments name a protected server are signalled; a long-lived server in a burst is signalled; argument text shaped like a row adds a candidate
+- [x] 6.2 Runaway eligibility: the executable, or what a package runner or interpreter runs, is a known shared MCP server; Claude and Codex CLIs excluded except `codex mcp-server`; cc-monitor carries the same awk program, compared by a test
+- [x] 6.3 Runaway selection: candidates from a listing without argument text; CPU time at least `CC_RUNAWAY_CPU` percent of an elapsed time of at least `CC_RUNAWAY_MIN`
+- [x] 6.4 Tests: every signal follows the re-check pause, and changes that land at the pause are seen; a hot server younger than the floor is not selected
+- [x] 6.5 Red-verify the installer: a stale line beside a hand-written one adds a second source line and names nothing; a missing rc file is backed up after the run's own append; a rewrite drops extended attributes
+- [x] 6.6 Installer: lines in another shape found beside stale lines; no backup of a file the run created; rewrites on a `cp -p` copy; tests run install.sh with /bin/bash
+- [x] 6.7 disk-janitor test: docker receives only the read-only calls the reports make
+- [x] 6.8 Spec: the baseline runaway counters requirement is modified; the design no longer overstates PID reuse
+
+## 7. Delivery
+
+- [ ] 7.1 All suites, `bash -n`, `zsh -n`, `openspec validate --strict`
+- [ ] 7.2 Independent review until no actionable findings
+- [ ] 7.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
