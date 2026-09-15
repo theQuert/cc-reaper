@@ -46,7 +46,8 @@ sandbox_home() {
 # Every scenario checks the installer finished: a repair that aborts step 1 leaves the
 # hook, the monitor and every janitor undeployed.
 install_into() {
-  HOME="$1" CC_REAPER_DAEMON=b PATH="${EXTRA_PATH:+$EXTRA_PATH:}$STUBS:$PATH" bash "$ROOT_DIR/install.sh" < /dev/null > "$1/install.out" 2>&1
+  # /bin/bash, the shebang's shell: with a newer bash first in PATH, `bash` would not run 3.2.
+  HOME="$1" CC_REAPER_DAEMON=b PATH="${EXTRA_PATH:+$EXTRA_PATH:}$STUBS:$PATH" /bin/bash "$ROOT_DIR/install.sh" < /dev/null > "$1/install.out" 2>&1
   echo "$?" > "$1/install.rc"
 }
 completed() {
@@ -96,6 +97,7 @@ alias ll='ls -l'
 EOF
 # 640, not mktemp's 600: a rewrite that dropped the mode would still pass at 600.
 chmod 640 "$H/.zshrc"
+xattr -w com.cc-reaper.test kept "$H/.zshrc"
 cp -p "$H/.zshrc" "$H/original"
 install_into "$H"
 completed "$H"; check "an install over stale lines completes" $?
@@ -106,6 +108,7 @@ grep -qxF 'export EDITOR=vim' "$H/.zshrc" && grep -qxF "alias ll='ls -l'" "$H/.z
   [ "$(wc -l < "$H/.zshrc")" -eq "$(wc -l < "$H/original")" ]
 check "every other line is left as it was" $?
 [ "$(stat -f %Lp "$H/.zshrc")" = 640 ]; check "the rewritten rc file keeps its mode" $?
+[ "$(xattr -p com.cc-reaper.test "$H/.zshrc" 2>/dev/null)" = kept ]; check "and its extended attributes" $?
 backup="$(ls "$H"/.zshrc.cc-reaper-backup-* 2>/dev/null | head -1)"
 [ -n "$backup" ] && cmp -s "$backup" "$H/original"; check "the rc file is backed up before it is changed" $?
 grep -qF 'janitor-blindspots/shell/claude-cleanup.sh' "$H/install.out"
@@ -158,6 +161,25 @@ completed "$H"; check "an install over an rc file without a final newline comple
 [ "$(count_line "$H/.zshrc" "$want_cleanup")" = 1 ] && [ "$(count_line "$H/.zshrc" "$want_monitor")" = 1 ]
 check "an appended line starts on its own line" $?
 
+# ─── A stale line beside a line the installer did not write ───────────────────
+H="$(sandbox_home)"
+printf '%s\n' 'source "/gone/worktree/shell/claude-cleanup.sh"' '. /gone/other/shell/claude-cleanup.sh' > "$H/.zshrc"
+install_into "$H"
+completed "$H"; check "an install over a stale line beside a hand-written one completes" $?
+! grep -q '/gone/worktree' "$H/.zshrc" && grep -qxF '. /gone/other/shell/claude-cleanup.sh' "$H/.zshrc" &&
+  [ "$(count_line "$H/.zshrc" "$want_cleanup")" = 0 ]
+check "the stale line is removed, the hand-written one kept, and nothing added beside it" $?
+grep -q 'left unchanged' "$H/install.out" && grep -qF '. /gone/other/shell/claude-cleanup.sh' "$H/install.out"
+check "and the installer names the hand-written line" $?
+
+# ─── No rc file yet ───────────────────────────────────────────────────────────
+H="$(sandbox_home)"
+install_into "$H"
+completed "$H"; check "an install with no rc file completes" $?
+[ "$(count_line "$H/.zshrc" "$want_cleanup")" = 1 ] && [ "$(count_line "$H/.zshrc" "$want_monitor")" = 1 ]
+check "a missing rc file is created with both lines" $?
+[ "$(backups "$H")" = 0 ]; check "and no backup is taken of the file the run created" $?
+
 # ─── rc files that must not be changed ────────────────────────────────────────
 H="$(sandbox_home)"
 mkdir -p "$H/dotfiles"
@@ -188,6 +210,9 @@ install_into "$H"
 completed "$H"; check "an install with a read-only rc file completes and deploys everything" $?
 cmp -s "$H/.zshrc" "$H/original"; check "a read-only rc file is left unchanged" $?
 grep -qF "$want_cleanup" "$H/install.out"; check "and the installer prints the replacement for it" $?
+# Refused up front, not by a rewrite that happens to fail: nothing to back up, and the reason named.
+[ "$(backups "$H")" = 0 ] && grep -q 'is not writable' "$H/install.out"
+check "and it is refused as not writable, with no backup taken" $?
 
 H="$(sandbox_home)"
 printf 'source "/gone/worktree/shell/claude-cleanup.sh"\n' > "$H/.zshrc"
