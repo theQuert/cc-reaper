@@ -102,6 +102,8 @@ bash tests/cc-monitor-optimize.sh      # Validate cc-monitor optimization menu l
 bash tests/cc-monitor-runaway.sh       # Validate runaway protected process detection
 bash tests/guard-session-detect.sh     # Validate session detection + guard phases under bash and zsh
 bash tests/protection-classes.sh       # Validate protection classes, runaway selection/signalling, tree RSS
+bash tests/monitor-selection.sh        # LaunchAgent monitor body: what it signals (no CPU-based selection)
+bash tests/install-rc-source.sh        # install.sh rc lines source the deployed copies and repair stale ones
 bash tests/worktree-janitor.sh         # Validate worktree gates, landing proofs, declarations, session mode, lock
 bash -n shell/claude-cleanup.sh        # Syntax check
 bash -n shell/cc-monitor.sh            # Syntax check

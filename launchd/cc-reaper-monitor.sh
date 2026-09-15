@@ -254,47 +254,15 @@ while IFS= read -r line; do
   fi
 done < <(ps -eo pid=,ppid=,tty=,%cpu=,%mem=,etime=,command= 2>/dev/null)
 
-# ─── Runaway-CPU override (kills regardless of the protected whitelist) ───────
-# is_cleanup_candidate() above protects shared MCP servers (supabase, claude-mem,
-# codex, ...) by name — correct while they are idle (~0% CPU). But a *whitelisted*
-# server stuck pegging a full core is exactly what must die: on 2026-06-13 an
-# orphaned Cloudflare MCP burned one core for 9h. (Cloudflare is no longer
-# whitelisted — the main sweep reaps it now that is_existing_orphan_cmd also
-# matches the "npm exec @scope/mcp-server-*" form.) CAVEAT: this override only
-# fires on a PPID=1 orphan that ITSELF burns CPU; a two-layer "orphan npm exec
-# wrapper (PPID=1, ~0% CPU) + hot node child (PPID!=1)" evades it, so it leans on
-# the main sweep killing the orphaned wrapper's whole PGID.
-# This pass reaps a PPID=1 orphan that is OLD
-# and sustaining high CPU no matter what its name is. Four gates make a false kill
-# near-impossible: parent already dead (PPID=1), CPU over threshold, old enough to
-# not be real startup work, and still hot on a re-sample 3s later (not a spike).
-RUNAWAY_CPU="${CC_RUNAWAY_CPU:-80}"                       # shared with cc-monitor/claude-guard
-RUNAWAY_ORPHAN_MIN_SEC="${CC_RUNAWAY_ORPHAN_MIN_SEC:-180}" # orphan age floor in SECONDS (not CC_RUNAWAY_MIN, which is minutes for live protected procs)
-
-while read -r rpid _ rcpu retime rcmd; do   # default IFS: split the 5 ps columns
-  [ -z "$rpid" ] && continue
-  # Explicit user protection remains an absolute boundary even though this
-  # pass deliberately overrides the built-in shared-service whitelist.
-  has_user_rule protect "$rcmd" && continue
-  # Gate: orphan old enough to not be legitimate startup work
-  [ "$(etime_to_seconds "$retime")" -lt "$RUNAWAY_ORPHAN_MIN_SEC" ] && continue
-  # Skip anything a section above already reaped
-  already_killed=false
-  for kp in "${kill_pids[@]}"; do [ "$kp" = "$rpid" ] && already_killed=true && break; done
-  $already_killed && continue
-  # Gate: confirm the burn is sustained, not a momentary spike
-  sleep 3
-  rcpu2=$(ps -o %cpu= -p "$rpid" 2>/dev/null | tr -d ' ')
-  [ -z "$rcpu2" ] && continue   # exited on its own
-  awk -v a="$rcpu2" -v th="$RUNAWAY_CPU" 'BEGIN { exit !((a + 0) >= (th + 0)) }' || continue
-  if terminate_unless_user_protected "$rpid"; then
-    log "KILL runaway (whitelist-override) PID=$rpid CPU=${rcpu}%->${rcpu2}% ELAPSED=$retime CMD=$(echo "$rcmd" | head -c 100)"
-    kill_pids+=("$rpid")
-    count=$((count + 1))
-  fi
-done < <(ps -eo pid=,ppid=,%cpu=,etime=,command= 2>/dev/null \
-  | awk -v th="$RUNAWAY_CPU" '$2 == 1 && ($3 + 0) >= (th + 0) { print }' \
-  | grep -E "[n]ode|[n]px|_npx|[m]cp|[b]un|[c]odex|[c]laude")
+# ─── No CPU-based selection ─────────────────────────────────────────────────
+# Being orphaned and hot does not make a process a candidate. Background test runs,
+# builds and experiments started from Claude Code are both, and their command lines
+# carry /private/tmp/claude-501/ scratchpad paths: every kill a name-substring
+# "runaway override" here logged on 2026-09-10/11 was a pytest run or a scratchpad
+# script. A stuck *shared* service is claude-guard's runaway phase's to signal - the
+# guard LaunchAgent runs it every 10 minutes through the single protection
+# classification, after CC_RUNAWAY_MIN minutes. Do not add a CPU pass back here: a
+# second, name-based selector is the drift the protection classes removed.
 
 if [ "$count" -eq 0 ]; then
   exit 0
