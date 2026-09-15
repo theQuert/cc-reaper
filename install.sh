@@ -185,7 +185,9 @@ _cc_rc_hands_off() {
 _CC_RC_BACKUP=""
 _cc_rc_backup() {
   [ -n "$_CC_RC_BACKUP" ] && return 0
-  [ -e "$SHELL_RC" ] || return 0
+  # No file yet: nothing to keep, and a backup later in the run would hold only what the run
+  # itself added.
+  [ -e "$SHELL_RC" ] || { _CC_RC_BACKUP=none; return 0; }
   local b
   b="$SHELL_RC.cc-reaper-backup-$(date +%Y%m%d%H%M%S)"
   # Never over the backup an earlier run took in the same second.
@@ -196,7 +198,7 @@ _cc_rc_backup() {
 }
 
 _cc_rc_install() {
-  local script=$1 want reason stale="" has_want=0 tmp mode=""
+  local script=$1 want reason stale="" others="" has_want=0 keep=0 tmp
   want="$(_cc_rc_line "$script")"
   reason="$(_cc_rc_hands_off)"
   if [ "$reason" = "cannot be read" ]; then
@@ -211,22 +213,28 @@ _cc_rc_install() {
       index($0, "source \"") == 1 &&
       substr($0, length($0) - length(suffix) + 1) == suffix &&
       gsub(/"/, "\"") == 2 { print }' "$SHELL_RC" 2>/dev/null)" || stale=""
+    # Live lines in any other shape, found whether or not a stale line sits beside them. One
+    # may be deliberate; a commented-out one sources nothing.
+    others="$(grep -v '^[[:space:]]*#' "$SHELL_RC" 2>/dev/null | grep -F -- "$script" | grep -vxF -- "$want" |
+      awk -v suffix="/shell/$script\"" '
+        !(index($0, "source \"") == 1 &&
+          substr($0, length($0) - length(suffix) + 1) == suffix &&
+          gsub(/"/, "\"") == 2)')" || others=""
   fi
-  if [ "$has_want" = 1 ] && [ -z "$stale" ]; then
+  if [ -n "$others" ]; then
+    echo "  $script: a line the installer did not write already sources it; left unchanged:"
+    printf '%s\n' "$others" | sed 's/^/    /'
+    [ -n "$stale" ] || return 0
+  elif [ "$has_want" = 1 ] && [ -z "$stale" ]; then
     echo "  $script: already sourced from ~/.cc-reaper"
     return 0
   fi
-  # A live line in another shape may be deliberate. A commented-out one sources nothing.
-  if [ "$has_want" = 0 ] && [ -z "$stale" ] && [ -e "$SHELL_RC" ] &&
-     grep -v '^[[:space:]]*#' "$SHELL_RC" | grep -qF -- "$script"; then
-    echo "  $script: a line the installer did not write already sources it; left unchanged:"
-    grep -v '^[[:space:]]*#' "$SHELL_RC" | grep -F -- "$script" | sed 's/^/    /'
-    return 0
-  fi
+  # The current line is added only where nothing else sources the script.
+  if [ "$has_want" = 1 ] || [ -n "$others" ]; then keep=1; fi
   if [ -n "$reason" ] || ! _cc_rc_backup; then
     echo "  $script: $SHELL_RC ${reason:-could not be backed up}; left unchanged. Make this change by hand:"
     [ -n "$stale" ] && printf '%s\n' "$stale" | sed 's/^/    remove: /'
-    [ "$has_want" = 1 ] || printf '    add:    %s\n' "$want"
+    [ "$keep" = 1 ] || printf '    add:    %s\n' "$want"
     return 0
   fi
   if [ -z "$stale" ]; then
@@ -243,20 +251,19 @@ _cc_rc_install() {
     fi
     return 0
   fi
-  # Rewritten beside the original, with its mode, and renamed into place. When the current
-  # line is already present the stale lines are only removed.
-  mode="$(stat -f %Lp "$SHELL_RC" 2>/dev/null)" || mode=""
+  # Rewritten on a copy that keeps the file's mode, ACL and extended attributes, and renamed into
+  # place. A stale line becomes the current line, or is only removed when something else already
+  # sources the script.
   tmp="$(mktemp "$SHELL_RC.cc-reaper.XXXXXX" 2>/dev/null)" || tmp=""
-  if [ -n "$tmp" ] &&
-     awk -v want="$want" -v keep="$has_want" -v suffix="/shell/$script\"" '
+  if [ -n "$tmp" ] && cp -p "$SHELL_RC" "$tmp" 2>/dev/null &&
+     awk -v want="$want" -v keep="$keep" -v suffix="/shell/$script\"" '
        index($0, "source \"") == 1 &&
        substr($0, length($0) - length(suffix) + 1) == suffix &&
        gsub(/"/, "\"") == 2 { if (keep == 0) { print want; keep = 1 }; next }
        { print }' "$SHELL_RC" > "$tmp" &&
-     { [ -z "$mode" ] || chmod "$mode" "$tmp"; } &&
      mv -f "$tmp" "$SHELL_RC"; then
-    if [ "$has_want" = 1 ]; then
-      echo "  $script: removed a line sourcing a checkout copy, beside the current line:"
+    if [ "$keep" = 1 ]; then
+      echo "  $script: removed a line sourcing a checkout copy:"
     else
       echo "  $script: replaced a line sourcing a checkout copy; now sourced from ~/.cc-reaper. Was:"
     fi
@@ -265,7 +272,7 @@ _cc_rc_install() {
     [ -n "$tmp" ] && rm -f "$tmp"
     echo "  $script: could not rewrite $SHELL_RC; make this change by hand:"
     printf '%s\n' "$stale" | sed 's/^/    remove: /'
-    [ "$has_want" = 1 ] || printf '    add:    %s\n' "$want"
+    [ "$keep" = 1 ] || printf '    add:    %s\n' "$want"
   fi
   return 0
 }
