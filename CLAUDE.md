@@ -52,11 +52,17 @@ Tests drive the two seams separately via `CC_REAPER_PS_SNAPSHOT_FILE` (`pid tty 
 |------|-------------|----------|--------|
 | Pattern-based cleanup | never | exempt, unless a user `cleanup` rule covers it | family predicates decide |
 | Process-group cleanup | never | skipped | signalled on membership |
-| Runaway phase | never selected | selected only if an MCP service (never an application, dev server or process manager); that PID alone is signalled, after a re-check | not selected |
+| Runaway phase | never selected | selected only if the process is itself a known shared MCP server that has used at least `CC_RUNAWAY_CPU` percent of its life as CPU time; that PID alone is signalled, after a re-check | not selected |
 
 They previously carried three separate lists (`_cc_reaper_protected_pattern`, `_cc_reaper_is_direct_cleanup_protected`, and an `MCP_WHITELIST` local to `_claude_pgid_kill`) that had drifted apart: a runaway shared MCP was selected by one and skipped by another, `mcp-server-stripe` was protected where `@stripe/mcp` was not, and a stuck system scanner was reachable by the runaway phase.
 
-**Runaway phase specifics**: it never selects `immutable`, so cc-reaper does not SIGTERM security software or a Spotlight reindex however hot they get. It *does* signal the `shared` MCP service it selected — that is the point of the phase — and only that PID, through `_cc_reaper_kill_pid`, never its process group: a shared MCP server started by a Claude CLI is in that CLI's group, and group signalling ended the session. It re-reads the PID after at least three seconds and signals only if the command is unchanged and its CPU is still over the threshold, because one sample plus a process's age is not "hot for an hour". Applications (`.app` bundles), dev servers and process managers classify `shared` but are never selected: the guard runs unattended, and on one host it had signalled ChatGPT.app and cmux.app, the terminal the sessions ran in. Reported counts are deliveries, not intentions: a candidate spared at the signal stage is not counted, adds nothing to the freed total, and raises no notification.
+**Runaway phase specifics**: it never selects `immutable`, so cc-reaper does not SIGTERM security software or a Spotlight reindex however hot they get. It *does* signal the `shared` MCP server it selected — that is the point of the phase — and only that PID, through `_cc_reaper_kill_pid`, never its process group: a shared MCP server started by a Claude CLI is in that CLI's group, and group signalling ended the session. Three rules keep selection to what the phase is for:
+
+- **Identity, not a substring.** The protection class is a substring test over the whole command line — right for protection, wrong for a kill path: a session whose `--settings` named `claude-mem` classified `shared`. `_cc_reaper_mcp_server_program` asks whether the process itself is a known shared MCP server: its executable, or the first word a package runner or interpreter (`npx`, `npm exec`, `uvx`, `node`, `python`) runs, compared whole as a package with any version dropped, a program in a `bin` directory, or a package directory under `node_modules`. No other argument counts. Claude and Codex CLIs never qualify (except `codex mcp-server`), nor does anything inside an `.app` bundle. `cc-monitor.sh` carries a byte-identical copy, compared by `tests/cc-monitor-runaway.sh`, so the monitor names `claude-guard` only for what it would select.
+- **Heat over the process's life.** CPU time must be at least `CC_RUNAWAY_CPU` percent of an elapsed time of at least `CC_RUNAWAY_MIN`. `ps %cpu` decays over about a minute, so it only confirms a candidate is still hot — at selection, and on a re-check after at least three seconds that also requires the command to be unchanged. The known ceiling: a stall late in a long-lived server is diluted and never selected; `cc-monitor` still reports it.
+- **Candidates from a listing without argument text.** PIDs come from `ps -axo pid=,etime=,time=,%cpu=`, and each command is read per PID and flattened to one line — the seam session detection uses — so a payload line shaped like a row cannot add a PID.
+
+Reported counts are deliveries, not intentions: a candidate spared at the signal stage is not counted, adds nothing to the freed total, and raises no notification.
 
 **Tree RSS** (`_claude_tree_rss`) sums the whole descendant tree in kilobytes and converts once, from a single `ps` walked in awk. Truncating each member first cost ~0.5 MB per process, and stopping at grandchildren missed anything behind a wrapper chain; the single-pass form is also ~5x faster than the two-level version it replaced.
 
@@ -100,7 +106,7 @@ bash tests/cc-monitor-runaway.sh       # Validate runaway protected process dete
 bash tests/guard-session-detect.sh     # Validate session detection + guard phases under bash and zsh
 bash tests/protection-classes.sh       # Validate protection classes, runaway selection/signalling, tree RSS
 bash tests/monitor-selection.sh        # LaunchAgent monitor body: what it signals (no CPU-based selection)
-bash tests/guard-runaway.sh            # claude-guard runaway phase run whole: one re-checked PID, never apps or groups
+bash tests/guard-runaway.sh            # claude-guard runaway phase run whole: known MCP servers, lifetime CPU, one re-checked PID
 bash tests/install-rc-source.sh        # install.sh rc lines source the deployed copies and repair stale ones
 bash tests/worktree-janitor.sh         # Validate worktree gates, landing proofs, declarations, session mode, lock
 bash -n shell/claude-cleanup.sh        # Syntax check
@@ -120,8 +126,8 @@ zsh -n shell/claude-cleanup.sh         # zsh reaches code paths bash-only checks
 | `CC_MAX_RSS_MB` | 4096 | Tree RSS threshold (MB); sessions exceeding this are killed regardless of activity |
 | `CC_MAX_FD` | 10000 | File descriptor threshold; sessions exceeding this are killed as FD-leak |
 | `CC_AGENT_STALE_MINUTES` | 360 | Age threshold (minutes) for stale agent-browser, Puppeteer Chrome, and detached Codex/MCP cleanup |
-| `CC_RUNAWAY_CPU` | 80 | CPU% above which a protected process is treated as stuck/runaway |
-| `CC_RUNAWAY_MIN` | 60 | Minutes of elapsed time required before a hot protected process is runaway |
+| `CC_RUNAWAY_CPU` | 80 | CPU time, as a percent of elapsed time, at or above which a known shared MCP server is runaway; it must also read at least this hot now |
+| `CC_RUNAWAY_MIN` | 60 | Minutes of elapsed time required before a process can be runaway |
 | `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds claude-guard waits before SIGTERM-ing runaway protected processes |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip claude-guard's runaway phase |
 
