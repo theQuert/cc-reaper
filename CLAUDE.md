@@ -54,11 +54,11 @@ Tests drive the two seams separately via `CC_REAPER_PS_SNAPSHOT_FILE` (`pid tty 
 |------|-------------|----------|--------|
 | Pattern-based cleanup | never | exempt, unless a user `cleanup` rule covers it | family predicates decide |
 | Process-group cleanup | never | skipped | signalled on membership |
-| Runaway phase | never selected | selected, and signalled | not selected |
+| Runaway phase | never selected | selected only if an MCP service (never an application, dev server or process manager); that PID alone is signalled, after a re-check | not selected |
 
 They previously carried three separate lists (`_cc_reaper_protected_pattern`, `_cc_reaper_is_direct_cleanup_protected`, and an `MCP_WHITELIST` local to `_claude_pgid_kill`) that had drifted apart: a runaway shared MCP was selected by one and skipped by another, `mcp-server-stripe` was protected where `@stripe/mcp` was not, and a stuck system scanner was reachable by the runaway phase.
 
-**Runaway phase specifics**: it never selects `immutable`, so cc-reaper does not SIGTERM security software or a Spotlight reindex however hot they get. It *does* signal the `shared` service it selected — that is the point of the phase, and `_claude_pgid_kill` takes a `force_target` argument for exactly that PID, sparing its group siblings. Reported counts are deliveries, not intentions: a candidate spared at the signal stage is not counted, adds nothing to the freed total, and raises no notification.
+**Runaway phase specifics**: it never selects `immutable`, so cc-reaper does not SIGTERM security software or a Spotlight reindex however hot they get. It *does* signal the `shared` MCP service it selected — that is the point of the phase — and only that PID, through `_cc_reaper_kill_pid`, never its process group: a shared MCP server started by a Claude CLI is in that CLI's group, and group signalling ended the session. It re-reads the PID after at least three seconds and signals only if the command is unchanged and its CPU is still over the threshold, because one sample plus a process's age is not "hot for an hour". Applications (`.app` bundles), dev servers and process managers classify `shared` but are never selected: the guard runs unattended, and on one host it had signalled ChatGPT.app and cmux.app, the terminal the sessions ran in. Reported counts are deliveries, not intentions: a candidate spared at the signal stage is not counted, adds nothing to the freed total, and raises no notification.
 
 **Tree RSS** (`_claude_tree_rss`) sums the whole descendant tree in kilobytes and converts once, from a single `ps` walked in awk. Truncating each member first cost ~0.5 MB per process, and stopping at grandchildren missed anything behind a wrapper chain; the single-pass form is also ~5x faster than the two-level version it replaced.
 
@@ -103,6 +103,7 @@ bash tests/cc-monitor-runaway.sh       # Validate runaway protected process dete
 bash tests/guard-session-detect.sh     # Validate session detection + guard phases under bash and zsh
 bash tests/protection-classes.sh       # Validate protection classes, runaway selection/signalling, tree RSS
 bash tests/monitor-selection.sh        # LaunchAgent monitor body: what it signals (no CPU-based selection)
+bash tests/guard-runaway.sh            # claude-guard runaway phase run whole: one re-checked PID, never apps or groups
 bash tests/install-rc-source.sh        # install.sh rc lines source the deployed copies and repair stale ones
 bash tests/worktree-janitor.sh         # Validate worktree gates, landing proofs, declarations, session mode, lock
 bash -n shell/claude-cleanup.sh        # Syntax check

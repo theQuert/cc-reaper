@@ -454,11 +454,15 @@ _cc_monitor_action() {
     ASK_BEFORE_KILL:runaway)
       # claude-guard reaps through its own protected-process whitelist, so suggesting it for
       # a process that is not on that list names a remedy that does nothing. Since runaway is
-      # no longer a protected-only label, the suggestion has to be split the same way.
-      if _cc_monitor_is_protected_cmd "$cmd"; then
-        echo "Run 'kill $pid' to terminate the stuck protected process, or 'claude-guard' to auto-reap runaway protected processes."
-      else
+      # no longer a protected-only label, the suggestion has to be split the same way. Nor does
+      # it reap an application, a dev server or a process manager, protected or not: the same
+      # exclusion as _cc_guard_runaway_eligible in claude-cleanup.sh.
+      if ! _cc_monitor_is_protected_cmd "$cmd"; then
         echo "Run 'kill $pid' if this is not doing work you need; claude-guard will not reap it, because it is not a protected process."
+      elif printf '%s\n' "$cmd" | grep -qE '\.app/|node.*(dev-server|http-server|next.*server)|pm2'; then
+        echo "Run 'kill $pid' if this is not doing work you need; claude-guard will not reap it, because it never signals an application, dev server or process manager."
+      else
+        echo "Run 'kill $pid' to terminate the stuck protected process, or 'claude-guard' to auto-reap runaway protected processes."
       fi ;;
     DO_NOT_KILL:system)
       echo "Do not kill system/security/UI processes; reduce workload or wait for the system task to finish." ;;

@@ -158,6 +158,24 @@ sys.exit(0 if ok else 1)
 ' && ok "runaway action distinguishes protected from report-only candidates" \
   || fail "runaway action distinguishes protected from report-only candidates"
 
+# claude-guard never signals an application, a dev server or a process manager, protected or
+# not: on one host it had signalled cmux.app, the terminal the sessions ran in. Naming it as
+# the remedy for one of those names a remedy that does nothing.
+apps_fixture="$(mktemp "${TMPDIR:-/tmp}/ccr-apps.XXXXXX")"
+printf "62199\t1\t62199\t??\t15:13:40\t80.8\t812000\t/Applications/cmux.app/Contents/MacOS/cmux\n" > "$apps_fixture"
+printf "70001\t1\t70001\t??\t01:30:00\t99.0\t100000\tnode /repo/node_modules/.bin/next dev-server --port 3000\n" >> "$apps_fixture"
+apps_out=$(CC_MONITOR_SNAPSHOT_FILE="$apps_fixture" bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json 2>/dev/null)
+printf '%s' "$apps_out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+by = {x.get("pid"): x for x in d.get("findings", [])}
+sys.exit(0 if all(p in by and by[p].get("family") == "runaway"
+                  and "claude-guard will not reap it" in (by[p].get("suggested_action") or "")
+                  for p in (62199, 70001)) else 1)
+' && ok "runaway action does not name claude-guard for an application or a dev server" \
+  || fail "runaway action does not name claude-guard for an application or a dev server"
+rm -f "$apps_fixture"
+
 #######################################################
 # Reclassification: family is runaway, classification is ASK_BEFORE_KILL
 #######################################################
