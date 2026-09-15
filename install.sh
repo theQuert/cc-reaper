@@ -88,9 +88,6 @@ _cc_report_failed_agents() {
   echo "           inspect with: launchctl print $AGENT_UI/<label>"
 }
 
-SHELL_SOURCE="source \"$SCRIPT_DIR/shell/claude-cleanup.sh\""
-MONITOR_SOURCE="source \"$SCRIPT_DIR/shell/cc-monitor.sh\""
-
 # Detect shell config file
 if [ -n "$ZSH_VERSION" ] || [ -f "$HOME_DIR/.zshrc" ]; then
   SHELL_RC="$HOME_DIR/.zshrc"
@@ -100,21 +97,169 @@ else
   SHELL_RC="$HOME_DIR/.zshrc"
 fi
 
-if grep -q "claude-cleanup.sh" "$SHELL_RC" 2>/dev/null; then
-  echo "  Already in $SHELL_RC, skipping."
-else
-  echo "" >> "$SHELL_RC"
-  echo "# Claude Code cleanup functions" >> "$SHELL_RC"
-  echo "$SHELL_SOURCE" >> "$SHELL_RC"
-  echo "  Added to $SHELL_RC"
-fi
+# Replace a deployed file by rename. bash reads a script as it runs, so overwriting one in
+# place hands a monitor, janitor or hook run already in progress a mix of old and new bytes;
+# a rename leaves that run on the file it opened. Interactive shells source these copies too.
+_cc_deploy() {
+  local src=$1 dst=$2 tmp
+  tmp="$(mktemp "$(dirname "$dst")/.$(basename "$dst").XXXXXX")" || return 1
+  if cp "$src" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dst"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
 
-if grep -q "cc-monitor.sh" "$SHELL_RC" 2>/dev/null; then
-  echo "  cc-monitor already in $SHELL_RC, skipping."
-else
-  echo "$MONITOR_SOURCE" >> "$SHELL_RC"
-  echo "  Added cc-monitor to $SHELL_RC"
-fi
+# The shell sources the deployed copies under ~/.cc-reaper - the ones step 5 installs and
+# the LaunchAgents already run - never this checkout. Under a worktree-per-session workflow
+# this checkout is a task worktree, and reclaiming it left every new shell printing two
+# "no such file or directory" errors with the commands gone (measured 2026-09-15). Guarded,
+# so a shell started before step 5 has run, or after an uninstall, prints nothing.
+#
+# Nothing about the rc file may stop the install. Where a change cannot be made safely it
+# is printed for the user to make, and the hook, the monitor and the janitors still deploy.
+_cc_rc_line() {
+  printf '[ -r "$HOME/.cc-reaper/%s" ] && source "$HOME/.cc-reaper/%s"' "$1" "$1"
+}
+
+# Why the rc file must not be changed at all, or nothing. A symlink or a second hard link
+# belongs to a dotfiles checkout: a rename would silently detach it, and an append would
+# write into the checkout. A directory that cannot hold the backup or the temporary file
+# fails those steps instead, and they print the change.
+_cc_rc_hands_off() {
+  local links=""
+  if [ -L "$SHELL_RC" ]; then
+    echo "is a symlink"
+  elif [ -e "$SHELL_RC" ] && [ ! -r "$SHELL_RC" ]; then
+    echo "cannot be read"
+  elif [ -e "$SHELL_RC" ] && [ ! -w "$SHELL_RC" ]; then
+    echo "is not writable"
+  elif [ -e "$SHELL_RC" ]; then
+    links="$(stat -f %l "$SHELL_RC" 2>/dev/null)" || links=1
+    case "$links" in ''|*[!0-9]*) links=1 ;; esac
+    [ "$links" -gt 1 ] && echo "has more than one hard link"
+  fi
+  return 0
+}
+
+# One backup per run, taken before the first change of any kind, so it is always the file
+# as it was before this install touched it.
+_CC_RC_BACKUP=""
+_cc_rc_backup() {
+  [ -n "$_CC_RC_BACKUP" ] && return 0
+  # No file yet: nothing to keep, and a backup later in the run would hold only what the run
+  # itself added.
+  [ -e "$SHELL_RC" ] || { _CC_RC_BACKUP=none; return 0; }
+  local b
+  b="$SHELL_RC.cc-reaper-backup-$(date +%Y%m%d%H%M%S)"
+  # Never over the backup an earlier run took in the same second.
+  [ -e "$b" ] && b="$b-$$"
+  cp -p "$SHELL_RC" "$b" 2>/dev/null || return 1
+  _CC_RC_BACKUP="$b"
+  echo "  Backed up $SHELL_RC to $b"
+}
+
+_cc_rc_install() {
+  local script=$1 want reason stale="" others="" disabled="" has_want=0 tmp
+  want="$(_cc_rc_line "$script")"
+  reason="$(_cc_rc_hands_off)"
+  if [ "$reason" = "cannot be read" ]; then
+    echo "  $script: $SHELL_RC cannot be read; left unchanged. Make sure it contains:"
+    printf '    %s\n' "$want"
+    return 0
+  fi
+  if [ -e "$SHELL_RC" ]; then
+    grep -qxF -- "$want" "$SHELL_RC" && has_want=1
+    # Whole lines in the one shape earlier installers wrote: source "<checkout>/shell/<script>".
+    stale="$(awk -v suffix="/shell/$script\"" '
+      index($0, "source \"") == 1 &&
+      substr($0, length($0) - length(suffix) + 1) == suffix &&
+      gsub(/"/, "\"") == 2 { print }' "$SHELL_RC" 2>/dev/null)" || stale=""
+    # Live lines in any other shape that name the script. One may source it deliberately, or
+    # only mention it, as an alias does; the installer cannot tell which.
+    others="$(grep -v '^[[:space:]]*#' "$SHELL_RC" 2>/dev/null | grep -F -- "$script" | grep -vxF -- "$want" |
+      awk -v suffix="/shell/$script\"" '
+        !(index($0, "source \"") == 1 &&
+          substr($0, length($0) - length(suffix) + 1) == suffix &&
+          gsub(/"/, "\"") == 2)')" || others=""
+    # The current line commented out: somebody turned it off.
+    disabled="$(awk -v want="$want" '{ l = $0; if (sub(/^[ \t]*#+[ \t]*/, "", l) && l == want) print }' "$SHELL_RC" 2>/dev/null)" || disabled=""
+  fi
+  if [ "$has_want" = 1 ] && [ -z "$stale" ]; then
+    echo "  $script: already sourced from ~/.cc-reaper"
+    return 0
+  fi
+  # The file is changed only where the result is certain: one stale line, with nothing else
+  # naming the script, is replaced in place. Anything more is left to a person, with the change
+  # printed. No line is ever removed: that can leave an `if` empty or join an `&&` to the next
+  # command, and beside an alias that only names the script it leaves nothing sourcing it.
+  if [ -n "$others" ]; then
+    echo "  $script: a line the installer did not write names it; left unchanged:"
+    printf '%s\n' "$others" | sed 's/^/    /'
+    echo "  Make any change by hand:"
+    [ -z "$stale" ] || printf '%s\n' "$stale" | sed 's/^/    remove: /'
+    printf '    add, unless a line above sources it: %s\n' "$want"
+    return 0
+  fi
+  if [ -n "$stale" ] && { [ "$has_want" = 1 ] || [ -n "$disabled" ] ||
+       [ "$(printf '%s\n' "$stale" | wc -l | tr -d ' ')" -gt 1 ]; }; then
+    echo "  $script: $SHELL_RC has more than one line for it; left unchanged. Make the change by hand:"
+    printf '%s\n' "$stale" | sed 's/^/    remove: /'
+    [ "$has_want" = 1 ] || [ -n "$disabled" ] || printf '    add:    %s\n' "$want"
+    return 0
+  fi
+  if [ -n "$disabled" ]; then
+    echo "  $script: its line in $SHELL_RC is commented out; left off"
+    return 0
+  fi
+  if [ -n "$reason" ] || ! _cc_rc_backup; then
+    echo "  $script: $SHELL_RC ${reason:-could not be backed up}; left unchanged. Make this change by hand:"
+    [ -z "$stale" ] || printf '%s\n' "$stale" | sed 's/^/    remove: /'
+    printf '    add:    %s\n' "$want"
+    return 0
+  fi
+  if [ -z "$stale" ]; then
+    if {
+      # On a line of its own, even after a final line with no newline.
+      if [ -s "$SHELL_RC" ] && [ "$(tail -c 1 "$SHELL_RC" | wc -l | tr -d ' ')" = 0 ]; then printf '\n'; fi
+      grep -qF '# Claude Code cleanup functions' "$SHELL_RC" 2>/dev/null || printf '\n# Claude Code cleanup functions\n'
+      printf '%s\n' "$want"
+    } >> "$SHELL_RC"; then
+      echo "  $script: added to $SHELL_RC"
+    else
+      echo "  $script: could not append to $SHELL_RC; add this line by hand:"
+      printf '    %s\n' "$want"
+    fi
+    return 0
+  fi
+  # Rewritten on a copy that keeps the file's mode, ACL and extended attributes, and renamed into
+  # place, the stale line becoming the current one.
+  tmp="$(mktemp "$SHELL_RC.cc-reaper.XXXXXX" 2>/dev/null)" || tmp=""
+  if [ -n "$tmp" ] && cp -p "$SHELL_RC" "$tmp" 2>/dev/null &&
+     awk -v want="$want" -v suffix="/shell/$script\"" '
+       index($0, "source \"") == 1 &&
+       substr($0, length($0) - length(suffix) + 1) == suffix &&
+       gsub(/"/, "\"") == 2 { print want; next }
+       { print }' "$SHELL_RC" > "$tmp" &&
+     mv -f "$tmp" "$SHELL_RC"; then
+    echo "  $script: replaced a line sourcing a checkout copy; now sourced from ~/.cc-reaper. Was:"
+    printf '%s\n' "$stale" | sed 's/^/    /'
+  else
+    # The copy carries the rc file's ACL, which can deny deleting it: drop the ACL first.
+    # Under set -e, neither step may stop the install.
+    if [ -n "$tmp" ]; then
+      chmod -N "$tmp" 2>/dev/null || :
+      rm -f "$tmp" 2>/dev/null || echo "  $script: could not remove the temporary copy $tmp"
+    fi
+    echo "  $script: could not rewrite $SHELL_RC; make this change by hand:"
+    printf '%s\n' "$stale" | sed 's/^/    remove: /'
+    printf '    add:    %s\n' "$want"
+  fi
+  return 0
+}
+
+_cc_rc_install claude-cleanup.sh
+_cc_rc_install cc-monitor.sh
 
 # ─── 2. Stop hook ───────────────────────────────────────────────────────────
 
@@ -138,8 +283,7 @@ if [ -L "$_CC_HOOK_DEST" ]; then
   echo "  Left alone: writing through it would modify that file in place. Update it"
   echo "  there, or remove the symlink and re-run this installer."
 else
-  cp "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$_CC_HOOK_DEST"
-  chmod +x "$_CC_HOOK_DEST"
+  _cc_deploy "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$_CC_HOOK_DEST"
 fi
 
 # Update global settings.json
@@ -274,8 +418,7 @@ else
   mkdir -p "$REAPER_DIR/logs"
 
   # Copy monitor script
-  cp "$SCRIPT_DIR/launchd/cc-reaper-monitor.sh" "$REAPER_DIR/"
-  chmod +x "$REAPER_DIR/cc-reaper-monitor.sh"
+  _cc_deploy "$SCRIPT_DIR/launchd/cc-reaper-monitor.sh" "$REAPER_DIR/cc-reaper-monitor.sh"
 
   # Install plist with actual home path
   PLIST_DIR="$HOME_DIR/Library/LaunchAgents"
@@ -309,8 +452,7 @@ mkdir -p "$PLIST_DIR"
 # claude-cleanup.sh (a launchd agent has no TCC access to a ~/Documents checkout),
 # with guard-runner.sh next to it.
 for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cleanup guard-runner; do
-  cp "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/"
-  chmod +x "$REAPER_DIR/$SCRIPT.sh"
+  _cc_deploy "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
 done
 
 for AGENT in resource-watch disk-check weekly-clean guard; do
@@ -329,7 +471,8 @@ echo "                    not scheduled: a LaunchAgent has no TCC access to ~/Do
 echo "                    or as a SessionEnd hook: \"\$HOME\"/.cc-reaper/worktree-janitor.sh --session"
 echo "                    (reports only unless CC_WJ_SESSION_APPLY=1 and the hook input names a cwd;"
 echo "                     see docs/worktree-reclamation.md)"
-echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs whitelisted MCP pinned >80% CPU for >60 min)"
+echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs one known shared MCP server that has stayed"
+echo "                  >=80% CPU across its runs for 60+ min and is still hot; never a session, app or process group)"
 
 # ─── 5b. TCC probe ────────────────────────────────────────────────────────────
 #

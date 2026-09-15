@@ -591,33 +591,29 @@ _cc_dj_clean_dir() {
   _cc_dj_log "clean: removed '${label}' size=${bytes} bytes freed=${freed}"
 }
 
-# Dangling images: built layers no tag points at any more. `-f dangling=true` is a
-# filter, not a prune verb - it enumerates, and each id is passed to `rmi` explicitly, so
-# a tagged image cannot be reached however the inventory changes between calls.
-_cc_dj_docker_rmi_dangling() {
-  # The inventory's own status is checked before its output is believed. If the daemon
-  # goes away after the `docker info` probe, `docker images` fails and prints nothing, and
-  # reading that as "no dangling images" reports a target as done when nothing was
-  # examined - the same fault as the swallowed `rmi` status, one command earlier.
-  local ids ls_rc=0
+# Dangling images: built layers no tag points at any more. Reported, never removed.
+#
+# On a host shared with CI runner slots and other sessions' local stacks, an untagged
+# image is still somebody's build, and removing another user's resources is what a
+# shared host's operator forbids. Its last removal-era run freed 0 B. The count and the
+# command that lists them are enough for whoever owns them.
+#
+# The inventory's own status is checked before its output is believed: a daemon that
+# went away after the `docker info` probe makes `docker images` fail and print nothing,
+# and reading that as "no dangling images" reports a target as done when nothing was
+# examined.
+_cc_dj_docker_report_dangling() {
+  local ids ls_rc=0 count
   ids="$(docker images -f dangling=true -q 2>/dev/null)" || ls_rc=$?
   if [ "$ls_rc" -ne 0 ]; then
     echo "docker images failed (rc=$ls_rc); nothing examined"
     return "$ls_rc"
   fi
-  ids="$(printf '%s\n' "$ids" | sort -u)"
-  [ -n "$ids" ] || { echo "no dangling images"; return 0; }
-  # The pipeline's status must be docker's, not tail's: an image that became referenced
-  # between the inventory and the removal makes `rmi` fail, and swallowing that reported a
-  # failed cleanup as `done`, which is the exact fault this change exists to remove.
-  # Output is captured before it is trimmed. Piping the command group into `tail` would put
-  # the group in a subshell, where the status assignment is lost - the fix has to survive
-  # the shape of the pipeline, not just be written down.
-  local out rc=0
-  # shellcheck disable=SC2086
-  out="$(docker rmi $ids 2>&1)" || rc=$?
-  printf '%s\n' "$out" | tail -40
-  return "$rc"
+  count="$(printf '%s\n' "$ids" | grep . | sort -u | grep -c .)"
+  [ "$count" -gt 0 ] || { echo "no dangling images"; return 0; }
+  echo "$count dangling images; not removed"
+  echo "  review with: docker images -f dangling=true"
+  return 0
 }
 
 # Unreferenced volumes with docker-generated-looking names: 64 lowercase hex characters,
@@ -759,16 +755,17 @@ _cc_dj_clean() {
   # `prune -af` and had never fired only because launchd's PATH hid the docker binary;
   # repairing that PATH without replacing this would have armed it.
   #
-  # What is removed instead is addressed by id, computed from the current inventory, and
-  # provably unreachable: a dangling image carries no tag. Volumes are reported and never
-  # removed - see `_cc_dj_docker_report_dead_anon_volumes` for why a 64-hex name cannot
-  # establish that docker, rather than an operator, chose it.
+  # Nothing docker holds is removed. Dangling images and unreferenced volumes are
+  # reported: on a shared host an untagged image is another user's build (see
+  # `_cc_dj_docker_report_dangling`), and a 64-hex volume name cannot establish that
+  # docker, rather than an operator, chose it (see
+  # `_cc_dj_docker_report_dead_anon_volumes`).
   if ! command -v docker >/dev/null 2>&1; then
     _cc_dj_skip "docker cleanup (docker not found)"
   elif ! docker info >/dev/null 2>&1; then
     _cc_dj_skip "docker (daemon unreachable)"
   else
-    _cc_dj_clean_target "docker dangling images" _cc_dj_docker_rmi_dangling
+    _cc_dj_clean_target "docker dangling images (report only)" _cc_dj_docker_report_dangling
     # The volume report needs python3, which macOS does not ship without Command Line
     # Tools. Declared here rather than left to fail inside the target: a missing
     # interpreter makes it exit 127, and `_cc_dj_clean_target` counts a failed command as
