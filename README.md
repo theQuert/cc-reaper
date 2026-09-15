@@ -158,7 +158,7 @@ Add to `~/.claude/settings.json` in the `"Stop"` hooks array:
 
 #### Option A: LaunchAgent (zero-dependency, macOS only)
 
-Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1. It does **not** select by CPU: background test runs, builds and experiments started from Claude Code are orphaned and hot by nature, and a CPU pass here killed them (removed 2026-09-15; `CC_RUNAWAY_ORPHAN_MIN_SEC` no longer does anything). A stuck shared MCP is signalled by `claude-guard`'s runaway phase, which the guard LaunchAgent runs every 10 minutes.
+Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1. It does **not** select by CPU: background test runs, builds and experiments started from Claude Code are orphaned and hot by nature, and a CPU pass here killed them (removed 2026-09-15; `CC_RUNAWAY_ORPHAN_MIN_SEC` no longer does anything). A stuck shared MCP server is signalled by `claude-guard`'s runaway phase instead, which the guard LaunchAgent runs every 10 minutes. `install.sh` installs that agent and the manual steps below do not: a manual Option A install has no runaway coverage unless you run `claude-guard` yourself.
 
 > **Install gotcha:** the `sed` below must resolve `$HOME` to a real path. If it expands empty (e.g. under `sudo`), the plist gets a broken `/.cc-reaper/...` `ProgramArguments` and the agent silently fails every run with `last exit code = 78` — verify with `launchctl print gui/$(id -u)/com.cc-reaper.orphan-monitor | grep program`. `install.sh` now fails fast rather than installing a broken path.
 
@@ -357,7 +357,7 @@ cc-monitor --once --apply proc-janitor-scan     # preview-only via daemon
 
 ### Stuck/runaway processes
 
-Long-running MCP servers, dev servers, and security daemons are intentionally `protected` — `claude-cleanup` will never kill them. But "protected" is not absolute: a process pinned at high CPU for hours is broken, regardless of category.
+Long-running MCP servers, dev servers, and security daemons are intentionally `protected` — `claude-cleanup` will never kill them. But "protected" is not absolute: a process pinned at high CPU for hours is broken, and `cc-monitor` says so whatever its category. Only a shared MCP server is signalled for it automatically.
 
 Runaway is a claim about behaviour, so since 2026-08-30 **any** non-immutable process can be identified as one — not only those already on the protection list, which was backwards: the processes that run away are the ones nobody listed. Protection still decides what may be *done* about it.
 
@@ -366,11 +366,11 @@ Runaway is a claim about behaviour, so since 2026-08-30 **any** non-immutable pr
 | | threshold | acts on |
 |---|---|---|
 | `cc-monitor` (reports, never kills) | CPU ≥ `CC_RUNAWAY_CPU` (`80`) for ≥ `CC_RUNAWAY_MIN` minutes (**`30`**) | any non-immutable process |
-| `claude-guard` (SIGTERMs) | CPU ≥ `CC_RUNAWAY_CPU` (`80`) for ≥ `CC_RUNAWAY_MIN` minutes (**`60`**) | whitelisted protected MCP servers only |
+| `claude-guard` (SIGTERMs) | CPU ≥ `CC_RUNAWAY_CPU` (`80`) for ≥ `CC_RUNAWAY_MIN` minutes (**`60`**), and still ≥ `CC_RUNAWAY_CPU` on a re-check | whitelisted protected MCP servers only, never an application, dev server or process manager |
 
 Reporting earlier than the reaper acts is the point: the report costs a line an operator ignores, while the old shared floor meant a stuck loop held a core for a full hour before it could be named. `claude-guard`'s selection is a separate implementation with its own whitelist and its own default; nothing about which processes can be signalled changed.
 
-`cc-monitor` reclassifies the finding to family `runaway` / `ASK_BEFORE_KILL` and prints a dedicated section with a copy-pasteable kill line. The suggested action differs by protection status, because `claude-guard` filters through its whitelist and suggesting it for an unlisted process would name a remedy that does nothing:
+`cc-monitor` reclassifies the finding to family `runaway` / `ASK_BEFORE_KILL` and prints a dedicated section with a copy-pasteable kill line. The suggested action differs by protection status, because `claude-guard` filters through its whitelist and never signals an application, dev server or process manager; suggesting it for any of those would name a remedy that does nothing:
 
 ```text
 Stuck/runaway processes:
@@ -380,14 +380,14 @@ Stuck/runaway processes:
 
 A process carrying an Always Protect user rule is still labelled a runaway; its suggested action stays the Always Protect wording.
 
-`claude-guard` adds a Phase 0.5 that reaps these PIDs in PGID-aware mode after `CC_RUNAWAY_GRACE_SEC` (default 5) seconds, so you can `Ctrl+C` if the report surprises you:
+`claude-guard` adds a Phase 0.5 that reaps these PIDs after `CC_RUNAWAY_GRACE_SEC` (default 5) seconds, so you can `Ctrl+C` if the report surprises you. It signals each PID alone, never its process group: an MCP server started by a Claude CLI is in that CLI's group, and signalling the group ended the session. It first waits three more seconds and reads each PID again, skipping any that now runs a different command or has dropped below `CC_RUNAWAY_CPU`. It never selects an application (anything inside an `.app` bundle), a dev server or a process manager, though those are protected: the guard runs unattended, and on one host it had signalled ChatGPT.app and cmux.app, the terminal the sessions ran in.
 
 ```text
 === Claude Guard ===
   Config: max_sessions=3, idle_threshold=1%, max_rss=4096 MB, max_fd=10000, runaway=80%/60min
 
   --- Runaway protected processes (CPU >= 80% for >= 60 min) ---
-  PID 9594    CPU 102.7%  ETIME 09:07:51   node /Users/.../mcp-server-cloudflare run abc
+  PID 9594    CPU 102.7%  ETIME 09:07:51   uvx chroma-mcp --client-type persistent
   Sending SIGTERM in 5 seconds (Ctrl+C to abort)...
   Reaped 1 runaway protected process(es), freed ~340 MB
 ```

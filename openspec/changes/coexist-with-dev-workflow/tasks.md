@@ -22,12 +22,13 @@
 
 ## 5. Review round 1
 
-- [ ] 5.1 Red-verify the guard: a hot MCP server inside a live session's group gets the CLI, subagent and sibling signalled; an application and a dev server are selected; a cooled re-sample still signals
-- [ ] 5.2 Runaway phase: eligibility excludes `.app` bundles, dev servers and process managers; re-check command, eligibility and CPU after at least three seconds; signal the selected PID only; count deliveries
-- [ ] 5.3 Red-verify the installer: a read-only or unreadable rc stops the install; a hard link is broken; a backup taken after an append is not the pre-run file; a commented stale line blocks the current line; stale and current lines together leave the stale one
-- [ ] 5.4 Installer: backup before any change; manual path for symlink, hard link, unreadable, unwritable; print replaced lines; converge both states; never fail the install over rc configuration; deploy every script by rename
-- [ ] 5.5 Tests: docker removal asserted on the full `--clean` run with dangling ids present; installer exit status and banner checked; zsh stderr empty; sandboxes removed; monitor fixture PIDs above PID_MAX and unknown `ps` calls fail the suite
-- [ ] 5.6 Docs: CHANGELOG sections, README Option A runaway coverage, CLAUDE.md runaway row and specifics, installer guard echo
+- [x] 5.1 Red-verify the guard: a hot MCP server inside a live session's group gets the CLI, subagent and sibling signalled; an application and a dev server are selected; a cooled re-sample still signals
+- [x] 5.2 Runaway phase: eligibility excludes `.app` bundles, dev servers and process managers; re-check command, eligibility and CPU after at least three seconds; signal the selected PID only; count deliveries
+- [x] 5.3 Red-verify the installer: a read-only or unreadable rc stops the install; a hard link is broken; a backup taken after an append is not the pre-run file; a commented stale line blocks the current line; stale and current lines together leave the stale one
+- [x] 5.4 Installer: backup before any change; manual path for symlink, hard link, unreadable, unwritable; print replaced lines; converge both states; never fail the install over rc configuration; deploy every script by rename
+- [x] 5.5 Tests: docker removal asserted on the full `--clean` run with dangling ids present; installer exit status and banner checked; zsh stderr empty; sandboxes removed; monitor fixture PIDs above PID_MAX and unknown `ps` calls fail the suite
+- [x] 5.6 Docs: CHANGELOG sections, README Option A runaway coverage, CLAUDE.md runaway row and specifics, installer guard echo
+- [x] 5.7 cc-monitor: the runaway suggested action names claude-guard only for what it can reap
 
 ## 6. Delivery
 
