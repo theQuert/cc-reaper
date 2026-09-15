@@ -135,67 +135,139 @@ else
   SHELL_RC="$HOME_DIR/.zshrc"
 fi
 
+# Replace a deployed file by rename. bash reads a script as it runs, so overwriting one in
+# place hands a monitor, janitor or hook run already in progress a mix of old and new bytes;
+# a rename leaves that run on the file it opened. Interactive shells source these copies too.
+_cc_deploy() {
+  local src=$1 dst=$2 tmp
+  tmp="$(mktemp "$(dirname "$dst")/.$(basename "$dst").XXXXXX")" || return 1
+  if cp "$src" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dst"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 # The shell sources the deployed copies under ~/.cc-reaper - the ones step 5 installs and
 # the LaunchAgents already run - never this checkout. Under a worktree-per-session workflow
 # this checkout is a task worktree, and reclaiming it left every new shell printing two
 # "no such file or directory" errors with the commands gone (measured 2026-09-15). Guarded,
 # so a shell started before step 5 has run, or after an uninstall, prints nothing.
+#
+# Nothing about the rc file may stop the install. Where a change cannot be made safely it
+# is printed for the user to make, and the hook, the monitor and the janitors still deploy.
 _cc_rc_line() {
   printf '[ -r "$HOME/.cc-reaper/%s" ] && source "$HOME/.cc-reaper/%s"' "$1" "$1"
 }
 
-# Whole lines in the shape earlier installers wrote: source "<checkout>/shell/<script>".
-# Only that shape is repaired; anything else may be deliberate.
-_cc_rc_stale_lines() {
-  [ -f "$SHELL_RC" ] || return 0
-  awk -v suffix="/shell/$1\"" '
-    index($0, "source \"") == 1 &&
-    substr($0, length($0) - length(suffix) + 1) == suffix &&
-    gsub(/"/, "\"") == 2 { print }' "$SHELL_RC" 2>/dev/null
+# Why the rc file must not be changed at all, or nothing. A symlink or a second hard link
+# belongs to a dotfiles checkout: a rename would silently detach it, and an append would
+# write into the checkout. A directory that cannot hold the backup or the temporary file
+# fails those steps instead, and they print the change.
+_cc_rc_hands_off() {
+  local links=""
+  if [ -L "$SHELL_RC" ]; then
+    echo "is a symlink"
+  elif [ -e "$SHELL_RC" ] && [ ! -r "$SHELL_RC" ]; then
+    echo "cannot be read"
+  elif [ -e "$SHELL_RC" ] && [ ! -w "$SHELL_RC" ]; then
+    echo "is not writable"
+  elif [ -e "$SHELL_RC" ]; then
+    links="$(stat -f %l "$SHELL_RC" 2>/dev/null)" || links=1
+    case "$links" in ''|*[!0-9]*) links=1 ;; esac
+    [ "$links" -gt 1 ] && echo "has more than one hard link"
+  fi
+  return 0
 }
 
+# One backup per run, taken before the first change of any kind, so it is always the file
+# as it was before this install touched it.
 _CC_RC_BACKUP=""
+_cc_rc_backup() {
+  [ -n "$_CC_RC_BACKUP" ] && return 0
+  [ -e "$SHELL_RC" ] || return 0
+  local b
+  b="$SHELL_RC.cc-reaper-backup-$(date +%Y%m%d%H%M%S)"
+  # Never over the backup an earlier run took in the same second.
+  [ -e "$b" ] && b="$b-$$"
+  cp -p "$SHELL_RC" "$b" 2>/dev/null || return 1
+  _CC_RC_BACKUP="$b"
+  echo "  Backed up $SHELL_RC to $b"
+}
+
 _cc_rc_install() {
-  local script=$1 want stale tmp
+  local script=$1 want reason stale="" has_want=0 tmp mode=""
   want="$(_cc_rc_line "$script")"
-  if grep -qxF -- "$want" "$SHELL_RC" 2>/dev/null; then
+  reason="$(_cc_rc_hands_off)"
+  if [ "$reason" = "cannot be read" ]; then
+    echo "  $script: $SHELL_RC cannot be read; left unchanged. Make sure it contains:"
+    printf '    %s\n' "$want"
+    return 0
+  fi
+  if [ -e "$SHELL_RC" ]; then
+    grep -qxF -- "$want" "$SHELL_RC" && has_want=1
+    # Whole lines in the one shape earlier installers wrote: source "<checkout>/shell/<script>".
+    stale="$(awk -v suffix="/shell/$script\"" '
+      index($0, "source \"") == 1 &&
+      substr($0, length($0) - length(suffix) + 1) == suffix &&
+      gsub(/"/, "\"") == 2 { print }' "$SHELL_RC" 2>/dev/null)" || stale=""
+  fi
+  if [ "$has_want" = 1 ] && [ -z "$stale" ]; then
     echo "  $script: already sourced from ~/.cc-reaper"
     return 0
   fi
-  stale="$(_cc_rc_stale_lines "$script")"
-  if [ -n "$stale" ]; then
-    # A symlinked rc file belongs to a dotfiles checkout; replacing it by rename would
-    # turn the link into a copy. Say what to change instead.
-    if [ -L "$SHELL_RC" ]; then
-      echo "  $script: $SHELL_RC is a symlink; left unchanged. Replace this line:"
-      printf '    %s\n  with:\n    %s\n' "$stale" "$want"
-      return 0
-    fi
-    if [ -z "$_CC_RC_BACKUP" ]; then
-      _CC_RC_BACKUP="$SHELL_RC.cc-reaper-backup-$(date +%Y%m%d%H%M%S)"
-      cp -p "$SHELL_RC" "$_CC_RC_BACKUP" || return 1
-      echo "  Backed up $SHELL_RC to $_CC_RC_BACKUP"
-    fi
-    tmp="$(mktemp "$SHELL_RC.cc-reaper.XXXXXX")" || return 1
-    cp -p "$SHELL_RC" "$tmp" &&
-      awk -v want="$want" -v suffix="/shell/$script\"" '
-        index($0, "source \"") == 1 &&
-        substr($0, length($0) - length(suffix) + 1) == suffix &&
-        gsub(/"/, "\"") == 2 { print want; next } { print }' "$SHELL_RC" > "$tmp" &&
-      mv -f "$tmp" "$SHELL_RC" || { rm -f "$tmp"; return 1; }
-    echo "  $script: repaired a line sourcing a checkout copy; now sourced from ~/.cc-reaper"
+  # A live line in another shape may be deliberate. A commented-out one sources nothing.
+  if [ "$has_want" = 0 ] && [ -z "$stale" ] && [ -e "$SHELL_RC" ] &&
+     grep -v '^[[:space:]]*#' "$SHELL_RC" | grep -qF -- "$script"; then
+    echo "  $script: a line the installer did not write already sources it; left unchanged:"
+    grep -v '^[[:space:]]*#' "$SHELL_RC" | grep -F -- "$script" | sed 's/^/    /'
     return 0
   fi
-  if grep -q -- "$script" "$SHELL_RC" 2>/dev/null; then
-    echo "  $script: a line the installer did not write already mentions it; left unchanged:"
-    grep -- "$script" "$SHELL_RC" | sed 's/^/    /'
+  if [ -n "$reason" ] || ! _cc_rc_backup; then
+    echo "  $script: $SHELL_RC ${reason:-could not be backed up}; left unchanged. Make this change by hand:"
+    [ -n "$stale" ] && printf '%s\n' "$stale" | sed 's/^/    remove: /'
+    [ "$has_want" = 1 ] || printf '    add:    %s\n' "$want"
     return 0
   fi
-  if ! grep -q "claude-cleanup.sh\|cc-monitor.sh" "$SHELL_RC" 2>/dev/null; then
-    printf '\n# Claude Code cleanup functions\n' >> "$SHELL_RC"
+  if [ -z "$stale" ]; then
+    if {
+      # On a line of its own, even after a final line with no newline.
+      if [ -s "$SHELL_RC" ] && [ "$(tail -c 1 "$SHELL_RC" | wc -l | tr -d ' ')" = 0 ]; then printf '\n'; fi
+      grep -qF '# Claude Code cleanup functions' "$SHELL_RC" 2>/dev/null || printf '\n# Claude Code cleanup functions\n'
+      printf '%s\n' "$want"
+    } >> "$SHELL_RC"; then
+      echo "  $script: added to $SHELL_RC"
+    else
+      echo "  $script: could not append to $SHELL_RC; add this line by hand:"
+      printf '    %s\n' "$want"
+    fi
+    return 0
   fi
-  printf '%s\n' "$want" >> "$SHELL_RC"
-  echo "  $script: added to $SHELL_RC"
+  # Rewritten beside the original, with its mode, and renamed into place. When the current
+  # line is already present the stale lines are only removed.
+  mode="$(stat -f %Lp "$SHELL_RC" 2>/dev/null)" || mode=""
+  tmp="$(mktemp "$SHELL_RC.cc-reaper.XXXXXX" 2>/dev/null)" || tmp=""
+  if [ -n "$tmp" ] &&
+     awk -v want="$want" -v keep="$has_want" -v suffix="/shell/$script\"" '
+       index($0, "source \"") == 1 &&
+       substr($0, length($0) - length(suffix) + 1) == suffix &&
+       gsub(/"/, "\"") == 2 { if (keep == 0) { print want; keep = 1 }; next }
+       { print }' "$SHELL_RC" > "$tmp" &&
+     { [ -z "$mode" ] || chmod "$mode" "$tmp"; } &&
+     mv -f "$tmp" "$SHELL_RC"; then
+    if [ "$has_want" = 1 ]; then
+      echo "  $script: removed a line sourcing a checkout copy, beside the current line:"
+    else
+      echo "  $script: replaced a line sourcing a checkout copy; now sourced from ~/.cc-reaper. Was:"
+    fi
+    printf '%s\n' "$stale" | sed 's/^/    /'
+  else
+    [ -n "$tmp" ] && rm -f "$tmp"
+    echo "  $script: could not rewrite $SHELL_RC; make this change by hand:"
+    printf '%s\n' "$stale" | sed 's/^/    remove: /'
+    [ "$has_want" = 1 ] || printf '    add:    %s\n' "$want"
+  fi
+  return 0
 }
 
 _cc_rc_install claude-cleanup.sh
@@ -320,8 +392,7 @@ else
   mkdir -p "$REAPER_DIR/logs"
 
   # Copy monitor script
-  cp "$SCRIPT_DIR/launchd/cc-reaper-monitor.sh" "$REAPER_DIR/"
-  chmod +x "$REAPER_DIR/cc-reaper-monitor.sh"
+  _cc_deploy "$SCRIPT_DIR/launchd/cc-reaper-monitor.sh" "$REAPER_DIR/cc-reaper-monitor.sh"
 
   # Install plist with actual home path
   PLIST_DIR="$HOME_DIR/Library/LaunchAgents"
@@ -355,8 +426,7 @@ mkdir -p "$PLIST_DIR"
 # claude-cleanup.sh (a launchd agent has no TCC access to a ~/Documents checkout),
 # with guard-runner.sh next to it.
 for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cleanup guard-runner; do
-  cp "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/"
-  chmod +x "$REAPER_DIR/$SCRIPT.sh"
+  _cc_deploy "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
 done
 cp "$SCRIPT_DIR/shell/chrome-clone-janitor.py" "$REAPER_DIR/"
 chmod +x "$REAPER_DIR/chrome-clone-janitor.py"
