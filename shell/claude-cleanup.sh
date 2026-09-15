@@ -790,16 +790,12 @@ claude-sessions() {
 # processes actually signalled, so callers report deliveries rather than
 # intentions — the tree's pre-kill RSS would also count members left running.
 #
-# `force_target` makes the named PID itself bypass the `shared` exemption — the
-# runaway phase uses it to terminate a shared service that is stuck hot, which
-# is the one case where reclaiming it is the point. It never bypasses the
-# immutable class or a user `protect` rule, and never applies to the target's
-# group siblings.
+# Not for the runaway phase: a shared MCP server started by a Claude CLI is in that
+# CLI's process group, and signalling the group ended the session.
 #
-# Usage: _claude_pgid_kill <pid> [force_target]
+# Usage: _claude_pgid_kill <pid>
 _claude_pgid_kill() {
   local target_pid=$1
-  local force_target=${2:-0}
   local signalled=0
   local freed_kb=0
   local target_cmd=""
@@ -816,10 +812,7 @@ _claude_pgid_kill() {
       local class=""
       class=$(_cc_reaper_protection_class "$pid_cmd")
       [ "$class" = immutable ] && continue
-      if [ "$class" = shared ]; then
-        # Only the explicitly selected target crosses this exemption.
-        { [ "$force_target" = 1 ] && [ "$pid" = "$target_pid" ]; } || continue
-      fi
+      [ "$class" = shared ] && continue
       local pid_rss=""
       pid_rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
       if _cc_reaper_kill_pid "$pid"; then
@@ -863,13 +856,25 @@ _cc_guard_etime_to_seconds() {
   '
 }
 
-# Print TSV (pid, cpu, etime, command) for protected processes that have
-# sustained CPU% >= cpu_threshold over etime >= min_minutes.
+# Whether a command line is something the runaway phase may select: a shared service,
+# not covered by a user `protect` rule, and not an application, a development server
+# or a process manager. Those classify shared, but each is something a person is using
+# and this phase runs unattended - on the audited host it had signalled ChatGPT.app and
+# cmux.app, the terminal the sessions ran in. cc-monitor still reports them.
+_cc_guard_runaway_eligible() {
+  local cmd=$1
+  [ "$(_cc_reaper_protection_class "$cmd")" = shared ] || return 1
+  _cc_reaper_has_user_rule protect "$cmd" && return 1
+  echo "$cmd" | grep -qE '\.app/|node.*(dev-server|http-server|next.*server)|pm2' && return 1
+  return 0
+}
+
+# Print TSV (pid, cpu, etime, command) for runaway-eligible processes at or above
+# cpu_threshold whose etime is at least min_minutes. One sample and an age: the signal
+# stage re-checks before acting on it.
 _cc_guard_runaway_protected_pids() {
   local cpu_threshold=$1
   local min_minutes=$2
-  local protected_pattern=""
-  protected_pattern=$(_cc_reaper_protected_pattern)
   local min_seconds=$((min_minutes * 60))
   ps -axo pid=,etime=,%cpu=,command= 2>/dev/null | while read -r pid etime cpu rest; do
     [ -z "$pid" ] && continue
@@ -877,8 +882,7 @@ _cc_guard_runaway_protected_pids() {
     # scanners, cc-reaper itself, ordinary Chrome — are never signalled, however
     # hot they get: SIGTERM-ing security software or a Spotlight reindex costs
     # more than the CPU it would reclaim.
-    [ "$(_cc_reaper_protection_class "$rest")" = shared ] || continue
-    _cc_reaper_has_user_rule protect "$rest" && continue
+    _cc_guard_runaway_eligible "$rest" || continue
     awk -v a="$cpu" -v b="$cpu_threshold" 'BEGIN { exit !(a+0 >= b+0) }' || continue
     local secs=""
     secs=$(_cc_guard_etime_to_seconds "$etime")
@@ -928,26 +932,43 @@ claude-guard() {
         { printf "  PID %-7s  CPU %6s%%  ETIME %-14s  %s\n", $1, $2, $3, substr($4, 1, 80) }
       '
       if $dry_run; then
-        echo "  [DRY-RUN] Would SIGTERM the above PIDs (PGID-aware)."
+        echo "  [DRY-RUN] Would SIGTERM each PID above alone, if still hot on a re-check."
       else
         echo "  Sending SIGTERM in ${runaway_grace} seconds (Ctrl+C to abort)..."
         sleep "$runaway_grace"
-        local rkilled=0 rfreed=0
+        # One sample and a process's age are not "hot for an hour". Each PID is read again
+        # after a pause, and signalled only if it still runs the command it was selected
+        # for, is still eligible, and is still over the threshold.
+        sleep 3
+        local rkilled=0 rfreed_kb=0 rnow_cmd="" rnow_cpu="" rrss=""
         while IFS=$'\t' read -r rpid rcpu retime rrest; do
           [ -z "$rpid" ] && continue
-          # force_target: a runaway shared service is exactly what this phase
-          # exists to reclaim, so the selected PID crosses the shared exemption.
-          local rsent=0 rmb=0
-          read -r rsent rmb <<< "$(_claude_pgid_kill "$rpid" 1 2>/dev/null)"
-          if [ "${rsent:-0}" -gt 0 ]; then
+          rnow_cmd=$(ps -o command= -p "$rpid" 2>/dev/null)
+          if [ "$(printf '%s' "$rnow_cmd" | awk '{ $1 = $1 } 1')" != "$(printf '%s' "$rrest" | awk '{ $1 = $1 } 1')" ]; then
+            echo "  PID $rpid no longer runs the selected command; not signalled."
+            continue
+          fi
+          if ! _cc_guard_runaway_eligible "$rnow_cmd"; then
+            echo "  PID $rpid is no longer eligible - a protect rule covers it now; not signalled."
+            continue
+          fi
+          rnow_cpu=$(ps -o %cpu= -p "$rpid" 2>/dev/null | tr -d ' ')
+          if ! awk -v a="$rnow_cpu" -v b="$runaway_cpu" 'BEGIN { exit !(a != "" && a + 0 >= b + 0) }'; then
+            echo "  PID $rpid is at ${rnow_cpu:-?}% on the re-check; not signalled."
+            continue
+          fi
+          rrss=$(ps -o rss= -p "$rpid" 2>/dev/null | tr -d ' ')
+          # This PID alone. A shared MCP server started by a Claude CLI is in that CLI's
+          # process group, and signalling the group ended the session.
+          if _cc_reaper_kill_pid "$rpid"; then
             rkilled=$((rkilled + 1))
-            rfreed=$((rfreed + ${rmb:-0}))
-            _cc_reaper_notify "Claude Guard" "Runaway protected process" "Reaped runaway PID $rpid (CPU ${rcpu}%, etime ${retime})"
+            rfreed_kb=$((rfreed_kb + ${rrss:-0}))
+            _cc_reaper_notify "Claude Guard" "Runaway protected process" "Reaped runaway PID $rpid (CPU ${rnow_cpu}%, etime ${retime})"
           else
-            echo "  PID $rpid was spared at the signal stage; not counted."
+            echo "  PID $rpid could not be signalled; not counted."
           fi
         done <<< "$runaway_lines"
-        echo "  Reaped $rkilled runaway protected process(es), freed ~${rfreed} MB"
+        echo "  Reaped $rkilled runaway protected process(es), freed ~$((rfreed_kb / 1024)) MB"
       fi
       echo ""
     fi

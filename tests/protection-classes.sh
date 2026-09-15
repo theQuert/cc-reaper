@@ -93,9 +93,22 @@ out=$(runaway_with "903 03:00:00 99.0 npx chrome-devtools-mcp@latest --autoConne
 ")
 printf '%s' "$out" | grep -q '^903' && pass "runaway selects a shared MCP" || fail "runaway missed a shared MCP"
 
-out=$(runaway_with "904 03:00:00 99.0 /Applications/ChatGPT.app/Contents/Resources/codex
+# Applications, dev servers and process managers classify shared, but the phase runs
+# unattended and each is something a person is using. On the audited host it had
+# signalled ChatGPT.app and cmux.app, the terminal the sessions ran in.
+for row in "904 03:00:00 99.0 /Applications/ChatGPT.app/Contents/Resources/codex -c x" \
+           "907 15-13:40:59 80.8 /Applications/cmux.app/Contents/MacOS/cmux" \
+           "908 03:00:00 99.0 node /repo/node_modules/.bin/next dev-server --port 3000" \
+           "909 03:00:00 99.0 pm2 God Daemon"; do
+  out=$(runaway_with "$row
 ")
-printf '%s' "$out" | grep -q '^904' && pass "runaway selects a shared application" || fail "runaway missed a shared application"
+  [ -z "$out" ] && pass "runaway never selects: ${row#* * * }" || fail "runaway selected: ${row#* * * }"
+done
+
+out=$(runaway_with "910 03:00:00 99.0 npx -y @supabase/mcp-server-supabase@0.5.10 --read-only
+")
+printf '%s' "$out" | grep -q '^910' && pass "runaway selects a shared MCP launched through npx -y" \
+  || fail "runaway missed a shared MCP launched through npx -y"
 
 out=$(runaway_with "905 03:00:00 99.0 node /x/.bin/mcp-server-tauri
 ")
@@ -107,11 +120,12 @@ out=$(runaway_with "906 03:00:00 99.0 npx chrome-devtools-mcp@latest
 [ -z "$out" ] && pass "user protect rule keeps a process out of runaway" || fail "user protect rule ignored by runaway"
 : > "$rules_file"
 
-# ─── Runaway signalling ────────────────────────────────────────────────────
-# Group 500 holds the runaway MCP (500) and an idle sibling MCP (501).
+# ─── Process-group signalling ──────────────────────────────────────────────
+# Group 500 holds two shared MCP servers (500, 501) and an unprotected one (502). The
+# runaway phase never uses this path: see tests/guard-runaway.sh.
 
 kill_with() {
-  local target=$1 force=$2
+  local target=$1
   ( ps() { case "$*" in
         "-o command= -p 500") echo "npx chrome-devtools-mcp@latest --autoConnect" ;;
         "-o command= -p 501") echo "npm exec @upstash/context7-mcp" ;;
@@ -122,42 +136,37 @@ kill_with() {
         "-o rss= -p 502")     echo "  51200" ;;
         "-eo pid,pgid")       printf "500 500\n501 500\n502 500\n" ;;
         *) command ps "$@" ;; esac; }
-    _CC_REAPER_DRY_RUN=1 _claude_pgid_kill "$target" "$force" 2>&1 || true )
+    _CC_REAPER_DRY_RUN=1 _claude_pgid_kill "$target" 2>&1 || true )
 }
 
-out=$(kill_with 500 1)
-if printf '%s' "$out" | grep -q 'Would kill PID 500' \
+out=$(kill_with 500)
+if ! printf '%s' "$out" | grep -q 'Would kill PID 500' \
    && ! printf '%s' "$out" | grep -q 'Would kill PID 501'; then
-  pass "runaway target is signalled, shared sibling is spared"
+  pass "group cleanup spares every shared member, the target included"
 else
-  fail "runaway force-target behaviour wrong: $(printf '%s' "$out" | tr '\n' ' ')"
+  fail "group cleanup signalled a shared member: $(printf '%s' "$out" | tr '\n' ' ')"
 fi
 
 printf '%s' "$out" | grep -q 'Would kill PID 502' \
   && pass "unprotected group member is still signalled" \
   || fail "unprotected group member was spared"
 
-out=$(kill_with 500 0)
-printf '%s' "$out" | grep -q 'Would kill PID 500' \
-  && fail "shared target signalled without force" \
-  || pass "shared target is spared when not forced"
-
 # ─── Delivery counting ─────────────────────────────────────────────────────
 
 count_of() { printf '%s' "$1" | tail -1 | awk '{print $1}'; }
 freed_of() { printf '%s' "$1" | tail -1 | awk '{print $2}'; }
 
-out=$(kill_with 500 1)
-[ "$(count_of "$out")" = 2 ] && pass "count reports two deliveries" || fail "count wrong: $(count_of "$out")"
+out=$(kill_with 500)
+[ "$(count_of "$out")" = 1 ] && pass "count reports the one delivery" || fail "count wrong: $(count_of "$out")"
 
-# 500 (100 MB) and 502 (50 MB) are signalled; the spared sibling 501 (200 MB)
-# must not appear in the freed total.
-[ "$(freed_of "$out")" = 150 ] \
+# Only 502 (50 MB) is signalled; the spared 500 (100 MB) and 501 (200 MB) must not
+# appear in the freed total.
+[ "$(freed_of "$out")" = 50 ] \
   && pass "freed total counts only signalled processes" \
-  || fail "freed total wrong: $(freed_of "$out") (want 150)"
+  || fail "freed total wrong: $(freed_of "$out") (want 50)"
 
 printf 'protect\tchrome-devtools-mcp\n' > "$rules_file"
-out=$(kill_with 500 1 || true)
+out=$(kill_with 500 || true)
 [ "$(count_of "$out")" = 0 ] && pass "protected target reports zero deliveries" || fail "protected target counted: $(count_of "$out")"
 : > "$rules_file"
 
@@ -165,7 +174,7 @@ kill_immutable() {
   ( ps() { case "$*" in
         "-o command= -p 600") echo "/System/Library/x/mdworker_shared" ;;
         *) command ps "$@" ;; esac; }
-    _CC_REAPER_DRY_RUN=1 _claude_pgid_kill 600 1 2>&1 || true )
+    _CC_REAPER_DRY_RUN=1 _claude_pgid_kill 600 2>&1 || true )
 }
 out=$(kill_immutable)
 [ "$(count_of "$out")" = 0 ] && pass "immutable target reports zero deliveries" || fail "immutable target counted"
