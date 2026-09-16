@@ -90,6 +90,8 @@ source /path/to/cc-reaper/shell/claude-cleanup.sh
 source /path/to/cc-reaper/shell/cc-monitor.sh
 ```
 
+Source a checkout that stays put. `install.sh` sources the copies it deploys under `~/.cc-reaper/` instead, guarded with `[ -r ... ]`, because a checkout it ran from may be a task worktree that reclamation later removes - and then every new shell prints two `no such file or directory` errors and the commands are gone. On update it replaces a line it wrote earlier that points at a checkout, after backing the rc file up. When anything else in the file names the script, or there is more than one such line, it changes nothing and prints the change to make by hand: it never removes a line, because that can change what the lines around it mean.
+
 Commands available after restart:
 
 - `cc-monitor` — explain current CPU heat contributors by process family before cleanup (read-only)
@@ -156,7 +158,7 @@ Add to `~/.claude/settings.json` in the `"Stop"` hooks array:
 
 #### Option A: LaunchAgent (zero-dependency, macOS only)
 
-Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1. As a final pass it also reaps a PPID=1 orphan that is **sustaining high CPU** (`CC_RUNAWAY_CPU`, default 80%) past `CC_RUNAWAY_ORPHAN_MIN_SEC` (default 180s) **even if its name is whitelisted** — a stuck shared MCP pegging a core is exactly what the name-based whitelist must not protect.
+Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1. It does **not** select by CPU: background test runs, builds and experiments started from Claude Code are orphaned and hot by nature, and a CPU pass here killed them (removed 2026-09-15; `CC_RUNAWAY_ORPHAN_MIN_SEC` no longer does anything). A stuck shared MCP server is signalled by `claude-guard`'s runaway phase instead, which the guard LaunchAgent runs every 10 minutes. `install.sh` installs that agent and the manual steps below do not: a manual Option A install has no runaway coverage: `claude-guard` measures heat across its own runs, so only runs no more than 20 minutes apart - which the agent provides - ever select one.
 
 > **Install gotcha:** the `sed` below must resolve `$HOME` to a real path. If it expands empty (e.g. under `sudo`), the plist gets a broken `/.cc-reaper/...` `ProgramArguments` and the agent silently fails every run with `last exit code = 78` — verify with `launchctl print gui/$(id -u)/com.cc-reaper.orphan-monitor | grep program`. `install.sh` now fails fast rather than installing a broken path.
 
@@ -232,11 +234,11 @@ claude-guard --dry-run  # preview without killing
 | `CC_MAX_RSS_MB` | 4096 | Tree RSS threshold (MB); sessions exceeding this are killed regardless of activity |
 | `CC_MAX_FD` | 10000 | File descriptor threshold; sessions exceeding this are killed as FD-leak |
 | `CC_AGENT_STALE_MINUTES` | 360 | Age threshold for stale agent-browser, Puppeteer Chrome, and detached Codex/MCP cleanup |
-| `CC_RUNAWAY_CPU` | 80 | CPU% above which a process is treated as stuck/runaway (combined with `CC_RUNAWAY_MIN`). Shared by both tools |
-| `CC_RUNAWAY_MIN` | **30** in `cc-monitor`, **60** in `claude-guard` | Minutes of elapsed time before a hot process is treated as runaway. The two defaults differ on purpose — the monitor only reports, the guard signals — and setting this env var overrides both at once |
-| `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds `claude-guard` waits (Ctrl+C to abort) before SIGTERM-ing runaway protected processes |
+| `CC_RUNAWAY_CPU` | 80 | CPU% above which a process is treated as stuck/runaway (combined with `CC_RUNAWAY_MIN`). Shared by both tools; `claude-guard` measures it from CPU-time samples taken across its own runs |
+| `CC_RUNAWAY_MIN` | **30** in `cc-monitor`, **60** in `claude-guard` | Minutes a process must stay hot before it is treated as runaway: elapsed time in `cc-monitor`, time across its own runs in `claude-guard`. The two defaults differ on purpose — the monitor only reports, the guard signals — and setting this env var overrides both at once |
+| `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds `claude-guard` waits (Ctrl+C to abort) before the re-check, which adds three more; the banner prints the sum |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip `claude-guard`'s runaway phase entirely |
-| `CC_RUNAWAY_ORPHAN_MIN_SEC` | 180 | LaunchAgent monitor only: minimum **seconds** a PPID=1 orphan must have lived before its sustained-CPU burn (`CC_RUNAWAY_CPU`) can trigger the whitelist-override reap. Distinct from `CC_RUNAWAY_MIN` (minutes, for live protected processes). |
+| `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks, a path with no directory part is a file in the directory the guard runs from, and a recording run (not `--dry-run`) that cannot record this run's samples says so, on stderr and in claude-guard's report, and selects nothing |
 
 Example: lower the thresholds for constrained machines:
 
@@ -356,7 +358,7 @@ cc-monitor --once --apply proc-janitor-scan     # preview-only via daemon
 
 ### Stuck/runaway processes
 
-Long-running MCP servers, dev servers, and security daemons are intentionally `protected` — `claude-cleanup` will never kill them. But "protected" is not absolute: a process pinned at high CPU for hours is broken, regardless of category.
+Long-running MCP servers, dev servers, and security daemons are intentionally `protected` — `claude-cleanup` will never kill them. But "protected" is not absolute: a process pinned at high CPU for hours is broken, and `cc-monitor` says so whatever its category. Only a shared MCP server is signalled for it automatically.
 
 Runaway is a claim about behaviour, so since 2026-08-30 **any** non-immutable process can be identified as one — not only those already on the protection list, which was backwards: the processes that run away are the ones nobody listed. Protection still decides what may be *done* about it.
 
@@ -365,11 +367,11 @@ Runaway is a claim about behaviour, so since 2026-08-30 **any** non-immutable pr
 | | threshold | acts on |
 |---|---|---|
 | `cc-monitor` (reports, never kills) | CPU ≥ `CC_RUNAWAY_CPU` (`80`) for ≥ `CC_RUNAWAY_MIN` minutes (**`30`**) | any non-immutable process |
-| `claude-guard` (SIGTERMs) | CPU ≥ `CC_RUNAWAY_CPU` (`80`) for ≥ `CC_RUNAWAY_MIN` minutes (**`60`**) | whitelisted protected MCP servers only |
+| `claude-guard` (SIGTERMs) | ≥ `CC_RUNAWAY_CPU` (`80`) percent of every interval between its runs for ≥ `CC_RUNAWAY_MIN` minutes (**`60`**), and still ≥ `CC_RUNAWAY_CPU` now and on a re-check | a process that is itself a known shared MCP server; never an application, dev server, process manager or session |
 
-Reporting earlier than the reaper acts is the point: the report costs a line an operator ignores, while the old shared floor meant a stuck loop held a core for a full hour before it could be named. `claude-guard`'s selection is a separate implementation with its own whitelist and its own default; nothing about which processes can be signalled changed.
+Reporting earlier than the reaper acts is the point: the report costs a line an operator ignores, while the old shared floor meant a stuck loop held a core for a full hour before it could be named. `claude-guard`'s selection is a separate implementation, with its own identity test, its own measure of heat and its own default.
 
-`cc-monitor` reclassifies the finding to family `runaway` / `ASK_BEFORE_KILL` and prints a dedicated section with a copy-pasteable kill line. The suggested action differs by protection status, because `claude-guard` filters through its whitelist and suggesting it for an unlisted process would name a remedy that does nothing:
+`cc-monitor` reclassifies the finding to family `runaway` / `ASK_BEFORE_KILL` and prints a dedicated section with a copy-pasteable kill line. The suggested action differs by protection status, because `claude-guard` signals only a process that is itself a known shared MCP server — never an application, dev server, process manager or session — and suggesting it for anything else would name a remedy that does nothing:
 
 ```text
 Stuck/runaway processes:
@@ -379,14 +381,14 @@ Stuck/runaway processes:
 
 A process carrying an Always Protect user rule is still labelled a runaway; its suggested action stays the Always Protect wording.
 
-`claude-guard` adds a Phase 0.5 that reaps these PIDs in PGID-aware mode after `CC_RUNAWAY_GRACE_SEC` (default 5) seconds, so you can `Ctrl+C` if the report surprises you:
+`claude-guard` adds a Phase 0.5 that reaps these PIDs after `CC_RUNAWAY_GRACE_SEC` (default 5) seconds, so you can `Ctrl+C` if the report surprises you. It selects a process only when the process itself is a known shared MCP server — its executable, or what `npx`, `npm exec`, `uvx`, `node` or `python` runs — never because a name appears in its arguments: a Claude session whose `--settings` mention `claude-mem`, or a test run in a directory named after a server, is not one. Heat is measured across the guard's own runs: each run records the CPU time of every process hot at that moment, and a process is selected once it has used at least `CC_RUNAWAY_CPU` percent of every interval between runs for `CC_RUNAWAY_MIN` minutes; a gap of more than 20 minutes between runs starts over, so this relies on the guard agent's 10-minute runs. `ps %cpu` alone decays within about a minute, so a routine burst would qualify, and a lifetime average of CPU time let a multi-threaded server that was busy early qualify on a later burst while a stall late in a long life never did. The cost is delay: with the agent's 10-minute interval a stall is reaped 60 to 70 minutes after a run first sees it, and `cc-monitor` reports it sooner. `--dry-run` records no samples. It signals each PID alone, never its process group: an MCP server started by a Claude CLI is in that CLI's group, and signalling the group ended the session. It first waits three more seconds and reads each PID again, skipping any that now runs a different command or has dropped below `CC_RUNAWAY_CPU`. Applications (anything run from inside an `.app` bundle), dev servers and process managers are never selected, though they are protected: on one host the guard had signalled ChatGPT.app and cmux.app, the terminal the sessions ran in.
 
 ```text
 === Claude Guard ===
   Config: max_sessions=3, idle_threshold=1%, max_rss=4096 MB, max_fd=10000, runaway=80%/60min
 
-  --- Runaway protected processes (CPU >= 80% for >= 60 min) ---
-  PID 9594    CPU 102.7%  ETIME 09:07:51   node /Users/.../mcp-server-cloudflare run abc
+  --- Runaway protected processes (CPU >= 80% across runs for >= 60 min) ---
+  PID 9594    CPU 102.7%  ETIME 09:07:51   uvx chroma-mcp --client-type persistent
   Sending SIGTERM in 5 seconds (Ctrl+C to abort)...
   Reaped 1 runaway protected process(es), freed ~340 MB
 ```
@@ -416,12 +418,12 @@ Beyond process hygiene, cc-reaper ships three system-level janitors (added after
 |---|---|---|
 | `resource-watch.sh` | every 10 min (launchd) | Single-pass snapshot (load / CPU idle / memory / disk) to `~/.cc-reaper/logs/resource-watch.log`; macOS notification when load > 2× cores, disk free < 15%, or memory is critically tight. Per-metric 60-min cooldown. |
 | `disk-janitor.sh --check` | hourly (launchd) | **Read-only**: disk free % + Time Machine local-snapshot pin detection (snapshots holding freed space hostage after big deletes), plus a **report** of stale scratch checkouts under `/private/tmp` — directories nothing has open, holding no git repository, older than `CC_DJ_TMP_AGE_DAYS` and over `CC_DJ_TMP_MIN_MB`. It names them and never removes them: `/private/tmp` is world-writable and age plus size does not establish that something is abandoned. Alerts, never deletes. |
-| `disk-janitor.sh --clean` | Sunday 04:00 (launchd) | Cleans **rebuildable-only** targets: go-build / yarn / pip / brew / bun caches, Spotify / ShipIt / CoreSimulator caches, docker **dangling images** (by explicit id — no `prune` verb, and tagged images are never removed) plus a **report** of unreferenced volumes with docker-generated-looking names, which are never deleted, TM snapshot thinning (dated `com.apple.TimeMachine.*` only, only when disk is below threshold). Tools are resolved from a known directory list, not the caller's `PATH`, because launchd supplies neither Homebrew nor Docker. |
+| `disk-janitor.sh --clean` | Sunday 04:00 (launchd) | Cleans **rebuildable-only** targets: go-build / yarn / pip / brew / bun caches, Spotify / ShipIt / CoreSimulator caches, a **report** of docker dangling images (count and review command; none removed) and of unreferenced volumes with docker-generated-looking names, which are never deleted, TM snapshot thinning (dated `com.apple.TimeMachine.*` only, only when disk is below threshold). Tools are resolved from a known directory list, not the caller's `PATH`, because launchd supplies neither Homebrew nor Docker. |
 | `worktree-janitor.sh` | manual, or a SessionEnd hook (`--session`) | Inventories git worktrees under every root in `CC_WJ_ROOT` (colon-separated; defaults to `~/Documents/GitHub:~/GitHub:~/Documents`) or `--repo <path>`. A worktree is REMOVABLE only when **all** of these hold, and a check that cannot run keeps it: it holds nothing a command cannot rebuild (`git status --ignored`, discounting built-in caches and what the repository declares in **`.worktree-regenerable` on its base branch**, but never a credential-shaped file inside either); **no process on the machine** has its cwd there **or holds a file in it open**; its work has **landed** on the freshly fetched base branch - by ancestry, by content (squash merges), or by a merged PR at this exact head; and nothing in it changed within `CC_WJ_IDLE_HOURS` (default 6). A detached HEAD additionally needs ancestry, and a locked worktree (Claude Code locks its agent worktrees) or one with a populated submodule is always kept. The report names up to three entries that keep a worktree. **Dry-run by default** - only `--apply` removes, re-checking holders, contents and idleness right before each removal; branches are never deleted. `--session` returns at once and sweeps the session's repository detached, under a per-repository lock, logging to `~/.cc-reaper/logs/worktree-janitor-session.log`; it keeps the session's own checkout and **reports unless `CC_WJ_SESSION_APPLY=1`** and the hook input on stdin names one `cwd` that resolves - so `--session </dev/null` from cron or a wrapper only ever reports. The method and its failure modes: [docs/worktree-reclamation.md](docs/worktree-reclamation.md). A root that exists and cannot be read is reported and **fails the run**. |
 
-Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`, `~/Desktop`), never runs any `docker prune`, never removes a tagged image, never removes **any** volume, never kills processes, scheduled runs never delete worktrees or prune their administrative records, and a SessionEnd `--session` run removes only with `CC_WJ_SESSION_APPLY=1` and a resolvable `cwd` in its hook input.
+Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`, `~/Desktop`), never runs any `docker prune`, never removes **any** docker image or volume, never kills processes, scheduled runs never delete worktrees or prune their administrative records, and a SessionEnd `--session` run removes only with `CC_WJ_SESSION_APPLY=1` and a resolvable `cwd` in its hook input.
 
-What the docker step *does* remove, changed 2026-08-30: dangling images — no tag points at them — by explicit id, computed from the current inventory, and skipped entirely if any inventory command fails. It previously ran `docker system prune -af`, which reaches every unused tagged image including ones that take hours to rebuild; that is not "rebuildable-only" and is gone. **Unused tagged images now survive.**
+The docker step removes nothing, changed 2026-09-15. Until 2026-08-30 it ran `docker system prune -af`, which reaches every unused tagged image including ones that take hours to rebuild. It then removed dangling images by explicit id. On a host shared with CI runner slots and other sessions' stacks, an untagged image is still somebody's build, so it now prints the count and `docker images -f dangling=true` for whoever owns them.
 
 Volumes are reported and never removed. A 64-hex name looks docker-generated but does not prove it — `docker volume create` accepts such a name from anyone, and `docker volume inspect` exposes no flag that separates the two — so the janitor prints a count and the command to review them, and leaves the decision to you.
 
@@ -510,6 +512,7 @@ cc-reaper/
 ├── launchd/
 │   ├── cc-reaper-monitor.sh        # LaunchAgent monitor script (PGID + PPID=1 fallback)
 │   ├── com.cc-reaper.orphan-monitor.plist  # LaunchAgent config (10-min interval)
+│   ├── com.cc-reaper.guard.plist           # claude-guard runaway-phase agent (10-min interval)
 │   ├── com.cc-reaper.resource-watch.plist  # System snapshot agent (10-min interval)
 │   ├── com.cc-reaper.disk-check.plist      # Read-only disk check agent (hourly)
 │   └── com.cc-reaper.weekly-clean.plist    # Rebuildable-cache clean agent (Sun 04:00)
@@ -518,6 +521,7 @@ cc-reaper/
 ├── shell/
 │   ├── cc-monitor.sh               # Read-only heat attribution monitor
 │   ├── claude-cleanup.sh           # Shell functions (claude-ram, claude-fd, claude-cleanup, claude-sessions, claude-guard)
+│   ├── guard-runner.sh             # What the guard agent runs: claude-guard's runaway phase alone
 │   ├── resource-watch.sh           # System snapshot + threshold alerting
 │   ├── disk-janitor.sh             # Disk check (--check) / rebuildable-cache clean (--clean)
 │   └── worktree-janitor.sh         # Git worktree inventory + gated removal (dry-run default)
@@ -525,6 +529,11 @@ cc-reaper/
 │   ├── agent-process-patterns.sh   # Cleanup-candidate matcher validation
 │   ├── cc-monitor-optimize.sh      # cc-monitor optimization menu tests
 │   ├── cc-monitor-runaway.sh       # Runaway protected process detection tests
+│   ├── guard-runaway.sh            # The runaway phase run whole, under bash and zsh
+│   ├── guard-session-detect.sh     # Session detection + guard phases under bash and zsh
+│   ├── install-rc-source.sh        # Installer rc-line repair (stale, doubled, disabled, ACL)
+│   ├── monitor-selection.sh        # What the LaunchAgent monitor signals (no CPU-based selection)
+│   ├── protection-classes.sh       # Protection classes, runaway selection/signalling, tree RSS
 │   ├── ppid-fallback.sh            # PPID=1 fallback kill + whitelist validation
 │   ├── resource-watch.sh           # Snapshot / threshold / cooldown tests (stubbed)
 │   ├── disk-janitor.sh             # Read-only check / forbidden-flag / thinning tests (stubbed)

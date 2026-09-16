@@ -102,6 +102,24 @@ MCP_WHITELIST="supabase|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*m
 #
 # WHITELIST: Long-running MCP servers shared across sessions are also excluded.
 # CC_STOP_HOOK_AGGRESSIVE=1 skips the PPID=1 check (original behavior).
+#
+# KNOWN BLIND SPOT - a long-lived server started from a tool call is not in this
+# group and this hook will never see it. Claude Code runs every Bash tool call in
+# its own process group, so a `nohup ... &` child inherits THAT group rather than
+# the session's: measured 2026-09-06 on macOS, tool call pgid 55082 against session
+# pgid 69905. The sweep below matches on the session's own pgid, and the pattern
+# fallback further down names no such server either. Anything started that way has
+# to be ended by whatever owns it - for a server tied to a task worktree, the
+# reclaimer that knows the worktree has landed and gone idle, which has per-worktree
+# evidence a pattern here lacks. One such owner had been reading "the api process is
+# alive" as proof its stack was still in use, a condition nothing here was ever going
+# to falsify: four landed worktrees held eight containers for 6-11 hours across
+# sessions until it stopped letting a live process outrank a landed worktree.
+#
+# Do NOT close this by adding such a server to the pattern fallback. Every
+# nohup-ed background process is reparented to an orphan parent, so a pattern
+# cannot tell one session's server from another live session's, and would kill
+# the one still in use.
 
 SESSION_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
 if [ -n "$SESSION_PGID" ] && [ "$SESSION_PGID" != "0" ] && [ "$SESSION_PGID" != "1" ]; then
