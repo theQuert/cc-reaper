@@ -89,6 +89,8 @@ on its last run.
   `tests/install-rc-source.sh`; updated `tests/protection-classes.sh`,
   `tests/cc-monitor-runaway.sh` and `tests/disk-janitor.sh`.
 - **Docs:** README, CHANGELOG, CLAUDE.md.
-- **Rollback:** revert the merge commit and run `install.sh` again, which replaces each
-  deployed copy by rename and keeps no previous copy. The rc file is backed up as
-  `~/.zshrc.cc-reaper-backup-<timestamp>` before any change.
+- **Rollback:** revert the merge commit and run the reverted `install.sh`, which copies each
+  script over the deployed one in place rather than by rename, so run it when no LaunchAgent job
+  is mid-run. It keeps no previous copy. The rc file is backed up as
+  `~/.zshrc.cc-reaper-backup-<timestamp>` before any change, and the repaired rc lines load
+  whichever version is deployed.

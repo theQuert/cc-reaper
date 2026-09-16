@@ -22,7 +22,7 @@ Puppeteer profiles, whatever their CPU. A hot orphan outside those forms is reap
 bare `node …/index.js` MCP server and `npm exec @playwright/mcp` are both outside them. That gap
 is accepted and documented, because the class that shares it is user work.
 
-### The runaway phase signals one known MCP server that stayed hot across runs
+### The runaway phase signals a known MCP server that stayed hot across runs, alone
 
 The phase exists for one incident class: a shared MCP server stuck hot for hours. Five
 properties made it dangerous beside interactive work.
@@ -128,7 +128,10 @@ same way it already handles unreferenced volumes.
   10-minute interval and still count as hot. Accepted: the interval bounds it, and the re-check
   requires the server hot now.
 - **Samples live in one file.** A lost, unwritable or concurrently replaced file only restarts
-  streaks, which delays a reap and never causes one.
+  streaks, which delays a reap and never causes one. Two records that could claim a streak they
+  did not earn are refused rather than trusted: one dated after the run reading it, which is a
+  clock set back, and any record from a run whose samples could not be written completely - that
+  run leaves the previous file alone and selects nothing.
 - **Only listed MCP servers, in known forms, are eligible.** claude-mem's worker is protected but
   not listed, since its process form was never observed. A server run from its own checkout
   rather than from `node_modules` or a `bin` directory is not identified, nor is one run by a
