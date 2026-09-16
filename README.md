@@ -195,7 +195,11 @@ submodule gate still applies after the lease expires.
 
 #### Option A: LaunchAgent (zero-dependency, macOS only)
 
+<<<<<<< HEAD
 Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1. As a final pass it also reaps a PPID=1 orphan that is **sustaining high CPU** (`CC_RUNAWAY_CPU`, default 80%) past `CC_RUNAWAY_ORPHAN_MIN_SEC` (default 180s) **even if its name is whitelisted** — a stuck shared MCP pegging a core is exactly what the name-based whitelist must not protect.
+=======
+Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1. It does **not** select by CPU: background test runs, builds and experiments started from Claude Code are orphaned and hot by nature, and a CPU pass here killed them (removed 2026-09-15; `CC_RUNAWAY_ORPHAN_MIN_SEC` no longer does anything). A stuck shared MCP server is signalled by `claude-guard`'s runaway phase instead, which the guard LaunchAgent runs every 10 minutes. `install.sh` installs that agent and the manual steps below do not: a manual Option A install has no runaway coverage: `claude-guard` measures heat across its own runs, so only runs no more than 20 minutes apart - which the agent provides - ever select one.
+>>>>>>> cfc1ba4 (docs: the runaway phase signals each selected PID alone)
 
 > **Install gotcha:** the `sed` below must resolve `$HOME` to a real path. If it expands empty (e.g. under `sudo`), the plist gets a broken `/.cc-reaper/...` `ProgramArguments` and the agent silently fails every run with `last exit code = 78` — verify with `launchctl print gui/$(id -u)/com.cc-reaper.orphan-monitor | grep program`. `install.sh` now fails fast rather than installing a broken path.
 
