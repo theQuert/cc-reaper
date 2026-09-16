@@ -22,7 +22,9 @@ case "$CLEANUP" in
   *) CLEANUP="$(cd "$(dirname "$CLEANUP")" && pwd)/$(basename "$CLEANUP")" ;;
 esac
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/cc-guard-runaway.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+# One scenario makes a directory read-only; if the suite aborts inside it, `rm -rf` alone cannot
+# clean up after itself.
+trap 'chmod -R u+w "$tmp" 2>/dev/null; rm -rf "$tmp"' EXIT
 
 failures=0
 ok()  { printf "ok - %s\n" "$1"; }
@@ -168,6 +170,12 @@ awk() {
   fi
   command awk "$@"
 }
+# With CC_TEST_MV_FAIL=1 the rename that puts this run's samples in place fails, as it does on an
+# immutable file or one somebody else owns in a sticky directory.
+mv() {
+  if [ "${CC_TEST_MV_FAIL:-0}" = 1 ]; then return 1; fi
+  command mv "$@"
+}
 osascript() { :; }
 # shellcheck disable=SC1090
 . "$CLEANUP"
@@ -180,14 +188,15 @@ HARNESS
 # a scenario cannot inherit the previous one's environment.
 guard() {
   local rc sh="${GUARD_SHELL:-/bin/bash}" opt=""
-  # zsh reads `$ZDOTDIR/.zshenv` even for a script, and `bash script` reads nothing; `-f` is what
-  # makes the two legs the same environment rather than one that depends on whose shell it is.
+  # zsh reads `$ZDOTDIR/.zshenv` even for a script, and `bash script` reads nothing; `-f` drops
+  # that, leaving only `/etc/zshenv`, which no flag can turn off.
   [ "${sh##*/}" = zsh ] && opt=-f
-  CC_TEST_AWK_FAIL="${CC_TEST_AWK_FAIL:-0}" CC_RUNAWAY_CPU="${CC_RUNAWAY_CPU:-}" \
+  CC_TEST_AWK_FAIL="${CC_TEST_AWK_FAIL:-0}" CC_TEST_MV_FAIL="${CC_TEST_MV_FAIL:-0}" \
+    CC_RUNAWAY_CPU="${CC_RUNAWAY_CPU:-}" \
     CC_RUNAWAY_MIN="${CC_RUNAWAY_MIN:-}" CC_RUNAWAY_SAMPLES_FILE="${CC_RUNAWAY_SAMPLES_FILE:-}" \
     "$sh" ${opt:+"$opt"} "$tmp/harness.sh" "$@"
   rc=$?
-  unset CC_TEST_AWK_FAIL CC_RUNAWAY_CPU CC_RUNAWAY_MIN CC_RUNAWAY_SAMPLES_FILE GUARD_SHELL
+  unset CC_TEST_AWK_FAIL CC_TEST_MV_FAIL CC_RUNAWAY_CPU CC_RUNAWAY_MIN CC_RUNAWAY_SAMPLES_FILE GUARD_SHELL
   return $rc
 }
 
@@ -362,6 +371,29 @@ if [ -z "$ro_signalled" ] && [ "$ro_kept" = 1 ]; then
   ok "a run that cannot record any samples keeps the previous ones and signals nothing"
 else
   bad "a run that cannot record any samples keeps the previous ones and signals nothing: signalled [$ro_signalled], samples kept $ro_kept"
+fi
+# A phase that has turned itself off prints exactly what a quiet one prints, so it has to say so.
+if grep -q 'cannot record runaway samples' "$tmp/ro.out"; then
+  ok "and says so, rather than going quiet for as long as the directory stays read-only"
+else
+  bad "and says so, rather than going quiet for as long as the directory stays read-only"
+fi
+
+# A run whose samples are written but cannot be put in place: the rename is the third way to fail
+# to record, and it authorises no kill either.
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+cp "$tmp/samples.before" "$tmp/samples.tsv"
+CC_TEST_MV_FAIL=1 guard > "$tmp/mvfail.out" 2>&1
+if [ ! -s "$tmp/signalled" ] && cmp -s "$tmp/samples.tsv" "$tmp/samples.before" &&
+   ! ls "$tmp"/samples.tsv.* >/dev/null 2>&1; then
+  ok "a run that cannot put its samples in place keeps the previous ones and signals nothing"
+else
+  bad "a run that cannot put its samples in place keeps the previous ones and signals nothing: signalled [$(signalled_set)]"
+fi
+if grep -q 'cannot record runaway samples' "$tmp/mvfail.out"; then
+  ok "and says so too"
+else
+  bad "and says so too"
 fi
 
 if [ ! -s "$tmp/unstubbed" ]; then
