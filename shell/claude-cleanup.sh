@@ -1060,7 +1060,9 @@ claude-guard() {
       if $dry_run; then
         echo "  [DRY-RUN] Would SIGTERM each PID above alone, if still hot on a re-check."
       else
-        echo "  Sending SIGTERM in ${runaway_grace} seconds (Ctrl+C to abort)..."
+        # The grace period and the re-check pause are both spent before any signal, so the
+        # number a person reads has to be the sum.
+        echo "  Sending SIGTERM in $((runaway_grace + 3)) seconds (Ctrl+C to abort)..."
         sleep "$runaway_grace"
         # Selection measured each PID across runs. After a pause it is read again, and
         # signalled only if it still runs the command it was selected for, is still eligible,
