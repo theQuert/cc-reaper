@@ -86,8 +86,16 @@
 - [x] 11.4 The read-only scenario cannot leave behind a directory the suite's own cleanup cannot remove
 - [x] 11.5 Docs: the design bullet and both `CC_RUNAWAY_SAMPLES_FILE` rows say what an unwritable samples directory does, which is not what a lost file does
 
-## 12. Delivery
+## 12. Review round 8
 
-- [ ] 12.1 All suites, `bash -n`, `zsh -n`, `openspec validate coexist-with-dev-workflow --strict`
-- [ ] 12.2 Independent review until no actionable findings
-- [ ] 12.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
+- [x] 12.1 Red-verify: the awk-failure path records nothing and says nothing, while the spec and both doc tables say every failure to record warns
+- [x] 12.2 All three failures to record warn through one helper, with `printf`, so a samples path holding a backslash survives zsh's `echo`
+- [x] 12.3 The function returns 2 and claude-guard says in its own report that nothing could be recorded: the agent writes stderr to a different file from the report a person reads
+- [x] 12.4 Both suites drop `BASH_ENV` and `ENV` as well as zsh's rc, proven by a planted rc for each shell
+- [x] 12.5 The failure-to-record paths run under zsh as well as bash
+
+## 13. Delivery
+
+- [ ] 13.1 All suites, `bash -n`, `zsh -n`, `openspec validate coexist-with-dev-workflow --strict`
+- [ ] 13.2 Independent review until no actionable findings
+- [ ] 13.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
