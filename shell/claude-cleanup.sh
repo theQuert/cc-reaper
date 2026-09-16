@@ -902,11 +902,12 @@ _cc_guard_runaway_eligible() {
 #
 # Samples are keyed by PID and start time, read under LC_ALL=C and TZ=UTC so the guard agent and
 # an interactive shell write the same keys, and a reused PID starts fresh. With record=1 this
-# run's samples replace the file; a dry run or a listing leaves it alone. A lost or unwritable
-# file only restarts streaks. A record dated after the run reading it, or whose streak starts
-# after the sample was taken, is refused: that is a clock set back, or a damaged line. A run that
-# cannot write its samples to the end keeps the previous file and selects nothing, since a
-# partial record could claim any streak and a measurement that failed authorises no kill.
+# run's samples replace the file; a dry run or a listing leaves it alone. A lost file only
+# restarts streaks. A record dated after the run reading it, or whose streak starts after the
+# sample was taken, is refused: that is a clock set back, or a damaged line. A run that cannot
+# record this run's samples - it cannot create the file, or cannot write it to the end - keeps the
+# previous file and selects nothing, since a partial record could claim any streak and a
+# measurement that could not be taken authorises no kill.
 #
 # ponytail: one samples file, last writer wins - overlapping runs can drop each other's samples,
 # which only restarts streaks. Lock it if runs ever overlap routinely.
@@ -922,6 +923,9 @@ _cc_guard_runaway_protected_pids() {
   # create a directory there, and every later run would read nothing and record nothing.
   if [ "$record" = 1 ] && { [ "${samples%/*}" = "$samples" ] || mkdir -p "${samples%/*}" 2>/dev/null; }; then
     tmp=$(mktemp "$samples.XXXXXX" 2>/dev/null) || tmp=""
+  fi
+  if [ "$record" = 1 ] && [ -z "$tmp" ]; then
+    return 0
   fi
   list=$(LC_ALL=C TZ=UTC ps -axo pid=,lstart=,etime=,time=,%cpu= 2>/dev/null |
     awk -v now="$now" -v cpu="$cpu_threshold" -v min="$min_minutes" -v samples="$samples" -v out="$tmp" '
