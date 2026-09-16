@@ -633,6 +633,11 @@ expect_yes "report: dangling images are counted and the review command is named"
            printf "%s" "$out" | grep -q "2 dangling images" &&
            printf "%s" "$out" | grep -q "docker images -f dangling=true"' _ "$DOCKREP" "$SAFE_SYS_PATH" "$DJ"
 
+# The recorded calls are what make the sentence above true: a removal after the listing would
+# leave the count and the review command exactly as they are.
+expect_yes "report: the dangling-image report sends docker nothing but the listing" \
+  bash -c '[ -s "$1" ] && ! grep -vqx "images -f dangling=true -q" "$1"' _ "$DOCKREP_CALLS"
+
 # ---------------------------------------------------------------------------
 # TEST 12: an inventory that failed is not an empty inventory
 # ---------------------------------------------------------------------------
