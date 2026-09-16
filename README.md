@@ -238,7 +238,7 @@ claude-guard --dry-run  # preview without killing
 | `CC_RUNAWAY_MIN` | **30** in `cc-monitor`, **60** in `claude-guard` | Minutes a process must stay hot before it is treated as runaway: elapsed time in `cc-monitor`, time across its own runs in `claude-guard`. The two defaults differ on purpose — the monitor only reports, the guard signals — and setting this env var overrides both at once |
 | `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds `claude-guard` waits (Ctrl+C to abort) before SIGTERM-ing runaway protected processes |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip `claude-guard`'s runaway phase entirely |
-| `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks |
+| `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks, and a path with no directory part is a file in the directory the guard runs from |
 
 Example: lower the thresholds for constrained machines:
 
