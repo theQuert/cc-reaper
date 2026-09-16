@@ -16,6 +16,11 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CLEANUP="${GUARD_SCRIPT:-$ROOT_DIR/shell/claude-cleanup.sh}"
+# One run happens from another working directory, so the script to source cannot be relative.
+case "$CLEANUP" in
+  /*) ;;
+  *) CLEANUP="$(cd "$(dirname "$CLEANUP")" && pwd)/$(basename "$CLEANUP")" ;;
+esac
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/cc-guard-runaway.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -53,6 +58,7 @@ cat > "$T" <<'EOF'
 990007 1 990007 ?? 97.0 S 1-02:00:00 75:00.00 150000 97.0 npx -y @supabase/mcp-server-supabase@0.5.10 --read-only
 990008 1 990008 ?? 99.0 S 05:00:00 280:00.00 90000 99.0 uvx chroma-mcp --client-type cloud
 990009 1 990009 ?? 99.0 S 06:00:00 300:00.00 90000 99.0 uvx chroma-mcp --client-type http
+990010 1 990010 ?? 99.0 S 04:00:00 230:00.00 90000 99.0 uvx chroma-mcp --client-type local
 990011 990010 990011 ttys906 95.0 S 03:00:00 170:00.00 500000 95.0 claude --session-id 22222222-3333-4444-5555-666666666666 --settings {"hooks":{"Stop":[{"type":"command","command":"node /Users/me/.claude/plugins/claude-mem/scripts/summary-hook.js"}]}}
 990012 990011 990011 ?? 95.0 S 03:00:00 170:00.00 300000 95.0 claude --output-format stream-json --input-format stream-json --mcp-config {"mcpServers":{"context7":{"command":"npx","args":["-y","@upstash/context7-mcp"]}}}
 990013 1 990013 ?? 95.0 S 03:00:00 170:00.00 300000 95.0 node /Users/me/GitHub/context7-docs-sync/node_modules/.bin/stryker run
@@ -62,8 +68,9 @@ EOF
 
 # The samples an earlier run left: pid, the start it was recorded under, seconds since that
 # sample, the percent of those seconds the process used, and its hot streak in minutes as of that
-# sample. 990004 has none. 960005 is cool now and has one, to show a cool run drops it, and
-# 990009's is dated in the future, where a clock set back leaves it.
+# sample. 990004 has none. 960005 is cool now and has one, to show a cool run drops it, 990009's
+# is dated in the future, where a clock set back leaves it, and 990010's streak starts two hours
+# after the sample it sits in, which no clock produces.
 cat > "$tmp/prior" <<'EOF'
 960002 S 600 95 70
 960005 S 600 95 120
@@ -83,6 +90,7 @@ cat > "$tmp/prior" <<'EOF'
 990007 S 600 99 55
 990008 S 1500 99 120
 990009 S -3000 99 120
+990010 S 600 99 -120
 990011 S 600 95 120
 990012 S 600 95 120
 990013 S 600 95 120
@@ -98,70 +106,87 @@ mkdir -p "$tmp/cmds" "$tmp/home/.cc-reaper/logs"
 : > "$tmp/empty-snapshot"
 : > "$tmp/calls"
 
-guard() (
-  # The LaunchAgent runs with no shell options; this suite's `-u` must not leak in.
-  set +euo pipefail
-  export HOME="$tmp/home" CC_REAPER_RULES_FILE="$tmp/rules.tsv" CC_RUNAWAY_SAMPLES_FILE="$tmp/samples.tsv" \
-    CC_REAPER_PS_SNAPSHOT_FILE="$tmp/empty-snapshot" CC_REAPER_PS_CMD_SNAPSHOT_DIR="$tmp/cmds"
-  cmd_of() {
-    local now
-    now="$(awk -F '\t' -v p="$1" '$1 == p { print $2 }' "$tmp/now-cmd")"
-    if [ -n "$now" ]; then printf '%s\n' "$now"; return; fi
-    awk -v p="$1" '$1 == p { s = ""; for (i = 11; i <= NF; i++) s = s (i > 11 ? " " : "") $i; print s }' "$T"
-  }
-  ps() {
-    local s=$S r=$R
-    case "$*" in
-      "-axo pid=,lstart=,etime=,time=,%cpu=")
-        # Start times read in another locale or zone print differently, so a sample recorded by
-        # the guard agent would never match a run from an interactive shell.
-        if [ "${LC_ALL:-}" != C ] || [ "${TZ:-}" != UTC ]; then s="Mon 14 Sep 08:00:00 2026" r="Tue 15 Sep 17:00:00 2026"; fi
-        awk -v S="$s" -v R="$r" '{ print $1, ($6 == "R" ? R : S), $7, $8, $5 }' "$T" ;;
-      # The previous selection's format too, so GUARD_SCRIPT can point this suite at it
-      # and have it fail for the defect rather than for the format.
-      "-axo pid=,etime=,time=,%cpu=") awk '{ print $1, $7, $8, $5 }' "$T" ;;
-      "-o command= -p "*) cmd_of "${!#}" ;;
-      "-o %cpu= -p "*) awk -v p="${!#}" '$1 == p { print $10 }' "$T" ;;
-      "-o pgid= -p "*) awk -v p="${!#}" '$1 == p { print $3 }' "$T" ;;
-      "-eo pid,pgid") awk 'BEGIN { print "  PID  PGID" } { print $1, $3 }' "$T" ;;
-      "-o rss= -p "*) awk -v p="${!#}" '$1 == p { print $9 }' "$T" ;;
-      *) printf '%s\n' "$*" >> "$tmp/unstubbed"; return 0 ;;
-    esac
-  }
-  kill() {
-    local a
-    for a in "$@"; do
-      case "$a" in -*) ;; *) printf '%s\n' "$a" >> "$tmp/signalled"; printf 'kill %s\n' "$a" >> "$tmp/calls" ;; esac
-    done
-    case " $* " in *" 980004 "*) return 1 ;; esac
-    return 0
-  }
-  # At the re-check pause, 980002's PID comes to belong to another MCP server just as hot and a
-  # protect rule comes to cover 980003; 980004 has exited, so its signal is not delivered. Both
-  # changes land at the pause, so a PID read again before it would still be signalled.
-  sleep() {
-    printf 'sleep %s\n' "$1" >> "$tmp/calls"
-    if [ "${1%%.*}" -ge 3 ] 2>/dev/null; then
-      printf 'protect\tsequentialthinking\n' >> "$tmp/rules.tsv"
-      printf '980002\tnpx chrome-devtools-mcp@latest --isolated\n' >> "$tmp/now-cmd"
-    fi
-  }
-  date() { if [ "$*" = "+%s" ]; then echo "$NOW"; else command date "$@"; fi; }
-  # With CC_TEST_AWK_FAIL=1 the sampling awk prints its output and then fails, as it does when
-  # its output cannot be written to the end.
-  awk() {
-    if [ "${CC_TEST_AWK_FAIL:-0}" = 1 ]; then
-      case " $* " in *" samples="*) command awk "$@"; return 2 ;; esac
-    fi
-    command awk "$@"
-  }
-  osascript() { :; }
-  # shellcheck disable=SC1090
-  . "$CLEANUP"
-  # guard-runner.sh's environment
-  export CC_MAX_SESSIONS=99999 CC_MAX_RSS_MB=99999999 CC_MAX_FD=99999999 CC_RUNAWAY_GRACE_SEC=0
-  claude-guard "$@"
-)
+# The stubbed environment lives in a file so the same scenario can be run by bash and by zsh, the
+# shell cc-reaper is installed into. Nothing in here may be bash-only: `${!#}` for the last
+# argument is a bash substitution, so the stubs walk the arguments instead.
+export tmp T S R NOW CLEANUP
+cat > "$tmp/harness.sh" <<'HARNESS'
+# A fresh shell, so the suite's `set -u` cannot leak into the LaunchAgent's optionless one.
+export HOME="$tmp/home" CC_REAPER_RULES_FILE="$tmp/rules.tsv" \
+  CC_RUNAWAY_SAMPLES_FILE="${CC_RUNAWAY_SAMPLES_FILE:-$tmp/samples.tsv}" \
+  CC_REAPER_PS_SNAPSHOT_FILE="$tmp/empty-snapshot" CC_REAPER_PS_CMD_SNAPSHOT_DIR="$tmp/cmds"
+last_arg() { local a l=""; for a in "$@"; do l="$a"; done; printf '%s\n' "$l"; }
+cmd_of() {
+  local now
+  now="$(awk -F '\t' -v p="$1" '$1 == p { print $2 }' "$tmp/now-cmd")"
+  if [ -n "$now" ]; then printf '%s\n' "$now"; return; fi
+  awk -v p="$1" '$1 == p { s = ""; for (i = 11; i <= NF; i++) s = s (i > 11 ? " " : "") $i; print s }' "$T"
+}
+ps() {
+  local s="$S" r="$R"
+  case "$*" in
+    "-axo pid=,lstart=,etime=,time=,%cpu=")
+      # Start times read in another locale or zone print differently, so a sample recorded by
+      # the guard agent would never match a run from an interactive shell.
+      if [ "${LC_ALL:-}" != C ] || [ "${TZ:-}" != UTC ]; then s="Mon 14 Sep 08:00:00 2026" r="Tue 15 Sep 17:00:00 2026"; fi
+      awk -v S="$s" -v R="$r" '{ print $1, ($6 == "R" ? R : S), $7, $8, $5 }' "$T" ;;
+    # The previous selection's format too, so GUARD_SCRIPT can point this suite at it
+    # and have it fail for the defect rather than for the format.
+    "-axo pid=,etime=,time=,%cpu=") awk '{ print $1, $7, $8, $5 }' "$T" ;;
+    "-o command= -p "*) cmd_of "$(last_arg "$@")" ;;
+    "-o %cpu= -p "*) awk -v p="$(last_arg "$@")" '$1 == p { print $10 }' "$T" ;;
+    "-o pgid= -p "*) awk -v p="$(last_arg "$@")" '$1 == p { print $3 }' "$T" ;;
+    "-eo pid,pgid") awk 'BEGIN { print "  PID  PGID" } { print $1, $3 }' "$T" ;;
+    "-o rss= -p "*) awk -v p="$(last_arg "$@")" '$1 == p { print $9 }' "$T" ;;
+    *) printf '%s\n' "$*" >> "$tmp/unstubbed"; return 0 ;;
+  esac
+}
+kill() {
+  local a
+  for a in "$@"; do
+    case "$a" in -*) ;; *) printf '%s\n' "$a" >> "$tmp/signalled"; printf 'kill %s\n' "$a" >> "$tmp/calls" ;; esac
+  done
+  case " $* " in *" 980004 "*) return 1 ;; esac
+  return 0
+}
+# At the re-check pause, 980002's PID comes to belong to another MCP server just as hot and a
+# protect rule comes to cover 980003; 980004 has exited, so its signal is not delivered. Both
+# changes land at the pause, so a PID read again before it would still be signalled.
+sleep() {
+  printf 'sleep %s\n' "$1" >> "$tmp/calls"
+  if [ "${1%%.*}" -ge 3 ] 2>/dev/null; then
+    printf 'protect\tsequentialthinking\n' >> "$tmp/rules.tsv"
+    printf '980002\tnpx chrome-devtools-mcp@latest --isolated\n' >> "$tmp/now-cmd"
+  fi
+}
+date() { if [ "$*" = "+%s" ]; then echo "$NOW"; else command date "$@"; fi; }
+# With CC_TEST_AWK_FAIL=1 the sampling awk prints its output and then fails, as it does when
+# its output cannot be written to the end.
+awk() {
+  if [ "${CC_TEST_AWK_FAIL:-0}" = 1 ]; then
+    case " $* " in *" samples="*) command awk "$@"; return 2 ;; esac
+  fi
+  command awk "$@"
+}
+osascript() { :; }
+# shellcheck disable=SC1090
+. "$CLEANUP"
+# guard-runner.sh's environment
+export CC_MAX_SESSIONS=99999 CC_MAX_RSS_MB=99999999 CC_MAX_FD=99999999 CC_RUNAWAY_GRACE_SEC=0
+claude-guard "$@"
+HARNESS
+
+# Each run's overrides are its own: they are forwarded to the harness process and then cleared, so
+# a scenario cannot inherit the previous one's environment.
+guard() {
+  local rc
+  CC_TEST_AWK_FAIL="${CC_TEST_AWK_FAIL:-0}" CC_RUNAWAY_CPU="${CC_RUNAWAY_CPU:-}" \
+    CC_RUNAWAY_MIN="${CC_RUNAWAY_MIN:-}" CC_RUNAWAY_SAMPLES_FILE="${CC_RUNAWAY_SAMPLES_FILE:-}" \
+    "${GUARD_SHELL:-/bin/bash}" "$tmp/harness.sh" "$@"
+  rc=$?
+  unset CC_TEST_AWK_FAIL CC_RUNAWAY_CPU CC_RUNAWAY_MIN CC_RUNAWAY_SAMPLES_FILE GUARD_SHELL
+  return $rc
+}
 
 : > "$tmp/rules.tsv"; : > "$tmp/now-cmd"
 cp "$tmp/samples.before" "$tmp/samples.tsv"
@@ -170,6 +195,10 @@ guard > "$tmp/guard.out" 2>&1
 signalled() { grep -qx "$1" "$tmp/signalled" 2>/dev/null; }
 expect_signalled()     { if signalled "$1"; then ok "$2"; else bad "$2"; fi; }
 expect_not_signalled() { if signalled "$1"; then bad "$2"; else ok "$2"; fi; }
+# The whole delivered set, for the runs that repeat this scenario elsewhere.
+SELECTED="960002 980004 990007 "
+signalled_set() { sort -un "$tmp/signalled" 2>/dev/null | tr '\n' ' '; }
+SUMMARY='Reaped 2 runaway protected process(es), freed ~341 MB'
 
 expect_signalled     960002 "the runaway MCP server itself is signalled"
 expect_not_signalled 960001 "the Claude CLI that launched it is not signalled"
@@ -193,13 +222,14 @@ expect_not_signalled 990006 "a streak short of the floor at a sample under a min
 expect_signalled     990007 "a server idle for a day, then hot across runs for 65 minutes, is signalled"
 expect_not_signalled 990008 "a streak carried across a 25-minute gap between runs is not signalled"
 expect_not_signalled 990009 "a streak on a sample dated in the future is not signalled"
+expect_not_signalled 990010 "a streak that starts after the sample carrying it is not signalled"
 expect_not_signalled 990011 "a session whose --settings names claude-mem is not signalled"
 expect_not_signalled 990012 "a subagent whose --mcp-config names context7 is not signalled"
 expect_not_signalled 990013 "a stryker run under a context7-named directory is not signalled"
 expect_not_signalled 990014 "a pytest run under a supabase-mcp-named path is not signalled"
 expect_not_signalled 990015 "a Codex CLI configured with MCP servers is not signalled"
 
-if grep -qF 'Reaped 2 runaway protected process(es), freed ~341 MB' "$tmp/guard.out"; then
+if grep -qF "$SUMMARY" "$tmp/guard.out"; then
   ok "the summary counts the two deliveries, and only their memory"
 else
   bad "the summary counts the two deliveries, and only their memory: $(grep 'Reaped' "$tmp/guard.out")"
@@ -226,6 +256,7 @@ expect_sample 990005 "$R|$NOW|$NOW" "a reused PID is recorded under its own star
 expect_sample 990006 "$S|$((NOW - 30))|$((NOW - 3600))" "a sample less than a minute old is kept as it was"
 expect_sample 990008 "$S|$NOW|$NOW" "a gap of more than 20 minutes starts the streak over"
 expect_sample 990009 "$S|$NOW|$NOW" "a sample dated after this run starts the streak over"
+expect_sample 990010 "$S|$NOW|$NOW" "a streak starting after its own sample starts over"
 expect_sample 960005 "" "a process below the threshold at a run loses its streak"
 expect_sample 960001 "" "a process not hot now has no sample"
 
@@ -256,6 +287,37 @@ if cmp -s "$tmp/samples.tsv" "$tmp/samples.before" && [ ! -s "$tmp/signalled" ] 
   ok "a run that cannot record its samples keeps the previous ones and signals nothing"
 else
   bad "a run that cannot record its samples keeps the previous ones and signals nothing: signalled $(tr '\n' ' ' < "$tmp/signalled" 2>/dev/null)"
+fi
+
+# The same scenario under zsh, the shell the installer sources these functions into. `status` is
+# read-only there and a function named `kill` is not the builtin, so a kill branch that only ever
+# runs under bash proves nothing about the one on the host.
+if command -v zsh >/dev/null 2>&1; then
+  : > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+  cp "$tmp/samples.before" "$tmp/samples.tsv"
+  GUARD_SHELL=zsh guard > "$tmp/zsh.out" 2>&1
+  zsh_set="$(signalled_set)"
+  if [ "$zsh_set" = "$SELECTED" ] && grep -qF "$SUMMARY" "$tmp/zsh.out"; then
+    ok "zsh: the same servers are selected, signalled and counted"
+  else
+    bad "zsh: the same servers are selected, signalled and counted: signalled [$zsh_set]; $(grep -iE 'reaped|error|read-only|substitution|not found' "$tmp/zsh.out" | head -3 | tr '\n' ';')"
+  fi
+else
+  ok "zsh is not installed, so the zsh run is skipped"
+fi
+
+# A samples path with no directory part: `mkdir -p` on it would create a directory where the file
+# belongs, and every later run would read nothing and record nothing.
+mkdir -p "$tmp/nodir"
+cp "$tmp/samples.before" "$tmp/nodir/samples.tsv"
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+( cd "$tmp/nodir" && CC_RUNAWAY_SAMPLES_FILE=samples.tsv guard > "$tmp/nodir.out" 2>&1 )
+nodir_set="$(signalled_set)"
+if [ -f "$tmp/nodir/samples.tsv" ] && ! cmp -s "$tmp/nodir/samples.tsv" "$tmp/samples.before" &&
+   [ "$nodir_set" = "$SELECTED" ]; then
+  ok "a samples path with no directory is read and rewritten where the guard runs"
+else
+  bad "a samples path with no directory is read and rewritten where the guard runs: signalled [$nodir_set]$([ -d "$tmp/nodir/samples.tsv" ] && echo '; the samples path is a directory')"
 fi
 
 if [ ! -s "$tmp/unstubbed" ]; then
