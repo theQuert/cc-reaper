@@ -130,7 +130,7 @@ zsh -n shell/claude-cleanup.sh         # zsh reaches code paths bash-only checks
 | `CC_RUNAWAY_MIN` | 60 | Minutes a process must stay hot across claude-guard runs before it is runaway |
 | `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds claude-guard waits before SIGTERM-ing runaway protected processes |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip claude-guard's runaway phase |
-| `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks, and a path with no directory part is a file in the directory the guard runs from |
+| `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks, a path with no directory part is a file in the directory the guard runs from, and a run that cannot record this run's samples warns on stderr and selects nothing |
 
 ### Stop hook
 
