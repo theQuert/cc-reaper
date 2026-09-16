@@ -58,7 +58,7 @@
 - [x] 8.2 A sample dated after the run, or with a streak starting after it, is refused; a run that cannot write its samples leaves the previous file and selects nothing
 - [x] 8.3 The `.app` rule is proven on the executable and on the runner's operand
 - [x] 8.4 disk-janitor: the dangling-image report is asserted to send docker nothing but the listing
-- [x] 8.5 Deploy tooling: rollback keeps the repaired rc lines unless `--with-rc`; the deploy stops when a commented-out current line sits beside a stale one
+- [x] 8.5 Deploy tooling, which is host-local and lives beside this session rather than in the repository: rollback keeps the repaired rc lines unless `--with-rc`; the deploy stops when a commented-out current line sits beside a stale one
 - [x] 8.6 Docs: the runaway phase signals each selected PID alone; a manual install has no runaway coverage; the rollback note matches the reverted installer
 
 ## 9. Review round 5
@@ -66,10 +66,19 @@
 - [x] 9.1 Red-verify: a samples path with no directory part is turned into a directory, so the phase never records again
 - [x] 9.2 A samples path with no directory part is read and rewritten in the directory claude-guard runs from
 - [x] 9.3 The runaway phase's selection, re-check and kill branch run under zsh as well as bash, against the same scenario and the same delivered set
-- [x] 9.4 A sample whose streak starts after the sample was taken is refused, proven on a fixture of its own
+- [x] 9.4 A sample whose streak starts after the sample was taken is refused, proven on a fixture of its own: such a record can only shorten a streak, so what it changes is the sample recorded, not a kill
+- [x] 9.5 Docs: `zsh -n` reads a `status` local without complaint, so name the suites that run their phases under both shells, and say what a samples path with no directory part means
 
-## 10. Delivery
+## 10. Review round 6
 
-- [ ] 10.1 All suites, `bash -n`, `zsh -n`, `openspec validate --strict`
-- [ ] 10.2 Independent review until no actionable findings
-- [ ] 10.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
+- [x] 10.1 Red-verify: a run that can read its samples but cannot write them selects from the stale ones and signals
+- [x] 10.2 A run that cannot record any samples selects nothing, as a run that cannot finish writing them already did
+- [x] 10.3 The samples directory is created when it does not exist, and a first run at a path with no directory part leaves a file there, not a directory
+- [x] 10.4 A dry run is proven to signal nothing, and the zsh leg runs `zsh -f`, so neither leg depends on whose shell it is
+- [x] 10.5 Tasks: name the change `openspec validate --strict` gates, mark the deploy tooling as host-local, and say what the streak-after-its-own-sample fixture proves
+
+## 11. Delivery
+
+- [ ] 11.1 All suites, `bash -n`, `zsh -n`, `openspec validate coexist-with-dev-workflow --strict`
+- [ ] 11.2 Independent review until no actionable findings
+- [ ] 11.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
