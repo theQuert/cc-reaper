@@ -101,9 +101,9 @@ positive number SHALL be replaced by its default.
 A sample dated later than the run reading it, or whose streak starts after the sample was taken,
 SHALL NOT count, so a clock set back starts the streak over. A run that cannot record this run's
 samples - because it cannot create the file, cannot write it to the end, or cannot put it in place
-- SHALL leave the previous samples in place, SHALL report that on standard error, and SHALL select
-nothing. A samples path with no directory part SHALL name a file where claude-guard runs, not a
-directory to create.
+- SHALL leave the previous samples in place, SHALL say so both on standard error and in the report
+claude-guard prints, and SHALL select nothing. A samples path with no directory part SHALL name a
+file where claude-guard runs, not a directory to create.
 
 #### Scenario: Stuck for an hour after a long idle life
 - **WHEN** a shared MCP server a day old, whose lifetime average is 5%, has used at least 80% of every interval between samples for the last 65 minutes and reads over the threshold
@@ -143,11 +143,11 @@ directory to create.
 
 #### Scenario: Samples cannot be written completely
 - **WHEN** recording this run's samples fails, as when the disk is full
-- **THEN** the previous samples SHALL be left in place and the run SHALL select nothing
+- **THEN** the previous samples SHALL be left in place, the run SHALL say so, and it SHALL select nothing
 
 #### Scenario: Samples cannot be recorded at all
 - **WHEN** this run's samples file cannot be created or put in place, as when its directory is read-only
-- **THEN** the previous samples SHALL be left in place, the run SHALL say so on standard error, and it SHALL select nothing
+- **THEN** the previous samples SHALL be left in place, the run SHALL say so on standard error and in its report, and it SHALL select nothing
 
 #### Scenario: A samples path with no directory
 - **WHEN** `CC_RUNAWAY_SAMPLES_FILE` names a file with no directory part
