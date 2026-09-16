@@ -46,7 +46,7 @@ Detection is split across two seams so that **no argument value can influence wh
 
 Tests drive the two seams separately via `CC_REAPER_PS_SNAPSHOT_FILE` (`pid tty comm`) and `CC_REAPER_PS_CMD_SNAPSHOT_DIR` (one file per PID, so fixtures can hold the embedded newlines a real `--settings` argument produces).
 
-**zsh portability**: this project is installed into zsh, so `claude-guard`'s reaping paths must avoid two zsh traps that bash hides — `status` is a read-only variable (use `proc_status`), and arrays cannot be walked by numeric index (`${!arr[@]}` is `bad substitution`, `${arr[0]}` is empty). Kill candidates are carried as `pid<TAB>detail` records iterated by value. `zsh -n` belongs in the syntax check alongside `bash -n`.
+**zsh portability**: this project is installed into zsh, so `claude-guard`'s reaping paths must avoid two zsh traps that bash hides — `status` is a read-only variable (use `proc_status`), and arrays cannot be walked by numeric index (`${!arr[@]}` is `bad substitution`, `${arr[0]}` is empty). Kill candidates are carried as `pid<TAB>detail` records iterated by value. `zsh -n` belongs in the syntax check alongside `bash -n`, and `tests/guard-session-detect.sh` and `tests/guard-runaway.sh` each run their phases under both shells — a syntax check passes a `status` local, so only a run of the kill branch under zsh catches one.
 
 **Protection classes**: `_cc_reaper_protection_class` is the single owner of how protected a process is, returning `immutable`, `shared`, or `none` for a command line. All three cleanup paths consult it, which is what keeps them from disagreeing:
 
@@ -109,7 +109,7 @@ bash tests/cc-monitor-runaway.sh       # Validate runaway protected process dete
 bash tests/guard-session-detect.sh     # Validate session detection + guard phases under bash and zsh
 bash tests/protection-classes.sh       # Validate protection classes, runaway selection/signalling, tree RSS
 bash tests/monitor-selection.sh        # LaunchAgent monitor body: what it signals (no CPU-based selection)
-bash tests/guard-runaway.sh            # claude-guard runaway phase run whole: known MCP servers, CPU sampled across runs, each re-checked PID alone
+bash tests/guard-runaway.sh            # claude-guard runaway phase run whole under bash and zsh: known MCP servers, CPU sampled across runs, each re-checked PID alone
 bash tests/install-rc-source.sh        # install.sh rc lines source the deployed copies; a stale one is repaired only when nothing else names the script
 bash tests/worktree-janitor.sh         # Validate worktree gates, landing proofs, declarations, session mode, lock
 bash -n shell/claude-cleanup.sh        # Syntax check
@@ -133,7 +133,7 @@ zsh -n shell/claude-cleanup.sh         # zsh reaches code paths bash-only checks
 | `CC_RUNAWAY_MIN` | 60 | Minutes a process must stay hot across claude-guard runs before it is runaway |
 | `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds claude-guard waits before SIGTERM-ing runaway protected processes |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip claude-guard's runaway phase |
-| `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks |
+| `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks, and a path with no directory part is a file in the directory the guard runs from |
 
 ### Stop hook
 
