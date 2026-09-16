@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # cc-reaper guard-runner — scheduled by the com.cc-reaper.guard LaunchAgent.
 #
-# Runs ONLY claude-guard's runaway phase: reaps whitelisted MCP servers that
-# have been pinned at high CPU for a long time. Session / RSS / FD eviction is
+# Runs ONLY claude-guard's runaway phase: reaps a known shared MCP server that
+# has stayed hot across guard runs - measured from CPU-time samples, not from a
+# whitelist and not from one CPU reading. Session / RSS / FD eviction is
 # suppressed with huge thresholds so an unattended timer can NEVER kill an idle
 # session you meant to keep — only a genuinely runaway protected process dies.
 #

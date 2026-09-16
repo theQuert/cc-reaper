@@ -259,6 +259,13 @@ if grep -qF "$SUMMARY" "$tmp/guard.out"; then
 else
   bad "the summary counts the two deliveries, and only their memory: $(grep 'Reaped' "$tmp/guard.out")"
 fi
+# The grace period and the re-check pause are both spent before any signal, and this run's grace
+# is zero, so the banner has to name the three seconds it will still wait.
+if grep -qF 'Sending SIGTERM in 3 seconds' "$tmp/guard.out"; then
+  ok "the banner counts the re-check pause it will also spend"
+else
+  bad "the banner counts the re-check pause it will also spend: $(grep 'Sending SIGTERM' "$tmp/guard.out")"
+fi
 if awk '$1 == "sleep" { s += $2 } END { exit !(s >= 3) }' "$tmp/calls"; then
   ok "the re-check waits at least three seconds"
 else
