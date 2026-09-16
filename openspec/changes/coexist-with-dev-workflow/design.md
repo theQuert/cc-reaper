@@ -131,8 +131,9 @@ same way it already handles unreferenced volumes.
   streaks, which delays a reap and never causes one. A directory that cannot be written is not in
   that class: the run cannot record anything, so it warns and selects nothing, as does a run whose
   samples could not be written to the end or put in place - a partial or stale record could claim
-  a streak it did not earn. One record is refused outright for the same reason: a sample dated
-  after the run reading it, which is a clock set back.
+  a streak it did not earn. Two records are refused outright for the same reason: one dated
+  after the run reading it, which is a clock set back, and one whose streak starts after the
+  sample that carries it, which no clock produces.
 - **Only listed MCP servers, in known forms, are eligible.** claude-mem's worker is protected but
   not listed, since its process form was never observed. A server run from its own checkout
   rather than from `node_modules` or a `bin` directory is not identified, nor is one run by a

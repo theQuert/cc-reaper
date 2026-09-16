@@ -87,7 +87,8 @@ on its last run.
   `hooks/stop-cleanup-orphans.sh` (comment only).
 - **Tests:** new `tests/monitor-selection.sh`, `tests/guard-runaway.sh` and
   `tests/install-rc-source.sh`; updated `tests/protection-classes.sh`,
-  `tests/cc-monitor-runaway.sh` and `tests/disk-janitor.sh`.
+  `tests/cc-monitor-runaway.sh`, `tests/disk-janitor.sh`, `tests/guard-session-detect.sh` and
+  `tests/agent-process-patterns.sh`.
 - **Docs:** README, CHANGELOG, CLAUDE.md.
 - **Rollback:** revert the merge commit and run the reverted `install.sh`, which copies each
   script over the deployed one in place rather than by rename, so run it when no LaunchAgent job
