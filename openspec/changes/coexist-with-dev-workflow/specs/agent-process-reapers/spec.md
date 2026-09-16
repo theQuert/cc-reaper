@@ -100,7 +100,8 @@ positive number SHALL be replaced by its default.
 
 A sample dated later than the run reading it, or whose streak starts after the sample was taken,
 SHALL NOT count, so a clock set back starts the streak over. A run that cannot record this run's
-samples completely SHALL leave the previous samples in place and SHALL select nothing. A samples
+samples - because it cannot create the file, or cannot write it to the end - SHALL leave the
+previous samples in place and SHALL select nothing. A samples
 path with no directory part SHALL name a file where claude-guard runs, not a directory to create.
 
 #### Scenario: Stuck for an hour after a long idle life
@@ -141,6 +142,10 @@ path with no directory part SHALL name a file where claude-guard runs, not a dir
 
 #### Scenario: Samples cannot be written completely
 - **WHEN** recording this run's samples fails, as when the disk is full
+- **THEN** the previous samples SHALL be left in place and the run SHALL select nothing
+
+#### Scenario: Samples cannot be recorded at all
+- **WHEN** this run's samples file cannot be created, as when its directory is read-only
 - **THEN** the previous samples SHALL be left in place and the run SHALL select nothing
 
 #### Scenario: A samples path with no directory
