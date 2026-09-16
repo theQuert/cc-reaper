@@ -76,9 +76,18 @@
 - [x] 10.3 The samples directory is created when it does not exist, and a first run at a path with no directory part leaves a file there, not a directory
 - [x] 10.4 A dry run is proven to signal nothing, and the zsh leg runs `zsh -f`, so neither leg depends on whose shell it is
 - [x] 10.5 Tasks: name the change `openspec validate --strict` gates, mark the deploy tooling as host-local, and say what the streak-after-its-own-sample fixture proves
+- [x] 10.6 The runaway suite's signalled-set variable says what it holds: every PID the phase signals, one of whose deliveries fails
 
-## 11. Delivery
+## 11. Review round 7
 
-- [ ] 11.1 All suites, `bash -n`, `zsh -n`, `openspec validate coexist-with-dev-workflow --strict`
-- [ ] 11.2 Independent review until no actionable findings
-- [ ] 11.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
+- [x] 11.1 Red-verify: a run that cannot record its samples selects nothing and prints nothing; a rename that fails still selects from the previous samples
+- [x] 11.2 A run that cannot create, cannot finish, or cannot put its samples in place warns on stderr and selects nothing
+- [x] 11.3 The session-detection suite's zsh leg runs `zsh -f` as the runaway suite's does, so neither depends on whose shell it is
+- [x] 11.4 The read-only scenario cannot leave behind a directory the suite's own cleanup cannot remove
+- [x] 11.5 Docs: the design bullet and both `CC_RUNAWAY_SAMPLES_FILE` rows say what an unwritable samples directory does, which is not what a lost file does
+
+## 12. Delivery
+
+- [ ] 12.1 All suites, `bash -n`, `zsh -n`, `openspec validate coexist-with-dev-workflow --strict`
+- [ ] 12.2 Independent review until no actionable findings
+- [ ] 12.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
