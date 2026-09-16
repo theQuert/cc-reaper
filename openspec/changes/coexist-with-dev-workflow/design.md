@@ -127,11 +127,12 @@ same way it already handles unreferenced volumes.
 - **Within an interval, CPU time sums threads.** A multi-threaded server can idle for part of a
   10-minute interval and still count as hot. Accepted: the interval bounds it, and the re-check
   requires the server hot now.
-- **Samples live in one file.** A lost, unwritable or concurrently replaced file only restarts
-  streaks, which delays a reap and never causes one. Two records that could claim a streak they
-  did not earn are refused rather than trusted: one dated after the run reading it, which is a
-  clock set back, and any record from a run whose samples could not be written completely - that
-  run leaves the previous file alone and selects nothing.
+- **Samples live in one file.** A lost, unreadable or concurrently replaced file only restarts
+  streaks, which delays a reap and never causes one. A directory that cannot be written is not in
+  that class: the run cannot record anything, so it warns and selects nothing, as does a run whose
+  samples could not be written to the end or put in place - a partial or stale record could claim
+  a streak it did not earn. One record is refused outright for the same reason: a sample dated
+  after the run reading it, which is a clock set back.
 - **Only listed MCP servers, in known forms, are eligible.** claude-mem's worker is protected but
   not listed, since its process form was never observed. A server run from its own checkout
   rather than from `node_modules` or a `bin` directory is not identified, nor is one run by a
