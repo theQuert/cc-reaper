@@ -54,15 +54,22 @@
 
 ## 8. Review round 4
 
-- [ ] 8.1 Red-verify: a server whose runner's operand is inside an `.app` bundle, and `codex mcp-server` inside one, are eligible; a sample dated in the future carries its streak; a cool run keeps a streak; a run whose samples cannot be written selects and records anyway
-- [ ] 8.2 A sample dated after the run, or with a streak starting after it, is refused; a run that cannot write its samples leaves the previous file and selects nothing
-- [ ] 8.3 The `.app` rule is proven on the executable and on the runner's operand
-- [ ] 8.4 disk-janitor: the dangling-image report is asserted to send docker nothing but the listing
-- [ ] 8.5 Deploy tooling: rollback keeps the repaired rc lines unless `--with-rc`; the deploy stops when a commented-out current line sits beside a stale one
-- [ ] 8.6 Docs: the runaway phase signals each selected PID alone; a manual install has no runaway coverage; the rollback note matches the reverted installer
+- [x] 8.1 Red-verify: a server whose runner's operand is inside an `.app` bundle, and `codex mcp-server` inside one, are eligible; a sample dated in the future carries its streak; a cool run keeps a streak; a run whose samples cannot be written selects and records anyway
+- [x] 8.2 A sample dated after the run, or with a streak starting after it, is refused; a run that cannot write its samples leaves the previous file and selects nothing
+- [x] 8.3 The `.app` rule is proven on the executable and on the runner's operand
+- [x] 8.4 disk-janitor: the dangling-image report is asserted to send docker nothing but the listing
+- [x] 8.5 Deploy tooling: rollback keeps the repaired rc lines unless `--with-rc`; the deploy stops when a commented-out current line sits beside a stale one
+- [x] 8.6 Docs: the runaway phase signals each selected PID alone; a manual install has no runaway coverage; the rollback note matches the reverted installer
 
-## 9. Delivery
+## 9. Review round 5
 
-- [ ] 9.1 All suites, `bash -n`, `zsh -n`, `openspec validate --strict`
-- [ ] 9.2 Independent review until no actionable findings
-- [ ] 9.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
+- [x] 9.1 Red-verify: a samples path with no directory part is turned into a directory, so the phase never records again
+- [x] 9.2 A samples path with no directory part is read and rewritten in the directory claude-guard runs from
+- [x] 9.3 The runaway phase's selection, re-check and kill branch run under zsh as well as bash, against the same scenario and the same delivered set
+- [x] 9.4 A sample whose streak starts after the sample was taken is refused, proven on a fixture of its own
+
+## 10. Delivery
+
+- [ ] 10.1 All suites, `bash -n`, `zsh -n`, `openspec validate --strict`
+- [ ] 10.2 Independent review until no actionable findings
+- [ ] 10.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
