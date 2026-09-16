@@ -918,7 +918,9 @@ _cc_guard_runaway_protected_pids() {
   local cpu_threshold=$1 min_minutes=$2 record=${3:-0} now samples tmp="" list rc pid etime cpu cmd
   now=$(date +%s)
   samples=${CC_RUNAWAY_SAMPLES_FILE:-$HOME/.cc-reaper/state/runaway-samples.tsv}
-  if [ "$record" = 1 ] && mkdir -p "${samples%/*}" 2>/dev/null; then
+  # A path with no directory part names a file where claude-guard runs; `mkdir -p` on it would
+  # create a directory there, and every later run would read nothing and record nothing.
+  if [ "$record" = 1 ] && { [ "${samples%/*}" = "$samples" ] || mkdir -p "${samples%/*}" 2>/dev/null; }; then
     tmp=$(mktemp "$samples.XXXXXX" 2>/dev/null) || tmp=""
   fi
   list=$(LC_ALL=C TZ=UTC ps -axo pid=,lstart=,etime=,time=,%cpu= 2>/dev/null |
