@@ -179,10 +179,13 @@ HARNESS
 # Each run's overrides are its own: they are forwarded to the harness process and then cleared, so
 # a scenario cannot inherit the previous one's environment.
 guard() {
-  local rc
+  local rc sh="${GUARD_SHELL:-/bin/bash}" opt=""
+  # zsh reads `$ZDOTDIR/.zshenv` even for a script, and `bash script` reads nothing; `-f` is what
+  # makes the two legs the same environment rather than one that depends on whose shell it is.
+  [ "${sh##*/}" = zsh ] && opt=-f
   CC_TEST_AWK_FAIL="${CC_TEST_AWK_FAIL:-0}" CC_RUNAWAY_CPU="${CC_RUNAWAY_CPU:-}" \
     CC_RUNAWAY_MIN="${CC_RUNAWAY_MIN:-}" CC_RUNAWAY_SAMPLES_FILE="${CC_RUNAWAY_SAMPLES_FILE:-}" \
-    "${GUARD_SHELL:-/bin/bash}" "$tmp/harness.sh" "$@"
+    "$sh" ${opt:+"$opt"} "$tmp/harness.sh" "$@"
   rc=$?
   unset CC_TEST_AWK_FAIL CC_RUNAWAY_CPU CC_RUNAWAY_MIN CC_RUNAWAY_SAMPLES_FILE GUARD_SHELL
   return $rc
@@ -195,8 +198,9 @@ guard > "$tmp/guard.out" 2>&1
 signalled() { grep -qx "$1" "$tmp/signalled" 2>/dev/null; }
 expect_signalled()     { if signalled "$1"; then ok "$2"; else bad "$2"; fi; }
 expect_not_signalled() { if signalled "$1"; then bad "$2"; else ok "$2"; fi; }
-# The whole delivered set, for the runs that repeat this scenario elsewhere.
-SELECTED="960002 980004 990007 "
+# Every PID this scenario signals, for the runs that repeat it elsewhere. Two of the three are
+# delivered - 980004's signal fails - so the summary below counts two.
+SIGNALLED="960002 980004 990007 "
 signalled_set() { sort -un "$tmp/signalled" 2>/dev/null | tr '\n' ' '; }
 SUMMARY='Reaped 2 runaway protected process(es), freed ~341 MB'
 
@@ -260,8 +264,8 @@ expect_sample 990010 "$S|$NOW|$NOW" "a streak starting after its own sample star
 expect_sample 960005 "" "a process below the threshold at a run loses its streak"
 expect_sample 960001 "" "a process not hot now has no sample"
 
-# A dry run with zero thresholds: the defaults apply, and nothing is recorded.
-: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"
+# A dry run with zero thresholds: the defaults apply, nothing is recorded, and nothing is signalled.
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
 cp "$tmp/samples.before" "$tmp/samples.tsv"
 CC_RUNAWAY_CPU=0 CC_RUNAWAY_MIN=0 guard --dry-run > "$tmp/dry.out" 2>&1
 listed="$(awk '$1 == "PID" { print $2 }' "$tmp/dry.out" | sort -n | tr '\n' ' ')"
@@ -274,6 +278,11 @@ if cmp -s "$tmp/samples.tsv" "$tmp/samples.before"; then
   ok "a dry run records no samples"
 else
   bad "a dry run records no samples"
+fi
+if [ ! -s "$tmp/signalled" ]; then
+  ok "a dry run signals nothing"
+else
+  bad "a dry run signals nothing: $(signalled_set)"
 fi
 
 # A run whose samples cannot be written to the end: a partial file could claim any streak, and a
@@ -297,7 +306,7 @@ if command -v zsh >/dev/null 2>&1; then
   cp "$tmp/samples.before" "$tmp/samples.tsv"
   GUARD_SHELL=zsh guard > "$tmp/zsh.out" 2>&1
   zsh_set="$(signalled_set)"
-  if [ "$zsh_set" = "$SELECTED" ] && grep -qF "$SUMMARY" "$tmp/zsh.out"; then
+  if [ "$zsh_set" = "$SIGNALLED" ] && grep -qF "$SUMMARY" "$tmp/zsh.out"; then
     ok "zsh: the same servers are selected, signalled and counted"
   else
     bad "zsh: the same servers are selected, signalled and counted: signalled [$zsh_set]; $(grep -iE 'reaped|error|read-only|substitution|not found' "$tmp/zsh.out" | head -3 | tr '\n' ';')"
@@ -306,18 +315,53 @@ else
   ok "zsh is not installed, so the zsh run is skipped"
 fi
 
-# A samples path with no directory part: `mkdir -p` on it would create a directory where the file
-# belongs, and every later run would read nothing and record nothing.
+# A samples path with no directory part, on the first run, when no file is there yet: `mkdir -p`
+# on such a path creates a directory where the file belongs, and every run after it reads nothing
+# and records nothing, so the phase never selects again.
 mkdir -p "$tmp/nodir"
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+( cd "$tmp/nodir" && CC_RUNAWAY_SAMPLES_FILE=samples.tsv guard > "$tmp/nodir-first.out" 2>&1 )
+if [ -f "$tmp/nodir/samples.tsv" ] && [ -s "$tmp/nodir/samples.tsv" ]; then
+  ok "a first run at a samples path with no directory leaves a file there"
+else
+  bad "a first run at a samples path with no directory leaves a file there$([ -d "$tmp/nodir/samples.tsv" ] && echo ': it is a directory')"
+fi
+# And with samples already there, they are read and rewritten in that same directory.
 cp "$tmp/samples.before" "$tmp/nodir/samples.tsv"
 : > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
 ( cd "$tmp/nodir" && CC_RUNAWAY_SAMPLES_FILE=samples.tsv guard > "$tmp/nodir.out" 2>&1 )
 nodir_set="$(signalled_set)"
 if [ -f "$tmp/nodir/samples.tsv" ] && ! cmp -s "$tmp/nodir/samples.tsv" "$tmp/samples.before" &&
-   [ "$nodir_set" = "$SELECTED" ]; then
+   [ "$nodir_set" = "$SIGNALLED" ]; then
   ok "a samples path with no directory is read and rewritten where the guard runs"
 else
-  bad "a samples path with no directory is read and rewritten where the guard runs: signalled [$nodir_set]$([ -d "$tmp/nodir/samples.tsv" ] && echo '; the samples path is a directory')"
+  bad "a samples path with no directory is read and rewritten where the guard runs: signalled [$nodir_set]"
+fi
+
+# A samples path under a directory that does not exist yet: the run creates it and records there.
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+CC_RUNAWAY_SAMPLES_FILE="$tmp/fresh/state/samples.tsv" guard > "$tmp/fresh.out" 2>&1
+if [ -s "$tmp/fresh/state/samples.tsv" ]; then
+  ok "a samples directory that does not exist yet is created and recorded into"
+else
+  bad "a samples directory that does not exist yet is created and recorded into"
+fi
+
+# A run that can read its samples but cannot write them, its directory being read-only. Nothing of
+# this run can be recorded, so nothing is selected: the previous samples stand, and a measurement
+# that cannot be taken authorises no kill - the same rule as one that cannot be finished.
+mkdir -p "$tmp/ro"
+cp "$tmp/samples.before" "$tmp/ro/samples.tsv"
+chmod 555 "$tmp/ro"
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+CC_RUNAWAY_SAMPLES_FILE="$tmp/ro/samples.tsv" guard > "$tmp/ro.out" 2>&1
+ro_signalled="$(signalled_set)"
+ro_kept=1; cmp -s "$tmp/ro/samples.tsv" "$tmp/samples.before" || ro_kept=0
+chmod 755 "$tmp/ro"
+if [ -z "$ro_signalled" ] && [ "$ro_kept" = 1 ]; then
+  ok "a run that cannot record any samples keeps the previous ones and signals nothing"
+else
+  bad "a run that cannot record any samples keeps the previous ones and signals nothing: signalled [$ro_signalled], samples kept $ro_kept"
 fi
 
 if [ ! -s "$tmp/unstubbed" ]; then
