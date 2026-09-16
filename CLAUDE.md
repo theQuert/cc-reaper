@@ -128,7 +128,7 @@ zsh -n shell/claude-cleanup.sh         # zsh reaches code paths bash-only checks
 | `CC_AGENT_STALE_MINUTES` | 360 | Age threshold (minutes) for stale agent-browser, Puppeteer Chrome, and detached Codex/MCP cleanup |
 | `CC_RUNAWAY_CPU` | 80 | CPU, as a percent of each interval between claude-guard runs, at or above which a known shared MCP server stays hot; it must also read at least this hot now |
 | `CC_RUNAWAY_MIN` | 60 | Minutes a process must stay hot across claude-guard runs before it is runaway |
-| `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds claude-guard waits before SIGTERM-ing runaway protected processes |
+| `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds claude-guard waits before the re-check, which adds three more; the banner prints the sum |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip claude-guard's runaway phase |
 | `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks, a path with no directory part is a file in the directory the guard runs from, and a recording run (not `--dry-run`) that cannot record this run's samples says so, on stderr and in claude-guard's report, and selects nothing |
 

@@ -236,7 +236,7 @@ claude-guard --dry-run  # preview without killing
 | `CC_AGENT_STALE_MINUTES` | 360 | Age threshold for stale agent-browser, Puppeteer Chrome, and detached Codex/MCP cleanup |
 | `CC_RUNAWAY_CPU` | 80 | CPU% above which a process is treated as stuck/runaway (combined with `CC_RUNAWAY_MIN`). Shared by both tools; `claude-guard` measures it from CPU-time samples taken across its own runs |
 | `CC_RUNAWAY_MIN` | **30** in `cc-monitor`, **60** in `claude-guard` | Minutes a process must stay hot before it is treated as runaway: elapsed time in `cc-monitor`, time across its own runs in `claude-guard`. The two defaults differ on purpose — the monitor only reports, the guard signals — and setting this env var overrides both at once |
-| `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds `claude-guard` waits (Ctrl+C to abort) before SIGTERM-ing runaway protected processes |
+| `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds `claude-guard` waits (Ctrl+C to abort) before the re-check, which adds three more; the banner prints the sum |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip `claude-guard`'s runaway phase entirely |
 | `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks, a path with no directory part is a file in the directory the guard runs from, and a recording run (not `--dry-run`) that cannot record this run's samples says so, on stderr and in claude-guard's report, and selects nothing |
 
@@ -512,6 +512,7 @@ cc-reaper/
 ├── launchd/
 │   ├── cc-reaper-monitor.sh        # LaunchAgent monitor script (PGID + PPID=1 fallback)
 │   ├── com.cc-reaper.orphan-monitor.plist  # LaunchAgent config (10-min interval)
+│   ├── com.cc-reaper.guard.plist           # claude-guard runaway-phase agent (10-min interval)
 │   ├── com.cc-reaper.resource-watch.plist  # System snapshot agent (10-min interval)
 │   ├── com.cc-reaper.disk-check.plist      # Read-only disk check agent (hourly)
 │   └── com.cc-reaper.weekly-clean.plist    # Rebuildable-cache clean agent (Sun 04:00)
@@ -520,6 +521,7 @@ cc-reaper/
 ├── shell/
 │   ├── cc-monitor.sh               # Read-only heat attribution monitor
 │   ├── claude-cleanup.sh           # Shell functions (claude-ram, claude-fd, claude-cleanup, claude-sessions, claude-guard)
+│   ├── guard-runner.sh             # What the guard agent runs: claude-guard's runaway phase alone
 │   ├── resource-watch.sh           # System snapshot + threshold alerting
 │   ├── disk-janitor.sh             # Disk check (--check) / rebuildable-cache clean (--clean)
 │   └── worktree-janitor.sh         # Git worktree inventory + gated removal (dry-run default)
@@ -527,6 +529,11 @@ cc-reaper/
 │   ├── agent-process-patterns.sh   # Cleanup-candidate matcher validation
 │   ├── cc-monitor-optimize.sh      # cc-monitor optimization menu tests
 │   ├── cc-monitor-runaway.sh       # Runaway protected process detection tests
+│   ├── guard-runaway.sh            # The runaway phase run whole, under bash and zsh
+│   ├── guard-session-detect.sh     # Session detection + guard phases under bash and zsh
+│   ├── install-rc-source.sh        # Installer rc-line repair (stale, doubled, disabled, ACL)
+│   ├── monitor-selection.sh        # What the LaunchAgent monitor signals (no CPU-based selection)
+│   ├── protection-classes.sh       # Protection classes, runaway selection/signalling, tree RSS
 │   ├── ppid-fallback.sh            # PPID=1 fallback kill + whitelist validation
 │   ├── resource-watch.sh           # Snapshot / threshold / cooldown tests (stubbed)
 │   ├── disk-janitor.sh             # Read-only check / forbidden-flag / thinning tests (stubbed)
