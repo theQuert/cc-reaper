@@ -905,9 +905,9 @@ _cc_guard_runaway_eligible() {
 # run's samples replace the file; a dry run or a listing leaves it alone. A lost file only
 # restarts streaks. A record dated after the run reading it, or whose streak starts after the
 # sample was taken, is refused: that is a clock set back, or a damaged line. A run that cannot
-# record this run's samples - it cannot create the file, or cannot write it to the end - keeps the
-# previous file and selects nothing, since a partial record could claim any streak and a
-# measurement that could not be taken authorises no kill.
+# record this run's samples - it cannot create the file, cannot write it to the end, or cannot put
+# it in place - keeps the previous file, says so on stderr and selects nothing, since a partial
+# record could claim any streak and a measurement that could not be taken authorises no kill.
 #
 # ponytail: one samples file, last writer wins - overlapping runs can drop each other's samples,
 # which only restarts streaks. Lock it if runs ever overlap routinely.
@@ -925,6 +925,10 @@ _cc_guard_runaway_protected_pids() {
     tmp=$(mktemp "$samples.XXXXXX" 2>/dev/null) || tmp=""
   fi
   if [ "$record" = 1 ] && [ -z "$tmp" ]; then
+    # Stdout is this function's result, so this goes to stderr - and it has to be said at all: a
+    # phase that has turned itself off prints exactly what a phase with nothing to do prints, and
+    # a read-only samples directory does not repair itself.
+    echo "  WARNING: cannot record runaway samples at $samples; selecting nothing." >&2
     return 0
   fi
   list=$(LC_ALL=C TZ=UTC ps -axo pid=,lstart=,etime=,time=,%cpu= 2>/dev/null |
@@ -954,7 +958,16 @@ _cc_guard_runaway_protected_pids() {
       }')
   rc=$?
   if [ -n "$tmp" ]; then
-    if [ "$rc" = 0 ]; then mv -f "$tmp" "$samples" 2>/dev/null || rm -f "$tmp"; else rm -f "$tmp"; fi
+    if [ "$rc" = 0 ]; then
+      # The rename is the third way to fail to record, and it authorises no kill either.
+      mv -f "$tmp" "$samples" 2>/dev/null || {
+        rm -f "$tmp"
+        echo "  WARNING: cannot record runaway samples at $samples; selecting nothing." >&2
+        return 0
+      }
+    else
+      rm -f "$tmp"
+    fi
   fi
   [ "$rc" = 0 ] || return 0
   [ -n "$list" ] || return 0
