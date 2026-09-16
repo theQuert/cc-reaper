@@ -888,6 +888,18 @@ _cc_guard_runaway_eligible() {
   printf '%s\n' "$cmd" | awk "$(_cc_reaper_mcp_server_program)"
 }
 
+# The samples file this host records to. The phase and the report claude-guard prints both name
+# it, so the default has one owner.
+_cc_guard_samples_path() {
+  printf '%s\n' "${CC_RUNAWAY_SAMPLES_FILE:-$HOME/.cc-reaper/state/runaway-samples.tsv}"
+}
+
+# Said on stderr, because stdout is the selection the phase returns. `printf`, not `echo`: zsh's
+# `echo` expands escapes, and naming the path is the whole job of the line.
+_cc_guard_samples_warn() {
+  printf '  WARNING: cannot record runaway samples at %s; selecting nothing.\n' "$1" >&2
+}
+
 # Print TSV (pid, cpu, etime, command) for runaway-eligible processes that have stayed hot for at
 # least min_minutes and are at or above cpu_threshold %cpu now.
 #
@@ -916,16 +928,10 @@ _cc_guard_runaway_eligible() {
 # Candidates come from a listing without a command column, and each command is read per PID and
 # flattened to one line, so argument text shaped like a row or a record adds no PID - the seam
 # session detection already uses.
-# Said on stderr, because stdout is the selection this function returns. `printf`, not `echo`:
-# zsh's `echo` expands escapes, and naming the path is the whole job of the line.
-_cc_guard_samples_warn() {
-  printf '  WARNING: cannot record runaway samples at %s; selecting nothing.\n' "$1" >&2
-}
-
 _cc_guard_runaway_protected_pids() {
   local cpu_threshold=$1 min_minutes=$2 record=${3:-0} now samples tmp="" list rc pid etime cpu cmd
   now=$(date +%s)
-  samples=${CC_RUNAWAY_SAMPLES_FILE:-$HOME/.cc-reaper/state/runaway-samples.tsv}
+  samples=$(_cc_guard_samples_path)
   # A path with no directory part names a file where claude-guard runs; `mkdir -p` on it would
   # create a directory there, and every later run would read nothing and record nothing.
   if [ "$record" = 1 ] && { [ "${samples%/*}" = "$samples" ] || mkdir -p "${samples%/*}" 2>/dev/null; }; then
@@ -1042,8 +1048,8 @@ claude-guard() {
     # report. Somebody reading the report has to see that nothing was selected because nothing
     # could be recorded, not because nothing was hot.
     if [ "$runaway_rc" = 2 ]; then
-      echo "  --- Runaway protected processes ---"
-      echo "  This run's samples could not be recorded, so nothing was selected."
+      echo "  --- Runaway protected processes (not measured) ---"
+      echo "  This run's samples could not be recorded at $(_cc_guard_samples_path), so nothing was selected."
       echo ""
     fi
     if [ -n "$runaway_lines" ]; then

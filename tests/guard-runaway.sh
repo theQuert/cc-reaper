@@ -217,7 +217,8 @@ SUMMARY='Reaped 2 runaway protected process(es), freed ~341 MB'
 # somebody reading the agent's error log, and the report a person reads says the phase selected
 # nothing because of it - under the LaunchAgent the two streams go to different files.
 expect_warned() {
-  if grep -q 'cannot record runaway samples' "$2" && grep -q 'could not be recorded' "$1"; then
+  if grep -q 'cannot record runaway samples' "$2" && grep -q 'could not be recorded' "$1" &&
+     grep -qF "$4" "$1" && grep -qF "$4" "$2"; then
     ok "$3"
   else
     bad "$3: stdout [$(tr '\n' ';' < "$1")] stderr [$(tr '\n' ';' < "$2")]"
@@ -317,7 +318,7 @@ if cmp -s "$tmp/samples.tsv" "$tmp/samples.before" && [ ! -s "$tmp/signalled" ] 
 else
   bad "a run that cannot record its samples keeps the previous ones and signals nothing: signalled $(tr '\n' ' ' < "$tmp/signalled" 2>/dev/null)"
 fi
-expect_warned "$tmp/fail.out" "$tmp/fail.err" "and says so, as the other two failures to record do"
+expect_warned "$tmp/fail.out" "$tmp/fail.err" "and says so, as the other two failures to record do" "$tmp/samples.tsv"
 
 # A dry run whose sampling fails lists nothing: it records none, so it never reaches the warning,
 # and a reading that failed part way is not a report. This is the one path left where the run's
@@ -398,7 +399,7 @@ else
   bad "a run that cannot record any samples keeps the previous ones and signals nothing: signalled [$ro_signalled], samples kept $ro_kept"
 fi
 # A phase that has turned itself off prints exactly what a quiet one prints, so it has to say so.
-expect_warned "$tmp/ro.out" "$tmp/ro.err" "and says so, rather than going quiet for as long as the directory stays read-only"
+expect_warned "$tmp/ro.out" "$tmp/ro.err" "and says so, rather than going quiet for as long as the directory stays read-only" "$tmp/ro/samples.tsv"
 
 # A run whose samples are written but cannot be put in place: the rename is the third way to fail
 # to record, and it authorises no kill either.
@@ -411,18 +412,52 @@ if [ ! -s "$tmp/signalled" ] && cmp -s "$tmp/samples.tsv" "$tmp/samples.before" 
 else
   bad "a run that cannot put its samples in place keeps the previous ones and signals nothing: signalled [$(signalled_set)]"
 fi
-expect_warned "$tmp/mvfail.out" "$tmp/mvfail.err" "and says so too"
+expect_warned "$tmp/mvfail.out" "$tmp/mvfail.err" "and says so too" "$tmp/samples.tsv"
 # And under zsh, where this branch returns from inside a brace group.
 if command -v zsh >/dev/null 2>&1; then
   : > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
   cp "$tmp/samples.before" "$tmp/samples.tsv"
   CC_TEST_MV_FAIL=1 GUARD_SHELL=zsh guard > "$tmp/mvfail-zsh.out" 2> "$tmp/mvfail-zsh.err"
-  if [ ! -s "$tmp/signalled" ] && cmp -s "$tmp/samples.tsv" "$tmp/samples.before"; then
+  if [ ! -s "$tmp/signalled" ] && cmp -s "$tmp/samples.tsv" "$tmp/samples.before" &&
+     ! ls "$tmp"/samples.tsv.* >/dev/null 2>&1; then
     ok "zsh: a run that cannot put its samples in place signals nothing there either"
   else
     bad "zsh: a run that cannot put its samples in place signals nothing there either: signalled [$(signalled_set)]"
   fi
-  expect_warned "$tmp/mvfail-zsh.out" "$tmp/mvfail-zsh.err" "zsh: and says so"
+  expect_warned "$tmp/mvfail-zsh.out" "$tmp/mvfail-zsh.err" "zsh: and says so" "$tmp/samples.tsv"
+fi
+
+# zsh's `echo` expands escapes, and naming the path is the whole job of the warning.
+if command -v zsh >/dev/null 2>&1; then
+  mkdir -p "$tmp/ro-bs"
+  chmod 555 "$tmp/ro-bs"
+  : > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+  CC_RUNAWAY_SAMPLES_FILE="$tmp/ro-bs/sam\tples.tsv" GUARD_SHELL=zsh guard > "$tmp/bs.out" 2> "$tmp/bs.err"
+  chmod 755 "$tmp/ro-bs"
+  if grep -qF 'sam\tples.tsv' "$tmp/bs.err"; then
+    ok "zsh: the warning names the path as it is, backslash and all"
+  else
+    bad "zsh: the warning names the path as it is, backslash and all: $(tr '\n' ';' < "$tmp/bs.err")"
+  fi
+fi
+
+# `BASH_ENV` is read for `bash script` as well as for `bash -c`, so the harness must not inherit
+# one either: a leg that reports whatever the person's shell does reports nothing about the phase.
+benv="$tmp/benv"
+mkdir -p "$benv/bin"
+printf '#!/bin/sh\nexit 3\n' > "$benv/bin/awk"
+chmod +x "$benv/bin/awk"
+printf 'export PATH="%s/bin:$PATH"\n' "$benv" > "$benv/env.sh"
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+cp "$tmp/samples.before" "$tmp/samples.tsv"
+export BASH_ENV="$benv/env.sh"
+guard > "$tmp/benv.out" 2>&1
+unset BASH_ENV
+benv_set="$(signalled_set)"
+if [ "$benv_set" = "$SIGNALLED" ]; then
+  ok "a BASH_ENV on the way in does not reach the harness"
+else
+  bad "a BASH_ENV on the way in does not reach the harness: signalled [$benv_set]"
 fi
 
 if [ ! -s "$tmp/unstubbed" ]; then
