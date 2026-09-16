@@ -319,6 +319,19 @@ else
 fi
 expect_warned "$tmp/fail.out" "$tmp/fail.err" "and says so, as the other two failures to record do"
 
+# A dry run whose sampling fails lists nothing: it records none, so it never reaches the warning,
+# and a reading that failed part way is not a report. This is the one path left where the run's
+# own status still decides - a recording run returns before it.
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+cp "$tmp/samples.before" "$tmp/samples.tsv"
+CC_TEST_AWK_FAIL=1 guard --dry-run > "$tmp/dryfail.out" 2>&1
+if ! grep -q '^  PID ' "$tmp/dryfail.out" && [ ! -s "$tmp/signalled" ] &&
+   cmp -s "$tmp/samples.tsv" "$tmp/samples.before"; then
+  ok "a dry run whose sampling fails lists nothing"
+else
+  bad "a dry run whose sampling fails lists nothing: $(grep -c '^  PID ' "$tmp/dryfail.out") listed"
+fi
+
 # The same scenario under zsh, the shell the installer sources these functions into. `status` is
 # read-only there and a function named `kill` is not the builtin, so a kill branch that only ever
 # runs under bash proves nothing about the one on the host.

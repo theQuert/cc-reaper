@@ -95,6 +95,7 @@
 - [x] 12.5 The failure-to-record paths run under zsh as well as bash
 - [x] 12.6 CHANGELOG: the runaway entry carries the samples-integrity rules, the warning included - it is the one new line a user sees in the guard log
 - [x] 12.7 Both `CC_RUNAWAY_SAMPLES_FILE` rows say the rule is about a recording run, since a dry run that cannot record still lists from the previous samples
+- [x] 12.8 A dry run whose sampling fails lists nothing: a recording run now returns before that check, so the dry run is the only path its status still decides
 
 ## 13. Delivery
 
