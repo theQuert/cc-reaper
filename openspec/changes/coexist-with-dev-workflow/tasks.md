@@ -97,8 +97,18 @@
 - [x] 12.7 Both `CC_RUNAWAY_SAMPLES_FILE` rows say the rule is about a recording run, since a dry run that cannot record still lists from the previous samples
 - [x] 12.8 A dry run whose sampling fails lists nothing: a recording run now returns before that check, so the dry run is the only path its status still decides
 
-## 13. Delivery
+## 13. Review round 9
 
-- [ ] 13.1 All suites, `bash -n`, `zsh -n`, `openspec validate coexist-with-dev-workflow --strict`
-- [ ] 13.2 Independent review until no actionable findings
-- [ ] 13.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
+- [x] 13.1 Red-verify: the report says this run's samples could not be recorded without naming which path, in every failure scenario
+- [x] 13.2 The samples path has one owner, and the report names it as the stderr warning does
+- [x] 13.3 The `printf` behind the warning is proven: under zsh a samples path holding a backslash reaches the line unchanged
+- [x] 13.4 The runaway suite's `env -u BASH_ENV -u ENV` is proven by a planted `BASH_ENV`, as the session suite's is
+- [x] 13.5 The zsh rename-failure leg checks the temporary file is gone, as its bash twin does
+- [x] 13.6 The not-measured header is not a prefix of the listing header, so a grep for one cannot match the other
+- [x] 13.7 The warning helper sits outside the phase's docstring
+
+## 14. Delivery
+
+- [ ] 14.1 All suites, `bash -n`, `zsh -n`, `openspec validate coexist-with-dev-workflow --strict`
+- [ ] 14.2 Independent review until no actionable findings
+- [ ] 14.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
