@@ -903,7 +903,10 @@ _cc_guard_runaway_eligible() {
 # Samples are keyed by PID and start time, read under LC_ALL=C and TZ=UTC so the guard agent and
 # an interactive shell write the same keys, and a reused PID starts fresh. With record=1 this
 # run's samples replace the file; a dry run or a listing leaves it alone. A lost or unwritable
-# file only restarts streaks.
+# file only restarts streaks. A record dated after the run reading it, or whose streak starts
+# after the sample was taken, is refused: that is a clock set back, or a damaged line. A run that
+# cannot write its samples to the end keeps the previous file and selects nothing, since a
+# partial record could claim any streak and a measurement that failed authorises no kill.
 #
 # ponytail: one samples file, last writer wins - overlapping runs can drop each other's samples,
 # which only restarts streaks. Lock it if runs ever overlap routinely.
@@ -912,13 +915,13 @@ _cc_guard_runaway_eligible() {
 # flattened to one line, so argument text shaped like a row or a record adds no PID - the seam
 # session detection already uses.
 _cc_guard_runaway_protected_pids() {
-  local cpu_threshold=$1 min_minutes=$2 record=${3:-0} now samples tmp="" pid etime cpu cmd
+  local cpu_threshold=$1 min_minutes=$2 record=${3:-0} now samples tmp="" list rc pid etime cpu cmd
   now=$(date +%s)
   samples=${CC_RUNAWAY_SAMPLES_FILE:-$HOME/.cc-reaper/state/runaway-samples.tsv}
   if [ "$record" = 1 ] && mkdir -p "${samples%/*}" 2>/dev/null; then
     tmp=$(mktemp "$samples.XXXXXX" 2>/dev/null) || tmp=""
   fi
-  LC_ALL=C TZ=UTC ps -axo pid=,lstart=,etime=,time=,%cpu= 2>/dev/null |
+  list=$(LC_ALL=C TZ=UTC ps -axo pid=,lstart=,etime=,time=,%cpu= 2>/dev/null |
     awk -v now="$now" -v cpu="$cpu_threshold" -v min="$min_minutes" -v samples="$samples" -v out="$tmp" '
       function secs(t,   n, p, s) {
         n = split(t, p, ":")
@@ -929,7 +932,9 @@ _cc_guard_runaway_protected_pids() {
       }
       BEGIN {
         while ((getline line < samples) > 0)
-          if (split(line, f, "\t") == 5) { k = f[1] "\t" f[2]; at[k] = f[3]; used[k] = f[4]; since[k] = f[5] }
+          if (split(line, f, "\t") == 5 && f[3] + 0 <= now && f[5] + 0 <= f[3] + 0) {
+            k = f[1] "\t" f[2]; at[k] = f[3]; used[k] = f[4]; since[k] = f[5]
+          }
       }
       NF == 9 && $9 + 0 >= cpu + 0 {
         key = $1 "\t" $2 " " $3 " " $4 " " $5 " " $6
@@ -940,7 +945,14 @@ _cc_guard_runaway_protected_pids() {
         else { t = now; u = c; h = ((c - used[key]) * 100 >= cpu * (now - at[key])) ? since[key] : now }
         if (out != "") printf "%s\t%d\t%.2f\t%d\n", key, t, u, h > out
         if (t - h >= min * 60) print $1, $7, $9
-      }' | while read -r pid etime cpu; do
+      }')
+  rc=$?
+  if [ -n "$tmp" ]; then
+    if [ "$rc" = 0 ]; then mv -f "$tmp" "$samples" 2>/dev/null || rm -f "$tmp"; else rm -f "$tmp"; fi
+  fi
+  [ "$rc" = 0 ] || return 0
+  [ -n "$list" ] || return 0
+  printf '%s\n' "$list" | while read -r pid etime cpu; do
     cmd=$(ps -o command= -p "$pid" 2>/dev/null | tr '\n' ' ')
     cmd=${cmd% }
     # Immutable processes - system scanners, cc-reaper itself, ordinary Chrome - never
@@ -949,7 +961,6 @@ _cc_guard_runaway_protected_pids() {
     _cc_guard_runaway_eligible "$cmd" || continue
     printf "%s\t%s\t%s\t%s\n" "$pid" "$cpu" "$etime" "$cmd"
   done
-  if [ -n "$tmp" ]; then mv -f "$tmp" "$samples" 2>/dev/null || rm -f "$tmp"; fi
 }
 
 # Automatic session guard: kills bloated (RSS threshold) and idle sessions

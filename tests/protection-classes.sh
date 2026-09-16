@@ -175,6 +175,9 @@ not_eligible "python -m pytest /private/tmp/claude-501/-Users-me-GitHub-supabase
 not_eligible "/Users/me/.local/bin/codex --yolo -c mcp_servers.github.command=npx"
 not_eligible "node /Users/me/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js --mcp-config /Users/me/mcp/context7-mcp"
 not_eligible "/Applications/Claude.app/Contents/Resources/node /x/node_modules/@upstash/context7-mcp/dist/index.js"
+# The runner is outside the bundle and what it runs is inside it, and the other way round.
+not_eligible "node /Applications/Claude.app/Contents/Resources/app.asar.unpacked/node_modules/@upstash/context7-mcp/dist/index.js"
+not_eligible "/Applications/ChatGPT.app/Contents/Resources/codex mcp-server"
 not_eligible "node /Users/me/GitHub/context7-mcp/dist/index.js"
 not_eligible "node /repo/node_modules/.bin/next dev-server --port 3000"
 # A path argument ending in a server's name is a checkout, not the server.

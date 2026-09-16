@@ -52,6 +52,7 @@ cat > "$T" <<'EOF'
 990006 1 990006 ?? 99.0 S 03:00:00 170:00.00 90000 99.0 uvx chroma-mcp --client-type ephemeral
 990007 1 990007 ?? 97.0 S 1-02:00:00 75:00.00 150000 97.0 npx -y @supabase/mcp-server-supabase@0.5.10 --read-only
 990008 1 990008 ?? 99.0 S 05:00:00 280:00.00 90000 99.0 uvx chroma-mcp --client-type cloud
+990009 1 990009 ?? 99.0 S 06:00:00 300:00.00 90000 99.0 uvx chroma-mcp --client-type http
 990011 990010 990011 ttys906 95.0 S 03:00:00 170:00.00 500000 95.0 claude --session-id 22222222-3333-4444-5555-666666666666 --settings {"hooks":{"Stop":[{"type":"command","command":"node /Users/me/.claude/plugins/claude-mem/scripts/summary-hook.js"}]}}
 990012 990011 990011 ?? 95.0 S 03:00:00 170:00.00 300000 95.0 claude --output-format stream-json --input-format stream-json --mcp-config {"mcpServers":{"context7":{"command":"npx","args":["-y","@upstash/context7-mcp"]}}}
 990013 1 990013 ?? 95.0 S 03:00:00 170:00.00 300000 95.0 node /Users/me/GitHub/context7-docs-sync/node_modules/.bin/stryker run
@@ -61,9 +62,11 @@ EOF
 
 # The samples an earlier run left: pid, the start it was recorded under, seconds since that
 # sample, the percent of those seconds the process used, and its hot streak in minutes as of that
-# sample. 990004 has none, and neither has anything that is not hot now.
+# sample. 990004 has none. 960005 is cool now and has one, to show a cool run drops it, and
+# 990009's is dated in the future, where a clock set back leaves it.
 cat > "$tmp/prior" <<'EOF'
 960002 S 600 95 70
+960005 S 600 95 120
 970001 S 600 99 120
 970002 S 600 99 120
 970003 S 600 110 120
@@ -79,6 +82,7 @@ cat > "$tmp/prior" <<'EOF'
 990006 S 30 99 59.5
 990007 S 600 99 55
 990008 S 1500 99 120
+990009 S -3000 99 120
 990011 S 600 95 120
 990012 S 600 95 120
 990013 S 600 95 120
@@ -143,6 +147,14 @@ guard() (
     fi
   }
   date() { if [ "$*" = "+%s" ]; then echo "$NOW"; else command date "$@"; fi; }
+  # With CC_TEST_AWK_FAIL=1 the sampling awk prints its output and then fails, as it does when
+  # its output cannot be written to the end.
+  awk() {
+    if [ "${CC_TEST_AWK_FAIL:-0}" = 1 ]; then
+      case " $* " in *" samples="*) command awk "$@"; return 2 ;; esac
+    fi
+    command awk "$@"
+  }
   osascript() { :; }
   # shellcheck disable=SC1090
   . "$CLEANUP"
@@ -180,6 +192,7 @@ expect_not_signalled 990005 "a PID sampled under another process start is not si
 expect_not_signalled 990006 "a streak short of the floor at a sample under a minute old is not signalled"
 expect_signalled     990007 "a server idle for a day, then hot across runs for 65 minutes, is signalled"
 expect_not_signalled 990008 "a streak carried across a 25-minute gap between runs is not signalled"
+expect_not_signalled 990009 "a streak on a sample dated in the future is not signalled"
 expect_not_signalled 990011 "a session whose --settings names claude-mem is not signalled"
 expect_not_signalled 990012 "a subagent whose --mcp-config names context7 is not signalled"
 expect_not_signalled 990013 "a stryker run under a context7-named directory is not signalled"
@@ -212,6 +225,8 @@ expect_sample 990004 "$S|$NOW|$NOW" "a first sample is recorded, with no streak"
 expect_sample 990005 "$R|$NOW|$NOW" "a reused PID is recorded under its own start, with no streak"
 expect_sample 990006 "$S|$((NOW - 30))|$((NOW - 3600))" "a sample less than a minute old is kept as it was"
 expect_sample 990008 "$S|$NOW|$NOW" "a gap of more than 20 minutes starts the streak over"
+expect_sample 990009 "$S|$NOW|$NOW" "a sample dated after this run starts the streak over"
+expect_sample 960005 "" "a process below the threshold at a run loses its streak"
 expect_sample 960001 "" "a process not hot now has no sample"
 
 # A dry run with zero thresholds: the defaults apply, and nothing is recorded.
@@ -228,6 +243,19 @@ if cmp -s "$tmp/samples.tsv" "$tmp/samples.before"; then
   ok "a dry run records no samples"
 else
   bad "a dry run records no samples"
+fi
+
+# A run whose samples cannot be written to the end: a partial file could claim any streak, and a
+# measurement that failed authorises no kill.
+mv -f "$tmp/signalled" "$tmp/signalled.run1" 2>/dev/null
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"
+cp "$tmp/samples.before" "$tmp/samples.tsv"
+CC_TEST_AWK_FAIL=1 guard > "$tmp/fail.out" 2>&1
+if cmp -s "$tmp/samples.tsv" "$tmp/samples.before" && [ ! -s "$tmp/signalled" ] &&
+   ! ls "$tmp"/samples.tsv.* >/dev/null 2>&1; then
+  ok "a run that cannot record its samples keeps the previous ones and signals nothing"
+else
+  bad "a run that cannot record its samples keeps the previous ones and signals nothing: signalled $(tr '\n' ' ' < "$tmp/signalled" 2>/dev/null)"
 fi
 
 if [ ! -s "$tmp/unstubbed" ]; then
