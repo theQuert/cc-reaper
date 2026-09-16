@@ -906,8 +906,9 @@ _cc_guard_runaway_eligible() {
 # restarts streaks. A record dated after the run reading it, or whose streak starts after the
 # sample was taken, is refused: that is a clock set back, or a damaged line. A run that cannot
 # record this run's samples - it cannot create the file, cannot write it to the end, or cannot put
-# it in place - keeps the previous file, says so on stderr and selects nothing, since a partial
-# record could claim any streak and a measurement that could not be taken authorises no kill.
+# it in place - keeps the previous file, says so on stderr, returns 2 and selects nothing, since a
+# partial record could claim any streak and a measurement that could not be taken authorises no
+# kill.
 #
 # ponytail: one samples file, last writer wins - overlapping runs can drop each other's samples,
 # which only restarts streaks. Lock it if runs ever overlap routinely.
@@ -915,6 +916,12 @@ _cc_guard_runaway_eligible() {
 # Candidates come from a listing without a command column, and each command is read per PID and
 # flattened to one line, so argument text shaped like a row or a record adds no PID - the seam
 # session detection already uses.
+# Said on stderr, because stdout is the selection this function returns. `printf`, not `echo`:
+# zsh's `echo` expands escapes, and naming the path is the whole job of the line.
+_cc_guard_samples_warn() {
+  printf '  WARNING: cannot record runaway samples at %s; selecting nothing.\n' "$1" >&2
+}
+
 _cc_guard_runaway_protected_pids() {
   local cpu_threshold=$1 min_minutes=$2 record=${3:-0} now samples tmp="" list rc pid etime cpu cmd
   now=$(date +%s)
@@ -925,11 +932,10 @@ _cc_guard_runaway_protected_pids() {
     tmp=$(mktemp "$samples.XXXXXX" 2>/dev/null) || tmp=""
   fi
   if [ "$record" = 1 ] && [ -z "$tmp" ]; then
-    # Stdout is this function's result, so this goes to stderr - and it has to be said at all: a
-    # phase that has turned itself off prints exactly what a phase with nothing to do prints, and
-    # a read-only samples directory does not repair itself.
-    echo "  WARNING: cannot record runaway samples at $samples; selecting nothing." >&2
-    return 0
+    # It has to be said at all: a phase that has turned itself off prints exactly what a phase
+    # with nothing to do prints, and a read-only samples directory does not repair itself.
+    _cc_guard_samples_warn "$samples"
+    return 2
   fi
   list=$(LC_ALL=C TZ=UTC ps -axo pid=,lstart=,etime=,time=,%cpu= 2>/dev/null |
     awk -v now="$now" -v cpu="$cpu_threshold" -v min="$min_minutes" -v samples="$samples" -v out="$tmp" '
@@ -962,11 +968,14 @@ _cc_guard_runaway_protected_pids() {
       # The rename is the third way to fail to record, and it authorises no kill either.
       mv -f "$tmp" "$samples" 2>/dev/null || {
         rm -f "$tmp"
-        echo "  WARNING: cannot record runaway samples at $samples; selecting nothing." >&2
-        return 0
+        _cc_guard_samples_warn "$samples"
+        return 2
       }
     else
+      # awk could not write them to the end: the same failure to record, and the same answer.
       rm -f "$tmp"
+      _cc_guard_samples_warn "$samples"
+      return 2
     fi
   fi
   [ "$rc" = 0 ] || return 0
@@ -1024,11 +1033,19 @@ claude-guard() {
 
   # ─── Phase 0.5: Runaway protected processes ───────────────────────────
   if [ "$runaway_disable" != "1" ]; then
-    local runaway_lines=""
+    local runaway_lines="" runaway_rc=0
     # A dry run reads the samples and records none.
     local runaway_record=1
     $dry_run && runaway_record=0
-    runaway_lines=$(_cc_guard_runaway_protected_pids "$runaway_cpu" "$runaway_min" "$runaway_record")
+    runaway_lines=$(_cc_guard_runaway_protected_pids "$runaway_cpu" "$runaway_min" "$runaway_record") || runaway_rc=$?
+    # The warning above goes to stderr, which the guard agent writes to a different file from this
+    # report. Somebody reading the report has to see that nothing was selected because nothing
+    # could be recorded, not because nothing was hot.
+    if [ "$runaway_rc" = 2 ]; then
+      echo "  --- Runaway protected processes ---"
+      echo "  This run's samples could not be recorded, so nothing was selected."
+      echo ""
+    fi
     if [ -n "$runaway_lines" ]; then
       echo "  --- Runaway protected processes (CPU >= ${runaway_cpu}% across runs for >= ${runaway_min} min) ---"
       printf '%s\n' "$runaway_lines" | awk -F '\t' '

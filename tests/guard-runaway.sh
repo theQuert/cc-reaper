@@ -188,13 +188,14 @@ HARNESS
 # a scenario cannot inherit the previous one's environment.
 guard() {
   local rc sh="${GUARD_SHELL:-/bin/bash}" opt=""
-  # zsh reads `$ZDOTDIR/.zshenv` even for a script, and `bash script` reads nothing; `-f` drops
-  # that, leaving only `/etc/zshenv`, which no flag can turn off.
+  # Both shells read something on the way in - zsh `$ZDOTDIR/.zshenv`, bash `$BASH_ENV`, each even
+  # for a script - and dropping them is what keeps a leg from reporting whatever the person's own
+  # shell does. `/etc/zshenv` is the one no flag turns off.
   [ "${sh##*/}" = zsh ] && opt=-f
   CC_TEST_AWK_FAIL="${CC_TEST_AWK_FAIL:-0}" CC_TEST_MV_FAIL="${CC_TEST_MV_FAIL:-0}" \
     CC_RUNAWAY_CPU="${CC_RUNAWAY_CPU:-}" \
     CC_RUNAWAY_MIN="${CC_RUNAWAY_MIN:-}" CC_RUNAWAY_SAMPLES_FILE="${CC_RUNAWAY_SAMPLES_FILE:-}" \
-    "$sh" ${opt:+"$opt"} "$tmp/harness.sh" "$@"
+    env -u BASH_ENV -u ENV "$sh" ${opt:+"$opt"} "$tmp/harness.sh" "$@"
   rc=$?
   unset CC_TEST_AWK_FAIL CC_TEST_MV_FAIL CC_RUNAWAY_CPU CC_RUNAWAY_MIN CC_RUNAWAY_SAMPLES_FILE GUARD_SHELL
   return $rc
@@ -212,6 +213,16 @@ expect_not_signalled() { if signalled "$1"; then bad "$2"; else ok "$2"; fi; }
 SIGNALLED="960002 980004 990007 "
 signalled_set() { sort -un "$tmp/signalled" 2>/dev/null | tr '\n' ' '; }
 SUMMARY='Reaped 2 runaway protected process(es), freed ~341 MB'
+# Both streams carry a run that could not record: the warning names the path on stderr, for
+# somebody reading the agent's error log, and the report a person reads says the phase selected
+# nothing because of it - under the LaunchAgent the two streams go to different files.
+expect_warned() {
+  if grep -q 'cannot record runaway samples' "$2" && grep -q 'could not be recorded' "$1"; then
+    ok "$3"
+  else
+    bad "$3: stdout [$(tr '\n' ';' < "$1")] stderr [$(tr '\n' ';' < "$2")]"
+  fi
+}
 
 expect_signalled     960002 "the runaway MCP server itself is signalled"
 expect_not_signalled 960001 "the Claude CLI that launched it is not signalled"
@@ -299,13 +310,14 @@ fi
 mv -f "$tmp/signalled" "$tmp/signalled.run1" 2>/dev/null
 : > "$tmp/rules.tsv"; : > "$tmp/now-cmd"
 cp "$tmp/samples.before" "$tmp/samples.tsv"
-CC_TEST_AWK_FAIL=1 guard > "$tmp/fail.out" 2>&1
+CC_TEST_AWK_FAIL=1 guard > "$tmp/fail.out" 2> "$tmp/fail.err"
 if cmp -s "$tmp/samples.tsv" "$tmp/samples.before" && [ ! -s "$tmp/signalled" ] &&
    ! ls "$tmp"/samples.tsv.* >/dev/null 2>&1; then
   ok "a run that cannot record its samples keeps the previous ones and signals nothing"
 else
   bad "a run that cannot record its samples keeps the previous ones and signals nothing: signalled $(tr '\n' ' ' < "$tmp/signalled" 2>/dev/null)"
 fi
+expect_warned "$tmp/fail.out" "$tmp/fail.err" "and says so, as the other two failures to record do"
 
 # The same scenario under zsh, the shell the installer sources these functions into. `status` is
 # read-only there and a function named `kill` is not the builtin, so a kill branch that only ever
@@ -363,7 +375,7 @@ mkdir -p "$tmp/ro"
 cp "$tmp/samples.before" "$tmp/ro/samples.tsv"
 chmod 555 "$tmp/ro"
 : > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
-CC_RUNAWAY_SAMPLES_FILE="$tmp/ro/samples.tsv" guard > "$tmp/ro.out" 2>&1
+CC_RUNAWAY_SAMPLES_FILE="$tmp/ro/samples.tsv" guard > "$tmp/ro.out" 2> "$tmp/ro.err"
 ro_signalled="$(signalled_set)"
 ro_kept=1; cmp -s "$tmp/ro/samples.tsv" "$tmp/samples.before" || ro_kept=0
 chmod 755 "$tmp/ro"
@@ -373,27 +385,31 @@ else
   bad "a run that cannot record any samples keeps the previous ones and signals nothing: signalled [$ro_signalled], samples kept $ro_kept"
 fi
 # A phase that has turned itself off prints exactly what a quiet one prints, so it has to say so.
-if grep -q 'cannot record runaway samples' "$tmp/ro.out"; then
-  ok "and says so, rather than going quiet for as long as the directory stays read-only"
-else
-  bad "and says so, rather than going quiet for as long as the directory stays read-only"
-fi
+expect_warned "$tmp/ro.out" "$tmp/ro.err" "and says so, rather than going quiet for as long as the directory stays read-only"
 
 # A run whose samples are written but cannot be put in place: the rename is the third way to fail
 # to record, and it authorises no kill either.
 : > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
 cp "$tmp/samples.before" "$tmp/samples.tsv"
-CC_TEST_MV_FAIL=1 guard > "$tmp/mvfail.out" 2>&1
+CC_TEST_MV_FAIL=1 guard > "$tmp/mvfail.out" 2> "$tmp/mvfail.err"
 if [ ! -s "$tmp/signalled" ] && cmp -s "$tmp/samples.tsv" "$tmp/samples.before" &&
    ! ls "$tmp"/samples.tsv.* >/dev/null 2>&1; then
   ok "a run that cannot put its samples in place keeps the previous ones and signals nothing"
 else
   bad "a run that cannot put its samples in place keeps the previous ones and signals nothing: signalled [$(signalled_set)]"
 fi
-if grep -q 'cannot record runaway samples' "$tmp/mvfail.out"; then
-  ok "and says so too"
-else
-  bad "and says so too"
+expect_warned "$tmp/mvfail.out" "$tmp/mvfail.err" "and says so too"
+# And under zsh, where this branch returns from inside a brace group.
+if command -v zsh >/dev/null 2>&1; then
+  : > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+  cp "$tmp/samples.before" "$tmp/samples.tsv"
+  CC_TEST_MV_FAIL=1 GUARD_SHELL=zsh guard > "$tmp/mvfail-zsh.out" 2> "$tmp/mvfail-zsh.err"
+  if [ ! -s "$tmp/signalled" ] && cmp -s "$tmp/samples.tsv" "$tmp/samples.before"; then
+    ok "zsh: a run that cannot put its samples in place signals nothing there either"
+  else
+    bad "zsh: a run that cannot put its samples in place signals nothing there either: signalled [$(signalled_set)]"
+  fi
+  expect_warned "$tmp/mvfail-zsh.out" "$tmp/mvfail-zsh.err" "zsh: and says so"
 fi
 
 if [ ! -s "$tmp/unstubbed" ]; then

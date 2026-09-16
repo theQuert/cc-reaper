@@ -187,10 +187,11 @@ guard_phase_runs_under() {
     rm -rf "$tty_snap" "$cmd_dir"
   '
   local out opt=""
-  # zsh reads `$ZDOTDIR/.zshenv` even for `-c`, and `bash -c` reads nothing; `-f` drops that, so
-  # the leg does not depend on whose shell it is. bash has no such flag, hence the condition.
+  # Both shells read something on the way in - zsh `$ZDOTDIR/.zshenv`, bash `$BASH_ENV`, each even
+  # for `-c` - and the leg must not report whatever the person's own shell does. bash has no `-f`,
+  # hence the condition; `env -u` covers what the flag does not.
   [ "${shell_bin##*/}" = zsh ] && opt=-f
-  out=$("$shell_bin" ${opt:+"$opt"} -c "$script" 2>&1) || true
+  out=$(env -u BASH_ENV -u ENV "$shell_bin" ${opt:+"$opt"} -c "$script" 2>&1) || true
   if printf '%s' "$out" | grep -q 'bad substitution'; then
     fail "$expect (bad substitution)"
     return
@@ -217,18 +218,21 @@ for sh_bin in bash zsh; do
   guard_phase_runs_under "$sh_bin" "CC_MAX_SESSIONS=0 CC_IDLE_THRESHOLD=100" "$sh_bin: idle phase names a real PID"
 done
 
-# A `.zshenv` that puts a directory on PATH is an ordinary thing to have, and zsh reads it even
-# for `-c`. Without `-f` the leg would report whatever that shell happens to do.
-if command -v zsh >/dev/null 2>&1; then
-  zdot="$tmp_dir/zdot"
-  mkdir -p "$zdot/bin"
-  printf '#!/bin/sh\nexit 3\n' > "$zdot/bin/awk"
-  chmod +x "$zdot/bin/awk"
-  printf 'export PATH="%s/bin:$PATH"\n' "$zdot" > "$zdot/.zshenv"
-  export ZDOTDIR="$zdot"
-  guard_phase_runs_under zsh "CC_MAX_RSS_MB=1" "zsh: a .zshenv on the way in does not reach the phase"
-  unset ZDOTDIR
-fi
+# A `.zshenv` or a `BASH_ENV` that puts a directory on PATH is an ordinary thing to have, and each
+# shell reads its own even for `-c`. Without that being dropped, the leg reports whatever the
+# person's shell happens to do rather than what the phase does.
+rcdir="$tmp_dir/shellrc"
+mkdir -p "$rcdir/bin"
+printf '#!/bin/sh\nexit 3\n' > "$rcdir/bin/awk"
+chmod +x "$rcdir/bin/awk"
+printf 'export PATH="%s/bin:$PATH"\n' "$rcdir" > "$rcdir/.zshenv"
+cp "$rcdir/.zshenv" "$rcdir/bashenv.sh"
+export ZDOTDIR="$rcdir" BASH_ENV="$rcdir/bashenv.sh"
+for sh_bin in bash zsh; do
+  command -v "$sh_bin" >/dev/null 2>&1 || continue
+  guard_phase_runs_under "$sh_bin" "CC_MAX_RSS_MB=1" "$sh_bin: a shell rc on the way in does not reach the phase"
+done
+unset ZDOTDIR BASH_ENV
 
 if [ "$failures" -gt 0 ]; then
   printf "%s validation failure(s)\n" "$failures"
