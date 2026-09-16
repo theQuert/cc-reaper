@@ -93,6 +93,8 @@
 - [x] 12.3 The function returns 2 and claude-guard says in its own report that nothing could be recorded: the agent writes stderr to a different file from the report a person reads
 - [x] 12.4 Both suites drop `BASH_ENV` and `ENV` as well as zsh's rc, proven by a planted rc for each shell
 - [x] 12.5 The failure-to-record paths run under zsh as well as bash
+- [x] 12.6 CHANGELOG: the runaway entry carries the samples-integrity rules, the warning included - it is the one new line a user sees in the guard log
+- [x] 12.7 Both `CC_RUNAWAY_SAMPLES_FILE` rows say the rule is about a recording run, since a dry run that cannot record still lists from the previous samples
 
 ## 13. Delivery
 
