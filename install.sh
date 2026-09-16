@@ -471,8 +471,9 @@ echo "                    not scheduled: a LaunchAgent has no TCC access to ~/Do
 echo "                    or as a SessionEnd hook: \"\$HOME\"/.cc-reaper/worktree-janitor.sh --session"
 echo "                    (reports only unless CC_WJ_SESSION_APPLY=1 and the hook input names a cwd;"
 echo "                     see docs/worktree-reclamation.md)"
-echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs one known shared MCP server that has stayed"
-echo "                  >=80% CPU across its runs for 60+ min and is still hot; never a session, app or process group)"
+echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs each known shared MCP server that has stayed"
+echo "                  >=80% CPU across its runs for 60+ min and is still hot, that PID alone; never a session,"
+echo "                  an app or a process group)"
 
 # ─── 5b. TCC probe ────────────────────────────────────────────────────────────
 #
