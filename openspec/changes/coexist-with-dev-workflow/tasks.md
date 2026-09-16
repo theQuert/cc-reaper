@@ -92,7 +92,7 @@
 - [x] 12.2 All three failures to record warn through one helper, with `printf`, so a samples path holding a backslash survives zsh's `echo`
 - [x] 12.3 The function returns 2 and claude-guard says in its own report that nothing could be recorded: the agent writes stderr to a different file from the report a person reads
 - [x] 12.4 Both suites drop `BASH_ENV` and `ENV` as well as zsh's rc, proven by a planted rc for each shell
-- [x] 12.5 The failure-to-record paths run under zsh as well as bash
+- [x] 12.5 The rename failure-to-record path runs under zsh as well as bash
 - [x] 12.6 CHANGELOG: the runaway entry carries the samples-integrity rules, the warning included - it is the one new line a user sees in the guard log
 - [x] 12.7 Both `CC_RUNAWAY_SAMPLES_FILE` rows say the rule is about a recording run, since a dry run that cannot record still lists from the previous samples
 - [x] 12.8 A dry run whose sampling fails lists nothing: a recording run now returns before that check, so the dry run is the only path its status still decides
@@ -106,6 +106,10 @@
 - [x] 13.5 The zsh rename-failure leg checks the temporary file is gone, as its bash twin does
 - [x] 13.6 The not-measured header is not a prefix of the listing header, so a grep for one cannot match the other
 - [x] 13.7 The warning helper sits outside the phase's docstring
+- [x] 13.8 The spec says the recording rule is about a run that records, since a dry run that cannot record still lists from the previous samples
+- [x] 13.9 The SIGTERM banner names the grace period plus the re-check pause, which is what a person actually waits
+- [x] 13.10 `guard-runner.sh`, which is deployed and is what an operator opens, describes selection by streaks rather than by a whitelist
+- [x] 13.11 The design names both sample refusals, the proposal names every suite this change touches, and the README tree carries the guard agent, its runner and the suites added here
 
 ## 14. Delivery
 

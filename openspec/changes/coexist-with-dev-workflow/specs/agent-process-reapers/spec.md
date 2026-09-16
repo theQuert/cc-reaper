@@ -99,8 +99,9 @@ the streak. A dry run SHALL record nothing. A `CC_RUNAWAY_CPU` or `CC_RUNAWAY_MI
 positive number SHALL be replaced by its default.
 
 A sample dated later than the run reading it, or whose streak starts after the sample was taken,
-SHALL NOT count, so a clock set back starts the streak over. A run that cannot record this run's
-samples - because it cannot create the file, cannot write it to the end, or cannot put it in place
+SHALL NOT count, so a clock set back starts the streak over. A run that records its samples (so
+not `--dry-run`) and cannot - because it cannot create the file, cannot write it to the end, or
+cannot put it in place
 - SHALL leave the previous samples in place, SHALL say so both on standard error and in the report
 claude-guard prints, and SHALL select nothing. A samples path with no directory part SHALL name a
 file where claude-guard runs, not a directory to create.
@@ -142,11 +143,11 @@ file where claude-guard runs, not a directory to create.
 - **THEN** that sample SHALL NOT count, and the streak SHALL start over
 
 #### Scenario: Samples cannot be written completely
-- **WHEN** recording this run's samples fails, as when the disk is full
+- **WHEN** recording a run's samples fails part way, as when the disk is full
 - **THEN** the previous samples SHALL be left in place, the run SHALL say so, and it SHALL select nothing
 
 #### Scenario: Samples cannot be recorded at all
-- **WHEN** this run's samples file cannot be created or put in place, as when its directory is read-only
+- **WHEN** a recording run's samples file cannot be created or put in place, as when its directory is read-only
 - **THEN** the previous samples SHALL be left in place, the run SHALL say so on standard error and in its report, and it SHALL select nothing
 
 #### Scenario: A samples path with no directory
