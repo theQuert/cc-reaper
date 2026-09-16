@@ -52,8 +52,17 @@
 - [x] 7.7 disk-janitor tests: an unreferenced anonymous volume in the clean run, so the allowlist sees the volume report; the failed inventories' "nothing examined" message
 - [x] 7.8 Design, proposal and docs: sampling and its delay replace the lifetime average; the installer never removes a line; cc-monitor names claude-guard only for a known shared MCP server; the rollback note matches what install.sh keeps
 
-## 8. Delivery
+## 8. Review round 4
 
-- [ ] 8.1 All suites, `bash -n`, `zsh -n`, `openspec validate --strict`
-- [ ] 8.2 Independent review until no actionable findings
-- [ ] 8.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
+- [ ] 8.1 Red-verify: a server whose runner's operand is inside an `.app` bundle, and `codex mcp-server` inside one, are eligible; a sample dated in the future carries its streak; a cool run keeps a streak; a run whose samples cannot be written selects and records anyway
+- [ ] 8.2 A sample dated after the run, or with a streak starting after it, is refused; a run that cannot write its samples leaves the previous file and selects nothing
+- [ ] 8.3 The `.app` rule is proven on the executable and on the runner's operand
+- [ ] 8.4 disk-janitor: the dangling-image report is asserted to send docker nothing but the listing
+- [ ] 8.5 Deploy tooling: rollback keeps the repaired rc lines unless `--with-rc`; the deploy stops when a commented-out current line sits beside a stale one
+- [ ] 8.6 Docs: the runaway phase signals each selected PID alone; a manual install has no runaway coverage; the rollback note matches the reverted installer
+
+## 9. Delivery
+
+- [ ] 9.1 All suites, `bash -n`, `zsh -n`, `openspec validate --strict`
+- [ ] 9.2 Independent review until no actionable findings
+- [ ] 9.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions

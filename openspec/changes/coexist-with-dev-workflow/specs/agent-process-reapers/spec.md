@@ -82,6 +82,10 @@ eligible by the same test.
 - **WHEN** `npx -y mcp-remote https://mcp.linear.app/sse` meets the runaway thresholds
 - **THEN** it SHALL be selected
 
+#### Scenario: A server inside an application bundle
+- **WHEN** `node /Applications/Claude.app/Contents/Resources/app.asar.unpacked/node_modules/@upstash/context7-mcp/dist/index.js`, whose runner's operand is inside the bundle, or `/Applications/ChatGPT.app/Contents/Resources/codex mcp-server`, whose executable is, meets the runaway thresholds
+- **THEN** neither SHALL be selected
+
 ### Requirement: Runaway is measured across guard runs
 The runaway phase SHALL select a process only after it has stayed hot for at least
 `CC_RUNAWAY_MIN` minutes, measured across claude-guard's runs. Each run SHALL record, for every
@@ -93,6 +97,10 @@ threshold at a run or across an interval longer than 20 minutes, inside whose av
 stretch could hide. A lifetime average of CPU time, or `ps %cpu` alone, SHALL NOT stand in for
 the streak. A dry run SHALL record nothing. A `CC_RUNAWAY_CPU` or `CC_RUNAWAY_MIN` that is not a
 positive number SHALL be replaced by its default.
+
+A sample dated later than the run reading it, or whose streak starts after the sample was taken,
+SHALL NOT count, so a clock set back starts the streak over. A run that cannot record this run's
+samples completely SHALL leave the previous samples in place and SHALL select nothing.
 
 #### Scenario: Stuck for an hour after a long idle life
 - **WHEN** a shared MCP server a day old, whose lifetime average is 5%, has used at least 80% of every interval between samples for the last 65 minutes and reads over the threshold
@@ -117,6 +125,18 @@ positive number SHALL be replaced by its default.
 #### Scenario: Runs less than a minute apart
 - **WHEN** claude-guard runs less than a minute after a process's previous sample
 - **THEN** that sample SHALL be kept unchanged, and the streak SHALL be judged as of it
+
+#### Scenario: Below the threshold at a run
+- **WHEN** a process with a two-hour streak reads below `CC_RUNAWAY_CPU` at a run
+- **THEN** its sample SHALL be dropped, and its next hot run SHALL start a new streak
+
+#### Scenario: The clock is set back
+- **WHEN** a process's sample is dated later than the run reading it
+- **THEN** that sample SHALL NOT count, and the streak SHALL start over
+
+#### Scenario: Samples cannot be written completely
+- **WHEN** recording this run's samples fails, as when the disk is full
+- **THEN** the previous samples SHALL be left in place and the run SHALL select nothing
 
 #### Scenario: A long gap between runs
 - **WHEN** the previous sample of a hot shared MCP server is 25 minutes old, however hot the interval
@@ -147,7 +167,7 @@ rc configuration SHALL stop the rest of the installation.
 - **THEN** it SHALL append one guarded line for each, naming `$HOME/.cc-reaper/`, and no line naming the checkout it ran from
 
 #### Scenario: Stale line from a removed checkout
-- **WHEN** the rc file contains `source "/removed/worktree/shell/claude-cleanup.sh"` as a whole line
+- **WHEN** the rc file contains `source "/removed/worktree/shell/claude-cleanup.sh"` as a whole line, and no other line names the script
 - **THEN** `install.sh` SHALL replace that line with the guarded deployed-copy line, print the line it replaced, leave every other line unchanged, and keep the file's mode and extended attributes
 
 #### Scenario: Backup precedes every change
@@ -255,12 +275,12 @@ rule.
 ### Requirement: Runaway never selects immutable processes
 Runaway selection SHALL exclude processes classified `immutable`. A stuck system scanner SHALL
 NOT be signalled by cc-reaper under any threshold. Runaway selection SHALL also exclude
-applications (a command inside an `.app` bundle), development servers and process managers, even
+applications (a process run from inside an `.app` bundle), development servers and process managers, even
 though they classify `shared`: each is something a person is using, and the phase runs unattended.
 cc-monitor SHALL still report them, and SHALL NOT name claude-guard as the remedy for one.
 
 #### Scenario: Security software is stuck hot
-- **WHEN** `Bitdefender` sustains CPU ≥ `CC_RUNAWAY_CPU` for etime ≥ `CC_RUNAWAY_MIN`
+- **WHEN** `Bitdefender` stays over `CC_RUNAWAY_CPU` for longer than `CC_RUNAWAY_MIN` minutes
 - **THEN** it SHALL NOT be selected, listed, or signalled
 
 #### Scenario: Spotlight indexing is stuck hot
@@ -391,9 +411,9 @@ An orphaned parent is therefore sufficient on its own for the two family rungs, 
 - **THEN** that member SHALL still be spared, because the `cleanup` override applies to pattern-based candidacy only
 
 #### Scenario: Protected application is stuck hot
-- **WHEN** a `shared` application such as `ChatGPT.app` or `cmux.app` meets the runaway thresholds (CPU ≥ `CC_RUNAWAY_CPU` over etime ≥ `CC_RUNAWAY_MIN`)
+- **WHEN** a `shared` application such as `ChatGPT.app` or `cmux.app` stays over `CC_RUNAWAY_CPU` across guard runs for `CC_RUNAWAY_MIN` minutes
 - **THEN** the runaway phase SHALL NOT select or signal it, because signalling an application ends the work running inside it
-- **AND** a `shared` MCP server meeting the same thresholds SHALL be signalled, alone, if it is still over the threshold when re-checked
+- **AND** a known shared MCP server the runaway phase selects SHALL be signalled, alone, if it is still over the threshold when re-checked
 
 #### Scenario: User protect rule during the runaway phase
 - **WHEN** a process covered by a user `protect` rule meets the runaway thresholds
