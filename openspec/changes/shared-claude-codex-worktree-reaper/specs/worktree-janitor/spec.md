@@ -49,6 +49,7 @@ unmappable verified-live claim SHALL make the destructive run fail closed.
 - **WHEN** several candidate worktrees are judged from the same activity snapshot
 - **THEN** each transcript's current-two-user-turn window is indexed at most once for that snapshot
 - **AND** the pre-removal activity refresh builds a new snapshot before destructive action
+- **AND** structured active and recent transcript matching is skipped when a cheaper gate already keeps the worktree
 
 #### Scenario: Unchanged transcript evidence is reused across scheduled sweeps
 - **WHEN** a later scheduled sweep sees the same transcript path, device, inode, size, and modification time

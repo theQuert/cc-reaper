@@ -188,6 +188,23 @@ run_wj --apply >/dev/null 2>&1
 check "a historical Claude tool call outside the current two user turns does not pin a worktree" test ! -d "$WT"
 kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
 
+new_fixture claude-unlanded-skips-tool-transcript
+printf 'unlanded\n' > "$WT/unlanded.txt"
+git -C "$WT" add unlanded.txt
+git -C "$WT" commit -qm unlanded
+age_worktree 72
+sid=acacacac-bbbb-4ccc-8ddd-eeeeeeeeeeee
+python3 -c 'import time; time.sleep(120)' "$sid" </dev/null >/dev/null 2>&1 & claude_pid=$!
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s"}\n' "$claude_pid" "$sid" "$PRIMARY" > "$CLAUDE_SESSIONS/$claude_pid.json"
+mkdir -p "$CLAUDE_PROJECTS/project"
+transcript="$CLAUDE_PROJECTS/project/$sid.jsonl"
+printf '{"path":"%s"\n' "$WT" > "$transcript"
+rc=0; out="$(run_wj --apply 2>&1)" || rc=$?
+check "an unlanded worktree does not parse active structured transcripts" test "$rc" -eq 0
+case "$out" in *'KEEP(unlanded)'*) ok "the cheaper unlanded gate decides before active tool matching" ;; *) bad "the cheaper unlanded gate decides before active tool matching" ;; esac
+check "the unlanded worktree remains present" test -d "$WT"
+kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
+
 new_fixture codex-live
 age_worktree 72
 tid=22222222-3333-7444-8555-666666666666

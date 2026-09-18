@@ -1087,9 +1087,11 @@ _cc_wj_reconcile_codex_archive() { # <task id>
 # Return 0 for an active claim, 1 for no claim, 2 when activity became unknowable,
 # and 3 when a captured-live Codex task became a recent archived lease. Globals carry
 # the human-readable result.
-_cc_wj_active_claim() {
+_cc_wj_active_claim() { # <worktree> [all|cwd|tool]
   local wt="$(_cc_wj_realpath "$1")" harness cwd sid transcript rc lock lock_rc reconcile_rc recent_rc
+  local mode="${2:-all}"
   _CC_WJ_ACTIVE_REASON=""
+  if [ "$mode" != "tool" ]; then
   while IFS=$'\t' read -r harness cwd sid; do
     [ -n "$cwd" ] || continue
     case "$cwd/" in "$wt/"|"$wt/"*)
@@ -1100,6 +1102,8 @@ _cc_wj_active_claim() {
   done <<ACTIVE_CLAIMS
 $_CC_WJ_ACTIVE_CLAIMS
 ACTIVE_CLAIMS
+  fi
+  if [ "$mode" != "cwd" ]; then
   while IFS=$'\t' read -r harness sid transcript; do
     [ -n "$transcript" ] || continue
     # The cleanup task necessarily names every target it inventories. Treating its own
@@ -1143,6 +1147,7 @@ ACTIVE_CLAIMS
   done <<ACTIVE_TRANSCRIPTS
 $_CC_WJ_ACTIVE_TRANSCRIPTS
 ACTIVE_TRANSCRIPTS
+  fi
   return 1
 }
 
@@ -2239,7 +2244,9 @@ KEEP
             2) active="yes"; active_detail="$_CC_WJ_ACTIVE_ERROR"; ACTIVE_OK="no"; activity_blind=1 ;;
           esac
           if [ "$active" = "no" ] && [ "$lease" = "no" ]; then
-            _cc_wj_active_claim "$wt_path"; active_rc=$?
+            # Direct cwd claims are an in-memory lookup. Structured transcript matching
+            # is deferred until the other gates prove this worktree could be removed.
+            _cc_wj_active_claim "$wt_path" cwd; active_rc=$?
             case "$active_rc" in
               0) active="yes"; active_detail="$_CC_WJ_ACTIVE_REASON" ;;
               2) active="yes"; active_detail="$_CC_WJ_ACTIVE_ERROR"; ACTIVE_OK="no"; activity_blind=1 ;;
@@ -2280,18 +2287,27 @@ KEEP
           *) classification="KEEP($git_keep)" ;;
         esac
       fi
-      # Structured transcript matching is the expensive recent-session proof. Ask it
-      # only for a worktree every cheaper gate would otherwise make removable; direct
-      # cwd leases were checked above. `--claims PATH` remains the explicit full scan.
+      # Structured transcript matching is the expensive active/recent-session proof.
+      # Ask it only for a worktree every cheaper gate would otherwise make removable;
+      # direct cwd claims and leases were checked above. `--claims PATH` remains the
+      # explicit full scan.
       if [ -z "$classification" ] && [ "$dirty" = "0" ] && [ "$active" = "no" ] &&
          [ "$lease" = "no" ] &&
          { [ "$landed" = ancestor ] || [ "$landed" = content ] || [ "$landed" = pr ]; } &&
          [ "$idle" = "yes" ]; then
-        _cc_wj_recent_claim "$wt_path" "$session_grace_hours" tool; recent_rc=$?
-        case "$recent_rc" in
-          0) lease="yes"; lease_detail="$_CC_WJ_RECENT_REASON" ;;
+        _cc_wj_active_claim "$wt_path" tool; active_rc=$?
+        case "$active_rc" in
+          0) active="yes"; active_detail="$_CC_WJ_ACTIVE_REASON" ;;
           2) active="yes"; active_detail="$_CC_WJ_ACTIVE_ERROR"; ACTIVE_OK="no"; activity_blind=1 ;;
+          3) lease="yes"; lease_detail="$_CC_WJ_RECENT_REASON" ;;
         esac
+        if [ "$active" = "no" ] && [ "$lease" = "no" ]; then
+          _cc_wj_recent_claim "$wt_path" "$session_grace_hours" tool; recent_rc=$?
+          case "$recent_rc" in
+            0) lease="yes"; lease_detail="$_CC_WJ_RECENT_REASON" ;;
+            2) active="yes"; active_detail="$_CC_WJ_ACTIVE_ERROR"; ACTIVE_OK="no"; activity_blind=1 ;;
+          esac
+        fi
       fi
       [ -n "$classification" ] ||
         classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle" "$lease")
