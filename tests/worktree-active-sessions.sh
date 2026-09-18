@@ -74,8 +74,9 @@ new_fixture() {
   CLAUDE_SESSIONS="$CASE/claude-sessions"
   CLAUDE_PROJECTS="$CASE/claude-projects"
   CODEX_LOCKS="$CASE/codex-locks"
+  CODEX_SESSIONS="$CASE/codex-sessions"
   CODEX_STATE="$CASE/codex.sqlite"
-  mkdir -p "$CASE" "$CLAUDE_SESSIONS" "$CLAUDE_PROJECTS" "$CODEX_LOCKS"
+  mkdir -p "$CASE" "$CLAUDE_SESSIONS" "$CLAUDE_PROJECTS" "$CODEX_LOCKS" "$CODEX_SESSIONS"
   git init --bare -q -b main "$ORIGIN"
   git clone -q "$ORIGIN" "$PRIMARY"
   git -C "$PRIMARY" config user.email test@example.com
@@ -103,7 +104,8 @@ run_wj() {
   PATH="$BIN:$PATH" CC_WJ_CONFIG="$CASE/no-config" CC_WJ_LOG="$CASE/wj.log" \
     CC_WJ_STATE_DIR="$CASE/state" CC_WJ_CLAUDE_SESSIONS="$CLAUDE_SESSIONS" \
     CC_WJ_CLAUDE_PROJECTS="$CLAUDE_PROJECTS" CC_WJ_CODEX_LOCKS="$CODEX_LOCKS" \
-    CC_WJ_CODEX_STATE_DB="$CODEX_STATE" CC_WJ_NOTIFY_MIN_GB=999999 \
+    CC_WJ_CODEX_SESSIONS="$CODEX_SESSIONS" CC_WJ_CODEX_STATE_DB="$CODEX_STATE" \
+    CC_WJ_NOTIFY_MIN_GB=999999 \
     CODEX_THREAD_ID="${CODEX_THREAD_ID:-}" CLAUDE_CODE_SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}" \
     bash "$WJ" --repo "$PRIMARY" "$@"
 }
@@ -281,6 +283,22 @@ rollout="$CASE/racing-rollout.jsonl"; : > "$rollout"
 out="$(run_wj --apply 2>&1)"
 check "a fresh Codex lock waits for its state row and keeps the worktree" test -d "$WT"
 case "$out" in *'active Codex'*) ok "the fresh-lock retry preserves the mapped keep reason" ;; *) bad "the fresh-lock retry preserves the mapped keep reason" ;; esac
+
+new_fixture codex-old-lock-state-race
+age_worktree 72
+tid=24242424-3333-7444-8555-666666666666
+lock="$CODEX_LOCKS/$tid.lock"; : > "$lock"
+old_stamp="$(date -v-1H '+%Y%m%d%H%M.%S' 2>/dev/null || date -d '1 hour ago' '+%Y%m%d%H%M.%S')"
+touch -t "$old_stamp" "$lock"
+printf 'p9\nn%s\n' "$lock" > "$LSOF_LOCK_FILE"
+make_codex_state
+mkdir -p "$CODEX_SESSIONS/2026/09/19"
+rollout="$CODEX_SESSIONS/2026/09/19/rollout-2026-09-19T00-00-00-$tid.jsonl"
+printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$tid" "$WT" > "$rollout"
+rc=0; out="$(run_wj --apply 2>&1)" || rc=$?
+check "an older open Codex lock maps from rollout metadata while its state row lags" test "$rc" -eq 0
+check "the rollout-mapped live Codex claim keeps its worktree" test -d "$WT"
+case "$out" in *'active Codex'*) ok "the rollout fallback preserves the mapped keep reason" ;; *) bad "the rollout fallback preserves the mapped keep reason" ;; esac
 
 new_fixture codex-stale
 age_worktree 72

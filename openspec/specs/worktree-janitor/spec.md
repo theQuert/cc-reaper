@@ -64,6 +64,11 @@ commits are never deleted - only the working directory.
 - **WHEN** a verified-live Claude session or open Codex writer lock maps to the worktree by cwd, or its structured tool calls name the worktree
 - **THEN** it is classified KEEP with a reason that identifies the harness and claim
 
+#### Scenario: Codex state row lags a live writer lock
+- **WHEN** an open Codex writer lock has no task row yet but exactly one active rollout has a matching session id and an absolute cwd in its `session_meta`
+- **THEN** the rollout maps the live claim without waiting for an unbounded state update, and the worktree is classified KEEP
+- **AND** a missing, duplicate, unreadable, mismatched, or unsafe rollout makes the activity scan fail closed and removes nothing
+
 #### Scenario: Stale registry artifact
 - **WHEN** a Claude PID record is dead or reused, or a Codex lock file exists but is not open
 - **THEN** that artifact alone does not claim a worktree

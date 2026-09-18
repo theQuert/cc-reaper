@@ -507,6 +507,14 @@ still vetoes removal regardless of age.
 | `CC_WJ_SCHEDULE_APPLY` | `1` | `~/.cc-reaper/worktree-janitor.conf` | `0` makes scheduled sweeps report-only. |
 | `CC_WJ_ROOT` | `~/GitHub` | `~/.cc-reaper/worktree-janitor.conf` | Colon-separated ordinary source roots to inventory. Claude/Codex-owned worktree roots are discovered separately. |
 
+An active Codex app task can create its writer lock before the matching row appears in
+`~/.codex/state_5.sqlite`. The janitor first gives a newly-created row a short bounded
+retry, then maps the verified-open lock from the uniquely matching rollout's
+`session_meta` under `~/.codex/sessions`. Missing, duplicate, unreadable, mismatched, or
+unsafe metadata fails the whole activity scan closed, so no worktree is removed. For an
+alternate Codex data layout, `CC_WJ_CODEX_SESSIONS` can point a diagnostic invocation at
+the active rollout registry.
+
 For a slower workflow, extend both retention gates rather than only slowing the schedule.
 For example, this keeps settled worktrees for at least 14 days and checks twice a day:
 
