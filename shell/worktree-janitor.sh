@@ -410,6 +410,13 @@ _cc_wj_claim_cwd() {
   (builtin cd -P -- "$cwd" >/dev/null 2>&1 && pwd -P)
 }
 
+_cc_wj_transcript_cache_identity() { # <mode> <path>
+  local stat_identity
+  stat_identity="$(stat -f '%d %i %z %m' "$2" 2>/dev/null)" ||
+    stat_identity="$(stat -c '%d %i %s %Y' "$2" 2>/dev/null)" || return 1
+  printf '%s\0%s\0%s\n' "$1" "$2" "$stat_identity"
+}
+
 # Query only the meaningful tail of an append-only transcript. Real session files on the
 # measured host exceed 100 MB; reading each whole file once per candidate made a six-hour
 # janitor run itself a sustained I/O workload. In reverse order the current two human
@@ -435,13 +442,14 @@ _cc_wj_transcript_tail_query() { # <claude-cwd|claude-claim|codex-claim> <file> 
     # later target can then use grep instead of starting another Python interpreter for
     # every transcript.  A malformed relevant record keeps the legacy target-specific
     # parser on the path below, so the optimization cannot weaken fail-closed behavior.
-    if [ -n "$cache" ] && [ -f "$cache.search" ] &&
-       [ ! -e "$cache.fatal" ] && [ ! -e "$cache.unsafe" ]; then
-      if LC_ALL=C grep -F -q -- "$wt" "$cache.search" 2>/dev/null; then
-        return 0
-      fi
-      if [ -n "$alt" ] && LC_ALL=C grep -F -q -- "$alt" "$cache.search" 2>/dev/null; then
-        return 0
+    if [ -n "$cache" ] && [ -f "$cache.search" ] && [ -f "$cache.identity" ] &&
+       [ ! -e "$cache.fatal" ] && [ ! -e "$cache.unsafe" ] &&
+       cmp -s "$cache.identity" <(_cc_wj_transcript_cache_identity "$mode" "$transcript"); then
+      LC_ALL=C grep -F -q -- "$wt" "$cache.search" 2>/dev/null
+      case $? in 0) return 0 ;; 1) ;; *) return 2 ;; esac
+      if [ -n "$alt" ]; then
+        LC_ALL=C grep -F -q -- "$alt" "$cache.search" 2>/dev/null
+        case $? in 0) return 0 ;; 1) ;; *) return 2 ;; esac
       fi
       return 1
     fi
@@ -750,6 +758,18 @@ try:
                             write_bytes(cache_path + ".fatal", b"1")
                         if unsafe:
                             write_bytes(cache_path + ".unsafe", b"1")
+                        # Written last: the shell fast path is available only when
+                        # the exact mode/path/file identity that produced the atomic
+                        # projection is visible. The cksum is only a filename shard;
+                        # it is never trusted as cache identity.
+                        identity = (
+                            mode.encode("utf-8")
+                            + b"\0"
+                            + os.fsencode(path)
+                            + b"\0"
+                            + f"{stat.st_dev} {stat.st_ino} {stat.st_size} {int(stat.st_mtime)}\n".encode("ascii")
+                        )
+                        write_bytes(cache_path + ".identity", identity)
                     except OSError:
                         raise SystemExit(2)
                     # The projection was built from the same normalized layers as
@@ -2085,16 +2105,27 @@ _cc_wj_scavenge_private_temp() {
 
 _cc_wj_cleanup_and_reraise() {
   local signal="$1" status="$2"
+  local caller_trap=""
   # Bash uses dynamic scope, so these are the interrupted _cc_wj_run_inner locals.
   _cc_wj_remove_private_temp "${work:-}"
+  case "$signal" in
+    INT) caller_trap="${old_int:-}" ;;
+    TERM) caller_trap="${old_term:-}" ;;
+    HUP) caller_trap="${old_hup:-}" ;;
+  esac
   trap - INT TERM HUP
-  [ -z "${old_signals:-}" ] || eval "$old_signals"
-  # Re-raising from inside this handler nests the restored handler, and Bash then
-  # skips the caller's EXIT trap when that nested handler exits. Defer the signal
-  # until this cleanup handler has returned so the caller observes normal ordering:
-  # its signal trap first, then its EXIT trap.
-  (kill -s "$signal" "$$") &
-  return "$status"
+  # Running a restored signal trap nested inside this handler makes Bash skip EXIT
+  # when that caller trap exits. Run the caller's quoted trap action in a subshell
+  # with EXIT disabled, then exit this shell normally so its original EXIT trap runs
+  # exactly once. No interrupted janitor body resumes between cleanup and exit.
+  if [ -n "$caller_trap" ]; then
+    (
+      trap - EXIT
+      eval "set -- $caller_trap"
+      [ "${1:-}" = trap ] && [ "${2:-}" = -- ] && eval "${3:-}"
+    )
+  fi
+  exit "$status"
 }
 
 # ─── Removal ──────────────────────────────────────────────────────────────────
@@ -2338,7 +2369,7 @@ _cc_wj_run_inner() {
   local prune_repos=()
 
   # Holder scans, taken once per run into files and taken again right before each removal.
-  local work old_exit="" old_signals="" cleanup_exit_installed=0
+  local work old_exit="" old_int="" old_term="" old_hup="" cleanup_exit_installed=0
   local LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
   _cc_wj_scavenge_private_temp
   work="$(mktemp -d "${TMPDIR:-/tmp}/cc-wj.XXXXXX")" || {
@@ -2357,7 +2388,9 @@ _cc_wj_run_inner() {
   # installed run executes through that path.
   if [ -n "${BASH_VERSION:-}" ]; then
     old_exit="$(trap -p EXIT)"
-    old_signals="$(trap -p INT TERM HUP)"
+    old_int="$(trap -p INT)"
+    old_term="$(trap -p TERM)"
+    old_hup="$(trap -p HUP)"
     if [ -z "$old_exit" ]; then
       trap '_cc_wj_remove_private_temp "$work"' EXIT
       cleanup_exit_installed=1
@@ -2659,7 +2692,9 @@ KEEP
   _cc_wj_remove_private_temp "$work"
   if [ -n "${BASH_VERSION:-}" ]; then
     trap - INT TERM HUP
-    [ -z "$old_signals" ] || eval "$old_signals"
+    [ -z "$old_int" ] || eval "$old_int"
+    [ -z "$old_term" ] || eval "$old_term"
+    [ -z "$old_hup" ] || eval "$old_hup"
     [ "$cleanup_exit_installed" -eq 0 ] || trap - EXIT
   fi
 

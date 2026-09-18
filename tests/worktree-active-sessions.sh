@@ -567,6 +567,32 @@ check "an unsupported lone surrogate retains exact claim answers" test "$lone_su
 lone_surrogate_queries="$(wc -l < "$lone_surrogate_trace" | tr -d ' ')"
 check "an unsupported lone surrogate bypasses the projection fast path" test "$lone_surrogate_queries" -eq 2
 
+collision_first=/tmp/cc-reaper-collision-2pnsrgg4jq7d
+collision_second=/tmp/cc-reaper-collision-3ecjmulj4j9o
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' \
+  '{"type":"response_item","payload":{"type":"custom_tool_call","input":"workdir=/unrelated"}}' > "$collision_first"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' > "$collision_second"
+printf '{"type":"response_item","payload":{"type":"custom_tool_call","input":"workdir=%s"}}\n' \
+  "$WT" >> "$collision_second"
+collision_cache="$CASE/collision-cache"
+collision_result="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DIR="$collision_cache" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$4"; a=$?; _cc_wj_transcript_claims_path Codex "$3" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
+  _ "$WJ" "$collision_first" "$collision_second" "$WT")"
+check "a cksum collision cannot reuse another transcript's projection" test "$collision_result" = "1 0"
+rm -f "$collision_first" "$collision_second"
+
+grep_failure_bin="$CASE/grep-failure-bin"
+mkdir -p "$grep_failure_bin"
+printf '#!/bin/sh\nexit 2\n' > "$grep_failure_bin/grep"
+chmod +x "$grep_failure_bin/grep"
+grep_failure_cache="$CASE/grep-failure-cache"
+grep_failure_result="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DIR="$grep_failure_cache" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3" >/dev/null; PATH="$4:$PATH"; _cc_wj_transcript_claims_path Codex "$2" "$3"; printf "%s\n" "$?"' \
+  _ "$WJ" "$escaped_transcript" "$escaped_target" "$grep_failure_bin")"
+check "a projection grep error fails closed" test "$grep_failure_result" = "2"
+
 mixed_target="$CASE/café-worktree"
 mixed_transcript="$CASE/mixed-escaped-rollout.jsonl"
 python3 - "$mixed_transcript" "$CASE" <<'PY'

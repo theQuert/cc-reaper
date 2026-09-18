@@ -52,6 +52,7 @@ unmappable verified-live claim SHALL make the destructive run fail closed.
 - **AND** matching another candidate does not start another interpreter for that transcript
 - **AND** malformed relevant evidence still uses the exact parser and fails closed
 - **AND** non-UTF-8 filesystem path bytes round-trip through normalized evidence
+- **AND** cache-key collisions and projection lookup failures cannot answer no-claim
 - **AND** normal completion or an interrupt removes the private projection directory
 - **AND** interruption restores and runs the invoking Bash caller's existing signal and exit cleanup
 - **AND** a later start removes a private projection directory whose owner was force-killed

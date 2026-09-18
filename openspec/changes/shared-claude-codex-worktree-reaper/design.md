@@ -42,8 +42,11 @@ input text, and it is discarded with the private run directory.
 Installed bash runs register signal and exit cleanup immediately after that directory is
 created, before any projection is written. Projection encoding uses surrogate escapes so a
 non-UTF-8 filesystem byte remains the same byte the shell passes to fixed-string matching.
-Unsupported lone surrogates mark the projection unsafe and retain exact parsing. Signal
-cleanup restores and re-raises through caller-owned traps instead of replacing their cleanup.
+Unsupported lone surrogates mark the projection unsafe and retain exact parsing. The shell fast
+path validates an exact mode/path/device/inode/size/mtime identity rather than trusting its
+checksum filename, and any projection lookup error fails closed. Signal cleanup runs the
+caller-owned signal action without resuming the interrupted body, then exits through the caller's
+existing EXIT cleanup.
 Because launchd may escalate past shell traps, each run also records its owner PID and scavenges
 dead-owner private directories on the next start; unmarked directories receive a five-minute
 creation grace so concurrent starts cannot remove one between `mktemp` and owner registration.
