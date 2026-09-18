@@ -441,6 +441,15 @@ import tempfile
 mode, path, target, alternate, cache_path, index_path = sys.argv[1:]
 target_bytes = target.encode("utf-8", "surrogateescape")
 alternate_bytes = alternate.encode("utf-8", "surrogateescape")
+target_needles = {
+    target_bytes,
+    alternate_bytes,
+    json.dumps(target, ensure_ascii=True)[1:-1].encode("ascii"),
+    json.dumps(target, ensure_ascii=False)[1:-1].encode("utf-8", "surrogateescape"),
+    json.dumps(alternate, ensure_ascii=True)[1:-1].encode("ascii"),
+    json.dumps(alternate, ensure_ascii=False)[1:-1].encode("utf-8", "surrogateescape"),
+}
+target_needles.discard(b"")
 
 
 def reverse_lines(file_path):
@@ -612,19 +621,15 @@ try:
                 for begin, end in snapshot.get("ranges", []):
                     if begin < 0 or end > len(contents) or begin >= end:
                         raise SystemExit(2)
-                    prefix = contents[begin : min(end, begin + 8192)]
-                    names_target = (
-                        (target_bytes and contents.find(target_bytes, begin, end) >= 0)
-                        or (alternate_bytes and contents.find(alternate_bytes, begin, end) >= 0)
+                    # The offset index deliberately keeps every current-turn tool/user
+                    # record, including multi-megabyte results. Most transcripts cannot
+                    # name this candidate: reject them with mmap's byte search before
+                    # decoding a huge JSON value. Include both UTF-8 and JSON-escaped
+                    # spellings so non-ASCII or quoted paths retain exact behavior.
+                    names_target = any(
+                        contents.find(needle, begin, end) >= 0 for needle in target_needles
                     )
-                    if mode == "codex-claim":
-                        hinted = (
-                            b'"custom_tool_call"' in prefix
-                            or (b'"role"' in prefix and b'"user"' in prefix)
-                        )
-                    else:
-                        hinted = b'"tool_use"' in prefix or b'"user"' in prefix
-                    if not names_target and not hinted:
+                    if not names_target:
                         continue
                     try:
                         event = json.loads(contents[begin:end])

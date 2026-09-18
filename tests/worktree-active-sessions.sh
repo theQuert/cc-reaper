@@ -506,6 +506,16 @@ check "the cached transcript snapshot preserves matching and non-matching result
 cache_builds="$(wc -l < "$cache_trace" | tr -d ' ')"
 check "one activity snapshot indexes a large transcript once across candidate paths" test "$cache_builds" -eq 1
 
+escaped_target="$CASE/測試-worktree"
+escaped_transcript="$CASE/escaped-rollout.jsonl"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' \
+  "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"input\":\"workdir=$CASE/\\u6e2c\\u8a66-worktree\"}}" > "$escaped_transcript"
+escaped_result="$(CC_WJ_CONFIG="$CASE/no-config" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; printf "%s\n" "$?"' \
+  _ "$WJ" "$escaped_transcript" "$escaped_target")"
+check "JSON-escaped Unicode tool paths survive the byte prefilter" test "$escaped_result" = 0
+
 persistent_dir="$CASE/persistent-transcript-index"; persistent_trace="$CASE/persistent-trace"
 for generation in one two; do
   CC_WJ_TRANSCRIPT_CACHE_DIR="$CASE/cache-$generation" \
