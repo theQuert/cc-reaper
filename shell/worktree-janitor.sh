@@ -135,6 +135,19 @@ _cc_wj_session_grace_hours() {
   echo $((10#$v))
 }
 
+# `git status --ignored` walks the whole checkout. Bound it so one pathological or
+# unavailable filesystem cannot prevent every later worktree and future schedule from
+# being examined. Expiry is conservative: an unreadable status pins the worktree.
+_cc_wj_git_status_timeout_seconds() {
+  local v="${CC_WJ_GIT_STATUS_TIMEOUT_SECONDS:-300}" n
+  case "$v" in
+    ''|*[!0-9]*|??????*) return 1 ;;
+  esac
+  n=$((10#$v))
+  [ "$n" -gt 0 ] || return 1
+  echo "$n"
+}
+
 # Run a command under a time bound that ends its whole process group; exit 124 on expiry.
 #
 # `alarm; exec` bounds nothing that matters here: `gh` is a Go binary that ignores
@@ -1684,15 +1697,24 @@ _cc_wj_pin() {
 # the loop's. Nothing here is named `status` or `path`: both are reserved in zsh, and
 # this file is sourceable.
 _cc_wj_pins() {
-  local wt="$1" sf rec code rest base skip_next=0 drc
+  local wt="$1" sf rec code rest base skip_next=0 drc status_timeout status_rc=0
+  status_timeout="$(_cc_wj_git_status_timeout_seconds)" || {
+    _cc_wj_pin '??' "(invalid git status timeout)"; return 1; }
   sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-status.XXXXXX")" || {
     _cc_wj_pin '??' "(no temporary file to read its status into)"; return 1; }
   # No optional locks, so a user's concurrent commit never meets this scan's index.lock
   # and the index the idle gate reads is not rewritten; no fsmonitor, so no daemon starts
   # inside the worktree and shows up as its holder.
-  if ! git --no-optional-locks -c core.fsmonitor=false -C "$wt" status --porcelain --ignored -z > "$sf" 2>/dev/null; then
+  _cc_wj_with_timeout "$status_timeout" \
+    git --no-optional-locks -c core.fsmonitor=false -C "$wt" \
+      status --porcelain --ignored -z > "$sf" 2>/dev/null || status_rc=$?
+  if [ "$status_rc" -ne 0 ]; then
     rm -f "$sf"
-    _cc_wj_pin '??' "(git status failed)"
+    if [ "$status_rc" -eq 124 ]; then
+      _cc_wj_pin '??' "(git status timed out after ${status_timeout}s)"
+    else
+      _cc_wj_pin '??' "(git status failed)"
+    fi
     return 1
   fi
   while IFS= read -r -d '' rec; do
@@ -2322,13 +2344,17 @@ _cc_wj_run_inner() {
     return 2
   fi
 
-  local idle_hours session_grace_hours
+  local idle_hours session_grace_hours status_timeout
   if ! idle_hours="$(_cc_wj_idle_hours)"; then
     echo "worktree-janitor: CC_WJ_IDLE_HOURS=${CC_WJ_IDLE_HOURS:-} is not a whole number of hours below 100000; scanned and removed nothing" >&2
     return 2
   fi
   if ! session_grace_hours="$(_cc_wj_session_grace_hours)"; then
     echo "worktree-janitor: CC_WJ_SESSION_GRACE_HOURS=${CC_WJ_SESSION_GRACE_HOURS:-} is not a whole number of hours below 100000; scanned and removed nothing" >&2
+    return 2
+  fi
+  if ! status_timeout="$(_cc_wj_git_status_timeout_seconds)"; then
+    echo "worktree-janitor: CC_WJ_GIT_STATUS_TIMEOUT_SECONDS=${CC_WJ_GIT_STATUS_TIMEOUT_SECONDS:-} is not a positive whole number below 100000; scanned and removed nothing" >&2
     return 2
   fi
 

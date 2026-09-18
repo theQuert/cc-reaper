@@ -48,6 +48,10 @@ commits are never deleted - only the working directory.
 - **WHEN** a worktree has any uncommitted, untracked, or undiscounted ignored entry
 - **THEN** it is classified KEEP with reason `unrebuildable=<n>`, and the report names up to three of those entries with their porcelain codes
 
+#### Scenario: Worktree status scan reaches its bound
+- **WHEN** `git status --ignored` does not finish within the positive configurable per-worktree timeout
+- **THEN** the janitor terminates that status process group, keeps the worktree with a timeout reason, and continues examining later worktrees
+
 #### Scenario: Active session in clean worktree
 - **WHEN** any process's cwd resolves at or under the worktree
 - **THEN** it is classified KEEP with reason `active-session`
