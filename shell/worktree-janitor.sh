@@ -1087,7 +1087,7 @@ _cc_wj_scan_codex_recent() { # <grace hours>
   }
   now="$(date +%s)"; cutoff=$((now - grace * 3600))
   rows="$("$sqlite" -batch -noheader -cmd '.timeout 2000' "$state" \
-    "select id || char(9) || cwd || char(9) || rollout_path || char(9) || max(updated_at, coalesce(archived_at, 0)) || char(9) || archived from threads where max(updated_at, coalesce(archived_at, 0)) >= $cutoff;" 2>/dev/null)" || {
+    "select id || char(9) || cwd || char(9) || rollout_path || char(9) || max(updated_at, coalesce(archived_at, 0)) || char(9) || archived from threads where max(updated_at, coalesce(archived_at, 0)) >= $cutoff order by max(updated_at, coalesce(archived_at, 0)) desc, id desc;" 2>/dev/null)" || {
     _CC_WJ_ACTIVE_ERROR="recent Codex session leases could not be read from local state"
     return 1
   }
