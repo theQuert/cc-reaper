@@ -452,6 +452,23 @@ target_needles = {
 target_needles.discard(b"")
 
 
+def value_names_target(value, depth=0):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if target in text or alternate in text:
+        return True
+    # Codex custom_tool_call.input can itself be a JSON-encoded string. Decode a
+    # bounded number of layers so escaped solidi and Unicode become the actual path;
+    # keep the original text check for command-like inputs that are not JSON.
+    if isinstance(value, str) and depth < 4:
+        try:
+            nested = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if nested != value:
+            return value_names_target(nested, depth + 1)
+    return False
+
+
 def reverse_lines(file_path):
     with open(file_path, "rb") as handle:
         handle.seek(0, os.SEEK_END)
@@ -648,8 +665,7 @@ try:
                             and payload.get("type") == "custom_tool_call"
                         ):
                             value = payload.get("input", "")
-                            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-                            if target in text or alternate in text:
+                            if value_names_target(value):
                                 raise SystemExit(0)
                     elif isinstance(event, dict) and mode == "claude-claim":
                         message = event.get("message")
@@ -659,8 +675,7 @@ try:
                                 if not isinstance(item, dict) or item.get("type") != "tool_use":
                                     continue
                                 value = item.get("input", "")
-                                text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-                                if target in text or alternate in text:
+                                if value_names_target(value):
                                     raise SystemExit(0)
         raise SystemExit(1)
 

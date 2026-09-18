@@ -534,6 +534,24 @@ mixed_result="$(CC_WJ_CONFIG="$CASE/no-config" bash -c \
   _ "$WJ" "$mixed_transcript" "$mixed_target")"
 check "mixed solidus and uppercase Unicode escapes retain a tool claim" test "$mixed_result" = 0
 
+nested_target="$CASE/café-nested-worktree"
+nested_transcript="$CASE/nested-escaped-rollout.jsonl"
+python3 - "$nested_transcript" "$nested_target" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+user = {"type": "response_item", "payload": {"type": "message", "role": "user", "content": "finish task"}}
+nested = json.dumps({"workdir": sys.argv[2]}).replace("/", r"\/").replace(r"\u00e9", r"\u00E9")
+tool = {"type": "response_item", "payload": {"type": "custom_tool_call", "input": nested}}
+path.write_text(json.dumps(user) + "\n" + json.dumps(tool) + "\n")
+PY
+nested_result="$(CC_WJ_CONFIG="$CASE/no-config" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; printf "%s\n" "$?"' \
+  _ "$WJ" "$nested_transcript" "$nested_target")"
+check "nested JSON Codex arguments retain an escaped tool path claim" test "$nested_result" = 0
+
 persistent_dir="$CASE/persistent-transcript-index"; persistent_trace="$CASE/persistent-trace"
 for generation in one two; do
   CC_WJ_TRANSCRIPT_CACHE_DIR="$CASE/cache-$generation" \
