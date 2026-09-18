@@ -76,6 +76,10 @@ commits are never deleted - only the working directory.
 - **WHEN** a worktree's files have been idle longer than 48 hours but a mapped task was archived less than `CC_WJ_SESSION_GRACE_HOURS` ago
 - **THEN** the recent-session lease keeps the worktree even though its file-idle gate already holds
 
+#### Scenario: Many recent Codex tasks
+- **WHEN** the local Codex state contains many tasks inside the grace window
+- **THEN** the janitor evaluates their transcript claims by most recent activity first without dropping any task from the safety scan
+
 #### Scenario: Recent Claude transcript
 - **WHEN** a non-live Claude transcript was updated within the session grace window and its last recorded cwd maps to the worktree
 - **THEN** the worktree is `KEEP(recent-session)` until that transcript activity ages past the grace window

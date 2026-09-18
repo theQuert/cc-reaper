@@ -144,6 +144,31 @@ explicit_idle="$(CC_WJ_IDLE_HOURS=7 CC_WJ_CONFIG="$ROOT_DIR/config/worktree-jani
   'source "$1"; _cc_wj_idle_hours' _ "$WJ" 2>/dev/null || true)"
 check "an explicit one-shot idle window overrides the installed policy" test "$explicit_idle" = 7
 
+# A removable candidate stops at the first matching recent transcript. The local state
+# can contain hundreds of rows, so newest-first is both the likely match and the bounded
+# path for an archive/update that just created the lease.
+new_fixture codex-recent-order
+make_codex_state
+old_tid=11111111-1111-4111-8111-111111111111
+new_tid=22222222-2222-4222-8222-222222222222
+old_rollout="$CASE/old.jsonl"; : > "$old_rollout"
+new_rollout="$CASE/new.jsonl"; : > "$new_rollout"
+now="$(date +%s)"
+sqlite3 "$CODEX_STATE" "insert into threads(id,cwd,rollout_path,updated_at) values ('$old_tid','$PRIMARY','$old_rollout',$((now - 300)));"
+sqlite3 "$CODEX_STATE" "insert into threads(id,cwd,rollout_path,updated_at) values ('$new_tid','$PRIMARY','$new_rollout',$now);"
+order_log="$CASE/order.log"
+CC_WJ_CONFIG="$CASE/no-config" CC_WJ_CODEX_STATE_DB="$CODEX_STATE" ORDER_LOG="$order_log" \
+  bash -c '
+    source "$1"
+    _cc_wj_active_has_id() { return 1; }
+    _cc_wj_recent_add_transcript() { printf "%s\n" "$2" >> "$ORDER_LOG"; }
+    _cc_wj_recent_add_claim() { :; }
+    _cc_wj_claim_cwd() { printf "%s\n" "$1"; }
+    _cc_wj_scan_codex_recent 48
+  ' _ "$WJ"
+check "recent Codex tasks are evaluated newest-first" \
+  test "$(head -n 1 "$order_log")" = "$new_tid"
+
 new_fixture no-linked-network
 git -C "$PRIMARY" worktree remove "$WT"
 git -C "$PRIMARY" remote set-url origin http://127.0.0.1:9/unreachable.git
