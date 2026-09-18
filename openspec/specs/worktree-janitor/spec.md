@@ -165,6 +165,10 @@ into the report.
 - **WHEN** the repository has no `origin`, its default branch cannot be resolved, or the fetch fails or times out
 - **THEN** the run says so once for the repository and every worktree in it is classified KEEP with reason `base-unfetched`
 
+#### Scenario: Low-priority base fetch needs more than one minute
+- **WHEN** the scheduled agent's base fetch exceeds one minute but completes within the positive configurable fetch budget
+- **THEN** the fetched base is used normally instead of permanently disabling reclamation for that repository
+
 #### Scenario: Detached HEAD landed by content only
 - **WHEN** a detached HEAD is landed by content or PR but not by ancestry
 - **THEN** it is classified KEEP with reason `detached-head`

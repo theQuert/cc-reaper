@@ -289,6 +289,13 @@ expect_no "a zero CC_WJ_GIT_STATUS_TIMEOUT_SECONDS fails before scanning" \
 expect_yes "and the invalid status bound removed nothing" \
   test -d "$WT_CLEAN"
 
+expect_no "a zero CC_WJ_FETCH_TIMEOUT_SECONDS fails before scanning" \
+  env CC_WJ_FETCH_TIMEOUT_SECONDS=0 PATH="$STUBS_IDLE:$PATH" \
+    bash "$WJ" --repo "$PRIMARY" --apply
+
+expect_yes "and the invalid fetch bound removed nothing" \
+  test -d "$WT_CLEAN"
+
 # ─── Test 5: default (no --apply) removes nothing ────────────────────────────
 
 # Confirm fixtures are intact before apply
@@ -1356,6 +1363,7 @@ cat > "$GIT_STUBS/git" <<'STUB'
 printf '%s\n' "$*" >> "$GIT_ARGS_LOG"
 case " $* " in
   *" worktree list "*) [ -n "${GIT_FAIL_LIST:-}" ] && { echo "error: unknown switch \`z'" >&2; exit 129; } ;;
+  *" fetch "*) [ -n "${GIT_FETCH_SLEEP:-}" ] && sleep "$GIT_FETCH_SLEEP" ;;
 esac
 exec "$REAL_GIT" "$@"
 STUB
@@ -1370,6 +1378,18 @@ expect_yes "and is named" file_has "$TMPDIR_ROOT/out-nolist.txt" "could not list
 # records - a removal in a mode that removes nothing.
 expect_yes "the base fetch disables automatic maintenance" \
   bash -c 'grep " fetch " "$1" | grep -q -- "--no-auto-maintenance"' _ "$GIT_ARGS_LOG"
+
+base_fetch_uses_configured_bound() {
+  local start end
+  start=$(date +%s)
+  GIT_FETCH_SLEEP=3 CC_WJ_FETCH_TIMEOUT_SECONDS=1 PATH="$GIT_STUBS:$PATH" \
+    _cc_wj_prepare_base "$S_PRIMARY" >/dev/null 2>&1
+  end=$(date +%s)
+  [ $((end - start)) -lt 3 ] && [ "$_CC_WJ_BASE_OK" -eq 0 ] &&
+    [ "$_CC_WJ_BASE_WHY" = "origin/main could not be fetched within 1s" ]
+}
+expect_yes "the base fetch obeys its configured bound and fails closed" \
+  base_fetch_uses_configured_bound
 
 # ─── Review round 4 ───────────────────────────────────────────────────────────
 
