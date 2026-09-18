@@ -387,7 +387,16 @@ ACTIVE_IDS
 }
 
 _cc_wj_mtime_epoch() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+  local value
+  value="$(stat -f %m "$1" 2>/dev/null)" && case "$value" in
+    ''|*[!0-9]*) ;;
+    *) printf '%s\n' "$value"; return 0 ;;
+  esac
+  value="$(stat -c %Y "$1" 2>/dev/null)" && case "$value" in
+    ''|*[!0-9]*) ;;
+    *) printf '%s\n' "$value"; return 0 ;;
+  esac
+  return 1
 }
 
 _cc_wj_epoch_iso() {

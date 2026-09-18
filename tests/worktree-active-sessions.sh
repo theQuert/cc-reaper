@@ -108,6 +108,27 @@ make_codex_state() {
   sqlite3 "$CODEX_STATE" 'create table threads (id text primary key, cwd text not null, rollout_path text not null, updated_at integer not null default 0, archived integer not null default 0, archived_at integer);'
 }
 
+GNU_BIN="$TMP_ROOT/gnu-bin"
+mkdir -p "$GNU_BIN"
+cat > "$GNU_BIN/stat" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = -f ]; then
+  printf '  File: "%s"\n' "$3"
+  exit 1
+fi
+if [ "$1" = -c ] && [ "$2" = %Y ]; then
+  printf '1234567890\n'
+  exit 0
+fi
+exit 1
+STUB
+chmod +x "$GNU_BIN/stat"
+mtime_fixture="$TMP_ROOT/mtime-fixture"
+: > "$mtime_fixture"
+portable_mtime="$(PATH="$GNU_BIN:$PATH" CC_WJ_CONFIG="$TMP_ROOT/no-config" bash -c \
+  'source "$1"; _cc_wj_mtime_epoch "$2"' _ "$WJ" "$mtime_fixture" 2>/dev/null || true)"
+check "GNU stat fallback returns only the numeric modification epoch" test "$portable_mtime" = 1234567890
+
 # The policy belongs to cc-reaper and is two days even when no harness exports anything.
 default_idle="$(CC_WJ_CONFIG="$TMP_ROOT/no-config" bash -c \
   'source "$1"; unset CC_WJ_IDLE_HOURS; _cc_wj_idle_hours' _ "$WJ" 2>/dev/null || true)"
