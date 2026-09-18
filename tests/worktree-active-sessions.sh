@@ -553,6 +553,20 @@ byte_result="$(LC_ALL=C CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DI
   _ "$WJ" "$byte_transcript" "$cache_other" "$byte_target")"
 check "a surrogate-escaped filesystem byte survives the shared fast path" test "$byte_result" = "1 0"
 
+lone_surrogate_transcript="$CASE/lone-surrogate-rollout.jsonl"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' \
+  '{"type":"response_item","payload":{"type":"custom_tool_call","input":"workdir='"$WT"' \ud800"}}' > "$lone_surrogate_transcript"
+lone_surrogate_cache="$CASE/lone-surrogate-cache"
+lone_surrogate_trace="$CASE/lone-surrogate-trace"
+lone_surrogate_result="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DIR="$lone_surrogate_cache" \
+  CC_WJ_TRANSCRIPT_QUERY_TRACE="$lone_surrogate_trace" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?; _cc_wj_transcript_claims_path Codex "$2" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
+  _ "$WJ" "$lone_surrogate_transcript" "$WT" "$cache_other")"
+check "an unsupported lone surrogate retains exact claim answers" test "$lone_surrogate_result" = "0 1"
+lone_surrogate_queries="$(wc -l < "$lone_surrogate_trace" | tr -d ' ')"
+check "an unsupported lone surrogate bypasses the projection fast path" test "$lone_surrogate_queries" -eq 2
+
 mixed_target="$CASE/café-worktree"
 mixed_transcript="$CASE/mixed-escaped-rollout.jsonl"
 python3 - "$mixed_transcript" "$CASE" <<'PY'
@@ -649,14 +663,16 @@ CC_WJ_SCHEDULE_APPLY=1 run_wj --scheduled >/dev/null 2>&1
 check "scheduled mode applies when the cc-reaper policy opts in" test ! -d "$WT"
 
 new_fixture interrupted-temp-cleanup
-interrupt_tmp="$CASE/tmp"; interrupt_marker="$CASE/lsof-started"
+interrupt_tmp="$CASE/tmp"; interrupt_marker="$CASE/lsof-started"; interrupt_traps="$CASE/caller-traps"
 mkdir -p "$interrupt_tmp"
 env PATH="$BIN:$PATH" TMPDIR="$interrupt_tmp" LSOF_SLEEP_MARKER="$interrupt_marker" \
   LSOF_SLEEP_SECONDS=2 CC_WJ_CONFIG="$CASE/no-config" CC_WJ_LOG="$CASE/wj.log" \
   CC_WJ_STATE_DIR="$CASE/state" CC_WJ_CLAUDE_SESSIONS="$CLAUDE_SESSIONS" \
   CC_WJ_CLAUDE_PROJECTS="$CLAUDE_PROJECTS" CC_WJ_CODEX_LOCKS="$CODEX_LOCKS" \
   CC_WJ_CODEX_STATE_DB="$CODEX_STATE" CC_WJ_NOTIFY_MIN_GB=999999 \
-  bash "$WJ" --repo "$PRIMARY" >/dev/null 2>&1 &
+  INTERRUPT_TRAP_MARKER="$interrupt_traps" bash -c \
+  'trap '\''printf "EXIT\\n" >> "$INTERRUPT_TRAP_MARKER"'\'' EXIT; trap '\''printf "TERM\\n" >> "$INTERRUPT_TRAP_MARKER"; exit 143'\'' TERM; source "$1"; _cc_wj_run --repo "$2"' \
+  _ "$WJ" "$PRIMARY" >/dev/null 2>&1 &
 interrupt_pid=$!
 for _ in 1 2 3 4 5; do
   [ -e "$interrupt_marker" ] && break
@@ -666,6 +682,8 @@ kill -TERM "$interrupt_pid" 2>/dev/null || true
 wait "$interrupt_pid" 2>/dev/null || true
 interrupt_dirs="$(find "$interrupt_tmp" -maxdepth 1 -type d -name 'cc-wj.*' | wc -l | tr -d ' ')"
 check "an interrupted run removes its private transcript projection directory" test "$interrupt_dirs" -eq 0
+check "an interrupted sourced run restores the caller TERM trap" grep -q '^TERM$' "$interrupt_traps"
+check "an interrupted sourced run restores the caller EXIT trap" grep -q '^EXIT$' "$interrupt_traps"
 
 new_fixture harness-discovery
 age_worktree 72

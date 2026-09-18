@@ -733,10 +733,17 @@ try:
                                 unsafe = True
                             continue
                         values.extend(event_searchable_texts(event))
-                    search_payload = b"\0".join(
-                        value.encode("utf-8", "surrogateescape")
-                        for value in values
-                    )
+                    encoded_values = []
+                    for value in values:
+                        try:
+                            encoded_values.append(value.encode("utf-8", "surrogateescape"))
+                        except UnicodeEncodeError:
+                            # U+DC80..U+DCFF round-trip filesystem bytes. Other lone
+                            # surrogates have no shell-byte representation, so keep the
+                            # exact parser instead of turning an encoding error into the
+                            # status-1 "no claim" answer.
+                            fatal = True
+                    search_payload = b"\0".join(encoded_values)
                     try:
                         write_bytes(cache_path + ".search", search_payload)
                         if fatal:
@@ -2049,6 +2056,20 @@ _cc_wj_remove_private_temp() {
   esac
 }
 
+_cc_wj_cleanup_and_reraise() {
+  local signal="$1" status="$2"
+  # Bash uses dynamic scope, so these are the interrupted _cc_wj_run_inner locals.
+  _cc_wj_remove_private_temp "${work:-}"
+  trap - INT TERM HUP
+  [ -z "${old_signals:-}" ] || eval "$old_signals"
+  # Re-raising from inside this handler nests the restored handler, and Bash then
+  # skips the caller's EXIT trap when that nested handler exits. Defer the signal
+  # until this cleanup handler has returned so the caller observes normal ordering:
+  # its signal trap first, then its EXIT trap.
+  (kill -s "$signal" "$$") &
+  return "$status"
+}
+
 # ─── Removal ──────────────────────────────────────────────────────────────────
 
 # Remove a single worktree, never with force. Ignored residue does not stop a plain
@@ -2290,21 +2311,27 @@ _cc_wj_run_inner() {
   local prune_repos=()
 
   # Holder scans, taken once per run into files and taken again right before each removal.
-  local work old_traps="" LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
+  local work old_exit="" old_signals="" cleanup_exit_installed=0
+  local LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
   work="$(mktemp -d "${TMPDIR:-/tmp}/cc-wj.XXXXXX")" || {
     echo "worktree-janitor: no temporary directory for the process scan; scanned and removed nothing" >&2
     return 1
   }
-  # Installed and hook-triggered runs execute under bash. Preserve any caller traps,
-  # then register cleanup before transcript projections can materialize normalized
-  # tool input in this private directory. zsh only sources this file for helper tests;
-  # its `trap -p` is incompatible and no installed run executes through that path.
+  # Installed and hook-triggered runs execute under bash. Preserve caller traps, then
+  # register signal cleanup before transcript projections can materialize normalized
+  # tool input. An existing EXIT trap stays installed; otherwise add cleanup there too.
+  # zsh only sources this file for helper tests; its `trap -p` is incompatible and no
+  # installed run executes through that path.
   if [ -n "${BASH_VERSION:-}" ]; then
-    old_traps="$(trap -p EXIT INT TERM HUP)"
-    trap '_cc_wj_remove_private_temp "$work"' EXIT
-    trap '_cc_wj_remove_private_temp "$work"; exit 130' INT
-    trap '_cc_wj_remove_private_temp "$work"; exit 143' TERM
-    trap '_cc_wj_remove_private_temp "$work"; exit 129' HUP
+    old_exit="$(trap -p EXIT)"
+    old_signals="$(trap -p INT TERM HUP)"
+    if [ -z "$old_exit" ]; then
+      trap '_cc_wj_remove_private_temp "$work"' EXIT
+      cleanup_exit_installed=1
+    fi
+    trap '_cc_wj_cleanup_and_reraise INT 130' INT
+    trap '_cc_wj_cleanup_and_reraise TERM 143' TERM
+    trap '_cc_wj_cleanup_and_reraise HUP 129' HUP
   fi
   _CC_WJ_TRANSCRIPT_CACHE_ROOT="$work/transcript-cache"
   _CC_WJ_TRANSCRIPT_CACHE_GENERATION=0
@@ -2598,8 +2625,9 @@ KEEP
   done
   _cc_wj_remove_private_temp "$work"
   if [ -n "${BASH_VERSION:-}" ]; then
-    trap - EXIT INT TERM HUP
-    [ -z "$old_traps" ] || eval "$old_traps"
+    trap - INT TERM HUP
+    [ -z "$old_signals" ] || eval "$old_signals"
+    [ "$cleanup_exit_installed" -eq 0 ] || trap - EXIT
   fi
 
   # Run git worktree prune on repos that had removals or missing dirs (deduped).

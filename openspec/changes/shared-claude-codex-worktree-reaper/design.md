@@ -42,6 +42,8 @@ input text, and it is discarded with the private run directory.
 Installed bash runs register signal and exit cleanup immediately after that directory is
 created, before any projection is written. Projection encoding uses surrogate escapes so a
 non-UTF-8 filesystem byte remains the same byte the shell passes to fixed-string matching.
+Unsupported lone surrogates mark the projection unsafe and retain exact parsing. Signal
+cleanup restores and re-raises through caller-owned traps instead of replacing their cleanup.
 If a Codex writer lock closes while its captured rollout is being read, the janitor remaps
 that task through current Codex state. An archived task becomes bounded recent-session
 evidence for only its mapped cwd and structured tool paths; the expected rollout move does
