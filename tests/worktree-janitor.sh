@@ -723,11 +723,14 @@ git clone -q "$L_ORIGIN" "$U_ROOT" 2>/dev/null
 git -C "$U_ROOT" worktree add -q "$TMPDIR_ROOT/unfetched-wt" -b u origin/main 2>/dev/null
 git -C "$U_ROOT" config remote.origin.url "$TMPDIR_ROOT/no-such-origin.git"
 OUT_U="$TMPDIR_ROOT/out-unfetched.txt"
-_wj_idle --repo "$U_ROOT" > "$OUT_U"
+unfetched_rc=0
+_wj_idle --repo "$U_ROOT" > "$OUT_U" || unfetched_rc=$?
 expect_yes "an unreachable origin keeps its worktrees as KEEP(base-unfetched)" \
   file_after "$OUT_U" "unfetched-wt$" 2 "KEEP(base-unfetched)"
 expect_yes "and the report says the base could not be fetched" \
   file_has "$OUT_U" "could not be fetched"
+expect_yes "and the incomplete repository makes the run fail observably" \
+  test "$unfetched_rc" -ne 0
 
 
 # ─── What git itself protects ─────────────────────────────────────────────────

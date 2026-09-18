@@ -558,6 +558,9 @@ tail -f ~/.cc-reaper/logs/worktree-janitor-session.log
 Every scheduled sweep is delimited by `scheduled sweep started` and `scheduled sweep ended`
 records carrying timestamp, pid, elapsed seconds, and exit status. The installed stdout and
 stderr files are bounded at 1 MiB per current file, with the prior segment retained as `.old`.
+If a repository's fresh base cannot be fetched, every worktree in that repository is kept as
+`KEEP(base-unfetched)` and the sweep exits non-zero so unattended monitoring cannot mistake a
+safe but incomplete pass for a fully healthy one.
 
 `CC_WJ_SESSION_GRACE_HOURS` controls the recent-session lease independently of
 `CC_WJ_IDLE_HOURS`; both default to 48. Set either only with an explicit retention-policy

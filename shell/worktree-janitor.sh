@@ -2481,6 +2481,10 @@ KEEP
 
     if ! _cc_wj_prepare_base "$repo"; then
       echo "worktree-janitor: $repo: $_CC_WJ_BASE_WHY, so no worktree in it can be shown landed"
+      # Fail closed for deletion and fail visibly for operations.  A zero exit here made
+      # launchd report a healthy sweep even though an entire repository was ineligible
+      # only because its fresh-base proof could not run.
+      skipped=1
     fi
 
     # Collected to completion before anything is judged. Read as it is produced, the
