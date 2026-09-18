@@ -501,6 +501,7 @@ still vetoes removal regardless of age.
 | `CC_WJ_IDLE_HOURS` | `48` | `~/.cc-reaper/worktree-janitor.conf` | Minimum time since worktree files or git administrative state changed. |
 | `CC_WJ_SESSION_GRACE_HOURS` | `48` | `~/.cc-reaper/worktree-janitor.conf` | Lease after the latest mapped Claude transcript activity or Codex task update/archive. This protects an accidentally archived task even when its live writer lock disappears. |
 | `CC_WJ_GIT_STATUS_TIMEOUT_SECONDS` | `300` (5 minutes) | `~/.cc-reaper/worktree-janitor.conf` | Per-worktree bound for the ignored-file scan. A timeout keeps that worktree with an observable `git status timed out` reason; it never makes it removable. |
+| `CC_WJ_FETCH_TIMEOUT_SECONDS` | `180` (3 minutes) | `~/.cc-reaper/worktree-janitor.conf` | Per-repository fresh-base fetch budget. Low-priority scheduled I/O can need longer than an interactive fetch; expiry keeps every worktree in that repository and makes the run fail observably. |
 | `CC_REAPER_WORKTREE_INTERVAL_SECONDS` | `21600` (6 hours) | Environment when running `./install.sh` | How often launchd checks. Accepted range: `300` through `604800`; this changes detection latency, not eligibility. Repeat the value on later installs. |
 | `CC_WJ_SESSION_APPLY` | `1` | `~/.cc-reaper/worktree-janitor.conf` | `0` makes SessionEnd-triggered sweeps report-only. |
 | `CC_WJ_SCHEDULE_APPLY` | `1` | `~/.cc-reaper/worktree-janitor.conf` | `0` makes scheduled sweeps report-only. |

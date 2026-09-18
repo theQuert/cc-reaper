@@ -148,6 +148,19 @@ _cc_wj_git_status_timeout_seconds() {
   echo "$n"
 }
 
+# Scheduled agents deliberately yield I/O priority, so a fetch that is fast in a terminal
+# can need longer in launchd. Keep it bounded, but leave enough budget for that scheduling
+# difference instead of making every run permanently unable to prove work landed.
+_cc_wj_fetch_timeout_seconds() {
+  local v="${CC_WJ_FETCH_TIMEOUT_SECONDS:-180}" n
+  case "$v" in
+    ''|*[!0-9]*|??????*) return 1 ;;
+  esac
+  n=$((10#$v))
+  [ "$n" -gt 0 ] || return 1
+  echo "$n"
+}
+
 # Run a command under a time bound that ends its whole process group; exit 124 on expiry.
 #
 # `alarm; exec` bounds nothing that matters here: `gh` is a Go binary that ignores
@@ -1798,7 +1811,7 @@ _CC_WJ_BASE_WHY=""
 # `main` is never made: in a repository whose trunk is not main nothing would be an
 # ancestor, and the run would report normally while reclaiming nothing.
 _cc_wj_prepare_base() {
-  local repo="$1" base="${CC_WJ_BASE_BRANCH:-}" all dropped
+  local repo="$1" base="${CC_WJ_BASE_BRANCH:-}" all dropped fetch_timeout fetch_rc=0
   _CC_WJ_BASE=""; _CC_WJ_BASE_OK=0; _CC_WJ_BASE_WHY=""; _CC_WJ_DECLARED=""
   if ! git -C "$repo" config --get remote.origin.url >/dev/null 2>&1; then
     _CC_WJ_BASE_WHY="it has no origin remote"
@@ -1819,9 +1832,17 @@ _cc_wj_prepare_base() {
   _CC_WJ_BASE="$base"
   # Without automatic maintenance: the gc a fetch may start prunes worktree records, and
   # this runs in report mode too.
-  if ! _cc_wj_with_timeout 60 git -C "$repo" fetch --quiet --no-tags --no-auto-maintenance origin \
-       "+refs/heads/${base}:refs/remotes/origin/${base}" >/dev/null 2>&1; then
-    _CC_WJ_BASE_WHY="origin/$base could not be fetched"
+  fetch_timeout="$(_cc_wj_fetch_timeout_seconds)" || {
+    _CC_WJ_BASE_WHY="the base fetch timeout is invalid"; return 1; }
+  _cc_wj_with_timeout "$fetch_timeout" git -C "$repo" fetch --quiet --no-tags \
+    --no-auto-maintenance origin "+refs/heads/${base}:refs/remotes/origin/${base}" \
+    >/dev/null 2>&1 || fetch_rc=$?
+  if [ "$fetch_rc" -ne 0 ]; then
+    if [ "$fetch_rc" -eq 124 ]; then
+      _CC_WJ_BASE_WHY="origin/$base could not be fetched within ${fetch_timeout}s"
+    else
+      _CC_WJ_BASE_WHY="origin/$base could not be fetched"
+    fi
     return 1
   fi
   _CC_WJ_BASE_OK=1
@@ -2344,7 +2365,7 @@ _cc_wj_run_inner() {
     return 2
   fi
 
-  local idle_hours session_grace_hours status_timeout
+  local idle_hours session_grace_hours status_timeout fetch_timeout
   if ! idle_hours="$(_cc_wj_idle_hours)"; then
     echo "worktree-janitor: CC_WJ_IDLE_HOURS=${CC_WJ_IDLE_HOURS:-} is not a whole number of hours below 100000; scanned and removed nothing" >&2
     return 2
@@ -2355,6 +2376,10 @@ _cc_wj_run_inner() {
   fi
   if ! status_timeout="$(_cc_wj_git_status_timeout_seconds)"; then
     echo "worktree-janitor: CC_WJ_GIT_STATUS_TIMEOUT_SECONDS=${CC_WJ_GIT_STATUS_TIMEOUT_SECONDS:-} is not a positive whole number below 100000; scanned and removed nothing" >&2
+    return 2
+  fi
+  if ! fetch_timeout="$(_cc_wj_fetch_timeout_seconds)"; then
+    echo "worktree-janitor: CC_WJ_FETCH_TIMEOUT_SECONDS=${CC_WJ_FETCH_TIMEOUT_SECONDS:-} is not a positive whole number below 100000; scanned and removed nothing" >&2
     return 2
   fi
 
