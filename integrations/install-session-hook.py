@@ -29,8 +29,15 @@ def stop_command() -> str:
 
 
 def install(path: Path, harness: str) -> bool:
-    if path.exists():
-        data: dict[str, Any] = json.loads(path.read_text())
+    if path.is_symlink():
+        # Update the managed target atomically without replacing the symlink entry.
+        # A relative target is resolved against the link's parent by Path.resolve().
+        config_path = path.resolve(strict=True)
+    else:
+        config_path = path
+
+    if config_path.exists():
+        data: dict[str, Any] = json.loads(config_path.read_text())
     else:
         data = {}
 
@@ -146,16 +153,16 @@ def install(path: Path, harness: str) -> bool:
     if not changed:
         return False
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    mode = config_path.stat().st_mode & 0o777 if config_path.exists() else 0o600
     with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, delete=False
+        "w", encoding="utf-8", dir=config_path.parent, delete=False
     ) as handle:
         json.dump(data, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
         temp_path = Path(handle.name)
     os.chmod(temp_path, mode)
-    os.replace(temp_path, path)
+    os.replace(temp_path, config_path)
     return True
 
 

@@ -45,5 +45,23 @@ check "a Codex hook file can be created" grep -q 'worktree-session-end.sh codex'
 check "the generated Codex hook uses shared process cleanup" grep -q '\.cc-reaper/stop-cleanup-orphans.sh' "$CODEX"
 check "the generated Codex hook file is valid JSON" python3 -m json.tool "$CODEX" >/dev/null
 
+MANAGED_DIR="$TMP/managed-dotfiles"
+mkdir -p "$MANAGED_DIR" "$TMP/symlinked/.claude"
+MANAGED_SETTINGS="$MANAGED_DIR/settings.json"
+printf '{"hooks":{}}\n' > "$MANAGED_SETTINGS"
+SYMLINKED_SETTINGS="$TMP/symlinked/.claude/settings.json"
+ln -s ../../managed-dotfiles/settings.json "$SYMLINKED_SETTINGS"
+python3 "$ROOT_DIR/integrations/install-session-hook.py" --harness claude --file "$SYMLINKED_SETTINGS" >/dev/null
+check "a managed settings symlink is preserved" test -L "$SYMLINKED_SETTINGS"
+check "the symlink target receives the shared hook" grep -q 'worktree-session-end.sh claude' "$MANAGED_SETTINGS"
+check "the preserved settings symlink remains readable" python3 -m json.tool "$SYMLINKED_SETTINGS" >/dev/null
+
+BROKEN_SETTINGS="$TMP/symlinked/.claude/broken.json"
+ln -s ../../managed-dotfiles/missing.json "$BROKEN_SETTINGS"
+rc=0
+python3 "$ROOT_DIR/integrations/install-session-hook.py" --harness claude --file "$BROKEN_SETTINGS" >/dev/null 2>&1 || rc=$?
+check "a broken settings symlink is refused" test "$rc" -ne 0
+check "a refused broken settings symlink is preserved" test -L "$BROKEN_SETTINGS"
+
 [ "$failures" -eq 0 ] || exit 1
 echo "install-session-hook: all tests passed"

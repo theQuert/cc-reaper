@@ -259,6 +259,21 @@ case "$claims" in
   *) bad "--claims by path exposes the derived Codex lease"; printf '# claims output: %s\n' "$claims" ;;
 esac
 
+new_fixture codex-archived-missing-cwd-tool-workdir
+age_worktree 72
+tid=34445444-4444-7555-8666-777777777777
+make_codex_state
+rollout="$CASE/archived-missing-cwd-rollout.jsonl"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' \
+  "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"input\":\"workdir=$WT\"}}" > "$rollout"
+missing_cwd="$CASE/deleted-codex-cwd"
+now="$(date +%s)"
+sqlite3 "$CODEX_STATE" "insert into threads(id,cwd,rollout_path,updated_at,archived,archived_at) values ('$tid','$missing_cwd','$rollout',$((now - 60)),1,$now);"
+out="$(run_wj --apply 2>&1)"
+check "a recent archived Codex rollout survives a missing recorded cwd" test -d "$WT"
+case "$out" in *'KEEP(recent-session)'*"$tid"*'structured-tool-call'*) ok "the missing-cwd Codex lease remains observable" ;; *) bad "the missing-cwd Codex lease remains observable" ;; esac
+
 new_fixture codex-large-tail-record
 age_worktree 72
 tid=34454545-4444-7555-8666-777777777777
@@ -329,6 +344,19 @@ printf '%s\n' \
 out="$(run_wj --apply 2>&1)"
 check "recent inactive Claude tool workdir keeps an old worktree" test -d "$WT"
 case "$out" in *'KEEP(recent-session)'*"$sid"*'structured-tool-call'*) ok "the inventory exposes the derived Claude lease" ;; *) bad "the inventory exposes the derived Claude lease" ;; esac
+
+new_fixture claude-recent-missing-cwd-tool-workdir
+age_worktree 72
+sid=36465646-4444-4555-8666-777777777777
+mkdir -p "$CLAUDE_PROJECTS/project"
+transcript="$CLAUDE_PROJECTS/project/$sid.jsonl"
+missing_cwd="$CASE/deleted-claude-cwd"
+printf '%s\n' \
+  "{\"type\":\"user\",\"sessionId\":\"$sid\",\"cwd\":\"$missing_cwd\",\"message\":{\"content\":\"finish task\"}}" \
+  "{\"type\":\"assistant\",\"sessionId\":\"$sid\",\"cwd\":\"$missing_cwd\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"input\":{\"workdir\":\"$WT\"}}]}}" > "$transcript"
+out="$(run_wj --apply 2>&1)"
+check "a recent Claude transcript survives a missing recorded cwd" test -d "$WT"
+case "$out" in *'KEEP(recent-session)'*"$sid"*'structured-tool-call'*) ok "the missing-cwd Claude lease remains observable" ;; *) bad "the missing-cwd Claude lease remains observable" ;; esac
 
 new_fixture claude-recent-expired
 age_worktree 72

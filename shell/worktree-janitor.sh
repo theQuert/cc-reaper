@@ -841,18 +841,21 @@ _cc_wj_scan_claude_recent() { # <grace hours>
     cwd="$(_cc_wj_transcript_tail_query claude-cwd "$f")"
     [ -n "$cwd" ] || { _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base has no mappable cwd"; return 1; }
     case "$cwd" in /*) ;; *) _CC_WJ_ACTIVE_ERROR="recent Claude session $sid has a non-absolute cwd"; return 1 ;; esac
-    [ -e "$cwd" ] || continue
-    resolved="$(_cc_wj_claim_cwd "$cwd")" || {
-      _CC_WJ_ACTIVE_ERROR="recent Claude session $sid could not map cwd $cwd"
-      return 1
-    }
-    _cc_wj_recent_add_claim Claude "$resolved" "$sid" "$activity" transcript
     # Do not parse every recent transcript eagerly. Structured-path claims are only
     # relevant to a worktree that otherwise reaches the removable gate, where
     # `_cc_wj_transcript_claims_path` validates the matching transcript fail-closed.
     # Eager validation made every scheduled run read the full 48-hour transcript set,
     # then repeat that work before each removal candidate.
     _cc_wj_recent_add_transcript Claude "$sid" "$f" "$activity" transcript
+    # The recorded cwd can disappear while another worktree named by a current tool
+    # call is still live. Keep that transcript eligible for structured-path matching;
+    # only the direct cwd claim depends on the recorded path still existing.
+    [ -e "$cwd" ] || continue
+    resolved="$(_cc_wj_claim_cwd "$cwd")" || {
+      _CC_WJ_ACTIVE_ERROR="recent Claude session $sid could not map cwd $cwd"
+      return 1
+    }
+    _cc_wj_recent_add_claim Claude "$resolved" "$sid" "$activity" transcript
   done <<CLAUDE_RECENT
 $files
 CLAUDE_RECENT
@@ -891,15 +894,17 @@ _cc_wj_scan_codex_recent() { # <grace hours>
     case "$activity" in ''|*[!0-9]*) _CC_WJ_ACTIVE_ERROR="recent Codex task $tid has no valid activity time"; return 1 ;; esac
     case "$archived" in 0) claim_state=recent ;; 1) claim_state=archived ;; *) _CC_WJ_ACTIVE_ERROR="recent Codex task $tid has an invalid archived state"; return 1 ;; esac
     case "$cwd" in /*) ;; *) _CC_WJ_ACTIVE_ERROR="recent Codex task $tid has a non-absolute cwd"; return 1 ;; esac
+    case "$rollout" in ''|*$'\n'*|*$'\t'*) _CC_WJ_ACTIVE_ERROR="recent Codex task $tid has an unsafe transcript path"; return 1 ;; esac
+    [ -r "$rollout" ] || { _CC_WJ_ACTIVE_ERROR="the transcript for recent Codex task $tid is unreadable"; return 1; }
+    _cc_wj_recent_add_transcript Codex "$tid" "$rollout" "$activity" "$claim_state"
+    # A renamed or deleted recorded cwd must not discard current structured-path
+    # evidence in the rollout for a different, still-existing worktree.
     [ -e "$cwd" ] || continue
     resolved="$(_cc_wj_claim_cwd "$cwd")" || {
       _CC_WJ_ACTIVE_ERROR="recent Codex task $tid could not map cwd $cwd"
       return 1
     }
     _cc_wj_recent_add_claim Codex "$resolved" "$tid" "$activity" "$claim_state"
-    case "$rollout" in ''|*$'\n'*|*$'\t'*) _CC_WJ_ACTIVE_ERROR="recent Codex task $tid has an unsafe transcript path"; return 1 ;; esac
-    [ -r "$rollout" ] || { _CC_WJ_ACTIVE_ERROR="the transcript for recent Codex task $tid is unreadable"; return 1; }
-    _cc_wj_recent_add_transcript Codex "$tid" "$rollout" "$activity" "$claim_state"
   done <<CODEX_RECENT
 $rows
 CODEX_RECENT

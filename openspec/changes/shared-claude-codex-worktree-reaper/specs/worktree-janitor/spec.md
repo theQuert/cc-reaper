@@ -42,6 +42,7 @@ unmappable verified-live claim SHALL make the destructive run fail closed.
 - **WHEN** a Codex writer lock closes and its rollout moves to the archive while the janitor is inspecting it
 - **THEN** the janitor remaps the task through current Codex state
 - **AND** only the task's cwd or current-two-turn structured tool paths receive its bounded recent-session protection
+- **AND** a missing or renamed recorded cwd does not discard current structured tool-path evidence for another existing worktree
 - **AND** unrelated worktrees are not reported as actively claimed by that task
 
 #### Scenario: Transcript evidence is shared across candidates
