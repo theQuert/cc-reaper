@@ -46,6 +46,33 @@ STUBS="$(stub_bin)"
 SLOW_STUBS="$(stub_bin)"
 printf '#!/bin/sh\nsleep 120\n' > "$SLOW_STUBS/launchctl"; chmod +x "$SLOW_STUBS/launchctl"
 
+# launchd may acknowledge bootout before it is ready to accept the replacement plist.
+# This stub makes every label's first bootstrap fail, then accepts the retry.
+RETRY_STUBS="$(stub_bin)"
+cat > "$RETRY_STUBS/launchctl" <<'STUB'
+#!/bin/sh
+state=${LAUNCHCTL_RETRY_STATE:?}
+mkdir -p "$state"
+printf '%s\n' "$*" >> "$state/calls"
+case "$1" in
+  enable|kickstart) exit 0 ;;
+  bootout)
+    label=${2##*/}; rm -f "$state/$label.loaded"; exit 0 ;;
+  bootstrap)
+    label=${3##*/}; label=${label%.plist}
+    if [ -e "$state/$label.seen" ]; then
+      : > "$state/$label.loaded"; exit 0
+    fi
+    : > "$state/$label.seen"; exit 1
+    ;;
+  print)
+    label=${2##*/}; test -e "$state/$label.loaded"; exit $?
+    ;;
+esac
+exit 0
+STUB
+chmod +x "$RETRY_STUBS/launchctl"
+
 # macOS has no `timeout`, and `gtimeout` is a coreutils install this suite must not
 # require. Run bounded by hand, and kill the process GROUP - the installer spawns
 # children, and killing only the shell leaves them holding the pipe.
@@ -119,6 +146,20 @@ grep -q "No terminal on stdin" "$out"; check "it says which default it took, and
 grep -q "INSTALL DID NOT COMPLETE" "$out"; incomplete=$?
 [ "$incomplete" -ne 0 ]; check "a run that finished does not claim to be incomplete" $?
 rm -rf "$H" "$out"
+
+# ─── 1b. A rapid reinstall survives asynchronous launchd bootout ────────────
+H="$(sandbox_home)"
+out="$(mktemp)"
+retry_state="$(mktemp -d)"
+HOME="$H" PATH="$RETRY_STUBS:$PATH" LAUNCHCTL_RETRY_STATE="$retry_state" \
+  CC_REAPER_DAEMON=b bounded 60 bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
+rc=$?
+[ "$rc" -eq 0 ]; check "a launchd bootout race is retried" $?
+test -e "$retry_state/com.cc-reaper.worktree-janitor.loaded"; check "the retried worktree schedule is registered" $?
+test -e "$retry_state/com.cc-reaper.worktree-janitor.loaded" || sed 's/^/# launchctl: /' "$retry_state/calls"
+grep -q 'agents did not load' "$out"; warned=$?
+[ "$warned" -ne 0 ]; check "a recovered launchd race is not reported as failed" $?
+rm -rf "$H" "$out" "$retry_state"
 
 # ─── 2. /dev/null stdin ───────────────────────────────────────────────────────
 H="$(sandbox_home)"
@@ -223,6 +264,6 @@ for sig_pair in "HUP 129" "TERM 143"; do
   [ "$irc" -eq "$want" ]; check "SIG$signame exits $want, not another signal's status" $?
 done
 
-rm -rf "$STUBS" "$SLOW_STUBS"
+rm -rf "$STUBS" "$SLOW_STUBS" "$RETRY_STUBS"
 if [ "$failures" -eq 0 ]; then echo "install-no-tty: all tests passed"; else echo "$failures test failure(s)"; fi
 [ "$failures" -eq 0 ]

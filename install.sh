@@ -93,11 +93,18 @@ echo "[1/4] Installing shell functions..."
 AGENT_UI="gui/$(id -u)"
 AGENT_FAILED=""
 _cc_install_agent() {
-  local label=$1 plist=$2
+  local label=$1 plist=$2 attempt=1
   launchctl enable "$AGENT_UI/$label" 2>/dev/null || true
   launchctl bootout "$AGENT_UI/$label" 2>/dev/null || true
-  launchctl bootstrap "$AGENT_UI" "$plist" 2>/dev/null || true
-  launchctl print "$AGENT_UI/$label" >/dev/null 2>&1 && return 0
+  # bootout can return before launchd has fully retired the old service. A single
+  # immediate bootstrap then fails with the plist valid and leaves the schedule absent.
+  # Retry briefly, but trust only a successful print of the registered label.
+  while [ "$attempt" -le 20 ]; do
+    launchctl bootstrap "$AGENT_UI" "$plist" 2>/dev/null || true
+    launchctl print "$AGENT_UI/$label" >/dev/null 2>&1 && return 0
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
   AGENT_FAILED="$AGENT_FAILED $label"
   return 1
 }
