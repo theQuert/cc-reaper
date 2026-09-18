@@ -2103,6 +2103,17 @@ _cc_wj_scavenge_private_temp() {
   done
 }
 
+_cc_wj_capture_run_pid() {
+  local probe
+  /bin/sleep 5 & probe=$!
+  _CC_WJ_RUN_PID="$(ps -o ppid= -p "$probe" 2>/dev/null | awk '{ print $1; exit }')"
+  kill "$probe" 2>/dev/null || true
+  wait "$probe" 2>/dev/null || true
+  case "${_CC_WJ_RUN_PID:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+}
+
 _cc_wj_cleanup_and_reraise() {
   local signal="$1" status="$2"
   local caller_trap=""
@@ -2166,8 +2177,8 @@ _cc_wj_remove_worktree() {
 # that costs - one of two concurrent removals fails and is reported - so the lock is a
 # de-duplication of work, not the thing standing between a worktree and its deletion.
 _cc_wj_lock_write() {
-  echo "$$" > "$1/pid"
-  ps -o command= -p "$$" > "$1/cmd" 2>/dev/null
+  echo "${_CC_WJ_RUN_PID:-$$}" > "$1/pid"
+  ps -o command= -p "${_CC_WJ_RUN_PID:-$$}" > "$1/cmd" 2>/dev/null
 }
 
 _cc_wj_lock() {
@@ -2207,13 +2218,22 @@ _cc_wj_lock() {
 
 # Released only while it is still ours: after a takeover it belongs to somebody else.
 _cc_wj_unlock() {
-  [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] && rm -f "$1/pid" "$1/cmd" && rmdir "$1" 2>/dev/null
+  [ "$(cat "$1/pid" 2>/dev/null)" = "${_CC_WJ_RUN_PID:-$$}" ] && rm -f "$1/pid" "$1/cmd" && rmdir "$1" 2>/dev/null
   return 0
 }
 
 # ─── Main report/apply logic ─────────────────────────────────────────────────
 
 _cc_wj_run_inner() {
+  # Recover private projections even when this invocation later exits through help,
+  # --claims, invalid config, or empty discovery. Bash 3.2 leaves $$ pointing at the
+  # parent for a sourced background function, so derive the OS pid from a short-lived
+  # child before owner markers or repository locks are written.
+  _cc_wj_scavenge_private_temp
+  if ! _cc_wj_capture_run_pid; then
+    echo "worktree-janitor: could not determine the executing process id; scanned and removed nothing" >&2
+    return 1
+  fi
   # The scheduled agent's stdout/stderr pair is written by launchd, so no script owns it
   # unless one claims it. Bounded here, at the top of every run, rather than from
   # `_cc_wj_log_write`: a report-only run never calls that helper - every call site is in
@@ -2371,12 +2391,11 @@ _cc_wj_run_inner() {
   # Holder scans, taken once per run into files and taken again right before each removal.
   local work old_exit="" old_int="" old_term="" old_hup="" cleanup_exit_installed=0
   local LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
-  _cc_wj_scavenge_private_temp
   work="$(mktemp -d "${TMPDIR:-/tmp}/cc-wj.XXXXXX")" || {
     echo "worktree-janitor: no temporary directory for the process scan; scanned and removed nothing" >&2
     return 1
   }
-  if ! (umask 077; printf '%s\n' "$$" > "$work/.owner-pid"); then
+  if ! (umask 077; printf '%s\n' "$_CC_WJ_RUN_PID" > "$work/.owner-pid"); then
     _cc_wj_remove_private_temp "$work"
     echo "worktree-janitor: could not mark its private temporary directory; scanned and removed nothing" >&2
     return 1

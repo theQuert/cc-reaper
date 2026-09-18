@@ -724,6 +724,21 @@ check "the next run removes a private directory whose owner died" test ! -d "$sc
 check "the scavenger preserves a new directory before its owner marker is written" test -d "$scavenge_tmp/cc-wj.NEWONE"
 check "the scavenger preserves a private directory whose owner is alive" test -d "$scavenge_tmp/cc-wj.LIVE01"
 
+captured_pid_file="$CASE/captured-run-pid"
+captured_pid_result="$(bash -c \
+  'source "$1"; ( _cc_wj_capture_run_pid; printf "%s\n" "$_CC_WJ_RUN_PID" > "$2" ) & child=$!; wait "$child"; printf "%s %s\n" "$child" "$(cat "$2")"' \
+  _ "$WJ" "$captured_pid_file")"
+captured_pid_actual="${captured_pid_result%% *}"
+captured_pid_recorded="${captured_pid_result#* }"
+check "a sourced background run records its executing pid, not the parent shell" \
+  test "$captured_pid_actual" = "$captured_pid_recorded"
+
+early_scavenge_tmp="$CASE/early-scavenge-tmp"
+mkdir -p "$early_scavenge_tmp/cc-wj.EARLY1"
+printf '%s\n' 999999 > "$early_scavenge_tmp/cc-wj.EARLY1/.owner-pid"
+TMPDIR="$early_scavenge_tmp" CC_WJ_CONFIG="$CASE/no-config" bash "$WJ" --help >/dev/null
+check "private-temp scavenging runs before a help-mode early return" test ! -d "$early_scavenge_tmp/cc-wj.EARLY1"
+
 new_fixture harness-discovery
 age_worktree 72
 out="$(PATH="$BIN:$PATH" CC_WJ_CONFIG="$CASE/no-config" CC_WJ_ROOT="$CASE/no-source-root" \

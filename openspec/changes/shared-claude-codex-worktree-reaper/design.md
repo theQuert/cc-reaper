@@ -50,6 +50,9 @@ existing EXIT cleanup.
 Because launchd may escalate past shell traps, each run also records its owner PID and scavenges
 dead-owner private directories on the next start; unmarked directories receive a five-minute
 creation grace so concurrent starts cannot remove one between `mktemp` and owner registration.
+Scavenging precedes every argument/config/discovery early return, and sourced/background runs
+derive the OS process actually executing the function instead of trusting Bash 3.2's inherited
+`$$` value.
 If a Codex writer lock closes while its captured rollout is being read, the janitor remaps
 that task through current Codex state. An archived task becomes bounded recent-session
 evidence for only its mapped cwd and structured tool paths; the expected rollout move does

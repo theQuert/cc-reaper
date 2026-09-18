@@ -56,6 +56,7 @@ unmappable verified-live claim SHALL make the destructive run fail closed.
 - **AND** normal completion or an interrupt removes the private projection directory
 - **AND** interruption restores and runs the invoking Bash caller's existing signal and exit cleanup
 - **AND** a later start removes a private projection directory whose owner was force-killed
+- **AND** early-return and sourced/background invocations still recover dead-owner projections
 - **AND** the pre-removal activity refresh builds a new snapshot before destructive action
 - **AND** structured active and recent transcript matching is skipped when a cheaper gate already keeps the worktree
 
