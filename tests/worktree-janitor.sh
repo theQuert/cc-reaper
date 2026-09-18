@@ -282,6 +282,13 @@ expect_no "a malformed CC_WJ_IDLE_HOURS fails the run" \
 expect_yes "and the malformed run removed nothing" \
   test -d "$WT_CLEAN"
 
+expect_no "a zero CC_WJ_GIT_STATUS_TIMEOUT_SECONDS fails before scanning" \
+  env CC_WJ_GIT_STATUS_TIMEOUT_SECONDS=0 PATH="$STUBS_IDLE:$PATH" \
+    bash "$WJ" --repo "$PRIMARY" --apply
+
+expect_yes "and the invalid status bound removed nothing" \
+  test -d "$WT_CLEAN"
+
 # ─── Test 5: default (no --apply) removes nothing ────────────────────────────
 
 # Confirm fixtures are intact before apply
@@ -865,6 +872,31 @@ timeout_passes_status() {
   [ "$rc" -eq 3 ]
 }
 expect_yes "a command inside its bound keeps its own exit status" timeout_passes_status
+
+# A worktree can sit on a stalled filesystem or contain a pathological ignored tree.
+# One unreadable status must conservatively pin that worktree without holding the whole
+# scheduled sweep forever.
+STATUS_STUBS="$TMPDIR_ROOT/stubs-status-timeout"
+mkdir -p "$STATUS_STUBS"
+REAL_GIT=$(command -v git)
+cat > "$STATUS_STUBS/git" <<STUB
+#!/usr/bin/env bash
+case " \$* " in
+  *" status "*) sleep 3 ;;
+esac
+exec "$REAL_GIT" "\$@"
+STUB
+chmod +x "$STATUS_STUBS/git"
+
+git_status_scan_is_bounded() {
+  local start end out
+  start=$(date +%s)
+  out="$(PATH="$STATUS_STUBS:$PATH" CC_WJ_GIT_STATUS_TIMEOUT_SECONDS=1 _cc_wj_pins "$R_CACHE")"
+  end=$(date +%s)
+  [ $((end - start)) -lt 3 ] && [ "$out" = "?? (git status timed out after 1s)" ]
+}
+expect_yes "a timed-out git status pins the worktree and lets the sweep continue" \
+  git_status_scan_is_bounded
 
 # ─── Session mode ─────────────────────────────────────────────────────────────
 
