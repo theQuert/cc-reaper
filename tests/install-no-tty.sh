@@ -123,17 +123,35 @@ rm -rf "$H" "$out"
 # ─── 2. /dev/null stdin ───────────────────────────────────────────────────────
 H="$(sandbox_home)"
 out="$(mktemp)"
+printf '<plist version="1.0"><dict/></plist>\n' > "$H/Library/LaunchAgents/com.claude.worktree-inventory.plist"
 HOME="$H" PATH="$STUBS:$PATH" bounded 60 bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
 rc=$?
 [ "$rc" -eq 0 ]; check "it completes with stdin at EOF" $?
 grep -q "Done\." "$out"; check "it reaches the last step" $?
+cmp -s "$ROOT_DIR/config/worktree-janitor.conf" "$H/.cc-reaper/worktree-janitor.conf"; check "it deploys the shared worktree policy" $?
+cmp -s "$ROOT_DIR/hooks/worktree-session-end.sh" "$H/.cc-reaper/worktree-session-end.sh"; check "it deploys the shared SessionEnd entrypoint" $?
+test -f "$H/Library/LaunchAgents/com.cc-reaper.worktree-janitor.plist"; check "it installs the six-hour worktree LaunchAgent" $?
+grep -q 'worktree-session-end.sh claude' "$H/.claude/settings.json"; check "it migrates the Claude SessionEnd hook to cc-reaper" $?
+test ! -e "$H/Library/LaunchAgents/com.claude.worktree-inventory.plist"; check "it retires the legacy Claude worktree LaunchAgent" $?
+find "$H/.cc-reaper/migrated-launchagents" -name 'com.claude.worktree-inventory.*.plist' -type f | grep -q .; check "it preserves a recoverable copy of the legacy LaunchAgent" $?
 rm -rf "$H" "$out"
 
 # ─── 3. An explicit choice from a script ──────────────────────────────────────
 H="$(sandbox_home)"
 out="$(mktemp)"
-HOME="$H" PATH="$STUBS:$PATH" CC_REAPER_DAEMON=b bounded 60 bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
+HOME="$H" PATH="$STUBS:$PATH" CC_REAPER_DAEMON=b CC_REAPER_WORKTREE_INTERVAL_SECONDS=43200 bounded 60 bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
 grep -q "Choice from CC_REAPER_DAEMON" "$out"; check "CC_REAPER_DAEMON is honoured" $?
+grep -q '<integer>43200</integer>' "$H/Library/LaunchAgents/com.cc-reaper.worktree-janitor.plist"; check "the worktree schedule interval is configurable" $?
+rm -rf "$H" "$out"
+
+# ─── 3b. An invalid cadence fails before touching the sandbox ─────────────────
+H="$(sandbox_home)"
+out="$(mktemp)"
+HOME="$H" PATH="$STUBS:$PATH" CC_REAPER_WORKTREE_INTERVAL_SECONDS=60 \
+  bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
+rc=$?
+[ "$rc" -ne 0 ]; check "an unsafe worktree interval is rejected" $?
+test ! -e "$H/.cc-reaper/worktree-janitor.sh"; check "interval validation happens before installation writes" $?
 rm -rf "$H" "$out"
 
 # ─── 4. An interrupted run must not read like a finished one ──────────────────

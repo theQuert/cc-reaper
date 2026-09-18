@@ -161,6 +161,12 @@ export CC_WJ_LOG="$TMPDIR_ROOT/wj.log"
 export CC_WJ_STATE_DIR="$TMPDIR_ROOT/state"
 export CC_WJ_NOTIFY_MIN_GB=0
 export CC_WJ_COOLDOWN_SECS=0
+# Keep these holder/race fixtures isolated from the developer machine's live harness
+# registries. Shared-session behavior has its own focused suite.
+export CC_WJ_CLAUDE_SESSIONS="$TMPDIR_ROOT/no-claude-sessions"
+export CC_WJ_CLAUDE_PROJECTS="$TMPDIR_ROOT/no-claude-projects"
+export CC_WJ_CODEX_LOCKS="$TMPDIR_ROOT/no-codex-locks"
+export CC_WJ_CODEX_STATE_DB="$TMPDIR_ROOT/no-codex-state.sqlite"
 # Fixtures are created seconds before they are judged. The idle gate has its own cases
 # below; everywhere else it is set to a window nothing can fall inside.
 export CC_WJ_IDLE_HOURS=0
@@ -260,7 +266,7 @@ expect_yes "an empty open-file scan keeps every worktree" \
 # ─── Idle is measured, not assumed ───────────────────────────────────────────
 #
 # Clean, unheld and landed are all true of a worktree committed to a minute ago. The
-# fixtures were written seconds ago, so under the default six-hour window they are kept.
+# fixtures were written seconds ago, so under the configured window they are kept.
 
 OUT_RECENT="$TMPDIR_ROOT/out-recent.txt"
 CC_WJ_IDLE_HOURS=6 _wj_idle --repo "$PRIMARY" > "$OUT_RECENT"
@@ -372,7 +378,7 @@ expect_no "--apply does remove it, so the capability is not merely disabled" \
 WJ_HOME="$TMPDIR_ROOT/fakehome"
 AGENT_LOG_DIR="$WJ_HOME/.cc-reaper/logs"
 mkdir -p "$AGENT_LOG_DIR"
-BIG_LOG="$AGENT_LOG_DIR/launchd-worktree-report-stdout.log"
+BIG_LOG="$AGENT_LOG_DIR/launchd-worktree-janitor-stdout.log"
 head -c 2000000 /dev/zero | tr '\0' 'x' > "$BIG_LOG"
 
 HOME="$WJ_HOME" PATH="$STUBS_IDLE:$PATH" \
@@ -380,6 +386,17 @@ HOME="$WJ_HOME" PATH="$STUBS_IDLE:$PATH" \
 
 expect_yes "report-only bounds the scheduled agent's stdout log" \
   bash -c '[ "$(wc -c < "$1")" -le 1048576 ]' _ "$BIG_LOG"
+
+SCHEDULED_EVIDENCE="$(HOME="$WJ_HOME" PATH="$STUBS_IDLE:$PATH" \
+  bash "$WJ" --scheduled --repo "$PRUNE_REPO" 2>&1)"
+if printf '%s\n' "$SCHEDULED_EVIDENCE" | grep -Eq '^== worktree-janitor scheduled sweep started .* pid=[0-9]+$' &&
+   printf '%s\n' "$SCHEDULED_EVIDENCE" | grep -Eq '^== worktree-janitor scheduled sweep ended .* elapsed=[0-9]+s status=0$'; then
+  printf 'ok - a scheduled run records start/end, pid, elapsed time and status\n'
+else
+  printf 'not ok - a scheduled run records start/end, pid, elapsed time and status\n'
+  printf '# scheduled output: %s\n' "$SCHEDULED_EVIDENCE"
+  failures=$((failures + 1))
+fi
 
 
 # ─── Blind roots, and the difference between absent and denied ────────────────
@@ -1211,14 +1228,15 @@ if command -v zsh >/dev/null 2>&1; then
   }
   expect_yes "sourced from zsh, the base branch fetches" zsh_fetches_base
   zsh_report_is_clean() {
-    local out
+    local out stray
     out="$(CC_WJ_KEEP_PATH=/nonexistent PATH="$STUBS_IDLE:$PATH" \
       zsh -c 'source "$1" >/dev/null 2>&1; _cc_wj_run --repo "$2"' _ "$WJ" "$IDLE_PRIMARY" 2>&1)"
     # More than one worktree, or there is no second pass to print on.
-    [ "$(printf '%s\n' "$out" | grep -c '^  WORKTREE')" -ge 2 ] || return 1
+    [ "$(printf '%s\n' "$out" | grep -c '^  WORKTREE')" -ge 2 ] || { printf '# incomplete zsh report:\n%s\n' "$out"; return 1; }
     # Positive control: the report ran and reached its summary.
-    printf '%s\n' "$out" | grep -q '^Summary:' || return 1
-    ! printf '%s\n' "$out" | grep -q '^[a-z_]*='
+    printf '%s\n' "$out" | grep -q '^Summary:' || { printf '# zsh report has no summary:\n%s\n' "$out"; return 1; }
+    stray="$(printf '%s\n' "$out" | grep '^[a-z_]*=' || true)"
+    [ -z "$stray" ] || { printf '# stray zsh output: %s\n' "$stray"; return 1; }
   }
   expect_yes "sourced from zsh, the report prints no stray variable assignments" zsh_report_is_clean
   zsh_session_refuses() {

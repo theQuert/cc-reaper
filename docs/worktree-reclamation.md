@@ -18,6 +18,7 @@ A worktree may go only when **all** of these hold, and a check that cannot run k
 |---|---|---|
 | Contents | Does `git status --porcelain --ignored` show only things a command rebuilds? | Plain `--porcelain` hides ignored files, and removal deletes them: a `.env`, a local database, proof logs. |
 | Holders | Does any process have its cwd in the worktree, **or any file in it open**? | A session edits a task worktree through `git -C` and absolute paths while its own cwd is elsewhere. A cwd-only check sees nobody. And lsof escapes names: `\xNN` for a byte it will not print, `\\` for a backslash. No locale avoids it - under en_US.UTF-8 it still escapes a zero-width space - so scan with `LC_ALL=C`, decode the escapes back to bytes, and compare byte for byte. A path with a control character cannot be matched that way; count it as held. |
+| Harness claim | Does any verified-live Claude session or Codex writer lock claim it by cwd or a structured tool call in its current two human user turns? | The desktop host can keep its registry and rollout open while its process cwd is `/` or the primary checkout. An unbounded transcript search pins every historical worktree forever; the two-turn window preserves a follow-up before its first tool call without doing that. Transcript files can exceed 100 MB, so inspect them backwards from the tail and stop at the second user boundary instead of rereading their whole history for every candidate. A stale PID file or unopened lock is history, not a claim; an open claim that cannot be mapped is uncertainty and keeps every worktree. |
 | Landed | Has the work reached the **freshly fetched** base branch? | "Clean" says nothing about "finished". And in a squash-merging repository a landed branch is never an ancestor of its base. |
 | Idle | Was nothing in the worktree, **or its `HEAD`, `index` and `logs/`**, modified within the last N hours? | Clean, unheld and landed are all true one minute after a commit, and a `git switch` touches only the administrative files. Use `find -H`: BSD find does not follow a worktree path that is a symlink. Run your own `git status` with `--no-optional-locks`, or it rewrites the index you are judging. |
 | Git's own state | Is the worktree locked, or does it hold a populated submodule? | `git worktree lock` is an explicit request to keep, and Claude Code locks the worktrees it creates for agents. A submodule's dirty state is invisible to the outer status. |
@@ -105,39 +106,72 @@ separate investigation to find the 0-byte log that was holding 45 worktrees.
 
 ## Where to run it
 
-- **Not from a LaunchAgent on macOS**, if any repository lives under `~/Documents`, `~/Desktop`
-  or `~/Downloads`. TCC grants are per executable, launchd spawns `/bin/bash`, and every
-  scheduled run is denied while reporting success. Granting Full Disk Access to the terminal
-  does nothing for it; granting it to `/bin/bash` grants it to every bash script.
-- **From a SessionEnd hook, detached.** The session's processes carry its terminal's grant.
+- **From cc-reaper's six-hour LaunchAgent** for repositories under the installed `~/GitHub`
+  root and either harness's worktree root. If you configure `~/Documents`, `~/Desktop` or
+  `~/Downloads`, remember that TCC grants are per executable: launchd spawns `/bin/bash`.
+  A denial is reported and makes the run fail; granting Full Disk Access to the terminal does
+  nothing for it, while granting it to `/bin/bash` grants it to every bash script.
+- **From either harness's SessionEnd hook, detached.** The session's processes carry its terminal's grant.
   But every SessionEnd hook shares a deadline of at most 60 seconds, and a sweep of a large
   repository took 258. Fork, `setsid()` in the child, then let the parent exit — in that
   order, or an orphan reaper running beside the hook can see the sweep as an orphan still in
-  the session's process group and kill it.
+  the session's process group and kill it. Treat this as best-effort: app-level archive may
+  release a Codex writer lock without dispatching the repository hook. The LaunchAgent is
+  the guarantee layer that later evaluates the now-unclaimed worktree. Releasing the lock
+  starts a bounded recent-session lease from Codex update/archive time; recent Claude
+  transcript activity supplies the equivalent lease. This is separate from file idleness,
+  so an old worktree cannot become removable immediately after an accidental archive.
+  If archive moves a Codex rollout while a sweep is reading it, the sweep remaps the task
+  through current Codex state and applies that lease only to the archived task's cwd or
+  current-two-turn tool paths. The move does not pin unrelated worktrees.
 - **Under a per-repository lock**, so a session-end sweep and a manual run do not race. Record
   the holder's full command line with its pid; a name match mistakes a recycled pid for a sweep.
-- **Keeping the session's own checkout** - both `CLAUDE_PROJECT_DIR` and the `cwd` in the hook's
-  JSON input, since a session that worked in a linked worktree may report either. Bound the
+- **Keeping the session's own checkout** - `CODEX_PROJECT_DIR`/`CLAUDE_PROJECT_DIR` and the
+  `cwd` in the hook's JSON input, since a session that worked in a linked worktree may report either. Bound the
   read, but not with bash 3.2's `read -t -d ''`, which discards everything it read when it
   times out on a pipe left open. Unless exactly one `cwd` parses to an absolute path that
   still resolves, only report: the one worktree you must not touch is then unknown.
 - **With every external command bounded** — `lsof`, `git fetch`, `gh` — by a timeout that kills
   the process group. `gh` ignores `SIGALRM` and `lsof` resets its own alarms.
 
-With cc-reaper:
+The common hook command is:
 
 ```json
 {
   "hooks": {
     "SessionEnd": [
-      { "hooks": [ { "type": "command", "command": "\"$HOME\"/.cc-reaper/worktree-janitor.sh --session" } ] }
+      { "hooks": [ { "type": "command", "command": "\"$HOME\"/.cc-reaper/worktree-session-end.sh codex" } ] }
     ]
   }
 }
 ```
 
-It reports to `~/.cc-reaper/logs/worktree-janitor-session.log` and removes nothing until you
-set `CC_WJ_SESSION_APPLY=1`. Read a few reports first.
+Use `claude` instead of `codex` in Claude's global hook. `install.sh` migrates that global
+Claude entry automatically; Codex entries are repository-owned and should be checked in.
+Both trigger the same deployed script, report to
+`~/.cc-reaper/logs/worktree-janitor-session.log`, and take their 48-hour/session/schedule
+policy from `~/.cc-reaper/worktree-janitor.conf`.
+
+Observe the exact evidence without changing git or harness state:
+
+```bash
+~/.cc-reaper/worktree-janitor.sh --claims <session-id-or-path>
+~/.cc-reaper/worktree-janitor.sh --repo /path/to/primary-checkout
+```
+
+The first command lists live claims and recent leases with state, last activity, age, and
+remaining grace. The second is a report-only inventory; a lease prints
+`KEEP(recent-session)` and a `session lease:` line. `CC_WJ_SESSION_GRACE_HOURS` controls
+this lease and defaults to 48 independently of `CC_WJ_IDLE_HOURS`.
+
+A cleanup task's own structured tool calls are not activity claims: inventorying a target
+necessarily names it. Its verified cwd still protects the checkout it actually uses, while
+all other live Claude and Codex claims remain vetoes.
+
+Within one activity snapshot, each transcript's current-two-user-turn window is indexed
+once as byte ranges and reused across candidate worktrees. The temporary index contains no
+transcript or tool-call content and is discarded with the run. The destructive recheck
+starts a fresh snapshot, so this avoids repeated reads without weakening the final race gate.
 
 ## Five ways a reclaimer silently reclaims nothing
 
@@ -153,7 +187,9 @@ Each was observed on a real machine, and each produced output that looked like a
    report did not name, on a disk at 98%.
 4. **The hook deadline.** A sweep killed a quarter of the way through every time, with its
    report on a pipe nobody reads.
-5. **A second clone.** `git worktree list` only enumerates the repository you ask. A worktree
+5. **A second clone.** `git worktree list` only enumerates the repository you ask. cc-reaper
+   now searches `~/.claude/worktrees` and `~/.codex/worktrees` in addition to configured source
+   roots, but an arbitrary second clone outside all of them is still invisible. A worktree
    belonging to another clone of the same project — an IDE's or an agent app's own checkout —
    is not kept with a reason; it is absent from the report. There is no log line for this; the
    tell is arithmetic:
@@ -165,6 +201,12 @@ Each was observed on a real machine, and each produced output that looked like a
    ```
 
 ## What this does not do
+
+An attached-resource reaper that must stop a service before the process-holder gate can
+pass can call `worktree-janitor.sh --landed PATH`. This read-only query returns the same
+`ancestor`, `content`, or exact-head merged-PR proof as the janitor and returns non-zero
+for `no` or `unfetched`. That prevents an ancestry-only stack policy from retaining
+squash-merged work forever.
 
 - **End processes holding a worktree.** A dev server left running after its session is a
   holder, and the worktree is kept. cc-reaper's orphan reapers end those processes; the next

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cc-reaper.worktree-janitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__HOME__/.cc-reaper/worktree-janitor.sh</string>
+    <string>--scheduled</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>21600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.cc-reaper/logs/launchd-worktree-janitor-stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.cc-reaper/logs/launchd-worktree-janitor-stderr.log</string>
+</dict>
+</plist>

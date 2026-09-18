@@ -5,6 +5,31 @@
 #   bash shell/worktree-janitor.sh
 #   bash shell/worktree-janitor.sh --apply
 
+# The deployed config is the policy owner.  Preserve explicit environment values so a
+# one-shot diagnostic or test can override the installed cross-device policy.
+_CC_WJ_CONFIG_ERROR=""
+_CC_WJ_CONFIG_FILE="${CC_WJ_CONFIG:-$HOME/.cc-reaper/worktree-janitor.conf}"
+_CC_WJ_PRE_IDLE_SET="${CC_WJ_IDLE_HOURS+x}"; _CC_WJ_PRE_IDLE="${CC_WJ_IDLE_HOURS-}"
+_CC_WJ_PRE_GRACE_SET="${CC_WJ_SESSION_GRACE_HOURS+x}"; _CC_WJ_PRE_GRACE="${CC_WJ_SESSION_GRACE_HOURS-}"
+_CC_WJ_PRE_SESSION_SET="${CC_WJ_SESSION_APPLY+x}"; _CC_WJ_PRE_SESSION="${CC_WJ_SESSION_APPLY-}"
+_CC_WJ_PRE_SCHEDULE_SET="${CC_WJ_SCHEDULE_APPLY+x}"; _CC_WJ_PRE_SCHEDULE="${CC_WJ_SCHEDULE_APPLY-}"
+_CC_WJ_PRE_ROOT_SET="${CC_WJ_ROOT+x}"; _CC_WJ_PRE_ROOT="${CC_WJ_ROOT-}"
+if [ -e "$_CC_WJ_CONFIG_FILE" ]; then
+  if [ ! -r "$_CC_WJ_CONFIG_FILE" ]; then
+    _CC_WJ_CONFIG_ERROR="config $_CC_WJ_CONFIG_FILE is unreadable"
+  elif ! . "$_CC_WJ_CONFIG_FILE"; then
+    _CC_WJ_CONFIG_ERROR="config $_CC_WJ_CONFIG_FILE could not be loaded"
+  fi
+fi
+[ -z "$_CC_WJ_PRE_IDLE_SET" ] || CC_WJ_IDLE_HOURS="$_CC_WJ_PRE_IDLE"
+[ -z "$_CC_WJ_PRE_GRACE_SET" ] || CC_WJ_SESSION_GRACE_HOURS="$_CC_WJ_PRE_GRACE"
+[ -z "$_CC_WJ_PRE_SESSION_SET" ] || CC_WJ_SESSION_APPLY="$_CC_WJ_PRE_SESSION"
+[ -z "$_CC_WJ_PRE_SCHEDULE_SET" ] || CC_WJ_SCHEDULE_APPLY="$_CC_WJ_PRE_SCHEDULE"
+[ -z "$_CC_WJ_PRE_ROOT_SET" ] || CC_WJ_ROOT="$_CC_WJ_PRE_ROOT"
+unset _CC_WJ_PRE_IDLE_SET _CC_WJ_PRE_IDLE _CC_WJ_PRE_SESSION_SET _CC_WJ_PRE_SESSION
+unset _CC_WJ_PRE_GRACE_SET _CC_WJ_PRE_GRACE
+unset _CC_WJ_PRE_SCHEDULE_SET _CC_WJ_PRE_SCHEDULE _CC_WJ_PRE_ROOT_SET _CC_WJ_PRE_ROOT
+
 _cc_wj_usage() {
   cat <<'EOF'
 Usage: worktree-janitor [options]
@@ -14,19 +39,29 @@ Inventory and optionally remove stale git worktrees across local repos.
 Options:
   --apply             Remove REMOVABLE worktrees (default: report only)
   --repo <path>       Scan only this repo (repeatable; replaces auto-discovery)
-  --session           Sweep the repository of CLAUDE_PROJECT_DIR, detached (SessionEnd hook)
+  --landed <path>     Print the shared landed proof for one worktree; change nothing
+  --claims [id|path]  Print live claims and recent-session leases, optionally filtered
+  --session           Sweep the current Claude/Codex repository, detached (SessionEnd hook)
+  --scheduled         Apply only when CC_WJ_SCHEDULE_APPLY=1; otherwise report
   -h, --help          Show this help
 
 Environment:
   CC_WJ_ROOT              Root directory to discover repos under (default: ~/Documents/GitHub)
+  CC_WJ_HARNESS_ROOTS     Colon-separated Claude/Codex worktree roots
   CC_WJ_LOG               Log file path (default: ~/.cc-reaper/logs/worktree-janitor.log)
   CC_WJ_STATE_DIR         State directory for cooldown files (default: ~/.cc-reaper/state)
-  CC_WJ_IDLE_HOURS        Keep a worktree modified within this many hours (default: 6)
+  CC_WJ_IDLE_HOURS        Keep a worktree modified within this many hours (default: 48)
+  CC_WJ_SESSION_GRACE_HOURS Keep a worktree after mapped harness activity (default: 48)
   CC_WJ_NOTIFY_MIN_GB     Disk savings threshold in GB to trigger notification (default: 1)
   CC_WJ_COOLDOWN_SECS     Notification cooldown in seconds (default: 3600)
   CC_WJ_BASE_BRANCH       Integration branch (default: origin's default branch)
   CC_WJ_SESSION_APPLY     Set to 1 to let --session remove (default: report only)
+  CC_WJ_SCHEDULE_APPLY    Set to 1 to let --scheduled remove (default: report only)
   CC_WJ_SESSION_LOG       --session log (default: ~/.cc-reaper/logs/worktree-janitor-session.log)
+  CC_WJ_CLAUDE_SESSIONS  Claude live-session registry (default: ~/.claude/sessions)
+  CC_WJ_CLAUDE_PROJECTS  Claude transcript registry (default: ~/.claude/projects)
+  CC_WJ_CODEX_LOCKS      Codex writer-lock registry (default: ~/.codex/thread-writer-locks)
+  CC_WJ_CODEX_STATE_DB   Codex local state database (default: ~/.codex/state_5.sqlite)
 
 A worktree is removable only when it holds nothing a command cannot rebuild, no process
 has it as a working directory or holds a file in it, its work has landed on the fetched
@@ -43,6 +78,10 @@ EOF
 # worktrees sat under `~/Documents` and `~/GitHub` throughout.
 _cc_wj_roots() {
   printf '%s\n' "${CC_WJ_ROOT:-$HOME/Documents/GitHub:$HOME/GitHub:$HOME/Documents}" | tr ':' '\n'
+}
+
+_cc_wj_harness_roots() {
+  printf '%s\n' "${CC_WJ_HARNESS_ROOTS:-$HOME/.claude/worktrees:$HOME/.codex/worktrees}" | tr ':' '\n'
 }
 
 # Back-compat for anything sourcing the old single-root helper.
@@ -78,7 +117,18 @@ _cc_wj_cooldown_secs() {
 # reclaimer in theQuert/skills sat on `off` for a week while 78 worktrees accumulated.
 # Five digits at most, because `find -mmin` on a sixteen-digit count wraps.
 _cc_wj_idle_hours() {
-  local v="${CC_WJ_IDLE_HOURS:-6}"
+  local v="${CC_WJ_IDLE_HOURS:-48}"
+  case "$v" in
+    ''|*[!0-9]*|??????*) return 1 ;;
+  esac
+  echo $((10#$v))
+}
+
+# A released writer lock or dead session pid proves only that the task is not live now.
+# It does not prove that an archive was intentional or that the operator will not resume it.
+# This independent lease resets on harness activity even when no worktree file changed.
+_cc_wj_session_grace_hours() {
+  local v="${CC_WJ_SESSION_GRACE_HOURS:-48}"
   case "$v" in
     ''|*[!0-9]*|??????*) return 1 ;;
   esac
@@ -203,7 +253,7 @@ _cc_wj_unreadable_roots() {
     # root holding no repositories, and the run reported success.
     { [ -r "$root" ] && [ -x "$root" ]; } || { echo "$root"; continue; }
     find "$root" -maxdepth 1 -mindepth 1 -type d >/dev/null 2>&1 || echo "$root"
-  done < <(_cc_wj_roots)
+  done < <({ _cc_wj_roots; _cc_wj_harness_roots; } | awk '!seen[$0]++')
 }
 
 _cc_wj_discover_repos() {
@@ -218,6 +268,16 @@ _cc_wj_discover_repos() {
       fi
     done
   done < <(_cc_wj_roots)
+
+  # Harness-managed checkouts may be nested under a private root or belong to a second
+  # clone of a repository already present under ~/GitHub.  Looking only one level below
+  # ordinary source roots made those worktrees completely absent from the report.
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    [ -d "$root" ] && [ -r "$root" ] && [ -x "$root" ] || continue
+    find "$root" -mindepth 1 -maxdepth 5 -name .git -print -prune 2>/dev/null |
+      while IFS= read -r d; do dirname "$d"; done
+  done < <(_cc_wj_harness_roots)
 }
 
 # ─── Holders ──────────────────────────────────────────────────────────────────
@@ -282,6 +342,802 @@ _cc_wj_held() {
     LC_ALL=C grep -qxF -- "$p" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
     LC_ALL=C grep -qF -- "$p/" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
   done
+  return 1
+}
+
+# ─── Harness activity claims ────────────────────────────────────────────────
+
+# lsof proves that a process currently holds a path.  It cannot prove that an app task
+# has ended: both Claude and Codex can keep their own registry/rollout open while driving
+# a linked worktree through absolute tool paths.  These registries are therefore an
+# independent veto, not a substitute for the holder scan.
+_CC_WJ_ACTIVE_CLAIMS=""
+_CC_WJ_ACTIVE_TRANSCRIPTS=""
+_CC_WJ_ACTIVE_ERROR=""
+_CC_WJ_ACTIVE_REASON=""
+_CC_WJ_RECENT_CLAIMS=""
+_CC_WJ_RECENT_TRANSCRIPTS=""
+_CC_WJ_RECENT_REASON=""
+_CC_WJ_ACTIVE_GRACE_HOURS=0
+
+_cc_wj_active_add_claim() { # <harness> <resolved cwd> <id>
+  _CC_WJ_ACTIVE_CLAIMS="${_CC_WJ_ACTIVE_CLAIMS}${_CC_WJ_ACTIVE_CLAIMS:+$'\n'}$1"$'\t'"$2"$'\t'"$3"
+}
+
+_cc_wj_active_add_transcript() { # <harness> <id> <path>
+  _CC_WJ_ACTIVE_TRANSCRIPTS="${_CC_WJ_ACTIVE_TRANSCRIPTS}${_CC_WJ_ACTIVE_TRANSCRIPTS:+$'\n'}$1"$'\t'"$2"$'\t'"$3"
+}
+
+_cc_wj_recent_add_claim() { # <harness> <resolved cwd> <id> <activity epoch> <state>
+  _CC_WJ_RECENT_CLAIMS="${_CC_WJ_RECENT_CLAIMS}${_CC_WJ_RECENT_CLAIMS:+$'\n'}$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"$'\t'"$5"
+}
+
+_cc_wj_recent_add_transcript() { # <harness> <id> <path> <activity epoch> <state>
+  _CC_WJ_RECENT_TRANSCRIPTS="${_CC_WJ_RECENT_TRANSCRIPTS}${_CC_WJ_RECENT_TRANSCRIPTS:+$'\n'}$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"$'\t'"$5"
+}
+
+_cc_wj_active_has_id() { # <harness> <id>
+  local wanted_harness="$1" wanted_id="$2" harness cwd sid
+  while IFS=$'\t' read -r harness cwd sid; do
+    [ "$harness" = "$wanted_harness" ] && [ "$sid" = "$wanted_id" ] && return 0
+  done <<ACTIVE_IDS
+$_CC_WJ_ACTIVE_CLAIMS
+ACTIVE_IDS
+  return 1
+}
+
+_cc_wj_mtime_epoch() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+}
+
+_cc_wj_epoch_iso() {
+  date -r "$1" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null ||
+    date -d "@$1" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || printf '%s' "$1"
+}
+
+_cc_wj_claim_cwd() {
+  local cwd="$1"
+  case "$cwd" in ''|*$'\n'*|*$'\t'*) return 1 ;; esac
+  (builtin cd -P -- "$cwd" >/dev/null 2>&1 && pwd -P)
+}
+
+# Query only the meaningful tail of an append-only transcript. Real session files on the
+# measured host exceed 100 MB; reading each whole file once per candidate made a six-hour
+# janitor run itself a sustained I/O workload. In reverse order the current two human
+# turns end at the second user boundary, and Claude's last cwd is normally in the final
+# record. Invalid unrelated tail records are ignored just as `fromjson?` did for cwd;
+# an invalid record that actually names the target remains a fail-closed parse error.
+_cc_wj_transcript_tail_query() { # <claude-cwd|claude-claim|codex-claim> <file> [target alternate]
+  local mode="$1" transcript="$2" wt="${3:-}" alt="${4:-}" python cache="" index="" cache_key
+  python="$(command -v python3 2>/dev/null)" || return 2
+  if [[ "$mode" == *-claim ]]; then
+    cache_key="$(printf '%s\t%s' "$mode" "$transcript" | cksum | awk '{ print $1 "-" $2 }')"
+    if [ -n "${CC_WJ_TRANSCRIPT_CACHE_DIR:-}" ]; then
+      mkdir -p "$CC_WJ_TRANSCRIPT_CACHE_DIR" 2>/dev/null || return 2
+      cache="$CC_WJ_TRANSCRIPT_CACHE_DIR/$cache_key.json"
+    fi
+    if [ -n "${CC_WJ_TRANSCRIPT_INDEX_DIR:-}" ]; then
+      mkdir -p "$CC_WJ_TRANSCRIPT_INDEX_DIR" 2>/dev/null || CC_WJ_TRANSCRIPT_INDEX_DIR=""
+      [ -z "$CC_WJ_TRANSCRIPT_INDEX_DIR" ] || chmod 700 "$CC_WJ_TRANSCRIPT_INDEX_DIR" 2>/dev/null || true
+      [ -z "$CC_WJ_TRANSCRIPT_INDEX_DIR" ] || index="$CC_WJ_TRANSCRIPT_INDEX_DIR/$cache_key.json"
+    fi
+  fi
+  "$python" - "$mode" "$transcript" "$wt" "$alt" "$cache" "$index" <<'PY'
+import json
+import mmap
+import os
+import sys
+import tempfile
+
+mode, path, target, alternate, cache_path, index_path = sys.argv[1:]
+target_bytes = target.encode("utf-8", "surrogateescape")
+alternate_bytes = alternate.encode("utf-8", "surrogateescape")
+
+
+def reverse_lines(file_path):
+    with open(file_path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        # Segments of the one line crossing block boundaries, collected newest first.
+        # Joining a growing bytes object at every block is quadratic for a single large
+        # tool-result record (real rollouts contain lines tens of MB long).
+        pending = []
+        while position:
+            size = min(65536, position)
+            position -= size
+            handle.seek(position)
+            parts = handle.read(size).split(b"\n")
+            if len(parts) == 1:
+                pending.append(parts[0])
+                continue
+            line = parts[-1] + b"".join(reversed(pending))
+            if line:
+                yield line.rstrip(b"\r")
+            for line in reversed(parts[1:-1]):
+                if line:
+                    yield line.rstrip(b"\r")
+            pending = [parts[0]]
+        line = b"".join(reversed(pending))
+        if line:
+            yield line.rstrip(b"\r")
+
+
+def load_snapshot(snapshot_path, stat, allow_growth):
+    if not snapshot_path:
+        return None
+    try:
+        with open(snapshot_path, "r", encoding="utf-8") as cached:
+            candidate = json.load(cached)
+        size_matches = (
+            stat.st_size >= candidate.get("size", stat.st_size + 1)
+            if allow_growth
+            else stat.st_size == candidate.get("size", -1)
+        )
+        mtime_matches = allow_growth or candidate.get("mtime_ns") == stat.st_mtime_ns
+        if (
+            candidate.get("path") == path
+            and candidate.get("mode") == mode
+            and candidate.get("dev") == stat.st_dev
+            and candidate.get("ino") == stat.st_ino
+            and size_matches
+            and mtime_matches
+        ):
+            return candidate
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def write_snapshot(snapshot_path, snapshot):
+    if not snapshot_path:
+        return
+    directory = os.path.dirname(snapshot_path)
+    fd, temporary = tempfile.mkstemp(prefix=".transcript-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(snapshot, output, separators=(",", ":"))
+        os.replace(temporary, snapshot_path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+try:
+    if mode.endswith("-claim"):
+        with open(path, "rb") as preflight:
+            stat = os.fstat(preflight.fileno())
+            if stat.st_size == 0:
+                raise SystemExit(1)
+            with mmap.mmap(preflight.fileno(), 0, access=mmap.ACCESS_READ) as contents:
+                snapshot = load_snapshot(cache_path, stat, allow_growth=True)
+                if snapshot is None:
+                    snapshot = load_snapshot(index_path, stat, allow_growth=False)
+                    if snapshot is not None and cache_path:
+                        write_snapshot(cache_path, snapshot)
+
+                if snapshot is None:
+                    # Save only byte ranges, never transcript content. The ranges are the
+                    # small set of records which can affect a path claim inside the current
+                    # two user turns. Every candidate in this activity snapshot reuses them.
+                    ranges = []
+                    turns = 0
+                    end = len(contents)
+                    while end:
+                        if contents[end - 1 : end] == b"\n":
+                            end -= 1
+                            continue
+                        newline = contents.rfind(b"\n", 0, end)
+                        begin = 0 if newline < 0 else newline + 1
+                        prefix = contents[begin : min(end, begin + 8192)]
+                        if mode == "codex-claim":
+                            hinted = (
+                                b'"custom_tool_call"' in prefix
+                                or (b'"role"' in prefix and b'"user"' in prefix)
+                            )
+                        else:
+                            hinted = b'"tool_use"' in prefix or b'"user"' in prefix
+                        # An otherwise malformed record is relevant only when it literally
+                        # names an absolute target. Retain slash-bearing ranges so that the
+                        # later target-specific check preserves that fail-closed behaviour.
+                        if hinted or contents.find(b"/", begin, end) >= 0:
+                            ranges.append([begin, end])
+                        if hinted:
+                            try:
+                                event = json.loads(contents[begin:end])
+                            except (UnicodeDecodeError, json.JSONDecodeError):
+                                event = None
+                            if isinstance(event, dict) and mode == "codex-claim":
+                                payload = event.get("payload")
+                                if (
+                                    event.get("type") == "response_item"
+                                    and isinstance(payload, dict)
+                                    and payload.get("type") == "message"
+                                    and payload.get("role") == "user"
+                                ):
+                                    turns += 1
+                            elif isinstance(event, dict) and mode == "claude-claim":
+                                message = event.get("message")
+                                content = message.get("content") if isinstance(message, dict) else None
+                                is_user = event.get("type") == "user" and (
+                                    isinstance(content, str)
+                                    or (
+                                        isinstance(content, list)
+                                        and any(
+                                            isinstance(item, dict) and item.get("type") == "text"
+                                            for item in content
+                                        )
+                                    )
+                                )
+                                if is_user:
+                                    turns += 1
+                            if turns >= 2:
+                                break
+                        end = newline if newline >= 0 else 0
+                    snapshot = {
+                        "path": path,
+                        "mode": mode,
+                        "dev": stat.st_dev,
+                        "ino": stat.st_ino,
+                        "size": stat.st_size,
+                        "mtime_ns": stat.st_mtime_ns,
+                        "ranges": ranges,
+                    }
+                    if cache_path:
+                        try:
+                            write_snapshot(cache_path, snapshot)
+                        except OSError:
+                            raise SystemExit(2)
+                    if index_path:
+                        try:
+                            write_snapshot(index_path, snapshot)
+                        except OSError:
+                            pass
+                    if cache_path or index_path:
+                        trace = os.environ.get("CC_WJ_TRANSCRIPT_CACHE_TRACE")
+                        if trace:
+                            with open(trace, "a", encoding="utf-8") as output:
+                                output.write(path + "\n")
+
+                for begin, end in snapshot.get("ranges", []):
+                    if begin < 0 or end > len(contents) or begin >= end:
+                        raise SystemExit(2)
+                    prefix = contents[begin : min(end, begin + 8192)]
+                    names_target = (
+                        (target_bytes and contents.find(target_bytes, begin, end) >= 0)
+                        or (alternate_bytes and contents.find(alternate_bytes, begin, end) >= 0)
+                    )
+                    if mode == "codex-claim":
+                        hinted = (
+                            b'"custom_tool_call"' in prefix
+                            or (b'"role"' in prefix and b'"user"' in prefix)
+                        )
+                    else:
+                        hinted = b'"tool_use"' in prefix or b'"user"' in prefix
+                    if not names_target and not hinted:
+                        continue
+                    try:
+                        event = json.loads(contents[begin:end])
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        if names_target:
+                            raise SystemExit(2)
+                        continue
+                    if isinstance(event, dict) and mode == "codex-claim":
+                        payload = event.get("payload")
+                        if (
+                            event.get("type") == "response_item"
+                            and isinstance(payload, dict)
+                            and payload.get("type") == "custom_tool_call"
+                        ):
+                            value = payload.get("input", "")
+                            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                            if target in text or alternate in text:
+                                raise SystemExit(0)
+                    elif isinstance(event, dict) and mode == "claude-claim":
+                        message = event.get("message")
+                        content = message.get("content") if isinstance(message, dict) else None
+                        if event.get("type") == "assistant" and isinstance(content, list):
+                            for item in content:
+                                if not isinstance(item, dict) or item.get("type") != "tool_use":
+                                    continue
+                                value = item.get("input", "")
+                                text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                                if target in text or alternate in text:
+                                    raise SystemExit(0)
+        raise SystemExit(1)
+
+    for raw in reverse_lines(path):
+        prefix = raw[:8192]
+        if mode == "claude-cwd" and b'"cwd"' not in prefix:
+            continue
+        try:
+            event = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+
+        if mode == "claude-cwd":
+            cwd = event.get("cwd") if isinstance(event, dict) else None
+            if isinstance(cwd, str) and cwd:
+                print(cwd)
+                raise SystemExit(0)
+            continue
+        raise SystemExit(2)
+except OSError:
+    raise SystemExit(2)
+
+raise SystemExit(1)
+PY
+}
+
+_cc_wj_scan_claude_sessions() {
+  local registry="${CC_WJ_CLAUDE_SESSIONS:-$HOME/.claude/sessions}"
+  local projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
+  local f files base row pid sid cwd cmd resolved transcripts count transcript
+  [ -e "$registry" ] || return 0
+  if [ ! -d "$registry" ] || [ ! -r "$registry" ] || [ ! -x "$registry" ]; then
+    _CC_WJ_ACTIVE_ERROR="the Claude session registry $registry is unreadable"
+    return 1
+  fi
+  files="$(find "$registry" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null)" || {
+    _CC_WJ_ACTIVE_ERROR="the Claude session registry $registry could not be listed"
+    return 1
+  }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    base="${f##*/}"; base="${base%.json}"
+    case "$base" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$base" 2>/dev/null || continue
+    command -v jq >/dev/null 2>&1 || {
+      _CC_WJ_ACTIVE_ERROR="jq is unavailable, so live Claude session claims cannot be checked"
+      return 1
+    }
+    row="$(jq -er '[((.pid // "") | tostring), (.sessionId // ""), (.cwd // "")] | @tsv' "$f" 2>/dev/null)" || {
+      _CC_WJ_ACTIVE_ERROR="live Claude session record ${f##*/} could not be parsed"
+      return 1
+    }
+    IFS=$'\t' read -r pid sid cwd <<< "$row"
+    case "$pid" in ''|*[!0-9]*) _CC_WJ_ACTIVE_ERROR="live Claude session record ${f##*/} has no valid pid"; return 1 ;; esac
+    [ "$pid" = "$base" ] || {
+      _CC_WJ_ACTIVE_ERROR="live Claude session record ${f##*/} disagrees with pid $pid"
+      return 1
+    }
+    kill -0 "$pid" 2>/dev/null || continue
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null)" || {
+      kill -0 "$pid" 2>/dev/null || continue
+      _CC_WJ_ACTIVE_ERROR="live Claude pid $pid could not be inspected"
+      return 1
+    }
+    printf '%s\n' "$sid" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' || {
+      _CC_WJ_ACTIVE_ERROR="live Claude session record ${f##*/} has an invalid session id"
+      return 1
+    }
+    # A live pid may have been reused.  The opaque session id in its command line binds
+    # the registry record to this process.
+    case "$cmd" in *"$sid"*) ;; *) continue ;; esac
+    resolved="$(_cc_wj_claim_cwd "$cwd")" || {
+      _CC_WJ_ACTIVE_ERROR="live Claude session $sid could not map cwd ${cwd:-<empty>}"
+      return 1
+    }
+    _cc_wj_active_add_claim Claude "$resolved" "$sid"
+    if [ ! -d "$projects" ] || [ ! -r "$projects" ] || [ ! -x "$projects" ]; then
+      _CC_WJ_ACTIVE_ERROR="live Claude session $sid has no readable transcript registry at $projects"
+      return 1
+    fi
+    transcripts="$(find "$projects" -type f -name "$sid.jsonl" -print 2>/dev/null)" || {
+      _CC_WJ_ACTIVE_ERROR="the transcript for live Claude session $sid could not be located"
+      return 1
+    }
+    count="$(printf '%s\n' "$transcripts" | grep -c .)"
+    [ "$count" -eq 1 ] || {
+      _CC_WJ_ACTIVE_ERROR="live Claude session $sid did not map to exactly one transcript"
+      return 1
+    }
+    transcript="$transcripts"
+    case "$transcript" in *$'\n'*|*$'\t'*) _CC_WJ_ACTIVE_ERROR="live Claude session $sid has an unsafe transcript path"; return 1 ;; esac
+    [ -r "$transcript" ] || { _CC_WJ_ACTIVE_ERROR="the transcript for live Claude session $sid is unreadable"; return 1; }
+    _cc_wj_active_add_transcript Claude "$sid" "$transcript"
+  done <<CLAUDE_FILES
+$files
+CLAUDE_FILES
+}
+
+_cc_wj_scan_codex_sessions() {
+  local locks="${CC_WJ_CODEX_LOCKS:-$HOME/.codex/thread-writer-locks}"
+  local state="${CC_WJ_CODEX_STATE_DB:-$HOME/.codex/state_5.sqlite}"
+  local raw rc path base tid sqlite row cwd rollout resolved count lock_mtime now attempts attempt
+  [ -e "$locks" ] || return 0
+  if [ ! -d "$locks" ] || [ ! -r "$locks" ] || [ ! -x "$locks" ]; then
+    _CC_WJ_ACTIVE_ERROR="the Codex writer-lock registry $locks is unreadable"
+    return 1
+  fi
+  raw="$(_cc_wj_with_timeout 15 lsof -n -P -Fn +D "$locks" 2>/dev/null)"; rc=$?
+  # lsof uses 1 for a successful search with no matching open file.
+  if [ "$rc" -ge 2 ]; then
+    _CC_WJ_ACTIVE_ERROR="the Codex writer-lock registry $locks could not be scanned"
+    return 1
+  fi
+  while IFS= read -r path; do
+    case "$path" in "$locks"/*.lock) ;; *) continue ;; esac
+    base="${path##*/}"; tid="${base%.lock}"
+    printf '%s\n' "$tid" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' || continue
+    sqlite="$(command -v sqlite3 2>/dev/null)" || {
+      _CC_WJ_ACTIVE_ERROR="sqlite3 is unavailable, so active Codex claim $tid could not be mapped"
+      return 1
+    }
+    [ -r "$state" ] || {
+      _CC_WJ_ACTIVE_ERROR="active Codex claim $tid could not be mapped because $state is unreadable"
+      return 1
+    }
+    # Codex creates the writer lock just before its state row becomes visible. A schedule
+    # starting in that narrow window used to poison the entire run as activity-unknown.
+    # Retry only a freshly-created lock; an old unmappable lock is not treated as a race.
+    attempts=1
+    lock_mtime="$(_cc_wj_mtime_epoch "$path")"; now="$(date +%s)"
+    case "$lock_mtime" in
+      ''|*[!0-9]*) ;;
+      *) [ $((now - lock_mtime)) -le 10 ] && attempts=6 ;;
+    esac
+    attempt=1
+    while :; do
+      row="$("$sqlite" -batch -noheader -cmd '.timeout 2000' "$state" \
+        "select cwd || char(9) || rollout_path from threads where id = '$tid';" 2>/dev/null)" || {
+        _CC_WJ_ACTIVE_ERROR="active Codex claim $tid could not be mapped from local state"
+        return 1
+      }
+      count="$(printf '%s\n' "$row" | grep -c .)"
+      [ "$count" -eq 1 ] && break
+      [ "$attempt" -lt "$attempts" ] || break
+      sleep 0.5
+      attempt=$((attempt + 1))
+    done
+    [ "$count" -eq 1 ] || {
+      _CC_WJ_ACTIVE_ERROR="active Codex claim $tid could not be mapped to exactly one task"
+      return 1
+    }
+    IFS=$'\t' read -r cwd rollout <<< "$row"
+    resolved="$(_cc_wj_claim_cwd "$cwd")" || {
+      _CC_WJ_ACTIVE_ERROR="active Codex claim $tid could not be mapped to cwd ${cwd:-<empty>}"
+      return 1
+    }
+    case "$rollout" in ''|*$'\n'*|*$'\t'*) _CC_WJ_ACTIVE_ERROR="active Codex claim $tid has an unsafe transcript path"; return 1 ;; esac
+    [ -r "$rollout" ] || { _CC_WJ_ACTIVE_ERROR="the transcript for active Codex claim $tid is unreadable"; return 1; }
+    _cc_wj_active_add_claim Codex "$resolved" "$tid"
+    _cc_wj_active_add_transcript Codex "$tid" "$rollout"
+  done <<CODEX_LOCKS
+$(printf '%s\n' "$raw" | sed -n 's/^n//p')
+CODEX_LOCKS
+}
+
+_cc_wj_scan_claude_recent() { # <grace hours>
+  local grace="$1" projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
+  local now cutoff_minutes files f base sid activity cwd resolved
+  [ "$grace" -gt 0 ] || return 0
+  [ -e "$projects" ] || return 0
+  if [ ! -d "$projects" ] || [ ! -r "$projects" ] || [ ! -x "$projects" ]; then
+    _CC_WJ_ACTIVE_ERROR="the Claude transcript registry $projects is unreadable"
+    return 1
+  fi
+  command -v jq >/dev/null 2>&1 || {
+    _CC_WJ_ACTIVE_ERROR="jq is unavailable, so recent Claude session leases cannot be checked"
+    return 1
+  }
+  now="$(date +%s)"; cutoff_minutes=$((grace * 60))
+  files="$(find "$projects" -type f -name '*.jsonl' -mmin "-$cutoff_minutes" -print 2>/dev/null)" || {
+    _CC_WJ_ACTIVE_ERROR="the recent Claude transcript registry $projects could not be listed"
+    return 1
+  }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    base="${f##*/}"; sid="${base%.jsonl}"
+    printf '%s\n' "$sid" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' || continue
+    _cc_wj_active_has_id Claude "$sid" && continue
+    [ -r "$f" ] || { _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base is unreadable"; return 1; }
+    activity="$(_cc_wj_mtime_epoch "$f")"
+    case "$activity" in ''|*[!0-9]*) _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base has no readable activity time"; return 1 ;; esac
+    [ $((now - activity)) -lt $((grace * 3600)) ] || continue
+    # Raw-line parsing tolerates a final partial JSONL record while a live harness writes.
+    # Only the last explicit cwd is retained; message text never enters the diagnostic.
+    cwd="$(_cc_wj_transcript_tail_query claude-cwd "$f")"
+    [ -n "$cwd" ] || { _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base has no mappable cwd"; return 1; }
+    case "$cwd" in /*) ;; *) _CC_WJ_ACTIVE_ERROR="recent Claude session $sid has a non-absolute cwd"; return 1 ;; esac
+    [ -e "$cwd" ] || continue
+    resolved="$(_cc_wj_claim_cwd "$cwd")" || {
+      _CC_WJ_ACTIVE_ERROR="recent Claude session $sid could not map cwd $cwd"
+      return 1
+    }
+    _cc_wj_recent_add_claim Claude "$resolved" "$sid" "$activity" transcript
+    # Do not parse every recent transcript eagerly. Structured-path claims are only
+    # relevant to a worktree that otherwise reaches the removable gate, where
+    # `_cc_wj_transcript_claims_path` validates the matching transcript fail-closed.
+    # Eager validation made every scheduled run read the full 48-hour transcript set,
+    # then repeat that work before each removal candidate.
+    _cc_wj_recent_add_transcript Claude "$sid" "$f" "$activity" transcript
+  done <<CLAUDE_RECENT
+$files
+CLAUDE_RECENT
+}
+
+_cc_wj_scan_codex_recent() { # <grace hours>
+  local grace="$1" state="${CC_WJ_CODEX_STATE_DB:-$HOME/.codex/state_5.sqlite}"
+  local sqlite now cutoff rows tid cwd rollout activity archived resolved claim_state
+  [ "$grace" -gt 0 ] || return 0
+  [ -e "$state" ] || return 0
+  sqlite="$(command -v sqlite3 2>/dev/null)" || {
+    _CC_WJ_ACTIVE_ERROR="sqlite3 is unavailable, so recent Codex session leases cannot be checked"
+    return 1
+  }
+  command -v jq >/dev/null 2>&1 || {
+    _CC_WJ_ACTIVE_ERROR="jq is unavailable, so recent Codex transcript leases cannot be checked"
+    return 1
+  }
+  [ -r "$state" ] || {
+    _CC_WJ_ACTIVE_ERROR="recent Codex session leases could not be mapped because $state is unreadable"
+    return 1
+  }
+  now="$(date +%s)"; cutoff=$((now - grace * 3600))
+  rows="$("$sqlite" -batch -noheader -cmd '.timeout 2000' "$state" \
+    "select id || char(9) || cwd || char(9) || rollout_path || char(9) || max(updated_at, coalesce(archived_at, 0)) || char(9) || archived from threads where max(updated_at, coalesce(archived_at, 0)) >= $cutoff;" 2>/dev/null)" || {
+    _CC_WJ_ACTIVE_ERROR="recent Codex session leases could not be read from local state"
+    return 1
+  }
+  while IFS=$'\t' read -r tid cwd rollout activity archived; do
+    [ -n "$tid" ] || continue
+    printf '%s\n' "$tid" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' || {
+      _CC_WJ_ACTIVE_ERROR="recent Codex local state contains an invalid task id"
+      return 1
+    }
+    _cc_wj_active_has_id Codex "$tid" && continue
+    case "$activity" in ''|*[!0-9]*) _CC_WJ_ACTIVE_ERROR="recent Codex task $tid has no valid activity time"; return 1 ;; esac
+    case "$archived" in 0) claim_state=recent ;; 1) claim_state=archived ;; *) _CC_WJ_ACTIVE_ERROR="recent Codex task $tid has an invalid archived state"; return 1 ;; esac
+    case "$cwd" in /*) ;; *) _CC_WJ_ACTIVE_ERROR="recent Codex task $tid has a non-absolute cwd"; return 1 ;; esac
+    [ -e "$cwd" ] || continue
+    resolved="$(_cc_wj_claim_cwd "$cwd")" || {
+      _CC_WJ_ACTIVE_ERROR="recent Codex task $tid could not map cwd $cwd"
+      return 1
+    }
+    _cc_wj_recent_add_claim Codex "$resolved" "$tid" "$activity" "$claim_state"
+    case "$rollout" in ''|*$'\n'*|*$'\t'*) _CC_WJ_ACTIVE_ERROR="recent Codex task $tid has an unsafe transcript path"; return 1 ;; esac
+    [ -r "$rollout" ] || { _CC_WJ_ACTIVE_ERROR="the transcript for recent Codex task $tid is unreadable"; return 1; }
+    _cc_wj_recent_add_transcript Codex "$tid" "$rollout" "$activity" "$claim_state"
+  done <<CODEX_RECENT
+$rows
+CODEX_RECENT
+}
+
+_CC_WJ_TRANSCRIPT_CACHE_ROOT=""
+_CC_WJ_TRANSCRIPT_CACHE_GENERATION=0
+
+_cc_wj_scan_active_sessions() { # <recent-session grace hours>
+  local grace="${1:-0}"
+  _CC_WJ_ACTIVE_GRACE_HOURS="$grace"
+  if [ -n "$_CC_WJ_TRANSCRIPT_CACHE_ROOT" ]; then
+    _CC_WJ_TRANSCRIPT_CACHE_GENERATION=$((_CC_WJ_TRANSCRIPT_CACHE_GENERATION + 1))
+    CC_WJ_TRANSCRIPT_CACHE_DIR="$_CC_WJ_TRANSCRIPT_CACHE_ROOT/$_CC_WJ_TRANSCRIPT_CACHE_GENERATION"
+    mkdir -p "$CC_WJ_TRANSCRIPT_CACHE_DIR" || {
+      _CC_WJ_ACTIVE_ERROR="a transcript evidence snapshot could not be created"
+      return 1
+    }
+  fi
+  _CC_WJ_ACTIVE_CLAIMS=""; _CC_WJ_ACTIVE_TRANSCRIPTS=""; _CC_WJ_ACTIVE_ERROR=""
+  _CC_WJ_RECENT_CLAIMS=""; _CC_WJ_RECENT_TRANSCRIPTS=""; _CC_WJ_RECENT_REASON=""
+  _cc_wj_scan_claude_sessions || return 1
+  _cc_wj_scan_codex_sessions || return 1
+  _cc_wj_scan_claude_recent "$grace" || return 1
+  _cc_wj_scan_codex_recent "$grace" || return 1
+}
+
+# Return 0 when a structured tool call in the current two human user turns names the
+# target, 1 when none does, and 2 when the transcript cannot be parsed. Live claims and
+# recent leases intentionally share this parser.
+_cc_wj_transcript_claims_path() { # <harness> <transcript> <resolved target>
+  local harness="$1" transcript="$2" wt="$3" alt mode
+  case "$wt" in /private/*) alt="${wt#/private}" ;; *) alt="/private$wt" ;; esac
+  [ -r "$transcript" ] || return 2
+  case "$harness" in
+    Claude) mode=claude-claim ;;
+    Codex) mode=codex-claim ;;
+    *) return 1 ;;
+  esac
+  _cc_wj_transcript_tail_query "$mode" "$transcript" "$wt" "$alt"
+}
+
+_cc_wj_recent_claim() { # <worktree> <grace hours> [all|cwd|tool]
+  local wt="$(_cc_wj_realpath "$1")" grace="$2" harness cwd sid activity claim_state
+  local transcript rc best_scope="cwd"
+  local mode="${3:-all}"
+  local now age remaining best_activity=-1 best_harness="" best_cwd="" best_sid="" best_state=""
+  _CC_WJ_RECENT_REASON=""; now="$(date +%s)"
+  if [ "$mode" != "tool" ]; then
+  while IFS=$'\t' read -r harness cwd sid activity claim_state; do
+    [ -n "$cwd" ] || continue
+    case "$cwd/" in "$wt/"|"$wt/"*)
+      if [ "$activity" -gt "$best_activity" ]; then
+        best_activity="$activity"; best_harness="$harness"; best_cwd="$cwd"
+        best_sid="$sid"; best_state="$claim_state"
+      fi
+      ;;
+    esac
+  done <<RECENT_CLAIMS
+$_CC_WJ_RECENT_CLAIMS
+RECENT_CLAIMS
+  fi
+  if [ "$mode" != "cwd" ]; then
+  while IFS=$'\t' read -r harness sid transcript activity claim_state; do
+    [ -n "$transcript" ] || continue
+    _cc_wj_transcript_claims_path "$harness" "$transcript" "$wt"; rc=$?
+    if [ "$rc" -eq 2 ]; then
+      _CC_WJ_ACTIVE_ERROR="the transcript for recent $harness session $sid could not be parsed"
+      return 2
+    fi
+    if [ "$rc" -eq 0 ] && [ "$activity" -gt "$best_activity" ]; then
+      best_activity="$activity"; best_harness="$harness"; best_cwd="$wt"
+      best_sid="$sid"; best_state="$claim_state"; best_scope="structured-tool-call"
+    fi
+  done <<RECENT_TRANSCRIPTS
+$_CC_WJ_RECENT_TRANSCRIPTS
+RECENT_TRANSCRIPTS
+  fi
+  [ "$best_activity" -ge 0 ] || return 1
+  age=$((now - best_activity)); [ "$age" -lt 0 ] && age=0
+  remaining=$((grace * 3600 - age)); [ "$remaining" -lt 0 ] && remaining=0
+  _CC_WJ_RECENT_REASON="recent $best_harness session $best_sid state=$best_state scope=$best_scope path=$best_cwd last_activity=$(_cc_wj_epoch_iso "$best_activity") age=${age}s remaining=${remaining}s"
+  return 0
+}
+
+_cc_wj_print_claims() { # <grace hours> [id-or-path filter]
+  local grace="$1" filter="${2:-}" harness cwd sid activity claim_state now age remaining
+  local transcript target rc
+  printf 'CLAIMS session_grace_hours=%s\n' "$grace"
+  while IFS=$'\t' read -r harness cwd sid; do
+    [ -n "$cwd" ] || continue
+    if [ -n "$filter" ]; then case "$sid $cwd" in *"$filter"*) ;; *) continue ;; esac; fi
+    printf 'LIVE\tharness=%s\tid=%s\tcwd=%s\n' "$harness" "$sid" "$cwd"
+  done <<LIVE_CLAIMS
+$_CC_WJ_ACTIVE_CLAIMS
+LIVE_CLAIMS
+  now="$(date +%s)"
+  while IFS=$'\t' read -r harness cwd sid activity claim_state; do
+    [ -n "$cwd" ] || continue
+    if [ -n "$filter" ]; then case "$sid $cwd" in *"$filter"*) ;; *) continue ;; esac; fi
+    age=$((now - activity)); [ "$age" -lt 0 ] && age=0
+    remaining=$((grace * 3600 - age)); [ "$remaining" -lt 0 ] && remaining=0
+    printf 'RECENT\tharness=%s\tid=%s\tstate=%s\tcwd=%s\tlast_activity=%s\tage=%ss\tremaining=%ss\n' \
+      "$harness" "$sid" "$claim_state" "$cwd" "$(_cc_wj_epoch_iso "$activity")" "$age" "$remaining"
+  done <<RECENT_CLAIMS
+$_CC_WJ_RECENT_CLAIMS
+RECENT_CLAIMS
+  case "$filter" in
+    /*)
+      target="$(_cc_wj_realpath "$filter")"
+      while IFS=$'\t' read -r harness sid transcript; do
+        [ -n "$transcript" ] || continue
+        _cc_wj_transcript_claims_path "$harness" "$transcript" "$target"; rc=$?
+        [ "$rc" -ne 2 ] || { printf 'ERROR\tharness=%s\tid=%s\treason=unreadable-live-transcript\n' "$harness" "$sid"; return 2; }
+        [ "$rc" -eq 0 ] && printf 'LIVE_TOOL\tharness=%s\tid=%s\tpath=%s\tscope=current-two-user-turns\n' "$harness" "$sid" "$target"
+      done <<LIVE_TRANSCRIPTS
+$_CC_WJ_ACTIVE_TRANSCRIPTS
+LIVE_TRANSCRIPTS
+      while IFS=$'\t' read -r harness sid transcript activity claim_state; do
+        [ -n "$transcript" ] || continue
+        _cc_wj_transcript_claims_path "$harness" "$transcript" "$target"; rc=$?
+        [ "$rc" -ne 2 ] || { printf 'ERROR\tharness=%s\tid=%s\treason=unreadable-recent-transcript\n' "$harness" "$sid"; return 2; }
+        [ "$rc" -eq 0 ] || continue
+        age=$((now - activity)); [ "$age" -lt 0 ] && age=0
+        remaining=$((grace * 3600 - age)); [ "$remaining" -lt 0 ] && remaining=0
+        printf 'RECENT_TOOL\tharness=%s\tid=%s\tstate=%s\tpath=%s\tlast_activity=%s\tage=%ss\tremaining=%ss\tscope=current-two-user-turns\n' \
+          "$harness" "$sid" "$claim_state" "$target" "$(_cc_wj_epoch_iso "$activity")" "$age" "$remaining"
+      done <<RECENT_TRANSCRIPTS
+$_CC_WJ_RECENT_TRANSCRIPTS
+RECENT_TRANSCRIPTS
+      ;;
+  esac
+}
+
+# Replace one captured-live Codex task with its archived state after the writer lock has
+# closed and Codex has moved the rollout. Return 0 when reconciled, 1 while the state has
+# not reached archived yet, and 2 for an unsafe or unreadable mapping.
+_cc_wj_reconcile_codex_archive() { # <task id>
+  local sid="$1" state="${CC_WJ_CODEX_STATE_DB:-$HOME/.codex/state_5.sqlite}"
+  local sqlite row count cwd rollout activity archived resolved now attempt=1
+  sqlite="$(command -v sqlite3 2>/dev/null)" || return 2
+  [ -r "$state" ] || return 2
+  while :; do
+    row="$("$sqlite" -batch -noheader -cmd '.timeout 2000' "$state" \
+      "select cwd || char(9) || rollout_path || char(9) || max(updated_at, coalesce(archived_at, 0)) || char(9) || archived from threads where id = '$sid';" 2>/dev/null)" || return 2
+    count="$(printf '%s\n' "$row" | grep -c .)"
+    if [ "$count" -eq 1 ]; then
+      IFS=$'\t' read -r cwd rollout activity archived <<< "$row"
+      [ "$archived" = 1 ] && break
+    fi
+    [ "$attempt" -lt 6 ] || return 1
+    sleep 0.2
+    attempt=$((attempt + 1))
+  done
+  case "$cwd" in /*) ;; *) return 2 ;; esac
+  case "$rollout" in ''|*$'\n'*|*$'\t'*) return 2 ;; esac
+  case "$activity" in ''|*[!0-9]*) return 2 ;; esac
+  [ -r "$rollout" ] || return 2
+  resolved="$(_cc_wj_claim_cwd "$cwd")" || return 2
+
+  # Drop the stale live snapshot before adding the bounded archived lease. Subsequent
+  # candidates in this run then consult the relocated rollout instead of treating its
+  # expected disappearance as a claim on every path.
+  _CC_WJ_ACTIVE_CLAIMS="$(printf '%s\n' "$_CC_WJ_ACTIVE_CLAIMS" |
+    awk -F '\t' -v id="$sid" 'NF && !($1 == "Codex" && $3 == id)')"
+  _CC_WJ_ACTIVE_TRANSCRIPTS="$(printf '%s\n' "$_CC_WJ_ACTIVE_TRANSCRIPTS" |
+    awk -F '\t' -v id="$sid" 'NF && !($1 == "Codex" && $2 == id)')"
+  _CC_WJ_RECENT_CLAIMS="$(printf '%s\n' "$_CC_WJ_RECENT_CLAIMS" |
+    awk -F '\t' -v id="$sid" 'NF && !($1 == "Codex" && $3 == id)')"
+  _CC_WJ_RECENT_TRANSCRIPTS="$(printf '%s\n' "$_CC_WJ_RECENT_TRANSCRIPTS" |
+    awk -F '\t' -v id="$sid" 'NF && !($1 == "Codex" && $2 == id)')"
+  now="$(date +%s)"
+  if [ "$activity" -ge $((now - _CC_WJ_ACTIVE_GRACE_HOURS * 3600)) ]; then
+    _cc_wj_recent_add_claim Codex "$resolved" "$sid" "$activity" archived
+    _cc_wj_recent_add_transcript Codex "$sid" "$rollout" "$activity" archived
+  fi
+  return 0
+}
+
+# Return 0 for an active claim, 1 for no claim, 2 when activity became unknowable,
+# and 3 when a captured-live Codex task became a recent archived lease. Globals carry
+# the human-readable result.
+_cc_wj_active_claim() {
+  local wt="$(_cc_wj_realpath "$1")" harness cwd sid transcript rc lock lock_rc reconcile_rc recent_rc
+  _CC_WJ_ACTIVE_REASON=""
+  while IFS=$'\t' read -r harness cwd sid; do
+    [ -n "$cwd" ] || continue
+    case "$cwd/" in "$wt/"|"$wt/"*)
+      _CC_WJ_ACTIVE_REASON="active $harness session $sid claims cwd $cwd"
+      return 0
+      ;;
+    esac
+  done <<ACTIVE_CLAIMS
+$_CC_WJ_ACTIVE_CLAIMS
+ACTIVE_CLAIMS
+  while IFS=$'\t' read -r harness sid transcript; do
+    [ -n "$transcript" ] || continue
+    # The cleanup task necessarily names every target it inventories. Treating its own
+    # tool calls as ownership makes a manual cleanup unable to clean anything it looked
+    # at. Its cwd claim above still protects the checkout it is actually using; only its
+    # self-referential mentions are skipped. Other live sessions keep their full veto.
+    if { [ "$harness" = Codex ] && [ -n "${CODEX_THREAD_ID:-}" ] && [ "$sid" = "$CODEX_THREAD_ID" ]; } ||
+       { [ "$harness" = Claude ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && [ "$sid" = "$CLAUDE_CODE_SESSION_ID" ]; }; then
+      continue
+    fi
+    _cc_wj_transcript_claims_path "$harness" "$transcript" "$wt"; rc=$?
+    if [ "$rc" -eq 2 ]; then
+      if [ "$harness" = Codex ]; then
+        lock="${CC_WJ_CODEX_LOCKS:-$HOME/.codex/thread-writer-locks}/$sid.lock"
+        _cc_wj_with_timeout 5 lsof -n -P "$lock" >/dev/null 2>&1; lock_rc=$?
+        if [ "$lock_rc" -eq 1 ]; then
+          _cc_wj_reconcile_codex_archive "$sid"; reconcile_rc=$?
+          case "$reconcile_rc" in
+            0)
+              _cc_wj_recent_claim "$wt" "$_CC_WJ_ACTIVE_GRACE_HOURS"; recent_rc=$?
+              case "$recent_rc" in
+                0) return 3 ;;
+                2) return 2 ;;
+              esac
+              continue
+              ;;
+            *)
+              _CC_WJ_ACTIVE_ERROR="Codex session $sid ended while activity was being checked but its archived state could not be mapped"
+              return 2
+              ;;
+          esac
+        fi
+      fi
+      _CC_WJ_ACTIVE_ERROR="the transcript for active $harness session $sid could not be parsed"
+      return 2
+    fi
+    if [ "$rc" -eq 0 ]; then
+      _CC_WJ_ACTIVE_REASON="active $harness session $sid has a structured tool call in its current two user turns naming this worktree"
+      return 0
+    fi
+  done <<ACTIVE_TRANSCRIPTS
+$_CC_WJ_ACTIVE_TRANSCRIPTS
+ACTIVE_TRANSCRIPTS
   return 1
 }
 
@@ -795,6 +1651,28 @@ _cc_wj_landed() {
   fi
 }
 
+# Read-only policy query for another reaper that owns resources attached to a worktree.
+# A local stack must be stopped before the holder gate can allow worktree removal, so it
+# needs the exact same ancestry/content/PR answer without duplicating that policy.
+_cc_wj_query_landed() { # <worktree>
+  local wt="$1" proof
+  if [ ! -d "$wt" ] || ! git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "unknown"
+    return 2
+  fi
+  if ! _cc_wj_prepare_base "$wt"; then
+    echo "unfetched"
+    return 2
+  fi
+  proof="$(_cc_wj_landed "$wt")"
+  printf '%s\n' "$proof"
+  case "$proof" in
+    ancestor|content|pr) return 0 ;;
+    no) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
 # Merging HEAD into the base would change nothing. Ancestry misses every squash merge and
 # every rebase that left a local HEAD behind while its change landed; in a repository that
 # squash-merges, an ancestry-only test reclaims nothing while reporting normally.
@@ -901,6 +1779,7 @@ _cc_wj_classify() {
   local branch="${5:-}"  # branch name, or "(detached)"
   local landed="${6:-}"  # ancestor | content | pr | no | unfetched
   local idle="${7:-}"    # yes | no | unknown
+  local recent="${8:-no}" # "yes" when a bounded harness-session lease applies
 
   if [ "$dirty" = "MISSING" ]; then
     echo "KEEP(missing-dir)"
@@ -921,6 +1800,11 @@ _cc_wj_classify() {
 
   if [ "$active" != "no" ]; then
     echo "KEEP(active-session)"
+    return
+  fi
+
+  if [ "$recent" != "no" ]; then
+    echo "KEEP(recent-session)"
     return
   fi
 
@@ -1074,19 +1958,19 @@ _cc_wj_unlock() {
 
 # ─── Main report/apply logic ─────────────────────────────────────────────────
 
-_cc_wj_run() {
+_cc_wj_run_inner() {
   # The scheduled agent's stdout/stderr pair is written by launchd, so no script owns it
   # unless one claims it. Bounded here, at the top of every run, rather than from
   # `_cc_wj_log_write`: a report-only run never calls that helper - every call site is in
   # removal, pruning, or the apply-only summary - so bounding from there was unreachable
-  # for the one caller that produces these files daily.
+  # for the unattended caller that produces these files every six hours.
   local agent_log
-  for agent_log in "$HOME/.cc-reaper/logs/launchd-worktree-report-stdout.log" \
-                   "$HOME/.cc-reaper/logs/launchd-worktree-report-stderr.log"; do
+  for agent_log in "$HOME/.cc-reaper/logs/launchd-worktree-janitor-stdout.log" \
+                   "$HOME/.cc-reaper/logs/launchd-worktree-janitor-stderr.log"; do
     _cc_wj_bound_log "$agent_log"
   done
 
-  local apply=0
+  local apply=0 scheduled=0 claims_only=0 claims_filter=""
   local explicit_repos=()
 
   # Parse arguments
@@ -1105,9 +1989,29 @@ _cc_wj_run() {
         explicit_repos+=("$1")
         shift
         ;;
+      --landed)
+        shift
+        if [ -z "${1:-}" ]; then
+          echo "worktree-janitor: --landed requires a worktree path" >&2
+          return 1
+        fi
+        _cc_wj_query_landed "$1"
+        return $?
+        ;;
+      --claims)
+        claims_only=1
+        shift
+        if [ -n "${1:-}" ]; then
+          case "$1" in -*) ;; *) claims_filter="$1"; shift ;; esac
+        fi
+        ;;
       --session)
         _cc_wj_session
         return $?
+        ;;
+      --scheduled)
+        scheduled=1
+        shift
         ;;
       -h|--help)
         _cc_wj_usage
@@ -1121,10 +2025,39 @@ _cc_wj_run() {
     esac
   done
 
-  local idle_hours
+  if [ "$scheduled" -eq 1 ]; then
+    case "${CC_WJ_SCHEDULE_APPLY-}" in
+      1) apply=1 ;;
+      '') ;;
+      *) echo "worktree-janitor: CC_WJ_SCHEDULE_APPLY=${CC_WJ_SCHEDULE_APPLY} is not 1; reporting only" ;;
+    esac
+    if [ "${CC_WJ_TRANSCRIPT_INDEX_DIR+x}" != x ]; then
+      CC_WJ_TRANSCRIPT_INDEX_DIR="${CC_WJ_STATE_DIR:-$HOME/.cc-reaper/state}/transcript-index"
+    fi
+  fi
+
+  if [ -n "$_CC_WJ_CONFIG_ERROR" ]; then
+    echo "worktree-janitor: $_CC_WJ_CONFIG_ERROR; scanned and removed nothing" >&2
+    return 2
+  fi
+
+  local idle_hours session_grace_hours
   if ! idle_hours="$(_cc_wj_idle_hours)"; then
     echo "worktree-janitor: CC_WJ_IDLE_HOURS=${CC_WJ_IDLE_HOURS:-} is not a whole number of hours below 100000; scanned and removed nothing" >&2
     return 2
+  fi
+  if ! session_grace_hours="$(_cc_wj_session_grace_hours)"; then
+    echo "worktree-janitor: CC_WJ_SESSION_GRACE_HOURS=${CC_WJ_SESSION_GRACE_HOURS:-} is not a whole number of hours below 100000; scanned and removed nothing" >&2
+    return 2
+  fi
+
+  if [ "$claims_only" -eq 1 ]; then
+    if ! _cc_wj_scan_active_sessions "$session_grace_hours"; then
+      echo "worktree-janitor: $_CC_WJ_ACTIVE_ERROR; claims are incomplete" >&2
+      return 2
+    fi
+    _cc_wj_print_claims "$session_grace_hours" "$claims_filter"
+    return $?
   fi
 
   # Asked once, before discovery, so the reason a scan came back empty is on the
@@ -1155,7 +2088,13 @@ _cc_wj_run() {
   if [ "${#explicit_repos[@]}" -gt 0 ]; then
     repos=("${explicit_repos[@]}")
   else
+    local repo_keys="" key
     while IFS= read -r r; do
+      [ -n "$r" ] || continue
+      key="$(git -C "$r" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+      [ -n "$key" ] || continue
+      case $'\n'"$repo_keys"$'\n' in *$'\n'"$key"$'\n'*) continue ;; esac
+      repo_keys="${repo_keys}${repo_keys:+$'\n'}$key"
       repos+=("$r")
     done < <(_cc_wj_discover_repos)
   fi
@@ -1175,14 +2114,21 @@ _cc_wj_run() {
   local prune_repos=()
 
   # Holder scans, taken once per run into files and taken again right before each removal.
-  local work LSOF_OK="yes"
+  local work LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
   work="$(mktemp -d "${TMPDIR:-/tmp}/cc-wj.XXXXXX")" || {
     echo "worktree-janitor: no temporary directory for the process scan; scanned and removed nothing" >&2
     return 1
   }
+  _CC_WJ_TRANSCRIPT_CACHE_ROOT="$work/transcript-cache"
+  _CC_WJ_TRANSCRIPT_CACHE_GENERATION=0
   if ! _cc_wj_scan_holders "$work"; then
     LSOF_OK="no"
     echo "worktree-janitor: the process scan failed or saw nothing, so no worktree can be shown unheld" >&2
+  fi
+  if ! _cc_wj_scan_active_sessions "$session_grace_hours"; then
+    ACTIVE_OK="no"
+    activity_blind=1
+    echo "worktree-janitor: $_CC_WJ_ACTIVE_ERROR, so no worktree can be shown free of active sessions" >&2
   fi
 
   # The checkout the calling session stands in, kept whatever else is true of it:
@@ -1201,7 +2147,7 @@ KEEP
   local repo lock skipped=0
   # Declared once, outside the loop: zsh prints the value of an already-set local that is
   # declared again.
-  local active landed idle classification wt_phys git_keep head0 bytes kp
+  local active lease landed idle classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count
   for repo in "${repos[@]}"; do
     if [ ! -d "$repo" ]; then
       continue
@@ -1217,6 +2163,17 @@ KEEP
       _cc_wj_lock "$lock" || { skipped=1; continue; }
     fi
 
+    # Discovery also sees ordinary clones with no linked worktree. They have nothing this
+    # janitor can reclaim, so do not fetch their origin or load repository policy. Keep
+    # failures on the ordinary path below, where they are reported fail-closed.
+    if git -C "$repo" worktree list --porcelain > "$work/preflight-inventory" 2>/dev/null; then
+      linked_count="$(grep -c '^worktree ' "$work/preflight-inventory")"
+      if [ "$linked_count" -le 1 ]; then
+        [ -n "$lock" ] && _cc_wj_unlock "$lock"
+        continue
+      fi
+    fi
+
     if ! _cc_wj_prepare_base "$repo"; then
       echo "worktree-janitor: $repo: $_CC_WJ_BASE_WHY, so no worktree in it can be shown landed"
     fi
@@ -1230,7 +2187,6 @@ KEEP
       [ -n "$lock" ] && _cc_wj_unlock "$lock"
       continue
     fi
-
     while IFS=$'\t' read -r wt_path branch dirty ahead push_state pins; do
 
       if [ "$dirty" = "UNSAFE-PATH" ]; then
@@ -1253,9 +2209,39 @@ KEEP
         continue
       fi
 
-      active="no"
-      if [ "$LSOF_OK" = "no" ] || _cc_wj_held "$work" "$wt_path"; then
-        active="yes"
+      active="n/a"
+      active_detail="-"
+      lease="n/a"
+      lease_detail="-"
+      # A dirty or unreadable git state already keeps the worktree. Do not spend seconds
+      # rereading large harness transcripts to prove an additional keep reason that cannot
+      # change the outcome. Clean candidates still take every holder/session veto below.
+      if [ "$dirty" = "0" ]; then
+        active="no"
+        lease="no"
+        if [ "$LSOF_OK" = "no" ] || _cc_wj_held "$work" "$wt_path"; then
+          active="yes"
+          active_detail="process holder"
+        elif [ "$ACTIVE_OK" != "yes" ]; then
+          active="yes"
+          active_detail="$_CC_WJ_ACTIVE_ERROR"
+        else
+          # A direct recent cwd lease is an in-memory lookup and already vetoes removal.
+          # Ask it before parsing every live transcript for structured tool paths.
+          _cc_wj_recent_claim "$wt_path" "$session_grace_hours" cwd; recent_rc=$?
+          case "$recent_rc" in
+            0) lease="yes"; lease_detail="$_CC_WJ_RECENT_REASON" ;;
+            2) active="yes"; active_detail="$_CC_WJ_ACTIVE_ERROR"; ACTIVE_OK="no"; activity_blind=1 ;;
+          esac
+          if [ "$active" = "no" ] && [ "$lease" = "no" ]; then
+            _cc_wj_active_claim "$wt_path"; active_rc=$?
+            case "$active_rc" in
+              0) active="yes"; active_detail="$_CC_WJ_ACTIVE_REASON" ;;
+              2) active="yes"; active_detail="$_CC_WJ_ACTIVE_ERROR"; ACTIVE_OK="no"; activity_blind=1 ;;
+              3) lease="yes"; lease_detail="$_CC_WJ_RECENT_REASON" ;;
+            esac
+          fi
+        fi
       fi
 
       # Asked only of a worktree the cheaper gates have not already kept: the landed proofs
@@ -1263,7 +2249,7 @@ KEEP
       landed="-"
       idle="-"
       head0="$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)"
-      if [ "$dirty" = "0" ] && [ "$active" = "no" ]; then
+      if [ "$dirty" = "0" ] && [ "$active" = "no" ] && [ "$lease" = "no" ]; then
         landed="$(_cc_wj_landed "$wt_path")"
         case "$landed" in
           ancestor|content|pr) idle="$(_cc_wj_idle "$wt_path" "$idle_hours")" ;;
@@ -1289,13 +2275,28 @@ KEEP
           *) classification="KEEP($git_keep)" ;;
         esac
       fi
+      # Structured transcript matching is the expensive recent-session proof. Ask it
+      # only for a worktree every cheaper gate would otherwise make removable; direct
+      # cwd leases were checked above. `--claims PATH` remains the explicit full scan.
+      if [ -z "$classification" ] && [ "$dirty" = "0" ] && [ "$active" = "no" ] &&
+         [ "$lease" = "no" ] &&
+         { [ "$landed" = ancestor ] || [ "$landed" = content ] || [ "$landed" = pr ]; } &&
+         [ "$idle" = "yes" ]; then
+        _cc_wj_recent_claim "$wt_path" "$session_grace_hours" tool; recent_rc=$?
+        case "$recent_rc" in
+          0) lease="yes"; lease_detail="$_CC_WJ_RECENT_REASON" ;;
+          2) active="yes"; active_detail="$_CC_WJ_ACTIVE_ERROR"; ACTIVE_OK="no"; activity_blind=1 ;;
+        esac
+      fi
       [ -n "$classification" ] ||
-        classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle")
+        classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle" "$lease")
 
       printf "  WORKTREE  %s\n" "$wt_path"
-      printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s  landed=%s  idle=%s\n" \
-        "$branch" "$dirty" "$ahead" "$push_state" "$active" "$landed" "$idle"
+      printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s  recent=%s  landed=%s  idle=%s\n" \
+        "$branch" "$dirty" "$ahead" "$push_state" "$active" "$lease" "$landed" "$idle"
       printf "    classification: %s\n" "$classification"
+      [ "$active_detail" = "-" ] || printf "    active claim: %s\n" "$active_detail"
+      [ "$lease_detail" = "-" ] || printf "    session lease: %s\n" "$lease_detail"
       if [ "$dirty" != "0" ] && [ "${pins:--}" != "-" ]; then
         printf "    kept by: %s\n" "$pins"
         case "$pins" in
@@ -1316,6 +2317,43 @@ KEEP
         REMOVABLE)
           total_removable=$((total_removable + 1))
           if [ "$apply" -eq 1 ]; then
+            # A task can start after the inventory snapshot without yet opening any file
+            # in the worktree.  Refresh both harness registries before the destructive
+            # path, then refresh holders/content/idleness as before.
+            if ! _cc_wj_scan_active_sessions "$session_grace_hours"; then
+              ACTIVE_OK="no"; activity_blind=1
+              printf "    → kept: %s, so active sessions are unknown\n" "$_CC_WJ_ACTIVE_ERROR"
+              total_kept=$((total_kept + 1))
+              continue
+            fi
+            _cc_wj_active_claim "$wt_path"; active_rc=$?
+            case "$active_rc" in
+              0)
+                printf "    → kept: %s; claim appeared before removal\n" "$_CC_WJ_ACTIVE_REASON"
+                total_kept=$((total_kept + 1))
+                continue
+                ;;
+              2)
+                ACTIVE_OK="no"; activity_blind=1
+                printf "    → kept: %s, so active sessions are unknown\n" "$_CC_WJ_ACTIVE_ERROR"
+                total_kept=$((total_kept + 1))
+                continue
+                ;;
+            esac
+            _cc_wj_recent_claim "$wt_path" "$session_grace_hours"; recent_rc=$?
+            case "$recent_rc" in
+              0)
+                printf "    → kept: %s; recent-session lease appeared before removal\n" "$_CC_WJ_RECENT_REASON"
+                total_kept=$((total_kept + 1))
+                continue
+                ;;
+              2)
+                ACTIVE_OK="no"; activity_blind=1
+                printf "    → kept: %s, so recent sessions are unknown\n" "$_CC_WJ_ACTIVE_ERROR"
+                total_kept=$((total_kept + 1))
+                continue
+                ;;
+            esac
             # Everything above was decided from scans taken before the loop began, and
             # another session can have entered this worktree or written into it since.
             # Asked again against fresh scans, immediately before the one irreversible step.
@@ -1409,7 +2447,31 @@ KEEP
   # held lock was not swept either.
   [ "$blind" -eq 1 ] && return 1
   [ "$skipped" -eq 1 ] && return 1
+  [ "$activity_blind" -eq 1 ] && return 1
   return 0
+}
+
+# Delimit unattended output even when the inner run exits through an early validation or
+# discovery failure. The wrapper owns only scheduled evidence; manual reports retain their
+# established output shape for callers and tests.
+_cc_wj_run() {
+  local arg scheduled=0 started rc
+  for arg in "$@"; do
+    [ "$arg" = --scheduled ] && scheduled=1
+  done
+  if [ "$scheduled" -eq 1 ]; then
+    _cc_wj_bound_log "$HOME/.cc-reaper/logs/launchd-worktree-janitor-stdout.log"
+    _cc_wj_bound_log "$HOME/.cc-reaper/logs/launchd-worktree-janitor-stderr.log"
+    started="$(date +%s)"
+    printf '== worktree-janitor scheduled sweep started %s pid=%s\n' \
+      "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$$"
+  fi
+  _cc_wj_run_inner "$@"; rc=$?
+  if [ "$scheduled" -eq 1 ]; then
+    printf '== worktree-janitor scheduled sweep ended %s elapsed=%ss status=%s\n' \
+      "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$(( $(date +%s) - started ))" "$rc"
+  fi
+  return "$rc"
 }
 
 # ─── Session mode ─────────────────────────────────────────────────────────────
@@ -1422,8 +2484,8 @@ _cc_wj_gib() {
   esac
 }
 
-# `--session`: the inventory for the repository a Claude Code session stood in, meant to
-# run as a SessionEnd hook.
+# `--session`: the inventory for the repository a Claude Code or Codex session stood in,
+# meant to run through hooks/worktree-session-end.sh.
 #
 # Why a session and not a schedule: a LaunchAgent cannot read `~/Documents`, measured
 # 2026-08-30, which is why the inventory was never scheduled. A session's processes run
@@ -1481,7 +2543,9 @@ _cc_wj_session() {
     mkdir -p "$(dirname "$log")" 2>/dev/null
     _cc_wj_bound_log "$log"
     script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    export CC_WJ_DETACHED=1 CC_WJ_SESSION_DIR="${CLAUDE_PROJECT_DIR:-$PWD}" CC_WJ_SESSION_CWD="$hook_cwd" \
+    export CC_WJ_DETACHED=1 \
+      CC_WJ_SESSION_DIR="${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}" \
+      CC_WJ_SESSION_CWD="$hook_cwd" \
       CC_WJ_SESSION_CWD_UNPARSED="$unparsed"
     if command -v perl >/dev/null 2>&1; then
       perl -MPOSIX -e 'pipe(my $r, my $w) or exit 1; defined(my $p = fork) or exit 1;
@@ -1505,7 +2569,7 @@ _cc_wj_session() {
   [ -n "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 && dir="$cwd"
   t0="$(date +%s)"
   free0="$(_cc_wj_free_kb)"
-  echo "== worktree-janitor session sweep $(date '+%Y-%m-%dT%H:%M:%S%z') $dir (pid $$)"
+  echo "== worktree-janitor ${CC_WJ_HARNESS:-unknown} session sweep $(date '+%Y-%m-%dT%H:%M:%S%z') $dir (pid $$)"
   common="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   if [ -z "$common" ]; then
     echo "worktree-janitor: $dir is not inside a git repository; swept nothing"
