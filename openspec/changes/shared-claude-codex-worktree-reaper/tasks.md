@@ -18,7 +18,7 @@
 - [x] 2.11 Prove one activity snapshot indexes a large transcript once across multiple candidate paths.
 - [x] 2.12 Prove the actual LaunchAgent logs are bounded and scheduled runs have start/end evidence.
 - [x] 2.13 Prove unchanged transcript indexes persist across scheduled snapshots and a changed transcript invalidates them.
-- [x] 2.14 Prove multiple candidate paths start at most one transcript-query interpreter per activity snapshot without weakening malformed-record fail-closed behavior.
+- [x] 2.14 Prove multiple candidate paths start at most one transcript-query interpreter per activity snapshot without weakening malformed-record, non-UTF-8 path, or interrupted-run safety.
 
 ## 3. Implementation
 

@@ -22,6 +22,10 @@ export LSOF_CWD_FILE LSOF_OPEN_FILE LSOF_LOCK_FILE LSOF_LOCK_CALLS
 
 cat > "$BIN/lsof" <<'STUB'
 #!/usr/bin/env bash
+if [ -n "${LSOF_SLEEP_MARKER:-}" ]; then
+  : > "$LSOF_SLEEP_MARKER"
+  sleep "${LSOF_SLEEP_SECONDS:-2}"
+fi
 case " $* " in
   *" +D "*)
     printf 'x\n' >> "$LSOF_LOCK_CALLS"
@@ -538,6 +542,17 @@ check "JSON-escaped Unicode tool paths survive the shared fast path" test "$esca
 escaped_query_processes="$(wc -l < "$escaped_query_trace" | tr -d ' ')"
 check "the normalized Unicode claim reuses one interpreter" test "$escaped_query_processes" -eq 1
 
+byte_target="$CASE/"$'\377'"-worktree"
+byte_transcript="$CASE/non-utf8-rollout.jsonl"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' \
+  '{"type":"response_item","payload":{"type":"custom_tool_call","input":"workdir='"$CASE"'/\udcff-worktree"}}' > "$byte_transcript"
+byte_cache_dir="$CASE/non-utf8-transcript-cache"
+byte_result="$(LC_ALL=C CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DIR="$byte_cache_dir" \
+  bash -c 'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?; _cc_wj_transcript_claims_path Codex "$2" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
+  _ "$WJ" "$byte_transcript" "$cache_other" "$byte_target")"
+check "a surrogate-escaped filesystem byte survives the shared fast path" test "$byte_result" = "1 0"
+
 mixed_target="$CASE/café-worktree"
 mixed_transcript="$CASE/mixed-escaped-rollout.jsonl"
 python3 - "$mixed_transcript" "$CASE" <<'PY'
@@ -632,6 +647,25 @@ new_fixture scheduled-apply
 age_worktree 72
 CC_WJ_SCHEDULE_APPLY=1 run_wj --scheduled >/dev/null 2>&1
 check "scheduled mode applies when the cc-reaper policy opts in" test ! -d "$WT"
+
+new_fixture interrupted-temp-cleanup
+interrupt_tmp="$CASE/tmp"; interrupt_marker="$CASE/lsof-started"
+mkdir -p "$interrupt_tmp"
+env PATH="$BIN:$PATH" TMPDIR="$interrupt_tmp" LSOF_SLEEP_MARKER="$interrupt_marker" \
+  LSOF_SLEEP_SECONDS=2 CC_WJ_CONFIG="$CASE/no-config" CC_WJ_LOG="$CASE/wj.log" \
+  CC_WJ_STATE_DIR="$CASE/state" CC_WJ_CLAUDE_SESSIONS="$CLAUDE_SESSIONS" \
+  CC_WJ_CLAUDE_PROJECTS="$CLAUDE_PROJECTS" CC_WJ_CODEX_LOCKS="$CODEX_LOCKS" \
+  CC_WJ_CODEX_STATE_DB="$CODEX_STATE" CC_WJ_NOTIFY_MIN_GB=999999 \
+  bash "$WJ" --repo "$PRIMARY" >/dev/null 2>&1 &
+interrupt_pid=$!
+for _ in 1 2 3 4 5; do
+  [ -e "$interrupt_marker" ] && break
+  sleep 1
+done
+kill -TERM "$interrupt_pid" 2>/dev/null || true
+wait "$interrupt_pid" 2>/dev/null || true
+interrupt_dirs="$(find "$interrupt_tmp" -maxdepth 1 -type d -name 'cc-wj.*' | wc -l | tr -d ' ')"
+check "an interrupted run removes its private transcript projection directory" test "$interrupt_dirs" -eq 0
 
 new_fixture harness-discovery
 age_worktree 72

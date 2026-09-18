@@ -734,7 +734,7 @@ try:
                             continue
                         values.extend(event_searchable_texts(event))
                     search_payload = b"\0".join(
-                        value.encode("utf-8", "surrogatepass")
+                        value.encode("utf-8", "surrogateescape")
                         for value in values
                     )
                     try:
@@ -2037,6 +2037,18 @@ _cc_wj_maybe_notify() {
   osascript -e "display notification \"${msg}\" with title \"cc-reaper: worktree-janitor\"" 2>/dev/null || true
 }
 
+_cc_wj_remove_private_temp() {
+  local directory="${1:-}"
+  [ -d "$directory" ] || return 0
+  case "${directory##*/}" in
+    cc-wj.??????) rm -rf -- "$directory" ;;
+    *)
+      echo "worktree-janitor: refused to remove unexpected temporary path: $directory" >&2
+      return 1
+      ;;
+  esac
+}
+
 # ─── Removal ──────────────────────────────────────────────────────────────────
 
 # Remove a single worktree, never with force. Ignored residue does not stop a plain
@@ -2278,11 +2290,22 @@ _cc_wj_run_inner() {
   local prune_repos=()
 
   # Holder scans, taken once per run into files and taken again right before each removal.
-  local work LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
+  local work old_traps="" LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
   work="$(mktemp -d "${TMPDIR:-/tmp}/cc-wj.XXXXXX")" || {
     echo "worktree-janitor: no temporary directory for the process scan; scanned and removed nothing" >&2
     return 1
   }
+  # Installed and hook-triggered runs execute under bash. Preserve any caller traps,
+  # then register cleanup before transcript projections can materialize normalized
+  # tool input in this private directory. zsh only sources this file for helper tests;
+  # its `trap -p` is incompatible and no installed run executes through that path.
+  if [ -n "${BASH_VERSION:-}" ]; then
+    old_traps="$(trap -p EXIT INT TERM HUP)"
+    trap '_cc_wj_remove_private_temp "$work"' EXIT
+    trap '_cc_wj_remove_private_temp "$work"; exit 130' INT
+    trap '_cc_wj_remove_private_temp "$work"; exit 143' TERM
+    trap '_cc_wj_remove_private_temp "$work"; exit 129' HUP
+  fi
   _CC_WJ_TRANSCRIPT_CACHE_ROOT="$work/transcript-cache"
   _CC_WJ_TRANSCRIPT_CACHE_GENERATION=0
   if ! _cc_wj_scan_holders "$work"; then
@@ -2573,7 +2596,11 @@ KEEP
 
     [ -n "$lock" ] && _cc_wj_unlock "$lock"
   done
-  rm -rf "$work"
+  _cc_wj_remove_private_temp "$work"
+  if [ -n "${BASH_VERSION:-}" ]; then
+    trap - EXIT INT TERM HUP
+    [ -z "$old_traps" ] || eval "$old_traps"
+  fi
 
   # Run git worktree prune on repos that had removals or missing dirs (deduped).
   #

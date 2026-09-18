@@ -39,6 +39,9 @@ is reread before its evidence can participate in a destructive decision. The per
 index and per-run offset file contain byte ranges and file identity only, never transcript
 records or tool-call content. Only the ephemeral search projection contains normalized tool
 input text, and it is discarded with the private run directory.
+Installed bash runs register signal and exit cleanup immediately after that directory is
+created, before any projection is written. Projection encoding uses surrogate escapes so a
+non-UTF-8 filesystem byte remains the same byte the shell passes to fixed-string matching.
 If a Codex writer lock closes while its captured rollout is being read, the janitor remaps
 that task through current Codex state. An archived task becomes bounded recent-session
 evidence for only its mapped cwd and structured tool paths; the expected rollout move does

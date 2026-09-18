@@ -51,6 +51,8 @@ unmappable verified-live claim SHALL make the destructive run fail closed.
 - **AND** its normalized structured tool inputs are materialized at most once for that snapshot
 - **AND** matching another candidate does not start another interpreter for that transcript
 - **AND** malformed relevant evidence still uses the exact parser and fails closed
+- **AND** non-UTF-8 filesystem path bytes round-trip through normalized evidence
+- **AND** normal completion or an interrupt removes the private projection directory
 - **AND** the pre-removal activity refresh builds a new snapshot before destructive action
 - **AND** structured active and recent transcript matching is skipped when a cheaper gate already keeps the worktree
 

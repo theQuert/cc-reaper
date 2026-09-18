@@ -174,7 +174,8 @@ normalized structured-tool input into a private, ephemeral search projection, so
 candidates do not start another interpreter for the same transcript. Malformed relevant
 records bypass that fast path and retain exact fail-closed parsing. The persistent index
 contains only file identity and byte ranges; the temporary projection is discarded with the
-run. The destructive recheck starts a fresh snapshot, so this avoids repeated decoding
+run, including when a scheduled sweep is interrupted. Filesystem bytes outside UTF-8 are
+round-tripped rather than rewritten. The destructive recheck starts a fresh snapshot, so this avoids repeated decoding
 without weakening the final race gate.
 
 ## Five ways a reclaimer silently reclaims nothing
