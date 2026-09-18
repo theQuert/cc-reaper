@@ -516,6 +516,24 @@ escaped_result="$(CC_WJ_CONFIG="$CASE/no-config" bash -c \
   _ "$WJ" "$escaped_transcript" "$escaped_target")"
 check "JSON-escaped Unicode tool paths survive the byte prefilter" test "$escaped_result" = 0
 
+mixed_target="$CASE/café-worktree"
+mixed_transcript="$CASE/mixed-escaped-rollout.jsonl"
+python3 - "$mixed_transcript" "$CASE" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+user = {"type": "response_item", "payload": {"type": "message", "role": "user", "content": "finish task"}}
+tool = {"type": "response_item", "payload": {"type": "custom_tool_call", "input": f"workdir={sys.argv[2]}/café-worktree"}}
+encoded_tool = json.dumps(tool).replace("/", r"\/").replace(r"\u00e9", r"\u00E9")
+path.write_text(json.dumps(user) + "\n" + encoded_tool + "\n")
+PY
+mixed_result="$(CC_WJ_CONFIG="$CASE/no-config" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; printf "%s\n" "$?"' \
+  _ "$WJ" "$mixed_transcript" "$mixed_target")"
+check "mixed solidus and uppercase Unicode escapes retain a tool claim" test "$mixed_result" = 0
+
 persistent_dir="$CASE/persistent-transcript-index"; persistent_trace="$CASE/persistent-trace"
 for generation in one two; do
   CC_WJ_TRANSCRIPT_CACHE_DIR="$CASE/cache-$generation" \

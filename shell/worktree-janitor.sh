@@ -622,19 +622,22 @@ try:
                     if begin < 0 or end > len(contents) or begin >= end:
                         raise SystemExit(2)
                     # The offset index deliberately keeps every current-turn tool/user
-                    # record, including multi-megabyte results. Most transcripts cannot
-                    # name this candidate: reject them with mmap's byte search before
-                    # decoding a huge JSON value. Include both UTF-8 and JSON-escaped
-                    # spellings so non-ASCII or quoted paths retain exact behavior.
+                    # record, including multi-megabyte results. Decode every actual tool
+                    # call so JSON's many equivalent escape spellings retain exact claim
+                    # behavior; skip only records with no canonical harness tool marker.
+                    tool_marker = (
+                        b'"custom_tool_call"' if mode == "codex-claim" else b'"tool_use"'
+                    )
+                    has_tool_marker = contents.find(tool_marker, begin, end) >= 0
                     names_target = any(
                         contents.find(needle, begin, end) >= 0 for needle in target_needles
                     )
-                    if not names_target:
+                    if not has_tool_marker and not names_target:
                         continue
                     try:
                         event = json.loads(contents[begin:end])
                     except (UnicodeDecodeError, json.JSONDecodeError):
-                        if names_target:
+                        if names_target or has_tool_marker:
                             raise SystemExit(2)
                         continue
                     if isinstance(event, dict) and mode == "codex-claim":
