@@ -18,6 +18,13 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Yield CPU and disk bandwidth to active development sessions. -->
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
     <key>StandardOutPath</key>
     <string>__HOME__/.cc-reaper/logs/launchd-stdout.log</string>
 

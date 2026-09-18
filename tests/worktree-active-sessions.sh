@@ -724,6 +724,15 @@ check "the next run removes a private directory whose owner died" test ! -d "$sc
 check "the scavenger preserves a new directory before its owner marker is written" test -d "$scavenge_tmp/cc-wj.NEWONE"
 check "the scavenger preserves a private directory whose owner is alive" test -d "$scavenge_tmp/cc-wj.LIVE01"
 
+if command -v zsh >/dev/null 2>&1; then
+  empty_scavenge_tmp="$CASE/empty-scavenge-tmp"
+  mkdir -p "$empty_scavenge_tmp"
+  TMPDIR="$empty_scavenge_tmp" zsh -c 'source "$1"; _cc_wj_scavenge_private_temp' _ "$WJ"
+  check "zsh accepts an empty private-temp root" test $? -eq 0
+else
+  ok "zsh not installed, empty private-temp root case skipped"
+fi
+
 captured_pid_file="$CASE/captured-run-pid"
 captured_pid_result="$(bash -c \
   'source "$1"; ( _cc_wj_capture_run_pid; printf "%s\n" "$_CC_WJ_RUN_PID" > "$2" ) & child=$!; wait "$child"; printf "%s %s\n" "$child" "$(cat "$2")"' \

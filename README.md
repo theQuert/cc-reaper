@@ -489,6 +489,50 @@ launchctl bootout "gui/$(id -u)" \
 
 Rerunning `install.sh` enables and reloads the agent.
 
+### Tune worktree retention to your development pace
+
+The 48-hour defaults are a policy choice, not a hard-coded assumption. A worktree is
+eligible only after **both** time windows have expired, and an active Claude/Codex claim,
+process holder, unlanded commit, unrebuildable file, worktree lock, or populated submodule
+still vetoes removal regardless of age.
+
+| Setting | Default | Where to set it | Effect |
+|---|---:|---|---|
+| `CC_WJ_IDLE_HOURS` | `48` | `~/.cc-reaper/worktree-janitor.conf` | Minimum time since worktree files or git administrative state changed. |
+| `CC_WJ_SESSION_GRACE_HOURS` | `48` | `~/.cc-reaper/worktree-janitor.conf` | Lease after the latest mapped Claude transcript activity or Codex task update/archive. This protects an accidentally archived task even when its live writer lock disappears. |
+| `CC_REAPER_WORKTREE_INTERVAL_SECONDS` | `21600` (6 hours) | Environment when running `./install.sh` | How often launchd checks. Accepted range: `300` through `604800`; this changes detection latency, not eligibility. Repeat the value on later installs. |
+| `CC_WJ_SESSION_APPLY` | `1` | `~/.cc-reaper/worktree-janitor.conf` | `0` makes SessionEnd-triggered sweeps report-only. |
+| `CC_WJ_SCHEDULE_APPLY` | `1` | `~/.cc-reaper/worktree-janitor.conf` | `0` makes scheduled sweeps report-only. |
+| `CC_WJ_ROOT` | `~/GitHub` | `~/.cc-reaper/worktree-janitor.conf` | Colon-separated ordinary source roots to inventory. Claude/Codex-owned worktree roots are discovered separately. |
+
+For a slower workflow, extend both retention gates rather than only slowing the schedule.
+For example, this keeps settled worktrees for at least 14 days and checks twice a day:
+
+```bash
+# ~/.cc-reaper/worktree-janitor.conf
+: "${CC_WJ_IDLE_HOURS:=336}"
+: "${CC_WJ_SESSION_GRACE_HOURS:=336}"
+: "${CC_WJ_SESSION_APPLY:=1}"
+: "${CC_WJ_SCHEDULE_APPLY:=1}"
+: "${CC_WJ_ROOT:=$HOME/GitHub}"
+
+# Regenerate and reload the LaunchAgent with a 12-hour check interval.
+CC_REAPER_WORKTREE_INTERVAL_SECONDS=43200 CC_REAPER_DAEMON=b ./install.sh
+```
+
+The installer preserves an operator-edited `~/.cc-reaper/worktree-janitor.conf` instead of
+overwriting it. An explicit environment value overrides that file for one invocation, which
+is useful for a report-only policy check:
+
+```bash
+CC_WJ_IDLE_HOURS=336 CC_WJ_SESSION_GRACE_HOURS=336 \
+  ~/.cc-reaper/worktree-janitor.sh --repo "$HOME/GitHub/example"
+```
+
+Do not set either time gate shorter than the longest normal pause in your workflow. Keeping
+the schedule frequent is safe: it only re-evaluates the gates, and cannot make a live or
+otherwise protected worktree removable.
+
 ### Observe claims and cleanup decisions
 
 The claims diagnostic never fetches, prunes, or removes anything. Filter by thread/session
