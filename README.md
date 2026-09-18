@@ -1,6 +1,6 @@
 # cc-reaper
 
-Automated cleanup for orphan Claude Code processes (subagents, MCP servers, plugins) that leak memory after sessions end.
+Automated cleanup for orphan Claude Code/Codex processes and settled git worktrees that leak memory or disk after sessions end.
 
 ## The Problem
 
@@ -104,22 +104,33 @@ Commands available after restart:
 - `claude-guard` — automatic session reaper: kills FD-leaking, bloated (RSS > threshold), and excess idle sessions
 - `claude-guard --dry-run` — preview what claude-guard would kill without actually killing
 
-### 2. Claude Code Stop Hook
+### 2. Claude and Codex lifecycle hooks
 
-Copy the hook script:
+`install.sh` deploys both shared hook implementations under `~/.cc-reaper/`. It also
+migrates Claude's global `~/.claude/settings.json`; Codex hook files are normally checked
+into each repository, so pass that repository explicitly or edit its `.codex/hooks.json`.
+Legacy Claude orphan cleanup registered on `SessionEnd` is moved to `Stop` during migration.
 
 ```bash
-mkdir -p ~/.claude/hooks
-cp hooks/stop-cleanup-orphans.sh ~/.claude/hooks/
-chmod +x ~/.claude/hooks/stop-cleanup-orphans.sh
+# Optional: migrate one or more Codex repositories while installing.
+CC_REAPER_CODEX_REPOS="$HOME/GitHub/repo-a:$HOME/GitHub/repo-b" ./install.sh
 ```
 
-Add to `~/.claude/settings.json` in the `"Stop"` hooks array:
+For a manual installation, copy both hooks to cc-reaper's own runtime directory:
+
+```bash
+mkdir -p ~/.cc-reaper
+cp hooks/stop-cleanup-orphans.sh hooks/worktree-session-end.sh ~/.cc-reaper/
+chmod +x ~/.cc-reaper/stop-cleanup-orphans.sh ~/.cc-reaper/worktree-session-end.sh
+```
+
+Add the process cleanup command to the `"Stop"` array in Claude's global
+`~/.claude/settings.json` or the repository's `.codex/hooks.json`:
 
 ```json
 {
   "type": "command",
-  "command": "\"$HOME\"/.claude/hooks/stop-cleanup-orphans.sh",
+  "command": "\"$HOME\"/.cc-reaper/stop-cleanup-orphans.sh",
   "timeout": 15
 }
 ```
@@ -135,7 +146,7 @@ Add to `~/.claude/settings.json` in the `"Stop"` hooks array:
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME\"/.claude/hooks/stop-cleanup-orphans.sh",
+            "command": "\"$HOME\"/.cc-reaper/stop-cleanup-orphans.sh",
             "timeout": 15
           }
         ]
@@ -146,6 +157,34 @@ Add to `~/.claude/settings.json` in the `"Stop"` hooks array:
 ```
 
 </details>
+
+`Stop` is emitted after a completed assistant turn and can happen many times in one
+session. `SessionEnd` is emitted by the Claude or Codex host when that session/task is
+actually closed; cc-reaper does not infer it from process age or transcript timestamps.
+The host passes the event JSON on stdin. The shared SessionEnd entrypoint validates that
+payload, protects its `cwd`, detaches the sweep, and returns promptly:
+
+```json
+{
+  "type": "command",
+  "command": "\"$HOME\"/.cc-reaper/worktree-session-end.sh codex",
+  "timeout": 10
+}
+```
+
+Use `claude` instead of `codex` in Claude's global hook. A missing, ambiguous, or invalid
+event `cwd` makes that SessionEnd sweep report-only; it never guesses which checkout just
+closed.
+
+Archiving a task in the Claude or Codex app is **not guaranteed to emit `SessionEnd`**.
+Observed Codex app behavior changes the task to `notLoaded` and releases its writer lock
+without running the repository hook. SessionEnd is therefore only a best-effort
+low-latency trigger; the independent LaunchAgent schedule is the guarantee layer. Once the
+writer lock is gone, the archived task no longer counts as live, but its archive/update
+time starts a separate 48-hour recent-session lease. This prevents an old worktree from
+becoming immediately removable after an accidental archive. Claude uses recent transcript
+activity for the same bounded lease. Every other landed, content, holder, idle, lock, and
+submodule gate still applies after the lease expires.
 
 > **⚠️ Safety**: The Stop hook now includes built-in safety mechanisms:
 > - **Orphan-only filtering**: By default, only kills processes whose parent has already exited — those reparented to an *orphan parent*. On macOS that is PID 1 (launchd); on Linux it is PID 1 **or the invoking user's `systemd --user` manager** (the per-user reparent target — Linux orphans land there, not on PID 1). This is the definitive indicator of orphan status — unlike TTY filtering, it works correctly in SSH, Docker, tmux, and all terminal environments. Active Claude sessions, subagents, and shared MCP servers (still parented by a live process) are never killed.
@@ -417,15 +456,118 @@ Beyond process hygiene, cc-reaper ships three system-level janitors (added after
 | `resource-watch.sh` | every 10 min (launchd) | Single-pass snapshot (load / CPU idle / memory / disk) to `~/.cc-reaper/logs/resource-watch.log`; macOS notification when load > 2× cores, disk free < 15%, or memory is critically tight. Per-metric 60-min cooldown. |
 | `disk-janitor.sh --check` | hourly (launchd) | **Read-only**: disk free % + Time Machine local-snapshot pin detection (snapshots holding freed space hostage after big deletes), plus a **report** of stale scratch checkouts under `/private/tmp` — directories nothing has open, holding no git repository, older than `CC_DJ_TMP_AGE_DAYS` and over `CC_DJ_TMP_MIN_MB`. It names them and never removes them: `/private/tmp` is world-writable and age plus size does not establish that something is abandoned. Alerts, never deletes. |
 | `disk-janitor.sh --clean` | Sunday 04:00 (launchd) | Cleans **rebuildable-only** targets: go-build / yarn / pip / brew / bun caches, Spotify / ShipIt / CoreSimulator caches, docker **dangling images** (by explicit id — no `prune` verb, and tagged images are never removed) plus a **report** of unreferenced volumes with docker-generated-looking names, which are never deleted, TM snapshot thinning (dated `com.apple.TimeMachine.*` only, only when disk is below threshold). Tools are resolved from a known directory list, not the caller's `PATH`, because launchd supplies neither Homebrew nor Docker. |
-| `worktree-janitor.sh` | manual, or a SessionEnd hook (`--session`) | Inventories git worktrees under every root in `CC_WJ_ROOT` (colon-separated; defaults to `~/Documents/GitHub:~/GitHub:~/Documents`) or `--repo <path>`. A worktree is REMOVABLE only when **all** of these hold, and a check that cannot run keeps it: it holds nothing a command cannot rebuild (`git status --ignored`, discounting built-in caches and what the repository declares in **`.worktree-regenerable` on its base branch**, but never a credential-shaped file inside either); **no process on the machine** has its cwd there **or holds a file in it open**; its work has **landed** on the freshly fetched base branch - by ancestry, by content (squash merges), or by a merged PR at this exact head; and nothing in it changed within `CC_WJ_IDLE_HOURS` (default 6). A detached HEAD additionally needs ancestry, and a locked worktree (Claude Code locks its agent worktrees) or one with a populated submodule is always kept. The report names up to three entries that keep a worktree. **Dry-run by default** - only `--apply` removes, re-checking holders, contents and idleness right before each removal; branches are never deleted. `--session` returns at once and sweeps the session's repository detached, under a per-repository lock, logging to `~/.cc-reaper/logs/worktree-janitor-session.log`; it keeps the session's own checkout and **reports unless `CC_WJ_SESSION_APPLY=1`** and the hook input on stdin names one `cwd` that resolves - so `--session </dev/null` from cron or a wrapper only ever reports. The method and its failure modes: [docs/worktree-reclamation.md](docs/worktree-reclamation.md). A root that exists and cannot be read is reported and **fails the run**. |
+| `worktree-janitor.sh` | every 6 hours by default, Claude/Codex SessionEnd, or manual | Inventories ordinary source roots plus `~/.claude/worktrees` and `~/.codex/worktrees`, deduplicated by git common directory. A worktree is REMOVABLE only when **all** checks succeed: only regenerable content remains; no process has a cwd or open file there; no verified-live Claude/Codex session claims it by cwd or structured tool call; no mapped harness activity falls within the **48-hour recent-session lease**; its work landed on the freshly fetched base by ancestry, content, or exact-head merged PR; it has been untouched for **48 hours**; and it is neither locked nor carrying a populated submodule. The same activity, content, HEAD, idle and git-state gates are repeated immediately before removal. Direct invocation is dry-run unless `--apply`; the installed policy separately opts SessionEnd and the scheduled run into apply. `--claims [id\|path]` exposes live and recent claims read-only; `--landed PATH` exposes the shared landed proof. The installer boots out and archives the legacy Claude worktree LaunchAgent so two destructive policies cannot race. Branches are never deleted and removal never uses `--force`. Policy lives in `~/.cc-reaper/worktree-janitor.conf`, not Claude or Codex settings. See [the reclamation method](docs/worktree-reclamation.md). |
 
-Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`, `~/Desktop`), never runs any `docker prune`, never removes a tagged image, never removes **any** volume, never kills processes, scheduled runs never delete worktrees or prune their administrative records, and a SessionEnd `--session` run removes only with `CC_WJ_SESSION_APPLY=1` and a resolvable `cwd` in its hook input.
+### Worktree schedule
+
+The default LaunchAgent interval is 21,600 seconds (6 hours), with `RunAtLoad` enabled. It
+also covers app actions such as archive that may release a session without dispatching the
+repository's `SessionEnd` hook.
+Choose a fixed interval at install time with
+`CC_REAPER_WORKTREE_INTERVAL_SECONDS`; accepted values are 300 through 604,800 seconds:
+
+```bash
+# Every 12 hours. Repeat this value on later installer runs so the generated plist
+# keeps the same operator-selected cadence.
+CC_REAPER_WORKTREE_INTERVAL_SECONDS=43200 ./install.sh
+
+# Verify the installed value.
+plutil -p ~/Library/LaunchAgents/com.cc-reaper.worktree-janitor.plist | grep StartInterval
+```
+
+This is a launchd interval measured from agent loading, not a wall-clock cron expression.
+Changing it does not weaken either 48-hour gate or any active-session/content/landed
+check. `CC_WJ_SCHEDULE_APPLY=0` in `~/.cc-reaper/worktree-janitor.conf` keeps the schedule
+loaded but makes its runs report-only. To disable only this schedule while retaining the
+hooks:
+
+```bash
+launchctl disable "gui/$(id -u)/com.cc-reaper.worktree-janitor"
+launchctl bootout "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.cc-reaper.worktree-janitor.plist"
+```
+
+Rerunning `install.sh` enables and reloads the agent.
+
+### Observe claims and cleanup decisions
+
+The claims diagnostic never fetches, prunes, or removes anything. Filter by thread/session
+id or path to verify an archive lease directly:
+
+```bash
+# The archived Codex task should show state=archived, age, and remaining grace.
+~/.cc-reaper/worktree-janitor.sh --claims 01a0ab07-8ed5-7110-85e0-2a8f91d59c44
+
+# A path filter also shows recent structured tool calls when the task's own cwd stayed
+# in the primary checkout.
+~/.cc-reaper/worktree-janitor.sh --claims "$HOME/GitHub/example-worktrees/task"
+
+# Full report-only classification for one repository. A leased checkout prints
+# classification: KEEP(recent-session) plus a "session lease:" evidence line.
+~/.cc-reaper/worktree-janitor.sh --repo "$HOME/GitHub/example"
+
+# Observe unattended decisions and SessionEnd sweeps.
+tail -f ~/.cc-reaper/logs/launchd-worktree-janitor-stdout.log
+tail -f ~/.cc-reaper/logs/worktree-janitor-session.log
+```
+
+Every scheduled sweep is delimited by `scheduled sweep started` and `scheduled sweep ended`
+records carrying timestamp, pid, elapsed seconds, and exit status. The installed stdout and
+stderr files are bounded at 1 MiB per current file, with the prior segment retained as `.old`.
+
+`CC_WJ_SESSION_GRACE_HOURS` controls the recent-session lease independently of
+`CC_WJ_IDLE_HOURS`; both default to 48. Set either only with an explicit retention-policy
+decision. An expired lease merely removes that one veto—the worktree must still pass every
+other gate.
+
+The inventory indexes each live/recent transcript's current-two-user-turn byte ranges once
+per activity snapshot rather than rereading a multi-megabyte transcript for every candidate
+worktree. The index is temporary, stores offsets rather than transcript content, and is rebuilt
+for the pre-removal activity refresh. A Codex rollout moved by archive is remapped through the
+current state database and becomes path-scoped recent-session evidence instead of an active
+claim on unrelated worktrees.
+
+Scheduled sweeps reuse unchanged offset indexes from
+`~/.cc-reaper/state/transcript-index`. Reuse requires the same path, device, inode, size,
+and nanosecond modification time; any change rebuilds the index. These files contain only
+file identity and byte ranges, never transcript records or tool-call content.
+
+### Hook ownership
+
+The harness still decides *when* lifecycle events occur; cc-reaper owns only the two
+portable cleanup implementations below. Other safety, context, notification, validation,
+handoff, and repository-specific hooks remain owned by Claude/Codex or by the repository.
+
+| Event | Typical frequency | Extracted into cc-reaper | Shared command |
+|---|---|---|---|
+| `Stop` | after each completed assistant turn | process-orphan cleanup | `~/.cc-reaper/stop-cleanup-orphans.sh` |
+| `SessionEnd` | once when the host closes a session/task | worktree inventory and gated reclamation | `~/.cc-reaper/worktree-session-end.sh <claude\|codex>` |
+| `SessionStart`, `PreToolUse`, `PostToolUse`, `Notification` | host/repository-specific | no | remains in harness settings |
+
+Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`, `~/Desktop`) unless an operator explicitly adds a repository root there, never runs any `docker prune`, never removes a tagged image, never removes **any** volume, worktree cleanup never kills processes or deletes branches, and a hook payload whose own cwd cannot be established turns that SessionEnd sweep into a report.
 
 What the docker step *does* remove, changed 2026-08-30: dangling images — no tag points at them — by explicit id, computed from the current inventory, and skipped entirely if any inventory command fails. It previously ran `docker system prune -af`, which reaches every unused tagged image including ones that take hours to rebuild; that is not "rebuildable-only" and is gone. **Unused tagged images now survive.**
 
 Volumes are reported and never removed. A 64-hex name looks docker-generated but does not prove it — `docker volume create` accepts such a name from anyone, and `docker volume inspect` exposes no flag that separates the two — so the janitor prints a count and the command to review them, and leaves the decision to you.
 
-Config via env: `CC_RW_LOAD_FACTOR` / `CC_RW_DISK_MIN_PCT` / `CC_RW_MEM_MIN_PCT` / `CC_RW_COOLDOWN_SECS` (watch), `CC_DJ_DISK_MIN_PCT` / `CC_DJ_COOLDOWN_SECS` / `CC_DJ_TMP_DIRS` / `CC_DJ_TMP_AGE_DAYS` / `CC_DJ_TMP_MIN_MB` (disk — the stale temp **report**), `CC_WJ_ROOT` / `CC_WJ_IDLE_HOURS` / `CC_WJ_BASE_BRANCH` / `CC_WJ_SESSION_APPLY` / `CC_WJ_SESSION_LOG` / `CC_WJ_NOTIFY_MIN_GB` (worktree).
+Config via env: `CC_RW_LOAD_FACTOR` / `CC_RW_DISK_MIN_PCT` / `CC_RW_MEM_MIN_PCT` / `CC_RW_COOLDOWN_SECS` (watch), `CC_DJ_DISK_MIN_PCT` / `CC_DJ_COOLDOWN_SECS` / `CC_DJ_TMP_DIRS` / `CC_DJ_TMP_AGE_DAYS` / `CC_DJ_TMP_MIN_MB` (disk — the stale temp **report**), `CC_WJ_ROOT` / `CC_WJ_HARNESS_ROOTS` / `CC_WJ_IDLE_HOURS` / `CC_WJ_SESSION_GRACE_HOURS` / `CC_WJ_BASE_BRANCH` / `CC_WJ_SESSION_APPLY` / `CC_WJ_SCHEDULE_APPLY` / `CC_WJ_SESSION_LOG` / `CC_WJ_NOTIFY_MIN_GB` (worktree). The installed defaults are in `~/.cc-reaper/worktree-janitor.conf`; an explicit environment value wins for a one-shot run.
+
+Claude's global `settings.json` is migrated by `install.sh`. Codex hooks are repository-owned,
+so check both shared triggers into each repository's `.codex/hooks.json` (or pass a
+colon-separated list in `CC_REAPER_CODEX_REPOS` when installing):
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "\"$HOME\"/.cc-reaper/stop-cleanup-orphans.sh", "timeout": 15}]}
+    ],
+    "SessionEnd": [
+      {"hooks": [{"type": "command", "command": "\"$HOME\"/.cc-reaper/worktree-session-end.sh codex", "timeout": 10}]}
+    ]
+  }
+}
+```
 
 ## macOS Companion App (local)
 
@@ -496,6 +638,12 @@ This local app is currently unsigned and repository-staged. Packaging into `/App
 | Tool | Required | Install |
 |---|---|---|
 | bash/zsh | Required | Pre-installed on macOS/Linux |
+| Git 2.38+ | Required for worktree and content-landed checks | Xcode Command Line Tools or your package manager |
+| Python 3 | Required for hook migration and bounded Claude/Codex transcript-tail queries | Xcode Command Line Tools or your package manager |
+| `jq` | Required for harness registry parsing | `brew install jq` |
+| `sqlite3` | Required when Codex task claims are present | Pre-installed on macOS |
+| `lsof` | Required for cwd/open-file vetoes | Pre-installed on macOS/Linux |
+| GitHub CLI (`gh`) | Optional exact-head merged-PR landed proof | `brew install gh` |
 | macOS LaunchAgent | Option A (recommended) | Built-in, zero dependencies |
 | [proc-janitor](https://github.com/jhlee0409/proc-janitor) | Option B | `brew install jhlee0409/tap/proc-janitor` |
 | Claude Code | — | The tool this project cleans up after |
@@ -506,13 +654,17 @@ This local app is currently unsigned and repository-staged. Packaging into `/App
 cc-reaper/
 ├── install.sh                      # One-command installer/updater (interactive daemon choice)
 ├── hooks/
-│   └── stop-cleanup-orphans.sh     # Claude Code Stop hook (PPID=1 orphan filtering + pattern fallback)
+│   ├── stop-cleanup-orphans.sh     # Session orphan filtering + pattern fallback
+│   └── worktree-session-end.sh     # Shared Claude/Codex SessionEnd trigger
+├── config/
+│   └── worktree-janitor.conf       # 48h + scheduled/session apply policy
 ├── launchd/
 │   ├── cc-reaper-monitor.sh        # LaunchAgent monitor script (PGID + PPID=1 fallback)
 │   ├── com.cc-reaper.orphan-monitor.plist  # LaunchAgent config (10-min interval)
 │   ├── com.cc-reaper.resource-watch.plist  # System snapshot agent (10-min interval)
 │   ├── com.cc-reaper.disk-check.plist      # Read-only disk check agent (hourly)
-│   └── com.cc-reaper.weekly-clean.plist    # Rebuildable-cache clean agent (Sun 04:00)
+│   ├── com.cc-reaper.weekly-clean.plist    # Rebuildable-cache clean agent (Sun 04:00)
+│   └── com.cc-reaper.worktree-janitor.plist # Shared worktree sweep (6-hour interval)
 ├── proc-janitor/
 │   └── config.toml                 # proc-janitor daemon config (alternative to LaunchAgent)
 ├── shell/

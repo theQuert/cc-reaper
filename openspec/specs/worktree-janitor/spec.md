@@ -2,16 +2,24 @@
 
 ## Purpose
 
-Multi-repo git worktree inventory and gated removal: dual safety gate (dirty / active-process-cwd), dry-run by default, branches and commits never deleted.
+Multi-repo git worktree inventory and gated removal shared by Claude and Codex: content,
+holder, active-harness, landing, 48-hour idle and git-state gates; direct runs are dry-run by
+default, and branches and commits are never deleted.
 
 ## Requirements
 
 ### Requirement: Multi-repo worktree inventory
-The janitor SHALL discover git worktrees from a configurable repo list (default: every git repo directly under `~/Documents/GitHub/`) and classify each worktree as KEEP or REMOVABLE with a stated reason.
+The janitor SHALL discover git worktrees from configurable ordinary source roots and from
+the Claude and Codex harness worktree roots, deduplicate them by git common directory, and
+classify each worktree as KEEP or REMOVABLE with a stated reason.
 
 #### Scenario: Inventory run
 - **WHEN** the janitor runs in report mode
 - **THEN** every non-primary worktree is listed with: dirty file count, branch, ahead-of-origin/main count, push state, active-process state, and final classification
+
+#### Scenario: Harness-owned second clone
+- **WHEN** a harness-owned checkout is not registered under an ordinary source root
+- **THEN** it is still present in the report and evaluated by the same gates
 
 ### Requirement: Dual safety gate for removal
 A worktree SHALL be classified REMOVABLE only when every gate below holds, and each gate
@@ -22,14 +30,18 @@ commits are never deleted - only the working directory.
    regenerable (built-in cache lists, or the repository's `.worktree-regenerable`).
 2. **Holders:** machine-wide scans of every process's working directory and of every open
    file both succeed and name nothing at or under the worktree.
-3. **Landed:** against a base branch fetched during this run, HEAD is an ancestor, or merging
+3. **Harness claims:** no verified-live Claude session or open Codex writer lock claims the
+   worktree by cwd or by a structured tool-call input in its current two human user turns,
+   and no Claude/Codex session activity mapped to that worktree falls within
+   `CC_WJ_SESSION_GRACE_HOURS` (48 by default).
+4. **Landed:** against a base branch fetched during this run, HEAD is an ancestor, or merging
    HEAD into the base produces the base's own tree, or a merged pull request whose head is
    HEAD and whose base is the base branch has a merge commit contained in the fetched base.
-4. **Idle:** nothing under the worktree - followed through a symlinked worktree path - and
+5. **Idle:** nothing under the worktree - followed through a symlinked worktree path - and
    none of its git administrative files (`HEAD`, `index`, `logs/`) was modified within
-   `CC_WJ_IDLE_HOURS` hours.
-5. **Detached:** a detached HEAD is additionally landed by ancestry.
-6. **Not locked, no populated submodule:** `git worktree lock` is an explicit request to keep
+   `CC_WJ_IDLE_HOURS` hours (48 by default).
+6. **Detached:** a detached HEAD is additionally landed by ancestry.
+7. **Not locked, no populated submodule:** `git worktree lock` is an explicit request to keep
    a worktree, and a populated submodule carries state the outer status does not show.
 
 #### Scenario: Dirty worktree
@@ -43,6 +55,67 @@ commits are never deleted - only the working directory.
 #### Scenario: A process holds a file open inside the worktree
 - **WHEN** no process's cwd is inside the worktree but a process holds a file under it open
 - **THEN** it is classified KEEP with reason `active-session`
+
+#### Scenario: Active Claude or Codex claim
+- **WHEN** a verified-live Claude session or open Codex writer lock maps to the worktree by cwd, or its structured tool calls name the worktree
+- **THEN** it is classified KEEP with a reason that identifies the harness and claim
+
+#### Scenario: Stale registry artifact
+- **WHEN** a Claude PID record is dead or reused, or a Codex lock file exists but is not open
+- **THEN** that artifact alone does not claim a worktree
+
+#### Scenario: Archived Codex task
+- **WHEN** the app archives a Codex task without dispatching SessionEnd and its writer lock is no longer open
+- **THEN** its `archived_at` or later activity starts a recent-session lease, and the worktree is `KEEP(recent-session)` for the configured grace period
+
+#### Scenario: Archived task after old worktree activity
+- **WHEN** a worktree's files have been idle longer than 48 hours but a mapped task was archived less than `CC_WJ_SESSION_GRACE_HOURS` ago
+- **THEN** the recent-session lease keeps the worktree even though its file-idle gate already holds
+
+#### Scenario: Recent Claude transcript
+- **WHEN** a non-live Claude transcript was updated within the session grace window and its last recorded cwd maps to the worktree
+- **THEN** the worktree is `KEEP(recent-session)` until that transcript activity ages past the grace window
+
+#### Scenario: Recent session used another tool workdir
+- **WHEN** a recent inactive Claude or Codex session cwd is outside the worktree but a structured tool call in its current two human user turns names the worktree
+- **THEN** the same recent-session lease keeps that worktree and reports `scope=structured-tool-call`
+
+#### Scenario: Session grace expires
+- **WHEN** no live claim exists and every mapped session activity is older than `CC_WJ_SESSION_GRACE_HOURS`
+- **THEN** session history does not keep the worktree, and every other removal gate still applies
+
+#### Scenario: Session grace malformed
+- **WHEN** `CC_WJ_SESSION_GRACE_HOURS` is not a whole number below 100000
+- **THEN** the run exits non-zero before classifying anything and removes nothing
+
+### Requirement: Observable harness claims
+The janitor SHALL expose a read-only `--claims` diagnostic and SHALL include the winning
+session claim or lease in ordinary inventory output without reading transcript message text
+into the report.
+
+#### Scenario: Inspect claims after archive
+- **WHEN** an operator runs `worktree-janitor --claims` after a Codex task was archived
+- **THEN** the output identifies its harness, session id, cwd, archived status, last-activity time, age, and remaining grace
+
+#### Scenario: Inspect claims by worktree path
+- **WHEN** an operator runs `worktree-janitor --claims PATH`
+- **THEN** direct cwd claims and structured tool claims in the current two human user turns that name PATH are printed without transcript message text
+
+#### Scenario: Inventory explains recent retention
+- **WHEN** a recent-session lease keeps a worktree
+- **THEN** the inventory prints `KEEP(recent-session)` and the lease that won
+
+#### Scenario: Claims diagnostic is read-only
+- **WHEN** `--claims` is run under any apply configuration
+- **THEN** it does not fetch, prune, remove a worktree, or change harness state
+
+#### Scenario: Live claim cannot be mapped
+- **WHEN** a verified-live claim cannot be parsed or mapped uniquely to cwd and transcript
+- **THEN** no worktree is removed and the run exits non-zero
+
+#### Scenario: Harness claim appears before removal
+- **WHEN** a claim appears after classification but before removal
+- **THEN** the pre-removal claim refresh keeps the worktree
 
 #### Scenario: A path the holder scan escapes
 - **WHEN** lsof prints a name with its own escaping (`\xNN` for a byte it will not print, `\\` for a backslash)
@@ -114,8 +187,9 @@ commits are never deleted - only the working directory.
 
 ### Requirement: Dry-run by default
 The janitor SHALL default to report-only mode; deletion SHALL occur only with an explicit
-`--apply` flag, or in session mode with `CC_WJ_SESSION_APPLY=1` exactly. Any unattended
-invocation without that opt-in SHALL run report mode.
+`--apply` flag, in session mode with `CC_WJ_SESSION_APPLY=1` exactly, or in scheduled mode
+with `CC_WJ_SCHEDULE_APPLY=1` exactly. Any unattended invocation without its opt-in SHALL
+run report mode.
 
 #### Scenario: Default invocation
 - **WHEN** the janitor runs with no flags
@@ -129,9 +203,13 @@ invocation without that opt-in SHALL run report mode.
 - **WHEN** the user runs `worktree-janitor --apply`
 - **THEN** only REMOVABLE worktrees are removed, each removal is logged, and a summary (removed count, reclaimed bytes, kept count) is printed
 
-#### Scenario: Scheduled run cannot delete
-- **WHEN** a launchd-scheduled invocation runs
-- **THEN** it is report mode unconditionally
+#### Scenario: Scheduled run
+- **WHEN** the LaunchAgent invokes `--scheduled` at its default six-hour interval or an installer-selected interval from 300 through 604800 seconds
+- **THEN** it applies only when `CC_WJ_SCHEDULE_APPLY=1`, otherwise it reports only
+
+#### Scenario: Custom schedule interval
+- **WHEN** an operator installs with `CC_REAPER_WORKTREE_INTERVAL_SECONDS` set to a whole number from 300 through 604800
+- **THEN** only the installed worktree LaunchAgent uses that interval, and every cleanup safety gate remains unchanged
 
 #### Scenario: Session mode without opt-in
 - **WHEN** `--session` runs and `CC_WJ_SESSION_APPLY` is unset or anything other than `1`
@@ -170,8 +248,8 @@ git collapses is discounted when every file inside it (at most 200) is declared.
 
 ### Requirement: Session mode
 `worktree-janitor --session` SHALL return immediately and run the inventory detached for the
-repository containing `CLAUDE_PROJECT_DIR` (or the working directory), so that it can be
-installed as a Claude Code SessionEnd hook.
+repository containing the hook payload cwd, `CODEX_PROJECT_DIR`, `CLAUDE_PROJECT_DIR`, or the
+working directory, so that one deployed entrypoint can serve Claude and Codex SessionEnd.
 
 #### Scenario: Detaching
 - **WHEN** `--session` is invoked

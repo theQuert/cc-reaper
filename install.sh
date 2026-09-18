@@ -16,6 +16,25 @@ if [ -z "$HOME_DIR" ] || [ ! -d "$HOME_DIR" ]; then
   exit 1
 fi
 
+# Validate the generated worktree LaunchAgent cadence before this installer writes
+# anything. A typo must not leave an otherwise healthy installation half-updated.
+WORKTREE_INTERVAL_SECONDS="${CC_REAPER_WORKTREE_INTERVAL_SECONDS:-21600}"
+case "$WORKTREE_INTERVAL_SECONDS" in
+  ''|*[!0-9]*)
+    echo "FATAL: CC_REAPER_WORKTREE_INTERVAL_SECONDS must be a whole number from 300 to 604800." >&2
+    exit 1
+    ;;
+esac
+if [ "${#WORKTREE_INTERVAL_SECONDS}" -gt 7 ]; then
+  echo "FATAL: CC_REAPER_WORKTREE_INTERVAL_SECONDS must be from 300 to 604800." >&2
+  exit 1
+fi
+WORKTREE_INTERVAL_SECONDS=$((10#$WORKTREE_INTERVAL_SECONDS))
+if [ "$WORKTREE_INTERVAL_SECONDS" -lt 300 ] || [ "$WORKTREE_INTERVAL_SECONDS" -gt 604800 ]; then
+  echo "FATAL: CC_REAPER_WORKTREE_INTERVAL_SECONDS must be from 300 to 604800." >&2
+  exit 1
+fi
+
 # An interrupted install must not read like a finished one.
 #
 # Measured 2026-09-01: a run that blocked at the daemon prompt had already updated the
@@ -48,7 +67,8 @@ trap 'exit 129' HUP   # 128 + SIGHUP(1)
 IS_UPDATE=false
 if grep -q "claude-cleanup.sh" "$HOME_DIR/.zshrc" 2>/dev/null || \
    grep -q "claude-cleanup.sh" "$HOME_DIR/.bashrc" 2>/dev/null || \
-   [ -f "$HOME_DIR/.claude/hooks/stop-cleanup-orphans.sh" ]; then
+   [ -f "$HOME_DIR/.claude/hooks/stop-cleanup-orphans.sh" ] || \
+   [ -f "$HOME_DIR/.cc-reaper/stop-cleanup-orphans.sh" ]; then
   IS_UPDATE=true
 fi
 
@@ -73,11 +93,18 @@ echo "[1/4] Installing shell functions..."
 AGENT_UI="gui/$(id -u)"
 AGENT_FAILED=""
 _cc_install_agent() {
-  local label=$1 plist=$2
+  local label=$1 plist=$2 attempt=1
   launchctl enable "$AGENT_UI/$label" 2>/dev/null || true
   launchctl bootout "$AGENT_UI/$label" 2>/dev/null || true
-  launchctl bootstrap "$AGENT_UI" "$plist" 2>/dev/null || true
-  launchctl print "$AGENT_UI/$label" >/dev/null 2>&1 && return 0
+  # bootout can return before launchd has fully retired the old service. A single
+  # immediate bootstrap then fails with the plist valid and leaves the schedule absent.
+  # Retry briefly, but trust only a successful print of the registered label.
+  while [ "$attempt" -le 20 ]; do
+    launchctl bootstrap "$AGENT_UI" "$plist" 2>/dev/null || true
+    launchctl print "$AGENT_UI/$label" >/dev/null 2>&1 && return 0
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
   AGENT_FAILED="$AGENT_FAILED $label"
   return 1
 }
@@ -116,50 +143,11 @@ else
   echo "  Added cc-monitor to $SHELL_RC"
 fi
 
-# ─── 2. Stop hook ───────────────────────────────────────────────────────────
+# ─── 2. Stop hook migration ─────────────────────────────────────────────────
 
-if $IS_UPDATE; then
-  echo "[2/4] Updating Claude Code Stop hook..."
-else
-  echo "[2/4] Installing Claude Code Stop hook..."
-fi
-
-HOOKS_DIR="$HOME_DIR/.claude/hooks"
-mkdir -p "$HOOKS_DIR"
-# Never through a symlink. This path is a symlink into another repository on at
-# least one machine, and `cp` follows it: installing cc-reaper silently rewrote a
-# file inside somebody else's checkout, leaving it dirty and replacing whatever
-# version lived there with this one. Measured on the reporting host, twice - the
-# second time by this very installer, after the content drift it caused had already
-# been found and fixed.
-_CC_HOOK_DEST="$HOOKS_DIR/stop-cleanup-orphans.sh"
-if [ -L "$_CC_HOOK_DEST" ]; then
-  echo "  Stop hook at $_CC_HOOK_DEST is a symlink to $(readlink "$_CC_HOOK_DEST")."
-  echo "  Left alone: writing through it would modify that file in place. Update it"
-  echo "  there, or remove the symlink and re-run this installer."
-else
-  cp "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$_CC_HOOK_DEST"
-  chmod +x "$_CC_HOOK_DEST"
-fi
-
-# Update global settings.json
-SETTINGS_FILE="$HOME_DIR/.claude/settings.json"
-HOOK_CMD="\"\\$HOME\"/.claude/hooks/stop-cleanup-orphans.sh"
-
-if [ -f "$SETTINGS_FILE" ] && grep -q "stop-cleanup-orphans" "$SETTINGS_FILE" 2>/dev/null; then
-  echo "  Hook script updated. settings.json already configured."
-else
-  echo "  Hook script copied to $HOOKS_DIR/"
-  echo "  NOTE: You need to manually add the hook to $SETTINGS_FILE."
-  echo "  Add this to the \"Stop\" hooks array:"
-  echo ""
-  echo "    {"
-  echo "      \"type\": \"command\","
-  echo "      \"command\": \"\\\"\\\$HOME\\\"/.claude/hooks/stop-cleanup-orphans.sh\","
-  echo "      \"timeout\": 15"
-  echo "    }"
-  echo ""
-fi
+echo "[2/4] Preparing shared lifecycle hooks..."
+echo "  Hook implementations will be deployed under $HOME_DIR/.cc-reaper."
+echo "  Existing Claude hook commands are migrated after deployment; Codex remains repository-owned."
 
 # ─── 3. Daemon setup (proc-janitor OR LaunchAgent) ──────────────────────────
 
@@ -312,24 +300,78 @@ for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cle
   cp "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/"
   chmod +x "$REAPER_DIR/$SCRIPT.sh"
 done
+cp "$SCRIPT_DIR/hooks/worktree-session-end.sh" "$REAPER_DIR/"
+chmod +x "$REAPER_DIR/worktree-session-end.sh"
+cp "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$REAPER_DIR/"
+chmod +x "$REAPER_DIR/stop-cleanup-orphans.sh"
 
-for AGENT in resource-watch disk-check weekly-clean guard; do
+# The policy lives with cc-reaper, not in either harness's settings.  Preserve an
+# operator-edited policy on update; the repository copy remains the reviewable default.
+WJ_CONFIG="$REAPER_DIR/worktree-janitor.conf"
+if [ ! -e "$WJ_CONFIG" ]; then
+  cp "$SCRIPT_DIR/config/worktree-janitor.conf" "$WJ_CONFIG"
+  chmod 600 "$WJ_CONFIG"
+  echo "  worktree policy installed at $WJ_CONFIG"
+elif cmp -s "$SCRIPT_DIR/config/worktree-janitor.conf" "$WJ_CONFIG"; then
+  echo "  worktree policy already current at $WJ_CONFIG"
+else
+  echo "  worktree policy preserved at $WJ_CONFIG (repository default differs; review with diff)"
+fi
+
+for AGENT in resource-watch disk-check weekly-clean guard worktree-janitor; do
   AGENT_LABEL="com.cc-reaper.$AGENT"
   AGENT_PLIST="$PLIST_DIR/$AGENT_LABEL.plist"
-  sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/$AGENT_LABEL.plist" > "$AGENT_PLIST"
+  if [ "$AGENT" = "worktree-janitor" ]; then
+    sed -e "s|__HOME__|$HOME_DIR|g" \
+      -e "s|<integer>21600</integer>|<integer>$WORKTREE_INTERVAL_SECONDS</integer>|" \
+      "$SCRIPT_DIR/launchd/$AGENT_LABEL.plist" > "$AGENT_PLIST"
+  else
+    sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/$AGENT_LABEL.plist" > "$AGENT_PLIST"
+  fi
   _cc_install_agent "$AGENT_LABEL" "$AGENT_PLIST" || true
 done
 _cc_report_failed_agents
 
+# One destructive policy owner. Leaving the old Claude inventory agent loaded would run
+# its Claude-only six-hour rule beside the shared 48-hour janitor, so the weaker policy
+# could still win a race after a successful install. Boot it out and move its plist to a
+# recoverable cc-reaper migration archive; do not unlink it irreversibly.
+LEGACY_WORKTREE_AGENT="$PLIST_DIR/com.claude.worktree-inventory.plist"
+if [ -e "$LEGACY_WORKTREE_AGENT" ]; then
+  launchctl bootout "gui/$(id -u)" "$LEGACY_WORKTREE_AGENT" >/dev/null 2>&1 ||
+    launchctl unload "$LEGACY_WORKTREE_AGENT" >/dev/null 2>&1 || true
+  MIGRATION_DIR="$REAPER_DIR/migrated-launchagents"
+  mkdir -p "$MIGRATION_DIR"
+  MIGRATION_COPY="$MIGRATION_DIR/com.claude.worktree-inventory.$(date '+%Y%m%d%H%M%S').$$.plist"
+  mv "$LEGACY_WORKTREE_AGENT" "$MIGRATION_COPY"
+  echo "  retired legacy Claude worktree agent; backup: $MIGRATION_COPY"
+fi
+
 echo "  resource-watch: snapshot every 10 min (alerts on load/disk/memory thresholds)"
 echo "  disk-check:     read-only disk + TM-snapshot check every hour"
 echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
-echo "  worktree-janitor: manual — run '~/.cc-reaper/worktree-janitor.sh' (report), add --apply to clean"
-echo "                    not scheduled: a LaunchAgent has no TCC access to ~/Documents, measured 2026-08-30"
-echo "                    or as a SessionEnd hook: \"\$HOME\"/.cc-reaper/worktree-janitor.sh --session"
-echo "                    (reports only unless CC_WJ_SESSION_APPLY=1 and the hook input names a cwd;"
-echo "                     see docs/worktree-reclamation.md)"
+echo "  worktree-janitor: every $WORKTREE_INTERVAL_SECONDS seconds + at load; 48h idle policy from ~/.cc-reaper/worktree-janitor.conf"
+echo "                    SessionEnd trigger: ~/.cc-reaper/worktree-session-end.sh <claude|codex>"
 echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs whitelisted MCP pinned >80% CPU for >60 min)"
+
+# Claude has one global hook file, so the installer can migrate it safely.  Codex hooks
+# are repository-owned; checked-in .codex/hooks.json files should invoke the same deployed
+# entrypoint.  CC_REAPER_CODEX_REPOS offers an explicit installer path for repositories
+# that do not check the hook in.
+if command -v python3 >/dev/null 2>&1; then
+  python3 "$SCRIPT_DIR/integrations/install-session-hook.py" \
+    --harness claude --file "$HOME_DIR/.claude/settings.json" || true
+  if [ -n "${CC_REAPER_CODEX_REPOS:-}" ]; then
+    while IFS= read -r _cc_codex_repo; do
+      [ -n "$_cc_codex_repo" ] || continue
+      python3 "$SCRIPT_DIR/integrations/install-session-hook.py" --harness codex \
+        --file "$_cc_codex_repo/.codex/hooks.json" || true
+    done < <(printf '%s\n' "$CC_REAPER_CODEX_REPOS" | tr ':' '\n')
+  fi
+else
+  echo "  WARNING: python3 is unavailable; SessionEnd hook JSON was not migrated."
+  echo "           Add ~/.cc-reaper/worktree-session-end.sh manually (see README)."
+fi
 
 # ─── 5b. TCC probe ────────────────────────────────────────────────────────────
 #
@@ -343,12 +385,10 @@ echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs whitelisted MC
 # it work and never learns the agent cannot. That disagreement is the whole reason
 # this is invisible without a probe.
 #
-# Reported, not recommended. No agent this installer schedules reads these paths -
-# they work under ~/Library and /private/tmp - so telling an operator to grant
-# /bin/bash Full Disk Access would hand every bash script on the machine access to all
-# protected user data while enabling no sweep that exists. What the probe is for is
-# the operator who later schedules something of their own over ~/Documents: that run
-# would exit 0 reporting nothing found, which is what an empty machine looks like.
+# Reported, not recommended.  The installed worktree policy deliberately scans
+# ~/GitHub, outside these protected directories.  An operator who adds ~/Documents to
+# CC_WJ_ROOT must either accept the Full Disk Access trade-off or keep that root out of
+# the scheduled sweep; a denied root is reported and makes the janitor exit non-zero.
 _cc_probe_tcc() {
   command -v launchctl >/dev/null 2>&1 || return 0
   [ "$(uname -s 2>/dev/null)" = Darwin ] || return 0
@@ -441,12 +481,9 @@ PLIST
 
   echo ""
   echo "  TCC: from a LaunchAgent, this machine cannot read:$denied"
-  echo "       Nothing installed here reads them today - resource-watch, disk-check,"
-  echo "       weekly-clean and guard work under ~/Library and /private/tmp, and"
-  echo "       worktree-janitor is manual by design for exactly this reason."
-  echo "       It matters if you schedule a sweep of your own over those paths: it"
-  echo "       would run, exit 0, and report nothing found, which is what an empty"
-  echo "       machine looks like."
+  echo "       The installed worktree schedule scans ~/GitHub, not these paths."
+  echo "       If you add one of them to CC_WJ_ROOT, that root will be reported blind"
+  echo "       and the run will fail until the access decision is resolved."
   echo "       Granting Full Disk Access to /bin/bash would fix that and would also"
   echo "       give EVERY bash script on this machine access to all protected user"
   echo "       data. Keep the repositories you want swept outside those directories"

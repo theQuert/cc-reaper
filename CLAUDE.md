@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-cc-reaper is a shell-based utility that cleans up orphan Claude Code processes (subagents, MCP servers, plugins) that leak memory after sessions end. It uses a three-layer defense: Stop hook (immediate), proc-janitor daemon (continuous), and manual shell commands (on-demand).
+cc-reaper is a shell-based utility that cleans up orphan Claude Code/Codex processes and settled git worktrees that leak memory or disk after sessions end. It uses hooks for low-latency triggers, background agents for guarantees, and manual commands for diagnosis/on-demand cleanup.
 
 ## Repository Structure
 
@@ -12,7 +12,9 @@ cc-reaper is a shell-based utility that cleans up orphan Claude Code processes (
 - `hooks/stop-cleanup-orphans.sh` — Claude Code Stop hook; kills orphans using orphan-parent filtering (only truly orphaned processes — reparented to PID 1, or on Linux to the user's `systemd --user` manager)
 - `shell/claude-cleanup.sh` — Shell functions: `claude-cleanup` (kill orphans), `claude-ram` (RAM report), `claude-fd` (FD usage report), `claude-sessions` (session list), `claude-guard` (auto-reaper with RSS/FD threshold + idle detection)
 - `shell/cc-monitor.sh` — Read-only heat attribution monitor (`cc-monitor`, `cc-monitor --apply`)
-- `shell/worktree-janitor.sh` — Worktree inventory and gated removal (clean, unheld, landed, idle); `--session` for a SessionEnd hook. The method is in `docs/worktree-reclamation.md`
+- `shell/worktree-janitor.sh` — Shared Claude/Codex worktree inventory and gated removal (clean, unheld, no live/recent harness claim, landed, idle); `--claims` for read-only claim/lease evidence, `--session` for either harness, and `--scheduled` for the guarantee layer. The method is in `docs/worktree-reclamation.md`
+- `config/worktree-janitor.conf` — Cross-device 48-hour/session/schedule policy deployed under `~/.cc-reaper`
+- `hooks/worktree-session-end.sh` — Thin shared Claude/Codex SessionEnd trigger
 - `proc-janitor/config.toml` — Daemon config with target patterns, whitelist, and grace period settings
 - `launchd/` — macOS LaunchAgent scripts for zero-dependency background monitoring
 - `tests/` — Lightweight bash validation scripts (mocked ps/kill for isolated testing)
@@ -75,6 +77,7 @@ cc-monitor --apply claude-cleanup   # Run cleanup module after report (no prompt
 claude-ram               # Show RAM usage by process category
 claude-fd                # Show file descriptor usage per session + VM processes
 claude-sessions          # List active sessions with idle/bloated status
+~/.cc-reaper/worktree-janitor.sh --claims [id-or-path]  # Read-only live/recent worktree claims
 
 # Cleanup (destructive)
 claude-cleanup           # Kill orphan processes (PGID → pattern → PPID fallback)

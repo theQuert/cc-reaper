@@ -46,6 +46,33 @@ STUBS="$(stub_bin)"
 SLOW_STUBS="$(stub_bin)"
 printf '#!/bin/sh\nsleep 120\n' > "$SLOW_STUBS/launchctl"; chmod +x "$SLOW_STUBS/launchctl"
 
+# launchd may acknowledge bootout before it is ready to accept the replacement plist.
+# This stub makes every label's first bootstrap fail, then accepts the retry.
+RETRY_STUBS="$(stub_bin)"
+cat > "$RETRY_STUBS/launchctl" <<'STUB'
+#!/bin/sh
+state=${LAUNCHCTL_RETRY_STATE:?}
+mkdir -p "$state"
+printf '%s\n' "$*" >> "$state/calls"
+case "$1" in
+  enable|kickstart) exit 0 ;;
+  bootout)
+    label=${2##*/}; rm -f "$state/$label.loaded"; exit 0 ;;
+  bootstrap)
+    label=${3##*/}; label=${label%.plist}
+    if [ -e "$state/$label.seen" ]; then
+      : > "$state/$label.loaded"; exit 0
+    fi
+    : > "$state/$label.seen"; exit 1
+    ;;
+  print)
+    label=${2##*/}; test -e "$state/$label.loaded"; exit $?
+    ;;
+esac
+exit 0
+STUB
+chmod +x "$RETRY_STUBS/launchctl"
+
 # macOS has no `timeout`, and `gtimeout` is a coreutils install this suite must not
 # require. Run bounded by hand, and kill the process GROUP - the installer spawns
 # children, and killing only the shell leaves them holding the pipe.
@@ -120,20 +147,52 @@ grep -q "INSTALL DID NOT COMPLETE" "$out"; incomplete=$?
 [ "$incomplete" -ne 0 ]; check "a run that finished does not claim to be incomplete" $?
 rm -rf "$H" "$out"
 
+# ─── 1b. A rapid reinstall survives asynchronous launchd bootout ────────────
+H="$(sandbox_home)"
+out="$(mktemp)"
+retry_state="$(mktemp -d)"
+HOME="$H" PATH="$RETRY_STUBS:$PATH" LAUNCHCTL_RETRY_STATE="$retry_state" \
+  CC_REAPER_DAEMON=b bounded 60 bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
+rc=$?
+[ "$rc" -eq 0 ]; check "a launchd bootout race is retried" $?
+test -e "$retry_state/com.cc-reaper.worktree-janitor.loaded"; check "the retried worktree schedule is registered" $?
+test -e "$retry_state/com.cc-reaper.worktree-janitor.loaded" || sed 's/^/# launchctl: /' "$retry_state/calls"
+grep -q 'agents did not load' "$out"; warned=$?
+[ "$warned" -ne 0 ]; check "a recovered launchd race is not reported as failed" $?
+rm -rf "$H" "$out" "$retry_state"
+
 # ─── 2. /dev/null stdin ───────────────────────────────────────────────────────
 H="$(sandbox_home)"
 out="$(mktemp)"
+printf '<plist version="1.0"><dict/></plist>\n' > "$H/Library/LaunchAgents/com.claude.worktree-inventory.plist"
 HOME="$H" PATH="$STUBS:$PATH" bounded 60 bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
 rc=$?
 [ "$rc" -eq 0 ]; check "it completes with stdin at EOF" $?
 grep -q "Done\." "$out"; check "it reaches the last step" $?
+cmp -s "$ROOT_DIR/config/worktree-janitor.conf" "$H/.cc-reaper/worktree-janitor.conf"; check "it deploys the shared worktree policy" $?
+cmp -s "$ROOT_DIR/hooks/worktree-session-end.sh" "$H/.cc-reaper/worktree-session-end.sh"; check "it deploys the shared SessionEnd entrypoint" $?
+test -f "$H/Library/LaunchAgents/com.cc-reaper.worktree-janitor.plist"; check "it installs the six-hour worktree LaunchAgent" $?
+grep -q 'worktree-session-end.sh claude' "$H/.claude/settings.json"; check "it migrates the Claude SessionEnd hook to cc-reaper" $?
+test ! -e "$H/Library/LaunchAgents/com.claude.worktree-inventory.plist"; check "it retires the legacy Claude worktree LaunchAgent" $?
+find "$H/.cc-reaper/migrated-launchagents" -name 'com.claude.worktree-inventory.*.plist' -type f | grep -q .; check "it preserves a recoverable copy of the legacy LaunchAgent" $?
 rm -rf "$H" "$out"
 
 # ─── 3. An explicit choice from a script ──────────────────────────────────────
 H="$(sandbox_home)"
 out="$(mktemp)"
-HOME="$H" PATH="$STUBS:$PATH" CC_REAPER_DAEMON=b bounded 60 bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
+HOME="$H" PATH="$STUBS:$PATH" CC_REAPER_DAEMON=b CC_REAPER_WORKTREE_INTERVAL_SECONDS=43200 bounded 60 bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
 grep -q "Choice from CC_REAPER_DAEMON" "$out"; check "CC_REAPER_DAEMON is honoured" $?
+grep -q '<integer>43200</integer>' "$H/Library/LaunchAgents/com.cc-reaper.worktree-janitor.plist"; check "the worktree schedule interval is configurable" $?
+rm -rf "$H" "$out"
+
+# ─── 3b. An invalid cadence fails before touching the sandbox ─────────────────
+H="$(sandbox_home)"
+out="$(mktemp)"
+HOME="$H" PATH="$STUBS:$PATH" CC_REAPER_WORKTREE_INTERVAL_SECONDS=60 \
+  bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
+rc=$?
+[ "$rc" -ne 0 ]; check "an unsafe worktree interval is rejected" $?
+test ! -e "$H/.cc-reaper/worktree-janitor.sh"; check "interval validation happens before installation writes" $?
 rm -rf "$H" "$out"
 
 # ─── 4. An interrupted run must not read like a finished one ──────────────────
@@ -205,6 +264,6 @@ for sig_pair in "HUP 129" "TERM 143"; do
   [ "$irc" -eq "$want" ]; check "SIG$signame exits $want, not another signal's status" $?
 done
 
-rm -rf "$STUBS" "$SLOW_STUBS"
+rm -rf "$STUBS" "$SLOW_STUBS" "$RETRY_STUBS"
 if [ "$failures" -eq 0 ]; then echo "install-no-tty: all tests passed"; else echo "$failures test failure(s)"; fi
 [ "$failures" -eq 0 ]
