@@ -685,6 +685,19 @@ check "an interrupted run removes its private transcript projection directory" t
 check "an interrupted sourced run restores the caller TERM trap" grep -q '^TERM$' "$interrupt_traps"
 check "an interrupted sourced run restores the caller EXIT trap" grep -q '^EXIT$' "$interrupt_traps"
 
+scavenge_tmp="$CASE/scavenge-tmp"
+mkdir -p "$scavenge_tmp/cc-wj.OLDONE" "$scavenge_tmp/cc-wj.NEWONE" \
+  "$scavenge_tmp/cc-wj.DEAD01" "$scavenge_tmp/cc-wj.LIVE01"
+touch -t 202001010000 "$scavenge_tmp/cc-wj.OLDONE" "$scavenge_tmp/cc-wj.DEAD01" \
+  "$scavenge_tmp/cc-wj.LIVE01"
+printf '%s\n' 999999 > "$scavenge_tmp/cc-wj.DEAD01/.owner-pid"
+printf '%s\n' "$$" > "$scavenge_tmp/cc-wj.LIVE01/.owner-pid"
+TMPDIR="$scavenge_tmp" bash -c 'source "$1"; _cc_wj_scavenge_private_temp' _ "$WJ"
+check "the next run removes an old unowned private directory" test ! -d "$scavenge_tmp/cc-wj.OLDONE"
+check "the next run removes a private directory whose owner died" test ! -d "$scavenge_tmp/cc-wj.DEAD01"
+check "the scavenger preserves a new directory before its owner marker is written" test -d "$scavenge_tmp/cc-wj.NEWONE"
+check "the scavenger preserves a private directory whose owner is alive" test -d "$scavenge_tmp/cc-wj.LIVE01"
+
 new_fixture harness-discovery
 age_worktree 72
 out="$(PATH="$BIN:$PATH" CC_WJ_CONFIG="$CASE/no-config" CC_WJ_ROOT="$CASE/no-source-root" \

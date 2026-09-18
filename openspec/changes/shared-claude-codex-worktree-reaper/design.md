@@ -44,6 +44,9 @@ created, before any projection is written. Projection encoding uses surrogate es
 non-UTF-8 filesystem byte remains the same byte the shell passes to fixed-string matching.
 Unsupported lone surrogates mark the projection unsafe and retain exact parsing. Signal
 cleanup restores and re-raises through caller-owned traps instead of replacing their cleanup.
+Because launchd may escalate past shell traps, each run also records its owner PID and scavenges
+dead-owner private directories on the next start; unmarked directories receive a five-minute
+creation grace so concurrent starts cannot remove one between `mktemp` and owner registration.
 If a Codex writer lock closes while its captured rollout is being read, the janitor remaps
 that task through current Codex state. An archived task becomes bounded recent-session
 evidence for only its mapped cwd and structured tool paths; the expected rollout move does

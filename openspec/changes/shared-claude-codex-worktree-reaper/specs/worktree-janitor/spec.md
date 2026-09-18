@@ -54,6 +54,7 @@ unmappable verified-live claim SHALL make the destructive run fail closed.
 - **AND** non-UTF-8 filesystem path bytes round-trip through normalized evidence
 - **AND** normal completion or an interrupt removes the private projection directory
 - **AND** interruption restores and runs the invoking Bash caller's existing signal and exit cleanup
+- **AND** a later start removes a private projection directory whose owner was force-killed
 - **AND** the pre-removal activity refresh builds a new snapshot before destructive action
 - **AND** structured active and recent transcript matching is skipped when a cheaper gate already keeps the worktree
 

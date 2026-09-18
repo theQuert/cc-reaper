@@ -93,12 +93,23 @@ echo "[1/4] Installing shell functions..."
 AGENT_UI="gui/$(id -u)"
 AGENT_FAILED=""
 _cc_install_agent() {
-  local label=$1 plist=$2 attempt=1
+  local label=$1 plist=$2 attempt=1 retire_attempt=1
   launchctl enable "$AGENT_UI/$label" 2>/dev/null || true
   launchctl bootout "$AGENT_UI/$label" 2>/dev/null || true
-  # bootout can return before launchd has fully retired the old service. A single
-  # immediate bootstrap then fails with the plist valid and leaves the schedule absent.
-  # Retry briefly, but trust only a successful print of the registered label.
+  # bootout can return before launchd has fully retired the old service. During that
+  # window `print` still succeeds for the OLD job, so treating print as proof after a
+  # failed bootstrap reports a successful update and then loses the schedule when the
+  # delayed bootout finishes. First observe the old label disappear, then bootstrap.
+  while launchctl print "$AGENT_UI/$label" >/dev/null 2>&1; do
+    if [ "$retire_attempt" -ge 100 ]; then
+      AGENT_FAILED="$AGENT_FAILED $label"
+      return 1
+    fi
+    retire_attempt=$((retire_attempt + 1))
+    sleep 0.1
+  done
+  # A transient bootstrap failure can still follow retirement. Retry briefly, but
+  # trust only a successful print after the old label was observed absent.
   while [ "$attempt" -le 20 ]; do
     launchctl bootstrap "$AGENT_UI" "$plist" 2>/dev/null || true
     launchctl print "$AGENT_UI/$label" >/dev/null 2>&1 && return 0

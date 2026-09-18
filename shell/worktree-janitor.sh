@@ -2056,6 +2056,33 @@ _cc_wj_remove_private_temp() {
   esac
 }
 
+_cc_wj_scavenge_private_temp() {
+  local root="${TMPDIR:-/tmp}" directory owner mtime now
+  [ -d "$root" ] || return 0
+  now="$(date +%s)"
+  for directory in "$root"/cc-wj.??????; do
+    [ -d "$directory" ] || continue
+    # Never cross users even if a shared temporary root contains a matching name.
+    [ -O "$directory" ] || continue
+    owner=""
+    if IFS= read -r owner 2>/dev/null < "$directory/.owner-pid"; then
+      case "$owner" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      # PID reuse only delays cleanup; it can never authorize removal of a live run.
+      kill -0 "$owner" 2>/dev/null && continue
+      _cc_wj_remove_private_temp "$directory"
+      continue
+    fi
+    # There is an unavoidable interval between mktemp and writing the owner marker.
+    # Retain unmarked directories for five minutes so a concurrent startup cannot
+    # remove a live run. This also migrates privacy residue from older installations.
+    mtime="$(_cc_wj_mtime_epoch "$directory")" || continue
+    [ $((now - mtime)) -ge 300 ] || continue
+    _cc_wj_remove_private_temp "$directory"
+  done
+}
+
 _cc_wj_cleanup_and_reraise() {
   local signal="$1" status="$2"
   # Bash uses dynamic scope, so these are the interrupted _cc_wj_run_inner locals.
@@ -2313,10 +2340,16 @@ _cc_wj_run_inner() {
   # Holder scans, taken once per run into files and taken again right before each removal.
   local work old_exit="" old_signals="" cleanup_exit_installed=0
   local LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
+  _cc_wj_scavenge_private_temp
   work="$(mktemp -d "${TMPDIR:-/tmp}/cc-wj.XXXXXX")" || {
     echo "worktree-janitor: no temporary directory for the process scan; scanned and removed nothing" >&2
     return 1
   }
+  if ! (umask 077; printf '%s\n' "$$" > "$work/.owner-pid"); then
+    _cc_wj_remove_private_temp "$work"
+    echo "worktree-janitor: could not mark its private temporary directory; scanned and removed nothing" >&2
+    return 1
+  fi
   # Installed and hook-triggered runs execute under bash. Preserve caller traps, then
   # register signal cleanup before transcript projections can materialize normalized
   # tool input. An existing EXIT trap stays installed; otherwise add cleanup there too.
