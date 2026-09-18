@@ -2079,6 +2079,12 @@ _cc_wj_remove_private_temp() {
 _cc_wj_scavenge_private_temp() {
   local root="${TMPDIR:-/tmp}" directory owner mtime now
   [ -d "$root" ] || return 0
+  # zsh aborts on an unmatched glob by default.  An empty temp root is the normal
+  # case, so keep the literal pattern and let the directory guard below skip it.
+  # `local_options` contains the change to this function when the file is sourced.
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    setopt local_options nonomatch
+  fi
   now="$(date +%s)"
   for directory in "$root"/cc-wj.??????; do
     [ -d "$directory" ] || continue

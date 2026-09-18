@@ -206,6 +206,8 @@ grep -q "Done\." "$out"; check "it reaches the last step" $?
 cmp -s "$ROOT_DIR/config/worktree-janitor.conf" "$H/.cc-reaper/worktree-janitor.conf"; check "it deploys the shared worktree policy" $?
 cmp -s "$ROOT_DIR/hooks/worktree-session-end.sh" "$H/.cc-reaper/worktree-session-end.sh"; check "it deploys the shared SessionEnd entrypoint" $?
 test -f "$H/Library/LaunchAgents/com.cc-reaper.worktree-janitor.plist"; check "it installs the six-hour worktree LaunchAgent" $?
+grep -q '<key>Nice</key>' "$H/Library/LaunchAgents/com.cc-reaper.orphan-monitor.plist"; check "the orphan monitor yields CPU priority" $?
+grep -q '<key>LowPriorityIO</key>' "$H/Library/LaunchAgents/com.cc-reaper.orphan-monitor.plist"; check "the orphan monitor yields I/O priority" $?
 grep -q 'worktree-session-end.sh claude' "$H/.claude/settings.json"; check "it migrates the Claude SessionEnd hook to cc-reaper" $?
 test ! -e "$H/Library/LaunchAgents/com.claude.worktree-inventory.plist"; check "it retires the legacy Claude worktree LaunchAgent" $?
 find "$H/.cc-reaper/migrated-launchagents" -name 'com.claude.worktree-inventory.*.plist' -type f | grep -q .; check "it preserves a recoverable copy of the legacy LaunchAgent" $?
