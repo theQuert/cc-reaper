@@ -522,10 +522,14 @@ other gate.
 
 The inventory indexes each live/recent transcript's current-two-user-turn byte ranges once
 per activity snapshot rather than rereading a multi-megabyte transcript for every candidate
-worktree. The index is temporary, stores offsets rather than transcript content, and is rebuilt
-for the pre-removal activity refresh. A Codex rollout moved by archive is remapped through the
-current state database and becomes path-scoped recent-session evidence instead of an active
-claim on unrelated worktrees.
+worktree. Its first candidate query creates a private, ephemeral projection of normalized
+structured-tool inputs; later candidates use fixed-string matching without starting another
+interpreter for that transcript. Malformed relevant records fall back to the exact parser and
+remain fail closed. Filesystem bytes round-trip through surrogate escapes, and signal/exit
+cleanup removes the private projection directory. The projection is rebuilt for the
+pre-removal activity refresh. A Codex
+rollout moved by archive is remapped through the current state database and becomes path-scoped
+recent-session evidence instead of an active claim on unrelated worktrees.
 
 Scheduled sweeps reuse unchanged offset indexes from
 `~/.cc-reaper/state/transcript-index`. Reuse requires the same path, device, inode, size,

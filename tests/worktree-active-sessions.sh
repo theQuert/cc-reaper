@@ -22,6 +22,10 @@ export LSOF_CWD_FILE LSOF_OPEN_FILE LSOF_LOCK_FILE LSOF_LOCK_CALLS
 
 cat > "$BIN/lsof" <<'STUB'
 #!/usr/bin/env bash
+if [ -n "${LSOF_SLEEP_MARKER:-}" ]; then
+  : > "$LSOF_SLEEP_MARKER"
+  sleep "${LSOF_SLEEP_SECONDS:-2}"
+fi
 case " $* " in
   *" +D "*)
     printf 'x\n' >> "$LSOF_LOCK_CALLS"
@@ -497,24 +501,97 @@ printf '%s\n' \
 printf '{"type":"event_msg","payload":{"message":"' >> "$cache_transcript"
 head -c 2097152 /dev/zero | tr '\0' x >> "$cache_transcript"
 printf '"}}\n' >> "$cache_transcript"
-cache_dir="$CASE/transcript-cache"; cache_trace="$CASE/cache-trace"
+cache_dir="$CASE/transcript-cache"; cache_trace="$CASE/cache-trace"; query_trace="$CASE/query-trace"
 cache_other="$CASE/not-this-worktree"; mkdir -p "$cache_other"
 cache_result="$(CC_WJ_TRANSCRIPT_CACHE_DIR="$cache_dir" CC_WJ_TRANSCRIPT_CACHE_TRACE="$cache_trace" \
+  CC_WJ_TRANSCRIPT_QUERY_TRACE="$query_trace" \
   bash -c 'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?; _cc_wj_transcript_claims_path Codex "$2" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
   _ "$WJ" "$cache_transcript" "$WT" "$cache_other")"
 check "the cached transcript snapshot preserves matching and non-matching results" test "$cache_result" = "0 1"
 cache_builds="$(wc -l < "$cache_trace" | tr -d ' ')"
 check "one activity snapshot indexes a large transcript once across candidate paths" test "$cache_builds" -eq 1
+query_processes="$(wc -l < "$query_trace" | tr -d ' ')"
+check "one activity snapshot starts Python once across candidate paths" test "$query_processes" -eq 1
+
+malformed_cache_transcript="$CASE/malformed-cache-rollout.jsonl"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"current"}}' \
+  "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"input\":\"workdir=$WT\"}" > "$malformed_cache_transcript"
+malformed_cache_dir="$CASE/malformed-transcript-cache"
+malformed_query_trace="$CASE/malformed-query-trace"
+malformed_cache_result="$(CC_WJ_TRANSCRIPT_CACHE_DIR="$malformed_cache_dir" \
+  CC_WJ_TRANSCRIPT_QUERY_TRACE="$malformed_query_trace" \
+  bash -c 'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?; _cc_wj_transcript_claims_path Codex "$2" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
+  _ "$WJ" "$malformed_cache_transcript" "$WT" "$cache_other")"
+check "a malformed canonical tool record stays fail closed for every candidate" test "$malformed_cache_result" = "2 2"
+malformed_query_processes="$(wc -l < "$malformed_query_trace" | tr -d ' ')"
+check "malformed relevant evidence bypasses the shared fast path" test "$malformed_query_processes" -eq 2
 
 escaped_target="$CASE/測試-worktree"
 escaped_transcript="$CASE/escaped-rollout.jsonl"
 printf '%s\n' \
   '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' \
   "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"input\":\"workdir=$CASE/\\u6e2c\\u8a66-worktree\"}}" > "$escaped_transcript"
-escaped_result="$(CC_WJ_CONFIG="$CASE/no-config" bash -c \
-  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; printf "%s\n" "$?"' \
-  _ "$WJ" "$escaped_transcript" "$escaped_target")"
-check "JSON-escaped Unicode tool paths survive the byte prefilter" test "$escaped_result" = 0
+escaped_cache_dir="$CASE/escaped-transcript-cache"
+escaped_query_trace="$CASE/escaped-query-trace"
+escaped_result="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DIR="$escaped_cache_dir" \
+  CC_WJ_TRANSCRIPT_QUERY_TRACE="$escaped_query_trace" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?; _cc_wj_transcript_claims_path Codex "$2" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
+  _ "$WJ" "$escaped_transcript" "$cache_other" "$escaped_target")"
+check "JSON-escaped Unicode tool paths survive the shared fast path" test "$escaped_result" = "1 0"
+escaped_query_processes="$(wc -l < "$escaped_query_trace" | tr -d ' ')"
+check "the normalized Unicode claim reuses one interpreter" test "$escaped_query_processes" -eq 1
+
+byte_target="$CASE/"$'\377'"-worktree"
+byte_transcript="$CASE/non-utf8-rollout.jsonl"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' \
+  '{"type":"response_item","payload":{"type":"custom_tool_call","input":"workdir='"$CASE"'/\udcff-worktree"}}' > "$byte_transcript"
+byte_cache_dir="$CASE/non-utf8-transcript-cache"
+byte_result="$(LC_ALL=C CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DIR="$byte_cache_dir" \
+  bash -c 'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?; _cc_wj_transcript_claims_path Codex "$2" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
+  _ "$WJ" "$byte_transcript" "$cache_other" "$byte_target")"
+check "a surrogate-escaped filesystem byte survives the shared fast path" test "$byte_result" = "1 0"
+
+lone_surrogate_transcript="$CASE/lone-surrogate-rollout.jsonl"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' \
+  '{"type":"response_item","payload":{"type":"custom_tool_call","input":"workdir='"$WT"' \ud800"}}' > "$lone_surrogate_transcript"
+lone_surrogate_cache="$CASE/lone-surrogate-cache"
+lone_surrogate_trace="$CASE/lone-surrogate-trace"
+lone_surrogate_result="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DIR="$lone_surrogate_cache" \
+  CC_WJ_TRANSCRIPT_QUERY_TRACE="$lone_surrogate_trace" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?; _cc_wj_transcript_claims_path Codex "$2" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
+  _ "$WJ" "$lone_surrogate_transcript" "$WT" "$cache_other")"
+check "an unsupported lone surrogate retains exact claim answers" test "$lone_surrogate_result" = "0 1"
+lone_surrogate_queries="$(wc -l < "$lone_surrogate_trace" | tr -d ' ')"
+check "an unsupported lone surrogate bypasses the projection fast path" test "$lone_surrogate_queries" -eq 2
+
+collision_first=/tmp/cc-reaper-collision-2pnsrgg4jq7d
+collision_second=/tmp/cc-reaper-collision-3ecjmulj4j9o
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' \
+  '{"type":"response_item","payload":{"type":"custom_tool_call","input":"workdir=/unrelated"}}' > "$collision_first"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' > "$collision_second"
+printf '{"type":"response_item","payload":{"type":"custom_tool_call","input":"workdir=%s"}}\n' \
+  "$WT" >> "$collision_second"
+collision_cache="$CASE/collision-cache"
+collision_result="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DIR="$collision_cache" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$4"; a=$?; _cc_wj_transcript_claims_path Codex "$3" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
+  _ "$WJ" "$collision_first" "$collision_second" "$WT")"
+check "a cksum collision cannot reuse another transcript's projection" test "$collision_result" = "1 0"
+rm -f "$collision_first" "$collision_second"
+
+grep_failure_bin="$CASE/grep-failure-bin"
+mkdir -p "$grep_failure_bin"
+printf '#!/bin/sh\nexit 2\n' > "$grep_failure_bin/grep"
+chmod +x "$grep_failure_bin/grep"
+grep_failure_cache="$CASE/grep-failure-cache"
+grep_failure_result="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DIR="$grep_failure_cache" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3" >/dev/null; PATH="$4:$PATH"; _cc_wj_transcript_claims_path Codex "$2" "$3"; printf "%s\n" "$?"' \
+  _ "$WJ" "$escaped_transcript" "$escaped_target" "$grep_failure_bin")"
+check "a projection grep error fails closed" test "$grep_failure_result" = "2"
 
 mixed_target="$CASE/café-worktree"
 mixed_transcript="$CASE/mixed-escaped-rollout.jsonl"
@@ -562,6 +639,11 @@ for generation in one two; do
 done
 persistent_builds="$(wc -l < "$persistent_trace" | tr -d ' ')"
 check "an unchanged transcript reuses its persistent offset index across snapshots" test "$persistent_builds" -eq 1
+if grep -R -F -q -- "$WT" "$persistent_dir"; then
+  bad "the persistent transcript index contains no normalized tool input"
+else
+  ok "the persistent transcript index contains no normalized tool input"
+fi
 printf '%s\n' '{"type":"event_msg","payload":{"message":"changed"}}' >> "$cache_transcript"
 CC_WJ_TRANSCRIPT_CACHE_DIR="$CASE/cache-three" \
   CC_WJ_TRANSCRIPT_INDEX_DIR="$persistent_dir" \
@@ -605,6 +687,57 @@ new_fixture scheduled-apply
 age_worktree 72
 CC_WJ_SCHEDULE_APPLY=1 run_wj --scheduled >/dev/null 2>&1
 check "scheduled mode applies when the cc-reaper policy opts in" test ! -d "$WT"
+
+new_fixture interrupted-temp-cleanup
+interrupt_tmp="$CASE/tmp"; interrupt_marker="$CASE/lsof-started"; interrupt_traps="$CASE/caller-traps"
+mkdir -p "$interrupt_tmp"
+env PATH="$BIN:$PATH" TMPDIR="$interrupt_tmp" LSOF_SLEEP_MARKER="$interrupt_marker" \
+  LSOF_SLEEP_SECONDS=2 CC_WJ_CONFIG="$CASE/no-config" CC_WJ_LOG="$CASE/wj.log" \
+  CC_WJ_STATE_DIR="$CASE/state" CC_WJ_CLAUDE_SESSIONS="$CLAUDE_SESSIONS" \
+  CC_WJ_CLAUDE_PROJECTS="$CLAUDE_PROJECTS" CC_WJ_CODEX_LOCKS="$CODEX_LOCKS" \
+  CC_WJ_CODEX_STATE_DB="$CODEX_STATE" CC_WJ_NOTIFY_MIN_GB=999999 \
+  INTERRUPT_TRAP_MARKER="$interrupt_traps" bash -c \
+  'trap '\''printf "EXIT\\n" >> "$INTERRUPT_TRAP_MARKER"'\'' EXIT; trap '\''printf "TERM\\n" >> "$INTERRUPT_TRAP_MARKER"; exit 143'\'' TERM; source "$1"; _cc_wj_run --repo "$2"' \
+  _ "$WJ" "$PRIMARY" >/dev/null 2>&1 &
+interrupt_pid=$!
+for _ in 1 2 3 4 5; do
+  [ -e "$interrupt_marker" ] && break
+  sleep 1
+done
+kill -TERM "$interrupt_pid" 2>/dev/null || true
+wait "$interrupt_pid" 2>/dev/null || true
+interrupt_dirs="$(find "$interrupt_tmp" -maxdepth 1 -type d -name 'cc-wj.*' | wc -l | tr -d ' ')"
+check "an interrupted run removes its private transcript projection directory" test "$interrupt_dirs" -eq 0
+check "an interrupted sourced run restores the caller TERM trap" grep -q '^TERM$' "$interrupt_traps"
+check "an interrupted sourced run restores the caller EXIT trap" grep -q '^EXIT$' "$interrupt_traps"
+
+scavenge_tmp="$CASE/scavenge-tmp"
+mkdir -p "$scavenge_tmp/cc-wj.OLDONE" "$scavenge_tmp/cc-wj.NEWONE" \
+  "$scavenge_tmp/cc-wj.DEAD01" "$scavenge_tmp/cc-wj.LIVE01"
+touch -t 202001010000 "$scavenge_tmp/cc-wj.OLDONE" "$scavenge_tmp/cc-wj.DEAD01" \
+  "$scavenge_tmp/cc-wj.LIVE01"
+printf '%s\n' 999999 > "$scavenge_tmp/cc-wj.DEAD01/.owner-pid"
+printf '%s\n' "$$" > "$scavenge_tmp/cc-wj.LIVE01/.owner-pid"
+TMPDIR="$scavenge_tmp" bash -c 'source "$1"; _cc_wj_scavenge_private_temp' _ "$WJ"
+check "the next run removes an old unowned private directory" test ! -d "$scavenge_tmp/cc-wj.OLDONE"
+check "the next run removes a private directory whose owner died" test ! -d "$scavenge_tmp/cc-wj.DEAD01"
+check "the scavenger preserves a new directory before its owner marker is written" test -d "$scavenge_tmp/cc-wj.NEWONE"
+check "the scavenger preserves a private directory whose owner is alive" test -d "$scavenge_tmp/cc-wj.LIVE01"
+
+captured_pid_file="$CASE/captured-run-pid"
+captured_pid_result="$(bash -c \
+  'source "$1"; ( _cc_wj_capture_run_pid; printf "%s\n" "$_CC_WJ_RUN_PID" > "$2" ) & child=$!; wait "$child"; printf "%s %s\n" "$child" "$(cat "$2")"' \
+  _ "$WJ" "$captured_pid_file")"
+captured_pid_actual="${captured_pid_result%% *}"
+captured_pid_recorded="${captured_pid_result#* }"
+check "a sourced background run records its executing pid, not the parent shell" \
+  test "$captured_pid_actual" = "$captured_pid_recorded"
+
+early_scavenge_tmp="$CASE/early-scavenge-tmp"
+mkdir -p "$early_scavenge_tmp/cc-wj.EARLY1"
+printf '%s\n' 999999 > "$early_scavenge_tmp/cc-wj.EARLY1/.owner-pid"
+TMPDIR="$early_scavenge_tmp" CC_WJ_CONFIG="$CASE/no-config" bash "$WJ" --help >/dev/null
+check "private-temp scavenging runs before a help-mode early return" test ! -d "$early_scavenge_tmp/cc-wj.EARLY1"
 
 new_fixture harness-discovery
 age_worktree 72

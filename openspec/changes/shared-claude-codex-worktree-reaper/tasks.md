@@ -18,6 +18,7 @@
 - [x] 2.11 Prove one activity snapshot indexes a large transcript once across multiple candidate paths.
 - [x] 2.12 Prove the actual LaunchAgent logs are bounded and scheduled runs have start/end evidence.
 - [x] 2.13 Prove unchanged transcript indexes persist across scheduled snapshots and a changed transcript invalidates them.
+- [x] 2.14 Prove multiple candidate paths start at most one transcript-query interpreter per activity snapshot without weakening malformed-record, non-UTF-8 path, or interrupted-run safety.
 
 ## 3. Implementation
 
@@ -32,6 +33,7 @@
 - [x] 3.9 Reconcile Codex archive races through current state and cache transcript-tail evidence per snapshot.
 - [x] 3.10 Bound the installed log paths and delimit scheduled runs with elapsed/status evidence.
 - [x] 3.11 Persist offset-only scheduled transcript indexes behind exact file-identity validation.
+- [x] 3.12 Materialize a private per-snapshot structured-tool search projection so candidate matching does not start an interpreter for every transcript/worktree pair.
 
 ## 4. Integration and proof
 

@@ -48,6 +48,15 @@ unmappable verified-live claim SHALL make the destructive run fail closed.
 #### Scenario: Transcript evidence is shared across candidates
 - **WHEN** several candidate worktrees are judged from the same activity snapshot
 - **THEN** each transcript's current-two-user-turn window is indexed at most once for that snapshot
+- **AND** its normalized structured tool inputs are materialized at most once for that snapshot
+- **AND** matching another candidate does not start another interpreter for that transcript
+- **AND** malformed relevant evidence still uses the exact parser and fails closed
+- **AND** non-UTF-8 filesystem path bytes round-trip through normalized evidence
+- **AND** cache-key collisions and projection lookup failures cannot answer no-claim
+- **AND** normal completion or an interrupt removes the private projection directory
+- **AND** interruption restores and runs the invoking Bash caller's existing signal and exit cleanup
+- **AND** a later start removes a private projection directory whose owner was force-killed
+- **AND** early-return and sourced/background invocations still recover dead-owner projections
 - **AND** the pre-removal activity refresh builds a new snapshot before destructive action
 - **AND** structured active and recent transcript matching is skipped when a cheaper gate already keeps the worktree
 

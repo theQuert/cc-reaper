@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Changed
+- **LaunchAgent replacement and private-temp recovery are fail-observable.** Installer updates now
+  wait until an asynchronously retiring old job is actually absent before registering its
+  replacement. Each janitor run also removes dead-owner transcript projection directories left
+  when launchd escalates past shell traps; fresh unmarked and live-owner directories are retained.
+- **Transcript claim matching now scales with transcripts, not transcript/worktree pairs.** The first candidate query in an activity snapshot materializes a private normalized tool-input projection; later candidates use fixed-string matching without starting another Python interpreter. Persistent indexes remain offset-only, pre-removal refreshes still rebuild activity state, malformed relevant records retain the exact fail-closed parser, non-UTF-8 path bytes round-trip, and signal/exit cleanup removes projections from interrupted runs.
 - **`worktree-janitor` reclaims only landed, idle, unheld, unclaimed worktrees.** The previous gate (clean + no process cwd from a `pgrep` subset + not detached) classified a worktree REMOVABLE while a session was editing it through `git -C`, and removed checkouts whose work had never reached the base. Now: machine-wide `lsof` of every cwd **and every open file**, each bounded and each failing closed on an empty or failed scan; verified-live Claude and Codex registry/tool-call claims as an independent veto; `CC_WJ_IDLE_HOURS` (default 48, a malformed value refuses the run); landing proven against a freshly fetched base by ancestry, `git merge-tree` content, or a merged PR at this exact head SHA whose merge commit is still on the base; a detached HEAD needs ancestry. Harness claims, holders, contents and idleness are asked again immediately before each removal. Superseded: "an unpushed branch is still removable".
 - **`.worktree-regenerable`** - a repository declares its own runtime byproducts, read from the fetched base (never the worktree), with patterns that name no path dropped and reported, and credential-shaped files inside declared directories or caches still keeping the worktree. The report names what keeps each one.
 

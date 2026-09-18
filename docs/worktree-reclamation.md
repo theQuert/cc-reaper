@@ -169,9 +169,14 @@ necessarily names it. Its verified cwd still protects the checkout it actually u
 all other live Claude and Codex claims remain vetoes.
 
 Within one activity snapshot, each transcript's current-two-user-turn window is indexed
-once as byte ranges and reused across candidate worktrees. The temporary index contains no
-transcript or tool-call content and is discarded with the run. The destructive recheck
-starts a fresh snapshot, so this avoids repeated reads without weakening the final race gate.
+once as byte ranges and reused across candidate worktrees. The first query also materializes
+normalized structured-tool input into a private, ephemeral search projection, so later
+candidates do not start another interpreter for the same transcript. Malformed relevant
+records bypass that fast path and retain exact fail-closed parsing. The persistent index
+contains only file identity and byte ranges; the temporary projection is discarded with the
+run, including when a scheduled sweep is interrupted. Filesystem bytes outside UTF-8 are
+round-tripped rather than rewritten. The destructive recheck starts a fresh snapshot, so this avoids repeated decoding
+without weakening the final race gate.
 
 ## Five ways a reclaimer silently reclaims nothing
 

@@ -410,6 +410,13 @@ _cc_wj_claim_cwd() {
   (builtin cd -P -- "$cwd" >/dev/null 2>&1 && pwd -P)
 }
 
+_cc_wj_transcript_cache_identity() { # <mode> <path>
+  local stat_identity
+  stat_identity="$(stat -f '%d %i %z %m' "$2" 2>/dev/null)" ||
+    stat_identity="$(stat -c '%d %i %s %Y' "$2" 2>/dev/null)" || return 1
+  printf '%s\0%s\0%s\n' "$1" "$2" "$stat_identity"
+}
+
 # Query only the meaningful tail of an append-only transcript. Real session files on the
 # measured host exceed 100 MB; reading each whole file once per candidate made a six-hour
 # janitor run itself a sustained I/O workload. In reverse order the current two human
@@ -430,6 +437,25 @@ _cc_wj_transcript_tail_query() { # <claude-cwd|claude-claim|codex-claim> <file> 
       [ -z "$CC_WJ_TRANSCRIPT_INDEX_DIR" ] || chmod 700 "$CC_WJ_TRANSCRIPT_INDEX_DIR" 2>/dev/null || true
       [ -z "$CC_WJ_TRANSCRIPT_INDEX_DIR" ] || index="$CC_WJ_TRANSCRIPT_INDEX_DIR/$cache_key.json"
     fi
+    # The first target in one activity snapshot asks Python to decode the current-turn
+    # tool inputs.  It writes their normalized text beside the offset snapshot.  Every
+    # later target can then use grep instead of starting another Python interpreter for
+    # every transcript.  A malformed relevant record keeps the legacy target-specific
+    # parser on the path below, so the optimization cannot weaken fail-closed behavior.
+    if [ -n "$cache" ] && [ -f "$cache.search" ] && [ -f "$cache.identity" ] &&
+       [ ! -e "$cache.fatal" ] && [ ! -e "$cache.unsafe" ] &&
+       cmp -s "$cache.identity" <(_cc_wj_transcript_cache_identity "$mode" "$transcript"); then
+      LC_ALL=C grep -F -q -- "$wt" "$cache.search" 2>/dev/null
+      case $? in 0) return 0 ;; 1) ;; *) return 2 ;; esac
+      if [ -n "$alt" ]; then
+        LC_ALL=C grep -F -q -- "$alt" "$cache.search" 2>/dev/null
+        case $? in 0) return 0 ;; 1) ;; *) return 2 ;; esac
+      fi
+      return 1
+    fi
+  fi
+  if [ -n "${CC_WJ_TRANSCRIPT_QUERY_TRACE:-}" ]; then
+    printf '%s\t%s\n' "$mode" "$transcript" >> "$CC_WJ_TRANSCRIPT_QUERY_TRACE"
   fi
   "$python" - "$mode" "$transcript" "$wt" "$alt" "$cache" "$index" <<'PY'
 import json
@@ -467,6 +493,45 @@ def value_names_target(value, depth=0):
         if nested != value:
             return value_names_target(nested, depth + 1)
     return False
+
+
+def searchable_texts(value, depth=0):
+    """Return every normalized text layer value_names_target can match."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    texts = [text]
+    if isinstance(value, str) and depth < 4:
+        try:
+            nested = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return texts
+        if nested != value:
+            texts.extend(searchable_texts(nested, depth + 1))
+    return texts
+
+
+def event_searchable_texts(event):
+    if not isinstance(event, dict):
+        return []
+    if mode == "codex-claim":
+        payload = event.get("payload")
+        if (
+            event.get("type") == "response_item"
+            and isinstance(payload, dict)
+            and payload.get("type") == "custom_tool_call"
+        ):
+            return searchable_texts(payload.get("input", ""))
+        return []
+    if mode == "claude-claim":
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if event.get("type") != "assistant" or not isinstance(content, list):
+            return []
+        texts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "tool_use":
+                texts.extend(searchable_texts(item.get("input", "")))
+        return texts
+    return []
 
 
 def reverse_lines(file_path):
@@ -510,7 +575,8 @@ def load_snapshot(snapshot_path, stat, allow_growth):
         )
         mtime_matches = allow_growth or candidate.get("mtime_ns") == stat.st_mtime_ns
         if (
-            candidate.get("path") == path
+            candidate.get("schema") == 2
+            and candidate.get("path") == path
             and candidate.get("mode") == mode
             and candidate.get("dev") == stat.st_dev
             and candidate.get("ino") == stat.st_ino
@@ -532,6 +598,20 @@ def write_snapshot(snapshot_path, snapshot):
         with os.fdopen(fd, "w", encoding="utf-8") as output:
             json.dump(snapshot, output, separators=(",", ":"))
         os.replace(temporary, snapshot_path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def write_bytes(pathname, payload):
+    directory = os.path.dirname(pathname)
+    fd, temporary = tempfile.mkstemp(prefix=".transcript-search-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(payload)
+        os.replace(temporary, pathname)
     finally:
         try:
             os.unlink(temporary)
@@ -611,6 +691,7 @@ try:
                                 break
                         end = newline if newline >= 0 else 0
                     snapshot = {
+                        "schema": 2,
                         "path": path,
                         "mode": mode,
                         "dev": stat.st_dev,
@@ -634,6 +715,74 @@ try:
                         if trace:
                             with open(trace, "a", encoding="utf-8") as output:
                                 output.write(path + "\n")
+
+                if cache_path:
+                    values = []
+                    fatal = False
+                    unsafe = False
+                    tool_marker = (
+                        b'"custom_tool_call"' if mode == "codex-claim" else b'"tool_use"'
+                    )
+                    for range_begin, range_end in snapshot.get("ranges", []):
+                        if (
+                            range_begin < 0
+                            or range_end > len(contents)
+                            or range_begin >= range_end
+                        ):
+                            raise SystemExit(2)
+                        raw = contents[range_begin:range_end]
+                        has_tool_marker = tool_marker in raw
+                        try:
+                            event = json.loads(raw)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            if has_tool_marker:
+                                fatal = True
+                            elif b"/" in raw:
+                                unsafe = True
+                            continue
+                        values.extend(event_searchable_texts(event))
+                    encoded_values = []
+                    for value in values:
+                        try:
+                            encoded_values.append(value.encode("utf-8", "surrogateescape"))
+                        except UnicodeEncodeError:
+                            # U+DC80..U+DCFF round-trip filesystem bytes. Other lone
+                            # surrogates have no shell-byte representation, so keep the
+                            # exact parser instead of turning an encoding error into the
+                            # status-1 "no claim" answer.
+                            fatal = True
+                    search_payload = b"\0".join(encoded_values)
+                    try:
+                        write_bytes(cache_path + ".search", search_payload)
+                        if fatal:
+                            write_bytes(cache_path + ".fatal", b"1")
+                        if unsafe:
+                            write_bytes(cache_path + ".unsafe", b"1")
+                        # Written last: the shell fast path is available only when
+                        # the exact mode/path/file identity that produced the atomic
+                        # projection is visible. The cksum is only a filename shard;
+                        # it is never trusted as cache identity.
+                        identity = (
+                            mode.encode("utf-8")
+                            + b"\0"
+                            + os.fsencode(path)
+                            + b"\0"
+                            + f"{stat.st_dev} {stat.st_ino} {stat.st_size} {int(stat.st_mtime)}\n".encode("ascii")
+                        )
+                        write_bytes(cache_path + ".identity", identity)
+                    except OSError:
+                        raise SystemExit(2)
+                    # The projection was built from the same normalized layers as
+                    # value_names_target. Use it for this first target too; otherwise
+                    # the process decodes every selected JSON record a second time
+                    # before later candidates finally reach the shell fast path.
+                    if not fatal and not unsafe:
+                        if any(
+                            target in value or (alternate and alternate in value)
+                            for value in values
+                        ):
+                            raise SystemExit(0)
+                        raise SystemExit(1)
 
                 for begin, end in snapshot.get("ranges", []):
                     if begin < 0 or end > len(contents) or begin >= end:
@@ -1915,6 +2064,81 @@ _cc_wj_maybe_notify() {
   osascript -e "display notification \"${msg}\" with title \"cc-reaper: worktree-janitor\"" 2>/dev/null || true
 }
 
+_cc_wj_remove_private_temp() {
+  local directory="${1:-}"
+  [ -d "$directory" ] || return 0
+  case "${directory##*/}" in
+    cc-wj.??????) rm -rf -- "$directory" ;;
+    *)
+      echo "worktree-janitor: refused to remove unexpected temporary path: $directory" >&2
+      return 1
+      ;;
+  esac
+}
+
+_cc_wj_scavenge_private_temp() {
+  local root="${TMPDIR:-/tmp}" directory owner mtime now
+  [ -d "$root" ] || return 0
+  now="$(date +%s)"
+  for directory in "$root"/cc-wj.??????; do
+    [ -d "$directory" ] || continue
+    # Never cross users even if a shared temporary root contains a matching name.
+    [ -O "$directory" ] || continue
+    owner=""
+    if IFS= read -r owner 2>/dev/null < "$directory/.owner-pid"; then
+      case "$owner" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      # PID reuse only delays cleanup; it can never authorize removal of a live run.
+      kill -0 "$owner" 2>/dev/null && continue
+      _cc_wj_remove_private_temp "$directory"
+      continue
+    fi
+    # There is an unavoidable interval between mktemp and writing the owner marker.
+    # Retain unmarked directories for five minutes so a concurrent startup cannot
+    # remove a live run. This also migrates privacy residue from older installations.
+    mtime="$(_cc_wj_mtime_epoch "$directory")" || continue
+    [ $((now - mtime)) -ge 300 ] || continue
+    _cc_wj_remove_private_temp "$directory"
+  done
+}
+
+_cc_wj_capture_run_pid() {
+  local probe
+  /bin/sleep 5 & probe=$!
+  _CC_WJ_RUN_PID="$(ps -o ppid= -p "$probe" 2>/dev/null | awk '{ print $1; exit }')"
+  kill "$probe" 2>/dev/null || true
+  wait "$probe" 2>/dev/null || true
+  case "${_CC_WJ_RUN_PID:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+}
+
+_cc_wj_cleanup_and_reraise() {
+  local signal="$1" status="$2"
+  local caller_trap=""
+  # Bash uses dynamic scope, so these are the interrupted _cc_wj_run_inner locals.
+  _cc_wj_remove_private_temp "${work:-}"
+  case "$signal" in
+    INT) caller_trap="${old_int:-}" ;;
+    TERM) caller_trap="${old_term:-}" ;;
+    HUP) caller_trap="${old_hup:-}" ;;
+  esac
+  trap - INT TERM HUP
+  # Running a restored signal trap nested inside this handler makes Bash skip EXIT
+  # when that caller trap exits. Run the caller's quoted trap action in a subshell
+  # with EXIT disabled, then exit this shell normally so its original EXIT trap runs
+  # exactly once. No interrupted janitor body resumes between cleanup and exit.
+  if [ -n "$caller_trap" ]; then
+    (
+      trap - EXIT
+      eval "set -- $caller_trap"
+      [ "${1:-}" = trap ] && [ "${2:-}" = -- ] && eval "${3:-}"
+    )
+  fi
+  exit "$status"
+}
+
 # ─── Removal ──────────────────────────────────────────────────────────────────
 
 # Remove a single worktree, never with force. Ignored residue does not stop a plain
@@ -1953,8 +2177,8 @@ _cc_wj_remove_worktree() {
 # that costs - one of two concurrent removals fails and is reported - so the lock is a
 # de-duplication of work, not the thing standing between a worktree and its deletion.
 _cc_wj_lock_write() {
-  echo "$$" > "$1/pid"
-  ps -o command= -p "$$" > "$1/cmd" 2>/dev/null
+  echo "${_CC_WJ_RUN_PID:-$$}" > "$1/pid"
+  ps -o command= -p "${_CC_WJ_RUN_PID:-$$}" > "$1/cmd" 2>/dev/null
 }
 
 _cc_wj_lock() {
@@ -1994,13 +2218,22 @@ _cc_wj_lock() {
 
 # Released only while it is still ours: after a takeover it belongs to somebody else.
 _cc_wj_unlock() {
-  [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] && rm -f "$1/pid" "$1/cmd" && rmdir "$1" 2>/dev/null
+  [ "$(cat "$1/pid" 2>/dev/null)" = "${_CC_WJ_RUN_PID:-$$}" ] && rm -f "$1/pid" "$1/cmd" && rmdir "$1" 2>/dev/null
   return 0
 }
 
 # ─── Main report/apply logic ─────────────────────────────────────────────────
 
 _cc_wj_run_inner() {
+  # Recover private projections even when this invocation later exits through help,
+  # --claims, invalid config, or empty discovery. Bash 3.2 leaves $$ pointing at the
+  # parent for a sourced background function, so derive the OS pid from a short-lived
+  # child before owner markers or repository locks are written.
+  _cc_wj_scavenge_private_temp
+  if ! _cc_wj_capture_run_pid; then
+    echo "worktree-janitor: could not determine the executing process id; scanned and removed nothing" >&2
+    return 1
+  fi
   # The scheduled agent's stdout/stderr pair is written by launchd, so no script owns it
   # unless one claims it. Bounded here, at the top of every run, rather than from
   # `_cc_wj_log_write`: a report-only run never calls that helper - every call site is in
@@ -2156,11 +2389,35 @@ _cc_wj_run_inner() {
   local prune_repos=()
 
   # Holder scans, taken once per run into files and taken again right before each removal.
-  local work LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
+  local work old_exit="" old_int="" old_term="" old_hup="" cleanup_exit_installed=0
+  local LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
   work="$(mktemp -d "${TMPDIR:-/tmp}/cc-wj.XXXXXX")" || {
     echo "worktree-janitor: no temporary directory for the process scan; scanned and removed nothing" >&2
     return 1
   }
+  if ! (umask 077; printf '%s\n' "$_CC_WJ_RUN_PID" > "$work/.owner-pid"); then
+    _cc_wj_remove_private_temp "$work"
+    echo "worktree-janitor: could not mark its private temporary directory; scanned and removed nothing" >&2
+    return 1
+  fi
+  # Installed and hook-triggered runs execute under bash. Preserve caller traps, then
+  # register signal cleanup before transcript projections can materialize normalized
+  # tool input. An existing EXIT trap stays installed; otherwise add cleanup there too.
+  # zsh only sources this file for helper tests; its `trap -p` is incompatible and no
+  # installed run executes through that path.
+  if [ -n "${BASH_VERSION:-}" ]; then
+    old_exit="$(trap -p EXIT)"
+    old_int="$(trap -p INT)"
+    old_term="$(trap -p TERM)"
+    old_hup="$(trap -p HUP)"
+    if [ -z "$old_exit" ]; then
+      trap '_cc_wj_remove_private_temp "$work"' EXIT
+      cleanup_exit_installed=1
+    fi
+    trap '_cc_wj_cleanup_and_reraise INT 130' INT
+    trap '_cc_wj_cleanup_and_reraise TERM 143' TERM
+    trap '_cc_wj_cleanup_and_reraise HUP 129' HUP
+  fi
   _CC_WJ_TRANSCRIPT_CACHE_ROOT="$work/transcript-cache"
   _CC_WJ_TRANSCRIPT_CACHE_GENERATION=0
   if ! _cc_wj_scan_holders "$work"; then
@@ -2451,7 +2708,14 @@ KEEP
 
     [ -n "$lock" ] && _cc_wj_unlock "$lock"
   done
-  rm -rf "$work"
+  _cc_wj_remove_private_temp "$work"
+  if [ -n "${BASH_VERSION:-}" ]; then
+    trap - INT TERM HUP
+    [ -z "$old_int" ] || eval "$old_int"
+    [ -z "$old_term" ] || eval "$old_term"
+    [ -z "$old_hup" ] || eval "$old_hup"
+    [ "$cleanup_exit_installed" -eq 0 ] || trap - EXIT
+  fi
 
   # Run git worktree prune on repos that had removals or missing dirs (deduped).
   #

@@ -31,9 +31,25 @@ sandbox_home() {
 # actually loading agents into the session running the suite.
 stub_bin() {
   local d; d="$(mktemp -d)" || return 1
-  for c in launchctl brew cargo; do
+  for c in brew cargo; do
     printf '#!/bin/sh\nexit 0\n' > "$d/$c"; chmod +x "$d/$c"
   done
+  cat > "$d/launchctl" <<'STUB'
+#!/bin/sh
+state="$(dirname "$0")/launchctl-state"
+mkdir -p "$state"
+case "$1" in
+  enable|kickstart) exit 0 ;;
+  bootout)
+    label=${2##*/}; rm -f "$state/$label.loaded"; exit 0 ;;
+  bootstrap)
+    label=${3##*/}; label=${label%.plist}; : > "$state/$label.loaded"; exit 0 ;;
+  print)
+    label=${2##*/}; test -e "$state/$label.loaded"; exit $? ;;
+esac
+exit 0
+STUB
+  chmod +x "$d/launchctl"
   printf '%s' "$d"
 }
 
@@ -46,8 +62,9 @@ STUBS="$(stub_bin)"
 SLOW_STUBS="$(stub_bin)"
 printf '#!/bin/sh\nsleep 120\n' > "$SLOW_STUBS/launchctl"; chmod +x "$SLOW_STUBS/launchctl"
 
-# launchd may acknowledge bootout before it is ready to accept the replacement plist.
-# This stub makes every label's first bootstrap fail, then accepts the retry.
+# launchd may acknowledge bootout while the old job is still printable, then remove it
+# later. This stub keeps a preloaded worktree label visible for three print calls and
+# makes every label's first bootstrap fail, then accepts the retry.
 RETRY_STUBS="$(stub_bin)"
 cat > "$RETRY_STUBS/launchctl" <<'STUB'
 #!/bin/sh
@@ -57,16 +74,32 @@ printf '%s\n' "$*" >> "$state/calls"
 case "$1" in
   enable|kickstart) exit 0 ;;
   bootout)
-    label=${2##*/}; rm -f "$state/$label.loaded"; exit 0 ;;
+    label=${2##*/}
+    if [ -e "$state/$label.loaded" ]; then
+      printf '0\n' > "$state/$label.retiring"
+    fi
+    exit 0
+    ;;
   bootstrap)
     label=${3##*/}; label=${label%.plist}
+    test ! -e "$state/$label.retiring" || exit 1
     if [ -e "$state/$label.seen" ]; then
       : > "$state/$label.loaded"; exit 0
     fi
     : > "$state/$label.seen"; exit 1
     ;;
   print)
-    label=${2##*/}; test -e "$state/$label.loaded"; exit $?
+    label=${2##*/}
+    if [ -e "$state/$label.retiring" ]; then
+      count=$(cat "$state/$label.retiring")
+      if [ "$count" -lt 3 ]; then
+        printf '%s\n' $((count + 1)) > "$state/$label.retiring"
+        exit 0
+      fi
+      rm -f "$state/$label.loaded" "$state/$label.retiring"
+      exit 1
+    fi
+    test -e "$state/$label.loaded"; exit $?
     ;;
 esac
 exit 0
@@ -151,6 +184,7 @@ rm -rf "$H" "$out"
 H="$(sandbox_home)"
 out="$(mktemp)"
 retry_state="$(mktemp -d)"
+: > "$retry_state/com.cc-reaper.worktree-janitor.loaded"
 HOME="$H" PATH="$RETRY_STUBS:$PATH" LAUNCHCTL_RETRY_STATE="$retry_state" \
   CC_REAPER_DAEMON=b bounded 60 bash "$ROOT_DIR/install.sh" >"$out" 2>&1 < /dev/null
 rc=$?

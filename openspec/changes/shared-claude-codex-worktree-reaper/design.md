@@ -26,14 +26,33 @@ is rebuilt immediately before removal to close the session-start race. The clean
 own tool-call mentions are excluded because inventory names its targets; its verified cwd
 claim still protects the checkout it actually uses.
 
-The current-two-turn window is indexed once per transcript and activity snapshot, then
-matched against every candidate worktree. A pre-removal refresh starts a new snapshot so
-the index is an optimization of repeated reads, not permission to rely on stale activity.
+The current-two-turn window is indexed once per transcript and activity snapshot. The first
+candidate query decodes that window and writes a normalized, NUL-delimited search projection
+inside the run's private temporary directory; later candidates use fixed-string matching
+instead of starting another Python interpreter. A malformed canonical tool record, or a
+malformed slash-bearing record that might name a path, bypasses the projection and retains
+the exact target-specific parser's fail-closed behavior. A pre-removal refresh starts a new
+snapshot so these files optimize repeated reads, not permission to rely on stale activity.
 Scheduled sweeps also retain an offset-only index under cc-reaper state. Reuse requires the
 same transcript path, device, inode, size, and nanosecond modification time; a changed file
 is reread before its evidence can participate in a destructive decision. The persistent
-and per-run indexes contain byte ranges and file identity only, never transcript records or
-tool-call content.
+index and per-run offset file contain byte ranges and file identity only, never transcript
+records or tool-call content. Only the ephemeral search projection contains normalized tool
+input text, and it is discarded with the private run directory.
+Installed bash runs register signal and exit cleanup immediately after that directory is
+created, before any projection is written. Projection encoding uses surrogate escapes so a
+non-UTF-8 filesystem byte remains the same byte the shell passes to fixed-string matching.
+Unsupported lone surrogates mark the projection unsafe and retain exact parsing. The shell fast
+path validates an exact mode/path/device/inode/size/mtime identity rather than trusting its
+checksum filename, and any projection lookup error fails closed. Signal cleanup runs the
+caller-owned signal action without resuming the interrupted body, then exits through the caller's
+existing EXIT cleanup.
+Because launchd may escalate past shell traps, each run also records its owner PID and scavenges
+dead-owner private directories on the next start; unmarked directories receive a five-minute
+creation grace so concurrent starts cannot remove one between `mktemp` and owner registration.
+Scavenging precedes every argument/config/discovery early return, and sourced/background runs
+derive the OS process actually executing the function instead of trusting Bash 3.2's inherited
+`$$` value.
 If a Codex writer lock closes while its captured rollout is being read, the janitor remaps
 that task through current Codex state. An archived task becomes bounded recent-session
 evidence for only its mapped cwd and structured tool paths; the expected rollout move does
