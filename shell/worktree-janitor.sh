@@ -61,6 +61,7 @@ Environment:
   CC_WJ_CLAUDE_SESSIONS  Claude live-session registry (default: ~/.claude/sessions)
   CC_WJ_CLAUDE_PROJECTS  Claude transcript registry (default: ~/.claude/projects)
   CC_WJ_CODEX_LOCKS      Codex writer-lock registry (default: ~/.codex/thread-writer-locks)
+  CC_WJ_CODEX_SESSIONS   Codex active rollout registry (default: ~/.codex/sessions)
   CC_WJ_CODEX_STATE_DB   Codex local state database (default: ~/.codex/state_5.sqlite)
 
 A worktree is removable only when it holds nothing a command cannot rebuild, no process
@@ -949,6 +950,46 @@ $files
 CLAUDE_FILES
 }
 
+# Codex can hold a live writer lock for minutes before publishing the task row to
+# state_5.sqlite. The rollout already exists in that interval and starts with bounded,
+# machine-readable session metadata. Map only one exact-id rollout whose metadata repeats
+# the same id and supplies a safe cwd. Anything ambiguous remains fail-closed.
+_cc_wj_codex_rollout_metadata() { # <thread id>
+  local tid="$1" sessions="${CC_WJ_CODEX_SESSIONS:-$HOME/.codex/sessions}"
+  local rollouts count rollout python
+  [ -d "$sessions" ] && [ -r "$sessions" ] && [ -x "$sessions" ] || return 1
+  rollouts="$(_cc_wj_with_timeout 15 find "$sessions" -type f -name "*-$tid.jsonl" -print 2>/dev/null)" || return 1
+  count="$(printf '%s\n' "$rollouts" | grep -c .)"
+  [ "$count" -eq 1 ] || return 1
+  rollout="$rollouts"
+  case "$rollout" in ''|*$'\t'*|*$'\r'*|*$'\n'*) return 1 ;; esac
+  [ -r "$rollout" ] || return 1
+  python="$(command -v python3 2>/dev/null)" || return 1
+  "$python" - "$rollout" "$tid" <<'PY'
+import json
+import sys
+
+path, expected_id = sys.argv[1:]
+try:
+    with open(path, "rb") as stream:
+        line = stream.readline(1024 * 1024 + 1)
+    if not line.endswith(b"\n") or len(line) > 1024 * 1024:
+        raise ValueError("unbounded session metadata")
+    record = json.loads(line)
+    payload = record.get("payload")
+    if record.get("type") != "session_meta" or not isinstance(payload, dict):
+        raise ValueError("missing session metadata")
+    cwd = payload.get("cwd")
+    if payload.get("id") != expected_id or not isinstance(cwd, str):
+        raise ValueError("mismatched session metadata")
+    if not cwd.startswith("/") or any(char in cwd for char in "\t\r\n"):
+        raise ValueError("unsafe session cwd")
+except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+print(f"{cwd}\t{path}")
+PY
+}
+
 _cc_wj_scan_codex_sessions() {
   local locks="${CC_WJ_CODEX_LOCKS:-$HOME/.codex/thread-writer-locks}"
   local state="${CC_WJ_CODEX_STATE_DB:-$HOME/.codex/state_5.sqlite}"
@@ -976,9 +1017,10 @@ _cc_wj_scan_codex_sessions() {
       _CC_WJ_ACTIVE_ERROR="active Codex claim $tid could not be mapped because $state is unreadable"
       return 1
     }
-    # Codex creates the writer lock just before its state row becomes visible. A schedule
-    # starting in that narrow window used to poison the entire run as activity-unknown.
-    # Retry only a freshly-created lock; an old unmappable lock is not treated as a race.
+    # Codex normally creates the writer lock just before its state row becomes visible.
+    # Preserve the short retry for that common case. Some app sessions publish the row
+    # much later, however, so lock age must not decide whether a verified-live task can
+    # be mapped; the exact rollout metadata below is the bounded fallback.
     attempts=1
     lock_mtime="$(_cc_wj_mtime_epoch "$path")"; now="$(date +%s)"
     case "$lock_mtime" in
@@ -998,8 +1040,15 @@ _cc_wj_scan_codex_sessions() {
       sleep 0.5
       attempt=$((attempt + 1))
     done
+    if [ "$count" -eq 0 ]; then
+      row="$(_cc_wj_codex_rollout_metadata "$tid")" || {
+        _CC_WJ_ACTIVE_ERROR="active Codex claim $tid could not be mapped to exactly one task or active rollout"
+        return 1
+      }
+      count=1
+    fi
     [ "$count" -eq 1 ] || {
-      _CC_WJ_ACTIVE_ERROR="active Codex claim $tid could not be mapped to exactly one task"
+      _CC_WJ_ACTIVE_ERROR="active Codex claim $tid could not be mapped to exactly one task or active rollout"
       return 1
     }
     IFS=$'\t' read -r cwd rollout <<< "$row"
