@@ -48,6 +48,9 @@ unmappable verified-live claim SHALL make the destructive run fail closed.
 #### Scenario: Transcript evidence is shared across candidates
 - **WHEN** several candidate worktrees are judged from the same activity snapshot
 - **THEN** each transcript's current-two-user-turn window is indexed at most once for that snapshot
+- **AND** its normalized structured tool inputs are materialized at most once for that snapshot
+- **AND** matching another candidate does not start another interpreter for that transcript
+- **AND** malformed relevant evidence still uses the exact parser and fails closed
 - **AND** the pre-removal activity refresh builds a new snapshot before destructive action
 - **AND** structured active and recent transcript matching is skipped when a cheaper gate already keeps the worktree
 

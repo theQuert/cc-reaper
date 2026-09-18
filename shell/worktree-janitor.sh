@@ -430,6 +430,24 @@ _cc_wj_transcript_tail_query() { # <claude-cwd|claude-claim|codex-claim> <file> 
       [ -z "$CC_WJ_TRANSCRIPT_INDEX_DIR" ] || chmod 700 "$CC_WJ_TRANSCRIPT_INDEX_DIR" 2>/dev/null || true
       [ -z "$CC_WJ_TRANSCRIPT_INDEX_DIR" ] || index="$CC_WJ_TRANSCRIPT_INDEX_DIR/$cache_key.json"
     fi
+    # The first target in one activity snapshot asks Python to decode the current-turn
+    # tool inputs.  It writes their normalized text beside the offset snapshot.  Every
+    # later target can then use grep instead of starting another Python interpreter for
+    # every transcript.  A malformed relevant record keeps the legacy target-specific
+    # parser on the path below, so the optimization cannot weaken fail-closed behavior.
+    if [ -n "$cache" ] && [ -f "$cache.search" ] &&
+       [ ! -e "$cache.fatal" ] && [ ! -e "$cache.unsafe" ]; then
+      if LC_ALL=C grep -F -q -- "$wt" "$cache.search" 2>/dev/null; then
+        return 0
+      fi
+      if [ -n "$alt" ] && LC_ALL=C grep -F -q -- "$alt" "$cache.search" 2>/dev/null; then
+        return 0
+      fi
+      return 1
+    fi
+  fi
+  if [ -n "${CC_WJ_TRANSCRIPT_QUERY_TRACE:-}" ]; then
+    printf '%s\t%s\n' "$mode" "$transcript" >> "$CC_WJ_TRANSCRIPT_QUERY_TRACE"
   fi
   "$python" - "$mode" "$transcript" "$wt" "$alt" "$cache" "$index" <<'PY'
 import json
@@ -467,6 +485,45 @@ def value_names_target(value, depth=0):
         if nested != value:
             return value_names_target(nested, depth + 1)
     return False
+
+
+def searchable_texts(value, depth=0):
+    """Return every normalized text layer value_names_target can match."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    texts = [text]
+    if isinstance(value, str) and depth < 4:
+        try:
+            nested = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return texts
+        if nested != value:
+            texts.extend(searchable_texts(nested, depth + 1))
+    return texts
+
+
+def event_searchable_texts(event):
+    if not isinstance(event, dict):
+        return []
+    if mode == "codex-claim":
+        payload = event.get("payload")
+        if (
+            event.get("type") == "response_item"
+            and isinstance(payload, dict)
+            and payload.get("type") == "custom_tool_call"
+        ):
+            return searchable_texts(payload.get("input", ""))
+        return []
+    if mode == "claude-claim":
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if event.get("type") != "assistant" or not isinstance(content, list):
+            return []
+        texts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "tool_use":
+                texts.extend(searchable_texts(item.get("input", "")))
+        return texts
+    return []
 
 
 def reverse_lines(file_path):
@@ -510,7 +567,8 @@ def load_snapshot(snapshot_path, stat, allow_growth):
         )
         mtime_matches = allow_growth or candidate.get("mtime_ns") == stat.st_mtime_ns
         if (
-            candidate.get("path") == path
+            candidate.get("schema") == 2
+            and candidate.get("path") == path
             and candidate.get("mode") == mode
             and candidate.get("dev") == stat.st_dev
             and candidate.get("ino") == stat.st_ino
@@ -532,6 +590,20 @@ def write_snapshot(snapshot_path, snapshot):
         with os.fdopen(fd, "w", encoding="utf-8") as output:
             json.dump(snapshot, output, separators=(",", ":"))
         os.replace(temporary, snapshot_path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def write_bytes(pathname, payload):
+    directory = os.path.dirname(pathname)
+    fd, temporary = tempfile.mkstemp(prefix=".transcript-search-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(payload)
+        os.replace(temporary, pathname)
     finally:
         try:
             os.unlink(temporary)
@@ -611,6 +683,7 @@ try:
                                 break
                         end = newline if newline >= 0 else 0
                     snapshot = {
+                        "schema": 2,
                         "path": path,
                         "mode": mode,
                         "dev": stat.st_dev,
@@ -634,6 +707,55 @@ try:
                         if trace:
                             with open(trace, "a", encoding="utf-8") as output:
                                 output.write(path + "\n")
+
+                if cache_path:
+                    values = []
+                    fatal = False
+                    unsafe = False
+                    tool_marker = (
+                        b'"custom_tool_call"' if mode == "codex-claim" else b'"tool_use"'
+                    )
+                    for range_begin, range_end in snapshot.get("ranges", []):
+                        if (
+                            range_begin < 0
+                            or range_end > len(contents)
+                            or range_begin >= range_end
+                        ):
+                            raise SystemExit(2)
+                        raw = contents[range_begin:range_end]
+                        has_tool_marker = tool_marker in raw
+                        try:
+                            event = json.loads(raw)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            if has_tool_marker:
+                                fatal = True
+                            elif b"/" in raw:
+                                unsafe = True
+                            continue
+                        values.extend(event_searchable_texts(event))
+                    search_payload = b"\0".join(
+                        value.encode("utf-8", "surrogatepass")
+                        for value in values
+                    )
+                    try:
+                        write_bytes(cache_path + ".search", search_payload)
+                        if fatal:
+                            write_bytes(cache_path + ".fatal", b"1")
+                        if unsafe:
+                            write_bytes(cache_path + ".unsafe", b"1")
+                    except OSError:
+                        raise SystemExit(2)
+                    # The projection was built from the same normalized layers as
+                    # value_names_target. Use it for this first target too; otherwise
+                    # the process decodes every selected JSON record a second time
+                    # before later candidates finally reach the shell fast path.
+                    if not fatal and not unsafe:
+                        if any(
+                            target in value or (alternate and alternate in value)
+                            for value in values
+                        ):
+                            raise SystemExit(0)
+                        raise SystemExit(1)
 
                 for begin, end in snapshot.get("ranges", []):
                     if begin < 0 or end > len(contents) or begin >= end:

@@ -497,24 +497,46 @@ printf '%s\n' \
 printf '{"type":"event_msg","payload":{"message":"' >> "$cache_transcript"
 head -c 2097152 /dev/zero | tr '\0' x >> "$cache_transcript"
 printf '"}}\n' >> "$cache_transcript"
-cache_dir="$CASE/transcript-cache"; cache_trace="$CASE/cache-trace"
+cache_dir="$CASE/transcript-cache"; cache_trace="$CASE/cache-trace"; query_trace="$CASE/query-trace"
 cache_other="$CASE/not-this-worktree"; mkdir -p "$cache_other"
 cache_result="$(CC_WJ_TRANSCRIPT_CACHE_DIR="$cache_dir" CC_WJ_TRANSCRIPT_CACHE_TRACE="$cache_trace" \
+  CC_WJ_TRANSCRIPT_QUERY_TRACE="$query_trace" \
   bash -c 'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?; _cc_wj_transcript_claims_path Codex "$2" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
   _ "$WJ" "$cache_transcript" "$WT" "$cache_other")"
 check "the cached transcript snapshot preserves matching and non-matching results" test "$cache_result" = "0 1"
 cache_builds="$(wc -l < "$cache_trace" | tr -d ' ')"
 check "one activity snapshot indexes a large transcript once across candidate paths" test "$cache_builds" -eq 1
+query_processes="$(wc -l < "$query_trace" | tr -d ' ')"
+check "one activity snapshot starts Python once across candidate paths" test "$query_processes" -eq 1
+
+malformed_cache_transcript="$CASE/malformed-cache-rollout.jsonl"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":"current"}}' \
+  "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"input\":\"workdir=$WT\"}" > "$malformed_cache_transcript"
+malformed_cache_dir="$CASE/malformed-transcript-cache"
+malformed_query_trace="$CASE/malformed-query-trace"
+malformed_cache_result="$(CC_WJ_TRANSCRIPT_CACHE_DIR="$malformed_cache_dir" \
+  CC_WJ_TRANSCRIPT_QUERY_TRACE="$malformed_query_trace" \
+  bash -c 'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?; _cc_wj_transcript_claims_path Codex "$2" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
+  _ "$WJ" "$malformed_cache_transcript" "$WT" "$cache_other")"
+check "a malformed canonical tool record stays fail closed for every candidate" test "$malformed_cache_result" = "2 2"
+malformed_query_processes="$(wc -l < "$malformed_query_trace" | tr -d ' ')"
+check "malformed relevant evidence bypasses the shared fast path" test "$malformed_query_processes" -eq 2
 
 escaped_target="$CASE/測試-worktree"
 escaped_transcript="$CASE/escaped-rollout.jsonl"
 printf '%s\n' \
   '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish task"}}' \
   "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"input\":\"workdir=$CASE/\\u6e2c\\u8a66-worktree\"}}" > "$escaped_transcript"
-escaped_result="$(CC_WJ_CONFIG="$CASE/no-config" bash -c \
-  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; printf "%s\n" "$?"' \
-  _ "$WJ" "$escaped_transcript" "$escaped_target")"
-check "JSON-escaped Unicode tool paths survive the byte prefilter" test "$escaped_result" = 0
+escaped_cache_dir="$CASE/escaped-transcript-cache"
+escaped_query_trace="$CASE/escaped-query-trace"
+escaped_result="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_CACHE_DIR="$escaped_cache_dir" \
+  CC_WJ_TRANSCRIPT_QUERY_TRACE="$escaped_query_trace" bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?; _cc_wj_transcript_claims_path Codex "$2" "$4"; b=$?; printf "%s %s\n" "$a" "$b"' \
+  _ "$WJ" "$escaped_transcript" "$cache_other" "$escaped_target")"
+check "JSON-escaped Unicode tool paths survive the shared fast path" test "$escaped_result" = "1 0"
+escaped_query_processes="$(wc -l < "$escaped_query_trace" | tr -d ' ')"
+check "the normalized Unicode claim reuses one interpreter" test "$escaped_query_processes" -eq 1
 
 mixed_target="$CASE/café-worktree"
 mixed_transcript="$CASE/mixed-escaped-rollout.jsonl"
@@ -562,6 +584,11 @@ for generation in one two; do
 done
 persistent_builds="$(wc -l < "$persistent_trace" | tr -d ' ')"
 check "an unchanged transcript reuses its persistent offset index across snapshots" test "$persistent_builds" -eq 1
+if grep -R -F -q -- "$WT" "$persistent_dir"; then
+  bad "the persistent transcript index contains no normalized tool input"
+else
+  ok "the persistent transcript index contains no normalized tool input"
+fi
 printf '%s\n' '{"type":"event_msg","payload":{"message":"changed"}}' >> "$cache_transcript"
 CC_WJ_TRANSCRIPT_CACHE_DIR="$CASE/cache-three" \
   CC_WJ_TRANSCRIPT_INDEX_DIR="$persistent_dir" \

@@ -26,14 +26,19 @@ is rebuilt immediately before removal to close the session-start race. The clean
 own tool-call mentions are excluded because inventory names its targets; its verified cwd
 claim still protects the checkout it actually uses.
 
-The current-two-turn window is indexed once per transcript and activity snapshot, then
-matched against every candidate worktree. A pre-removal refresh starts a new snapshot so
-the index is an optimization of repeated reads, not permission to rely on stale activity.
+The current-two-turn window is indexed once per transcript and activity snapshot. The first
+candidate query decodes that window and writes a normalized, NUL-delimited search projection
+inside the run's private temporary directory; later candidates use fixed-string matching
+instead of starting another Python interpreter. A malformed canonical tool record, or a
+malformed slash-bearing record that might name a path, bypasses the projection and retains
+the exact target-specific parser's fail-closed behavior. A pre-removal refresh starts a new
+snapshot so these files optimize repeated reads, not permission to rely on stale activity.
 Scheduled sweeps also retain an offset-only index under cc-reaper state. Reuse requires the
 same transcript path, device, inode, size, and nanosecond modification time; a changed file
 is reread before its evidence can participate in a destructive decision. The persistent
-and per-run indexes contain byte ranges and file identity only, never transcript records or
-tool-call content.
+index and per-run offset file contain byte ranges and file identity only, never transcript
+records or tool-call content. Only the ephemeral search projection contains normalized tool
+input text, and it is discarded with the private run directory.
 If a Codex writer lock closes while its captured rollout is being read, the janitor remaps
 that task through current Codex state. An archived task becomes bounded recent-session
 evidence for only its mapped cwd and structured tool paths; the expected rollout move does

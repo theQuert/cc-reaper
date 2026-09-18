@@ -859,8 +859,8 @@ AFTER_SUM="$(shasum "$REAL_HOOK" | cut -d" " -f1)"
 expect_yes "install does not write through a symlinked stop-hook path" \
   bash -c '[ "$1" = "$2" ]' _ "$BEFORE_SUM" "$AFTER_SUM"
 
-expect_yes "install says why it left the symlink alone" \
-  bash -c 'printf "%s\n" "$1" | grep -q "is a symlink to"' _ "$INST_OUT"
+expect_yes "install deploys the shared stop hook instead of owning the legacy symlink" \
+  bash -c '[ -f "$1/.cc-reaper/stop-cleanup-orphans.sh" ] && [ ! -L "$1/.cc-reaper/stop-cleanup-orphans.sh" ]' _ "$INST_HOME"
 
 # The stub is the point, so prove it was actually the thing standing in.
 expect_yes "the installer under test really used the stubbed launchctl" \
