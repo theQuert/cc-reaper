@@ -35,6 +35,16 @@ expect_no() {
   fi
 }
 
+expect_eq() {
+  local name=$1 expected=$2 actual=$3
+  if [ "$actual" = "$expected" ]; then
+    printf "ok - %s\n" "$name"
+  else
+    printf "not ok - %s (expected %s, got %s)\n" "$name" "$expected" "$actual"
+    failures=$((failures + 1))
+  fi
+}
+
 printf "protect\tCUSTOM.WORKER\ncleanup\tcustom.worker\n" > "$CC_REAPER_RULES_FILE"
 expect_yes "LaunchAgent reads case-insensitive literal protect rules" \
   has_user_rule protect "/opt/custom.worker --daemon"
@@ -42,6 +52,27 @@ expect_no "literal dots are not treated as regex wildcards" \
   has_user_rule protect "/opt/customXworker --daemon"
 expect_no "protect wins before scheduled candidate classification" \
   is_cleanup_candidate 1 "??" "12:00:00" "/opt/custom.worker worker-service.cjs --daemon"
+
+# Regression: bash arithmetic reads leading-zero fields as octal, so any
+# elapsed time containing "08"/"09" aborted etime_to_seconds and silently
+# skipped the candidate for that sweep (PR #27).
+expect_eq "zero-padded MM:SS parses as base-10" \
+  489 "$(etime_to_seconds "08:09")"
+expect_eq "zero-padded HH:MM:SS parses as base-10" \
+  8 "$(etime_to_seconds "00:00:08")"
+expect_eq "zero-padded day form parses as base-10" \
+  198545 "$(etime_to_seconds "02-07:09:05")"
+expect_eq "zero-padded day form with 08 hour parses as base-10" \
+  460809 "$(etime_to_seconds "5-08:00:09")"
+expect_eq "bare zero-padded field parses as base-10" \
+  9 "$(etime_to_seconds "09")"
+
+CC_AGENT_STALE_MINUTES=60
+expect_no "young zero-padded elapsed is not stale" \
+  is_stale_etime "00:00:08"
+expect_yes "old zero-padded elapsed is stale" \
+  is_stale_etime "2-07:09:05"
+unset CC_AGENT_STALE_MINUTES
 
 signal_log="$tmp_dir/signals"
 : > "$signal_log"
