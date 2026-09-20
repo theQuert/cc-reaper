@@ -125,6 +125,21 @@ _cc_wj_idle_hours() {
   echo $((10#$v))
 }
 
+# How long an UNLANDED worktree whose branch never opened a pull request may sit before it
+# counts as abandoned rather than in progress. Deliberately much longer than the idle
+# window: `KEEP(unlanded)` is the right answer for work on its way somewhere, and the only
+# thing separating that from work that stopped is time plus the absence of a pull request.
+# Measured on the reporting host 2026-09-20: 53 of 133 worktrees classified KEEP(unlanded),
+# 27 of them older than seven days with no pull request ever opened, holding 27 GB that no
+# sweep could ever reclaim because nothing was on its way to the base branch.
+_cc_wj_abandon_hours() {
+  local v="${CC_WJ_ABANDON_HOURS:-168}"
+  case "$v" in
+    ''|*[!0-9]*|??????*) return 1 ;;
+  esac
+  echo $((10#$v))
+}
+
 # A released writer lock or dead session pid proves only that the task is not live now.
 # It does not prove that an archive was intentional or that the operator will not resume it.
 # This independent lease resets on harness activity even when no worktree file changed.
@@ -1423,8 +1438,21 @@ _cc_wj_idle() {
   # second the scan started, whose age rounds below zero.
   [ "$hours" -eq 0 ] && { echo yes; return; }
   gd="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" || { echo unknown; return; }
+  # HEAD and index only. The per-worktree reflog is NOT evidence that anybody worked here:
+  # git rewrites it during ordinary maintenance -- reflog expiry, `gc --auto` -- for every
+  # worktree of a repository in one pass, so one background sweep resets "idle" on all of
+  # them at once and nothing can ever age out. Measured 2026-09-20 on the reporting host:
+  # 108 of 114 worktrees carried the SAME reflog timestamp to the minute, while their HEAD
+  # and index were 194-318 hours old and `find -mmin -10080` over the worktree matched
+  # nothing. The idle gate therefore answered "no" for essentially every worktree, which is
+  # why four consecutive scheduled sweeps removed 0 - a threshold nobody could reach, not a
+  # threshold set too high. 108 trees sharing a timestamp to the second is one event, not
+  # 108 people.
+  #
+  # HEAD moves on checkout, index on add/commit/status-with-changes; both are what "somebody
+  # worked in this checkout" actually looks like.
   set -- "$wt"
-  for f in HEAD index logs; do
+  for f in HEAD index; do
     [ -e "$gd/$f" ] && set -- "$@" "$gd/$f"
   done
   if ! recent="$(find -H "$@" -mmin "-$((hours * 60))" -print -quit 2>/dev/null)"; then
@@ -2012,6 +2040,47 @@ MERGES
   return 1
 }
 
+# Answer `yes` only when GitHub CONFIRMS that this branch has never had a pull request,
+# `no` for anything else including every failure. The whole value of this probe is its
+# zero, so it must never be able to produce one by examining nothing: an absent `gh`, an
+# unparseable remote, a detached HEAD, a network error and a non-zero exit all answer `no`.
+#
+# `gh pr list --state all` is the population that matters. `landed=pr` already asks whether
+# a MERGED pull request delivered this head; the question here is the opposite and wider --
+# whether one was ever opened at all, merged, closed or still open. A branch with a closed
+# pull request is a decision somebody made and is not abandoned; a branch with none is work
+# that never reached anyone.
+_cc_wj_never_had_pr() {
+  local wt="$1" branch url rest host slug out
+  command -v gh >/dev/null 2>&1 || { echo no; return; }
+  branch="$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null)" || { echo no; return; }
+  [ -n "$branch" ] || { echo no; return; }
+  url="$(git -C "$wt" config --get remote.origin.url 2>/dev/null)" || { echo no; return; }
+  url="${url%.git}"
+  case "$url" in
+    *://*)
+      rest="${url#*://}"; rest="${rest#*@}"
+      host="${rest%%/*}"; host="${host%%:*}"
+      slug="${rest#*/}" ;;
+    *:*)
+      host="${url%%:*}"; host="${host##*@}"
+      slug="${url#*:}" ;;
+    *) echo no; return ;;
+  esac
+  case "$slug" in */*) ;; *) echo no; return ;; esac
+  [ -n "$host" ] || { echo no; return ; }
+  # `--json number` so the answer is a JSON array and an empty one is `[]`, never the empty
+  # string a failed command also produces. The command substitution's own exit status is
+  # checked first, so a timeout or an API error cannot reach the emptiness test.
+  out="$(_cc_wj_with_timeout 30 gh api --hostname "$host" \
+        "repos/$slug/pulls?head=${slug%%/*}:$branch&state=all&per_page=1" \
+        --jq 'length' 2>/dev/null)" || { echo no; return; }
+  case "$out" in
+    0) echo yes ;;
+    *) echo no ;;
+  esac
+}
+
 # ─── What git itself protects ─────────────────────────────────────────────────
 
 # Print `locked` or `submodule` when git's own state says to keep worktree $1, nothing
@@ -2063,6 +2132,7 @@ _cc_wj_classify() {
   local landed="${6:-}"  # ancestor | content | pr | no | unfetched
   local idle="${7:-}"    # yes | no | unknown
   local recent="${8:-no}" # "yes" when a bounded harness-session lease applies
+  local abandoned="${9:-no}" # "yes" only when GitHub confirmed no pull request ever existed
 
   if [ "$dirty" = "MISSING" ]; then
     echo "KEEP(missing-dir)"
@@ -2094,7 +2164,14 @@ _cc_wj_classify() {
   case "$landed" in
     ancestor|content|pr) ;;
     unfetched) echo "KEEP(base-unfetched)"; return ;;
-    *) echo "KEEP(unlanded)"; return ;;
+    *)
+      # Not landed has two meanings and only one of them is "not yet". A branch that never
+      # opened a pull request has nothing on its way to the base, so waiting for it to land
+      # waits forever -- which is what kept 27 GB standing on the reporting host. Removal
+      # still takes only the checkout and leaves the branch, so the commits survive either
+      # way; what changes is whether the disk does.
+      [ "$abandoned" = "yes" ] || { echo "KEEP(unlanded)"; return ; }
+      ;;
   esac
 
   case "$idle" in
@@ -2414,13 +2491,17 @@ _cc_wj_run_inner() {
     return 2
   fi
 
-  local idle_hours session_grace_hours status_timeout fetch_timeout
+  local idle_hours session_grace_hours abandon_hours status_timeout fetch_timeout
   if ! idle_hours="$(_cc_wj_idle_hours)"; then
     echo "worktree-janitor: CC_WJ_IDLE_HOURS=${CC_WJ_IDLE_HOURS:-} is not a whole number of hours below 100000; scanned and removed nothing" >&2
     return 2
   fi
   if ! session_grace_hours="$(_cc_wj_session_grace_hours)"; then
     echo "worktree-janitor: CC_WJ_SESSION_GRACE_HOURS=${CC_WJ_SESSION_GRACE_HOURS:-} is not a whole number of hours below 100000; scanned and removed nothing" >&2
+    return 2
+  fi
+  if ! abandon_hours="$(_cc_wj_abandon_hours)"; then
+    echo "worktree-janitor: CC_WJ_ABANDON_HOURS=${CC_WJ_ABANDON_HOURS:-} is not a whole number of hours below 100000; scanned and removed nothing" >&2
     return 2
   fi
   if ! status_timeout="$(_cc_wj_git_status_timeout_seconds)"; then
@@ -2552,7 +2633,7 @@ KEEP
   local repo lock skipped=0
   # Declared once, outside the loop: zsh prints the value of an already-set local that is
   # declared again.
-  local active lease landed idle classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count
+  local active lease landed idle classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long
   for repo in "${repos[@]}"; do
     if [ ! -d "$repo" ]; then
       continue
@@ -2659,11 +2740,28 @@ KEEP
       # may reach the network, and the idle walk costs seconds on a tree with node_modules.
       landed="-"
       idle="-"
+      abandoned="no"
       head0="$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)"
       if [ "$dirty" = "0" ] && [ "$active" = "no" ] && [ "$lease" = "no" ]; then
         landed="$(_cc_wj_landed "$wt_path")"
         case "$landed" in
           ancestor|content|pr) idle="$(_cc_wj_idle "$wt_path" "$idle_hours")" ;;
+          unfetched) ;;
+          *)
+            # The abandoned question, asked in cost order: the tree walk before the network
+            # call, and the network call only for a tree that has already sat out the long
+            # window. Most unlanded worktrees are recent, so most pay neither.
+            #
+            # `idle` is taken from the LONG window's answer rather than walked a second
+            # time. The predicate is "nothing under this tree was modified within N hours",
+            # so a yes at 168 hours entails a yes at any smaller window; an `unknown` or a
+            # `no` entails nothing, and neither is copied.
+            idle_long="$(_cc_wj_idle "$wt_path" "$abandon_hours")"
+            if [ "$idle_long" = "yes" ]; then
+              idle="yes"
+              abandoned="$(_cc_wj_never_had_pr "$wt_path")"
+            fi
+            ;;
         esac
       fi
 
@@ -2692,7 +2790,8 @@ KEEP
       # explicit full scan.
       if [ -z "$classification" ] && [ "$dirty" = "0" ] && [ "$active" = "no" ] &&
          [ "$lease" = "no" ] &&
-         { [ "$landed" = ancestor ] || [ "$landed" = content ] || [ "$landed" = pr ]; } &&
+         { [ "$landed" = ancestor ] || [ "$landed" = content ] || [ "$landed" = pr ] ||
+           [ "$abandoned" = "yes" ]; } &&
          [ "$idle" = "yes" ]; then
         _cc_wj_active_claim "$wt_path" tool; active_rc=$?
         case "$active_rc" in
@@ -2709,7 +2808,7 @@ KEEP
         fi
       fi
       [ -n "$classification" ] ||
-        classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle" "$lease")
+        classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle" "$lease" "$abandoned")
 
       printf "  WORKTREE  %s\n" "$wt_path"
       printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s  recent=%s  landed=%s  idle=%s\n" \

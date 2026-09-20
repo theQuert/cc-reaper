@@ -584,6 +584,12 @@ expect_yes "an unreadable repo counts as dirty, not clean" undiscounted_is "$IGN
 
 # ─── The classifier: every unanswered gate keeps ─────────────────────────────
 
+# `expect_yes` runs its command in THIS shell, so a helper works and `bash -c` does not:
+# a fresh bash inherits no function definitions, and every assertion written that way fails
+# for a reason that has nothing to do with the thing under test.
+idle_is() { [ "$(_cc_wj_idle "$2" "$3")" = "$1" ]; }
+nopr_is() { [ "$(_cc_wj_never_had_pr "$2")" = "$1" ]; }
+
 classify7_is() {
   local want="$1" got; shift
   got="$(_cc_wj_classify /wt "$@")"
@@ -597,6 +603,89 @@ expect_yes "a clean, unheld, idle, landed branch is removable" \
 # working in, and it is kept.
 expect_yes "an unlanded branch is kept, although its branch would keep the commits" \
   classify7_is "KEEP(unlanded)" 0 no yes task/unpushed no yes
+# The idle predicate, on the layout it actually runs against. A LINKED worktree keeps its
+# git dir outside the checkout, so what the predicate names explicitly is all it sees --
+# which is why naming the reflog was load-bearing and wrong. Measured 2026-09-20: 108 of
+# 114 worktrees on the reporting host shared one reflog timestamp to the minute, because
+# git rewrites every worktree's reflog in a single maintenance pass. Four consecutive
+# scheduled sweeps removed nothing.
+IDLE_M="$(mktemp -d)"
+git -C "$IDLE_M" init -q 2>/dev/null
+git -C "$IDLE_M" -c user.email=t@t -c user.name=t commit -q --allow-empty -m x 2>/dev/null
+IDLE_W="$IDLE_M-wt"
+git -C "$IDLE_M" worktree add -q -b idle-probe "$IDLE_W" 2>/dev/null
+IDLE_GD="$(git -C "$IDLE_W" rev-parse --absolute-git-dir 2>/dev/null)"
+find -H "$IDLE_W" "$IDLE_GD/HEAD" "$IDLE_GD/index" -exec touch -t 202609010000 {} + 2>/dev/null
+expect_yes "a worktree nobody touched is idle" \
+  idle_is yes "$IDLE_W" 12
+touch "$IDLE_GD/logs/HEAD" "$IDLE_GD/logs" 2>/dev/null
+expect_yes "reflog churn is not activity, or one gc pass un-idles every worktree at once" \
+  idle_is yes "$IDLE_W" 12
+touch "$IDLE_GD/index" 2>/dev/null
+expect_yes "a touched index is activity" \
+  idle_is no "$IDLE_W" 12
+touch -t 202609010000 "$IDLE_GD/index" 2>/dev/null
+touch "$IDLE_W/somefile" 2>/dev/null
+expect_yes "a touched file in the checkout is activity" \
+  idle_is no "$IDLE_W" 12
+rm -rf "$IDLE_M" "$IDLE_W"
+
+# The probe behind that ninth argument. Its whole value is its `yes`, so every way of
+# learning nothing has to answer `no`: this is the gate standing between "nobody ever
+# opened a pull request for this" and "the question could not be asked".
+NOPR_TMP="$(mktemp -d)"
+git -C "$NOPR_TMP" init -q 2>/dev/null
+git -C "$NOPR_TMP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m x 2>/dev/null
+expect_yes "a worktree with no remote cannot be called abandoned" \
+  nopr_is no "$NOPR_TMP"
+git -C "$NOPR_TMP" remote add origin "not a url" 2>/dev/null
+expect_yes "a remote that does not parse cannot be called abandoned" \
+  nopr_is no "$NOPR_TMP"
+git -C "$NOPR_TMP" remote set-url origin https://github.com/theQuert/cc-reaper.git 2>/dev/null
+git -C "$NOPR_TMP" checkout -q --detach 2>/dev/null
+expect_yes "a detached HEAD cannot be called abandoned" \
+  nopr_is no "$NOPR_TMP"
+rm -rf "$NOPR_TMP"
+
+# The three cases above all assert `no`, which a function that only ever says `no` would
+# also satisfy. This is the pair that proves it discriminates: a branch name taken from a
+# real pull request at run time (so it cannot go stale) against one that has never existed.
+# Skipped, loudly, when the API cannot be reached -- a network failure must not read as a
+# passing calibration.
+if command -v gh >/dev/null 2>&1 &&
+   NOPR_BRANCH="$(gh pr list --repo theQuert/cc-reaper --state all --limit 1 --json headRefName --jq '.[0].headRefName' 2>/dev/null)" &&
+   [ -n "$NOPR_BRANCH" ]; then
+  NOPR_TMP2="$(mktemp -d)"
+  git -C "$NOPR_TMP2" init -q -b "$NOPR_BRANCH" 2>/dev/null
+  git -C "$NOPR_TMP2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m x 2>/dev/null
+  git -C "$NOPR_TMP2" remote add origin https://github.com/theQuert/cc-reaper.git 2>/dev/null
+  expect_yes "a branch that HAS a pull request is not abandoned" \
+    nopr_is no "$NOPR_TMP2"
+  git -C "$NOPR_TMP2" branch -m cc-reaper-branch-that-has-never-existed-probe 2>/dev/null
+  expect_yes "a branch that never had one is abandoned, so the probe discriminates" \
+    nopr_is yes "$NOPR_TMP2"
+  rm -rf "$NOPR_TMP2"
+else
+  printf "not ok - the no-pull-request probe could not be calibrated (gh unavailable)\n"
+  failures=$((failures + 1))
+fi
+
+# `abandoned` is the NINTH argument, so every case below passes the lease slot explicitly.
+# It answers a different question from `landed`: not "did this arrive at the base yet" but
+# "is anything on its way at all". Only a confirmed no-pull-request-ever may turn it on, and
+# the four negative cases are the point -- it unblocks the landed gate and nothing else.
+expect_yes "an unlanded branch that never had a pull request and sat out the long window is removable" \
+  classify7_is REMOVABLE 0 no yes task/abandoned no yes no yes
+expect_yes "an unlanded branch is kept when the pull-request probe could not answer" \
+  classify7_is "KEEP(unlanded)" 0 no yes task/unknown no yes no no
+expect_yes "abandoned does not override a dirty worktree" \
+  classify7_is "KEEP(unrebuildable=2)" 2 no yes task/abandoned no yes no yes
+expect_yes "abandoned does not override an active session" \
+  classify7_is "KEEP(active-session)" 0 yes yes task/abandoned no yes no yes
+expect_yes "abandoned does not override a worktree that is not idle" \
+  classify7_is "KEEP(recent-activity)" 0 no yes task/abandoned no no no yes
+expect_yes "an abandoned detached HEAD is kept, because nothing would reference its commits" \
+  classify7_is "KEEP(detached-head)" 0 no yes "(detached)" no yes no yes
 expect_yes "a base that was not fetched keeps" \
   classify7_is "KEEP(base-unfetched)" 0 no yes task/x unfetched yes
 expect_yes "a landed but recently modified worktree is kept" \
