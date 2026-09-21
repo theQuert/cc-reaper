@@ -692,6 +692,8 @@ echo "  ~/.cc-reaper/disk-janitor.sh --check           Read-only disk + snapshot
 echo "  ~/.cc-reaper/disk-janitor.sh --clean           Clean rebuildable caches now"
 echo "  ~/.cc-reaper/worktree-janitor.sh               Worktree report (dry-run)"
 echo "  ~/.cc-reaper/worktree-janitor.sh --apply       Remove clean idle worktrees"
+echo "  ~/.cc-reaper/worktree-janitor.sh --trim-regenerable  Report ignored cache trees"
+echo "  ~/.cc-reaper/worktree-janitor.sh --trim-regenerable --apply  Trim them safely"
 
 # The LAST line, not the last step. Anything that dies between the final step and here -
 # a banner that fails, a probe that aborts under `set -e` - is still an incomplete run,
