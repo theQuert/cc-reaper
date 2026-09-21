@@ -24,6 +24,8 @@ Options:
 
 Environment:
   CC_DJ_DISK_MIN_PCT    Minimum free disk % before action (default: 15)
+  CC_DJ_TRIM_WORKTREES   Set to 0 to disable pressure trimming of ignored regenerable
+                         worktree directories (default: 1)
   CC_DJ_COOLDOWN_SECS   Seconds between repeat --check notifications (default: 3600)
   CC_DJ_LOG             Log file path (default: ~/.cc-reaper/logs/disk-janitor.log)
   CC_DJ_STATE_DIR       State directory path (default: ~/.cc-reaper/state/)
@@ -34,6 +36,7 @@ EOF
 # Config defaults
 # ---------------------------------------------------------------------------
 CC_DJ_DISK_MIN_PCT="${CC_DJ_DISK_MIN_PCT:-15}"
+CC_DJ_TRIM_WORKTREES="${CC_DJ_TRIM_WORKTREES:-1}"
 CC_DJ_COOLDOWN_SECS="${CC_DJ_COOLDOWN_SECS:-3600}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
 CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
@@ -764,6 +767,24 @@ _cc_dj_clean() {
     _cc_dj_clean_target "go clean -cache" go clean -cache
   else
     _cc_dj_skip "go clean -cache (go not found)"
+  fi
+
+  # Worktree-preserving pressure trim. The cc-reaper janitor owns the holder and
+  # Claude/Codex claim checks; this caller only decides when to request the
+  # operation. It runs before dependency/download targets so a low-disk host can
+  # release tens of gigabytes of ignored node_modules without removing a branch,
+  # worktree, or active session. Report-only is still the default for direct
+  # janitor invocations; this target is apply-gated by disk pressure here.
+  if [ "$CC_DJ_TRIM_WORKTREES" = 1 ] && [ "$free_before" -lt "$CC_DJ_DISK_MIN_PCT" ]; then
+    local worktree_janitor="$HOME/.cc-reaper/worktree-janitor.sh"
+    if [ -x "$worktree_janitor" ]; then
+      _cc_dj_clean_target "worktree regenerable trim" \
+        "$worktree_janitor" --trim-regenerable --apply
+    else
+      _cc_dj_skip "worktree regenerable trim ($worktree_janitor not found)"
+    fi
+  else
+    _cc_dj_log "clean: worktree regenerable trim skipped (pressure=${free_before}%/${CC_DJ_DISK_MIN_PCT}%, enabled=${CC_DJ_TRIM_WORKTREES})"
   fi
 
   # -- yarn cache clean -------------------------------------------------------

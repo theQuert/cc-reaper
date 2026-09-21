@@ -52,10 +52,11 @@ PIP3_CAPTURE="$SANDBOX/pip3_calls"
 BREW_CAPTURE="$SANDBOX/brew_calls"
 BUN_CAPTURE="$SANDBOX/bun_calls"
 RM_CAPTURE="$SANDBOX/rm_calls"
+WORKTREE_TRIM_CAPTURE="$SANDBOX/worktree_trim_calls"
 
 touch "$TM_DELETE_CAPTURE" "$OSASCRIPT_CAPTURE" "$DOCKER_CAPTURE" \
       "$GO_CAPTURE" "$YARN_CAPTURE" "$PIP3_CAPTURE" "$BREW_CAPTURE" \
-      "$BUN_CAPTURE" "$RM_CAPTURE"
+      "$BUN_CAPTURE" "$RM_CAPTURE" "$WORKTREE_TRIM_CAPTURE"
 
 # We set FREE_PCT via the df stub; default below-threshold
 FREE_PCT="${FREE_PCT_OVERRIDE:-10}"
@@ -217,7 +218,7 @@ _run_dj() {
 _reset_captures() {
   truncate -s 0 "$TM_DELETE_CAPTURE" "$OSASCRIPT_CAPTURE" "$DOCKER_CAPTURE" \
                 "$GO_CAPTURE" "$YARN_CAPTURE" "$PIP3_CAPTURE" "$BREW_CAPTURE" \
-                "$BUN_CAPTURE" "$RM_CAPTURE"
+                "$BUN_CAPTURE" "$RM_CAPTURE" "$WORKTREE_TRIM_CAPTURE"
   rm -f "$SANDBOX/state/cooldown-disk" "$SANDBOX/dj.log"
 }
 
@@ -375,6 +376,25 @@ _run_dj --clean 80 0   # free=80% >= 15%
 
 expect_no "clean above threshold: TM snapshot NOT deleted" \
   test -s "$TM_DELETE_CAPTURE"
+
+# ---------------------------------------------------------------------------
+# TEST 5b: pressure trim is delegated to cc-reaper with an explicit apply flag
+# ---------------------------------------------------------------------------
+printf "\n# Test group 5b: pressure trim delegation\n"
+_reset_captures
+mkdir -p "$FAKE_HOME/.cc-reaper"
+cat > "$FAKE_HOME/.cc-reaper/worktree-janitor.sh" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$WORKTREE_TRIM_CAPTURE"
+STUB
+chmod +x "$FAKE_HOME/.cc-reaper/worktree-janitor.sh"
+
+_run_dj --clean 10 0
+
+expect_yes "pressure trim: cc-reaper receives regenerable apply request" \
+  grep -Fxq -- '--trim-regenerable --apply' "$WORKTREE_TRIM_CAPTURE"
+
+rm -f "$FAKE_HOME/.cc-reaper/worktree-janitor.sh"
 
 # ---------------------------------------------------------------------------
 # TEST 6: cooldown suppresses repeat --check notification

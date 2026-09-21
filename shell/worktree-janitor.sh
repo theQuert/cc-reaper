@@ -38,6 +38,9 @@ Inventory and optionally remove stale git worktrees across local repos.
 
 Options:
   --apply             Remove REMOVABLE worktrees (default: report only)
+  --trim-regenerable  Report or, with --apply, remove only ignored built-in regenerable
+                      directories (for example node_modules) from unheld, unclaimed
+                      worktrees; the worktree and branch remain
   --repo <path>       Scan only this repo (repeatable; replaces auto-discovery)
   --landed <path>     Print the shared landed proof for one worktree; change nothing
   --claims [id|path]  Print live claims and recent-session leases, optionally filtered
@@ -67,6 +70,8 @@ Environment:
 A worktree is removable only when it holds nothing a command cannot rebuild, no process
 has it as a working directory or holds a file in it, its work has landed on the fetched
 base branch, and nothing in it changed within CC_WJ_IDLE_HOURS. Branches are never deleted.
+`--trim-regenerable` uses the same holder and harness claim vetoes but does not require
+landing; it never removes tracked or non-regenerable content.
 EOF
 }
 
@@ -1868,6 +1873,125 @@ _cc_wj_undiscounted_count() {
   fi
 }
 
+# Print ignored, built-in regenerable directories in a worktree. This is deliberately
+# separate from `_cc_wj_pins`: a normal worktree removal discounts these paths, while a
+# pressure pass needs to name them so it can remove only those bytes and leave the
+# worktree, branch and all authored content in place.
+_cc_wj_regenerable_dirs() {
+  local wt="$1" sf rec code rest base status_timeout status_rc=0
+  status_timeout="$(_cc_wj_git_status_timeout_seconds)" || return 1
+  sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-regenerable.XXXXXX")" || return 1
+  _cc_wj_with_timeout "$status_timeout" \
+    git --no-optional-locks -c core.fsmonitor=false -C "$wt" \
+      status --porcelain --ignored -z > "$sf" 2>/dev/null || status_rc=$?
+  if [ "$status_rc" -ne 0 ]; then
+    rm -f "$sf"
+    return 1
+  fi
+  while IFS= read -r -d '' rec; do
+    [ -n "$rec" ] || continue
+    code="${rec:0:2}"
+    [ "$code" = '!!' ] || continue
+    rest="${rec:3}"
+    case "$rest" in
+      */) rest="${rest%/}" ;;
+      *) continue ;;
+    esac
+    case "$rest" in
+      *$'\n'*|*$'\t'*) continue ;;
+    esac
+    base="${rest##*/}"
+    case " $CC_WJ_REGENERABLE " in
+      *" $base "*) ;;
+      *) continue ;;
+    esac
+    [ -d "$wt/$rest" ] || continue
+    [ -L "$wt/$rest" ] && continue
+    # A cache directory containing an obvious credential is not disposable. The
+    # existing shallow check is intentional: package trees contain certificate
+    # bundles, while a credential parked near the cache root must veto trimming.
+    _cc_wj_find_credential "$wt/$rest" 2 && continue
+    printf '%s\n' "$wt/$rest"
+  done < "$sf"
+  rm -f "$sf"
+  return 0
+}
+
+_cc_wj_trim_regenerable() {
+  local wt="$1" work="$2" apply="$3" session_grace="$4" dir bytes before after list_file list_rc
+  local count=0 trimmed=0 reclaimed=0 active_rc recent_rc
+  [ "$LSOF_OK" = yes ] || { printf 'KEEP(process-scan-unknown)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'; return 0; }
+  [ "$ACTIVE_OK" = yes ] || { printf 'KEEP(session-scan-unknown)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'; return 0; }
+  if _cc_wj_held "$work" "$wt"; then
+    printf 'KEEP(active-session)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'
+    return 0
+  fi
+  _cc_wj_active_claim "$wt" trim; active_rc=$?
+  case "$active_rc" in
+    0) printf 'KEEP(%s)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n' "$_CC_WJ_ACTIVE_REASON"; return 0 ;;
+    2) printf 'KEEP(session-scan-unknown)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'; return 0 ;;
+  esac
+  _cc_wj_recent_claim "$wt" "$session_grace" trim; recent_rc=$?
+  case "$recent_rc" in
+    0) printf 'KEEP(%s)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n' "$_CC_WJ_RECENT_REASON"; return 0 ;;
+    2) printf 'KEEP(session-scan-unknown)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'; return 0 ;;
+  esac
+
+  list_file="$(mktemp "${TMPDIR:-/tmp}/cc-wj-trim-list.XXXXXX")" || {
+    printf 'KEEP(trim-list-unavailable)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'
+    return 0
+  }
+  _cc_wj_regenerable_dirs "$wt" > "$list_file" || list_rc=$?
+  list_rc="${list_rc:-0}"
+  if [ "$list_rc" -ne 0 ]; then
+    rm -f "$list_file"
+    printf 'KEEP(status-unknown)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'
+    return 0
+  fi
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    count=$((count + 1))
+    bytes=0
+    bytes=$(du -sk "$dir" 2>/dev/null | awk '{print $1 * 1024}') || bytes=0
+    printf '  TRIM_CANDIDATE  %s  bytes=%s\n' "$dir" "$bytes"
+    [ "$apply" -eq 1 ] || continue
+
+    # Recheck the safety boundary immediately before every directory removal.
+    # A session may start after inventory but before the first or a later cache.
+    if ! _cc_wj_scan_holders "$work" || ! _cc_wj_scan_active_sessions "$session_grace"; then
+      printf '    → kept: holder or session scan became unavailable\n'
+      break
+    fi
+    _cc_wj_active_claim "$wt" trim; active_rc=$?
+    [ "$active_rc" -eq 0 ] && { printf '    → kept: %s\n' "$_CC_WJ_ACTIVE_REASON"; break; }
+    [ "$active_rc" -eq 2 ] && { printf '    → kept: session scan became unavailable\n'; break; }
+    _cc_wj_recent_claim "$wt" "$session_grace" trim; recent_rc=$?
+    [ "$recent_rc" -eq 0 ] && { printf '    → kept: %s\n' "$_CC_WJ_RECENT_REASON"; break; }
+    [ "$recent_rc" -eq 2 ] && { printf '    → kept: session scan became unavailable\n'; break; }
+    if _cc_wj_held "$work" "$wt" || [ ! -d "$dir" ] || [ -L "$dir" ] ||
+       _cc_wj_find_credential "$dir" 2; then
+      printf '    → kept: cache changed or is no longer disposable\n'
+      break
+    fi
+    before="$bytes"
+    rm -rf -- "$dir" 2>/dev/null || {
+      printf '    → kept: removal failed\n'
+      break
+    }
+    after=0
+    [ -e "$dir" ] && after=1
+    if [ "$after" -ne 0 ]; then
+      printf '    → kept: cache still exists after removal\n'
+      break
+    fi
+    reclaimed=$((reclaimed + before))
+    trimmed=$((trimmed + 1))
+    printf '    → trimmed (%s bytes reclaimed)\n' "$before"
+  done < "$list_file"
+  rm -f "$list_file"
+  printf 'TRIM_RESULT count=%s trimmed=%s reclaimed=%s\n' "$count" "$trimmed" "$reclaimed"
+}
+
 # ─── Base branch and landing ─────────────────────────────────────────────────
 
 # Set per repository by `_cc_wj_prepare_base`: the integration branch, whether it was
@@ -2420,7 +2544,7 @@ _cc_wj_run_inner() {
     _cc_wj_bound_log "$agent_log"
   done
 
-  local apply=0 scheduled=0 claims_only=0 claims_filter=""
+  local apply=0 trim=0 scheduled=0 claims_only=0 claims_filter=""
   local explicit_repos=()
 
   # Parse arguments
@@ -2428,6 +2552,10 @@ _cc_wj_run_inner() {
     case "$1" in
       --apply)
         apply=1
+        shift
+        ;;
+      --trim-regenerable)
+        trim=1
         shift
         ;;
       --repo)
@@ -2573,6 +2701,9 @@ _cc_wj_run_inner() {
   local total_kept=0
   local total_removed=0
   local total_reclaimed=0
+  local total_trim_candidates=0
+  local total_trimmed=0
+  local total_trim_reclaimed=0
   local prune_repos=()
 
   # Holder scans, taken once per run into files and taken again right before each removal.
@@ -2633,7 +2764,7 @@ KEEP
   local repo lock skipped=0
   # Declared once, outside the loop: zsh prints the value of an already-set local that is
   # declared again.
-  local active lease landed idle classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long
+  local active lease landed idle classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes
   for repo in "${repos[@]}"; do
     if [ ! -d "$repo" ]; then
       continue
@@ -2734,6 +2865,49 @@ KEEP
             esac
           fi
         fi
+      fi
+
+      # Pressure mode is intentionally narrower than worktree removal. It only
+      # touches ignored built-in regenerable directories, and only after the
+      # same process and harness claim vetoes have established that this tree is
+      # not being used. The branch and worktree remain available for resume.
+      if [ "$trim" -eq 1 ]; then
+        printf "  WORKTREE  %s\n" "$wt_path"
+        printf "    branch=%s  dirty=%s  active=%s  recent=%s\n" "$branch" "$dirty" "$active" "$lease"
+        if [ "$dirty" != "0" ]; then
+          printf "    classification: KEEP(unrebuildable=%s)\n" "$dirty"
+          total_kept=$((total_kept + 1))
+          continue
+        fi
+        git_keep="$(_cc_wj_git_keep "$wt_path")"
+        case "$git_keep" in
+          '') ;;
+          unknown)
+            printf "    classification: KEEP(git-state-unknown)\n"
+            total_kept=$((total_kept + 1))
+            continue
+            ;;
+          *)
+            printf "    classification: KEEP(%s)\n" "$git_keep"
+            total_kept=$((total_kept + 1))
+            continue
+            ;;
+        esac
+        trim_result="$(_cc_wj_trim_regenerable "$wt_path" "$work" "$apply" "$session_grace_hours")"
+        printf "%s\n" "$trim_result"
+        trim_count="$(printf '%s\n' "$trim_result" | awk -F'[ =]' '/^TRIM_RESULT / {print $3}')"
+        trim_count_done="$(printf '%s\n' "$trim_result" | awk -F'[ =]' '/^TRIM_RESULT / {print $5}')"
+        trim_bytes="$(printf '%s\n' "$trim_result" | awk -F'[ =]' '/^TRIM_RESULT / {print $7}')"
+        case "$trim_count" in ''|*[!0-9]*) trim_count=0 ;; esac
+        case "$trim_count_done" in ''|*[!0-9]*) trim_count_done=0 ;; esac
+        case "$trim_bytes" in ''|*[!0-9]*) trim_bytes=0 ;; esac
+        total_trim_candidates=$((total_trim_candidates + trim_count))
+        if [ "$apply" -eq 1 ]; then
+          total_trimmed=$((total_trimmed + trim_count_done))
+          total_trim_reclaimed=$((total_trim_reclaimed + trim_bytes))
+        fi
+        printf '%s\n' "$trim_result" | grep -q '^KEEP(' && total_kept=$((total_kept + 1))
+        continue
       fi
 
       # Asked only of a worktree the cheaper gates have not already kept: the landed proofs
@@ -2952,7 +3126,17 @@ KEEP
 
   # Summary
   echo ""
-  if [ "$apply" -eq 1 ]; then
+  if [ "$trim" -eq 1 ]; then
+    gb_str="$(awk -v b="$total_trim_reclaimed" 'BEGIN { printf "%.2f", b / 1073741824 }')"
+    if [ "$apply" -eq 1 ]; then
+      printf "Summary: trimmed=%d  reclaimed=%s GB  kept=%d\n" \
+        "$total_trimmed" "$gb_str" "$total_kept"
+      _cc_wj_log_write "trim summary: trimmed=$total_trimmed reclaimed=${total_trim_reclaimed}B kept=$total_kept"
+    else
+      printf "Summary: trim-candidates=%d  kept=%d  (dry-run; use --apply --trim-regenerable to remove)\n" \
+        "$total_trim_candidates" "$total_kept"
+    fi
+  elif [ "$apply" -eq 1 ]; then
     local gb_str
     gb_str=$(awk -v b="$total_reclaimed" 'BEGIN { printf "%.2f", b / 1073741824 }')
     printf "Summary: removed=%d  reclaimed=%s GB  kept=%d\n" \
@@ -2964,8 +3148,8 @@ KEEP
   fi
 
   # Notification fires only on --apply pass (report-only runs don't measure bytes)
-  if [ "$apply" -eq 1 ] && [ "$total_reclaimed" -gt 0 ]; then
-    _cc_wj_maybe_notify "$total_reclaimed"
+  if [ "$apply" -eq 1 ] && { [ "$total_reclaimed" -gt 0 ] || [ "$total_trim_reclaimed" -gt 0 ]; }; then
+    _cc_wj_maybe_notify $((total_reclaimed + total_trim_reclaimed))
   fi
 
   # Finding repositories under one root does not make a denial on another harmless:

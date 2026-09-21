@@ -1245,6 +1245,56 @@ echo x > "$IDLE_PRIMARY/README"; igit add README; igit commit -qm base
 echo y > "$IDLE_PRIMARY/second"; igit add second; igit commit -qm second; igit push -q origin main
 I_FIRST="$(igit rev-parse HEAD~1)"
 
+# Pressure trim fixture: the branch is intentionally unlanded. Trimming removes only
+# ignored package/build trees after holder and harness-claim gates pass; the worktree
+# and branch remain available for a later resume.
+igit worktree add -q "$IDLE_ROOT/wt-trim" -b trim-regenerable origin/main 2>/dev/null
+TRIM_WT="$IDLE_ROOT/wt-trim"
+printf 'node_modules/\n.next/\n' > "$TRIM_WT/.gitignore"
+igit -C "$TRIM_WT" add .gitignore
+igit -C "$TRIM_WT" commit -qm "declare trim fixture caches"
+mkdir -p "$TRIM_WT/node_modules/pkg" "$TRIM_WT/.next/cache"
+printf 'package\n' > "$TRIM_WT/node_modules/pkg/index.js"
+printf 'next\n' > "$TRIM_WT/.next/cache/data"
+TRIM_WT_PHYS="$(phys "$TRIM_WT")"
+
+OUT_TRIM="$TMPDIR_ROOT/out-trim.txt"
+_wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable > "$OUT_TRIM"
+expect_yes "trim dry-run names node_modules as a candidate" \
+  file_has "$OUT_TRIM" "TRIM_CANDIDATE  $TRIM_WT_PHYS/node_modules"
+expect_yes "trim dry-run names .next as a candidate" \
+  file_has "$OUT_TRIM" "TRIM_CANDIDATE  $TRIM_WT_PHYS/.next"
+expect_yes "trim dry-run does not delete the worktree" \
+  test -d "$TRIM_WT"
+
+# A holder appears before the apply pass. The safety boundary must keep the entire
+# worktree untouched, including both regenerable directories.
+printf 'p1\nn/\np12345\nn%s\n' "$(phys "$TRIM_WT")" > "$LSOF_CWD_FILE"
+OUT_TRIM_HELD="$TMPDIR_ROOT/out-trim-held.txt"
+_wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable --apply > "$OUT_TRIM_HELD"
+expect_yes "trim apply keeps a worktree with an active holder" \
+  file_has "$OUT_TRIM_HELD" "KEEP(active-session)"
+expect_yes "trim active holder leaves node_modules intact" \
+  test -d "$TRIM_WT/node_modules"
+expect_yes "trim active holder leaves .next intact" \
+  test -d "$TRIM_WT/.next"
+lsof_default
+
+OUT_TRIM_APPLY="$TMPDIR_ROOT/out-trim-apply.txt"
+_wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable --apply > "$OUT_TRIM_APPLY"
+expect_yes "trim apply reports reclaimed directories" \
+  file_has "$OUT_TRIM_APPLY" "trimmed=2"
+expect_yes "trim apply keeps the worktree" \
+  test -d "$TRIM_WT"
+expect_yes "trim apply keeps the branch" \
+  git -C "$IDLE_PRIMARY" show-ref --verify --quiet refs/heads/trim-regenerable
+expect_no "trim apply removes node_modules only" \
+  test -e "$TRIM_WT/node_modules"
+expect_no "trim apply removes .next only" \
+  test -e "$TRIM_WT/.next"
+expect_yes "trim apply leaves authored .gitignore" \
+  test -f "$TRIM_WT/.gitignore"
+
 # The positive control: old everywhere, so it is idle - and it stays idle although the
 # janitor runs `git status` in it, which must not rewrite the index it is about to judge.
 igit worktree add -q "$IDLE_ROOT/wt-old" -b old origin/main 2>/dev/null
