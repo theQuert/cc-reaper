@@ -432,7 +432,7 @@ printf '#!/bin/sh\necho "find: permission denied" >&2\nexit 1\n' > "$FIND_STUB_W
 chmod +x "$FIND_STUB_WJ/find"
 
 expect_yes "an absent root is a skip, not a failure" \
-  bash -c 'CC_WJ_ROOT=/nope/does/not/exist bash "$1" >/dev/null 2>&1' _ "$WJ"
+  bash -c 'CC_WJ_ROOT=/nope/does/not/exist CC_WJ_HARNESS_ROOTS="$2/no-harness" bash "$1" >/dev/null 2>&1' _ "$WJ" "$TMPDIR_ROOT"
 
 expect_no "a root that exists and cannot be listed fails the run" \
   bash -c 'PATH="$3:$PATH" CC_WJ_ROOT="$2/denied" bash "$1" >/dev/null 2>&1' \
@@ -462,8 +462,8 @@ expect_yes "a denied root carries the trade-off and the alternative" \
     _ "$WJ" "$BLIND_ROOT" "$FIND_STUB_WJ"
 
 expect_yes "roots are plural" \
-  bash -c 'CC_WJ_ROOT="/nope/a:/nope/b" bash "$1" 2>&1 | grep -q "/nope/a,/nope/b"' \
-    _ "$WJ"
+  bash -c 'CC_WJ_ROOT="/nope/a:/nope/b" CC_WJ_HARNESS_ROOTS="$2/no-harness" bash "$1" 2>&1 | grep -q "/nope/a,/nope/b"' \
+    _ "$WJ" "$TMPDIR_ROOT"
 
 
 # ─── A detached HEAD is the one removal this script cannot undo ───────────────
