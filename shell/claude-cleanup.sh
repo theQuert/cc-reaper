@@ -868,7 +868,12 @@ _cc_reaper_mcp_server_program() {
         i = 2
         while (i <= NF) {
           if ($i == "--") { i++; break }
-          if ($i ~ /^(exec|x|dlx|run|tool)$/) { i++; continue }
+          if ((b == "npm" && i == 2 && $i == "exec") ||
+              (b == "pnpm" && i == 2 && $i ~ /^(exec|dlx)$/) ||
+              (b == "yarn" && i == 2 && $i ~ /^(exec|dlx)$/) ||
+              (b == "bun" && i == 2 && $i == "x") ||
+              (b == "uv" && ((i == 2 && $i ~ /^(tool|run)$/) ||
+                             (i == 3 && $2 == "tool" && $i == "run")))) { i++; continue }
           if ($i !~ /^-/) break
           # Unknown options may consume a value. That value cannot identify the
           # executable (e.g. node --conditions mcp-remote /repo/build.js).

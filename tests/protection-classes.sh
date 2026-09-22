@@ -72,7 +72,7 @@ for cmd in "/Library/Bitdefender/AVP/product/bin/BDLDaemon" \
 done
 
 # Option values must never identify an unrelated script as a shared server.
-for cmd in 'node --conditions mcp-remote /repo/build.js' 'python -X chroma-mcp /repo/benchmark.py'; do
+for cmd in 'node --conditions mcp-remote /repo/build.js' 'python -X chroma-mcp /repo/benchmark.py' 'node exec mcp-remote' 'python run chroma-mcp' 'npm run mcp-remote'; do
   if _cc_guard_runaway_eligible "$cmd"; then
     fail "option value incorrectly identifies MCP: $cmd"
   else
