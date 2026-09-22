@@ -49,6 +49,21 @@ expect_eq "elapsed 08:07:51 is parsed as decimal" 29271 "$(etime_to_seconds 08:0
 expect_eq "elapsed 09:07:51 is parsed as decimal" 32871 "$(etime_to_seconds 09:07:51)"
 expect_eq "elapsed day prefix and 09 hour are parsed as decimal" 119271 "$(etime_to_seconds 1-09:07:51)"
 
+# Cover the short and day-form variants that previously failed when bash treated
+# zero-padded fields containing 08/09 as octal.
+expect_eq "elapsed 08:09 is parsed as decimal MM:SS" 489 "$(etime_to_seconds 08:09)"
+expect_eq "elapsed 00:00:08 is parsed as decimal" 8 "$(etime_to_seconds 00:00:08)"
+expect_eq "elapsed 02-07:09:05 is parsed as decimal" 198545 "$(etime_to_seconds 02-07:09:05)"
+expect_eq "elapsed 5-08:00:09 is parsed as decimal" 460809 "$(etime_to_seconds 5-08:00:09)"
+expect_eq "elapsed bare 09 is parsed as decimal" 9 "$(etime_to_seconds 09)"
+
+CC_AGENT_STALE_MINUTES=60
+expect_no "young zero-padded elapsed is not stale" \
+  is_stale_etime 00:00:08
+expect_yes "old zero-padded elapsed is stale" \
+  is_stale_etime 2-07:09:05
+unset CC_AGENT_STALE_MINUTES
+
 printf "protect\tCUSTOM.WORKER\ncleanup\tcustom.worker\n" > "$CC_REAPER_RULES_FILE"
 expect_yes "LaunchAgent reads case-insensitive literal protect rules" \
   has_user_rule protect "/opt/custom.worker --daemon"
