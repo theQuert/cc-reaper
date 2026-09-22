@@ -2,7 +2,13 @@
 
 ## Purpose
 
-Disk hygiene: hourly read-only free-space + TM-snapshot-pin checks, weekly cleanup of rebuildable-only caches, and gated Time Machine local-snapshot thinning.
+Disk hygiene: hourly read-only free-space + TM-snapshot-pin checks, weekly cleanup of rebuildable-only caches, and gated Time Machine local-snapshot thinning. Chrome code-sign clones and OrbStack builder cache are handled by separate fail-closed gates.
+
+### Requirement: Chrome code-sign clones are reclaimed only when unheld
+The janitor SHALL inspect only directories named `code_sign_clone.<token>` beneath Chrome's exact code-sign clone root. It SHALL keep recent clones, clones with an open handle, and every clone when `lsof` cannot prove a usable inventory. Clean mode SHALL recheck identity and open handles immediately before removal.
+
+### Requirement: OrbStack builder cleanup requires runner drain proof
+The janitor SHALL always record OrbStack and Docker inventory when available. It SHALL never prune Docker volumes, running containers, or tagged images. Builder-cache pruning SHALL require `CC_DJ_ORBSTACK_DRAIN_CONFIRMED=1` and SHALL refuse while any `ci-runner-*` container exists; ordinary scheduled clean remains report-only for OrbStack.
 
 ## Requirements
 

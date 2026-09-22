@@ -35,6 +35,20 @@ expect_no() {
   fi
 }
 
+expect_eq() {
+  local name=$1 want=$2 got=$3
+  if [ "$got" = "$want" ]; then
+    printf "ok - %s\n" "$name"
+  else
+    printf "not ok - %s (got %s, want %s)\n" "$name" "$got" "$want"
+    failures=$((failures + 1))
+  fi
+}
+
+expect_eq "elapsed 08:07:51 is parsed as decimal" 29271 "$(etime_to_seconds 08:07:51)"
+expect_eq "elapsed 09:07:51 is parsed as decimal" 32871 "$(etime_to_seconds 09:07:51)"
+expect_eq "elapsed day prefix and 09 hour are parsed as decimal" 119271 "$(etime_to_seconds 1-09:07:51)"
+
 printf "protect\tCUSTOM.WORKER\ncleanup\tcustom.worker\n" > "$CC_REAPER_RULES_FILE"
 expect_yes "LaunchAgent reads case-insensitive literal protect rules" \
   has_user_rule protect "/opt/custom.worker --daemon"

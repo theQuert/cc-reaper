@@ -97,6 +97,13 @@ etime_to_seconds() {
 
   local a=0 b=0 c=0
   IFS=: read -r a b c <<< "$time_part"
+  # Bash arithmetic treats a leading zero as octal. `ps` emits HH:MM:SS with
+  # zero-padded fields, so 08:... and 09:... used to abort the monitor instead
+  # of returning an elapsed time. Force decimal before doing any arithmetic.
+  [ -n "$a" ] && a=$((10#$a)) || a=0
+  [ -n "$b" ] && b=$((10#$b)) || b=0
+  [ -n "$c" ] && c=$((10#$c)) || c=0
+  [ -n "$days" ] && days=$((10#$days)) || days=0
   if [ -n "$c" ]; then
     echo $((days * 86400 + a * 3600 + b * 60 + c))
   elif [ -n "$b" ]; then
