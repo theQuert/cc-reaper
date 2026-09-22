@@ -92,7 +92,8 @@ runaway_with() {
   samples="$(mktemp "${TMPDIR:-/tmp}/ccr-samples.XXXXXX")"
   printf '%s' "$table" | awk '{
       n = split($3, p, ":"); c = p[n] + (n >= 2 ? p[n - 1] * 60 : 0) + (n >= 3 ? p[n - 2] * 3600 : 0)
-      printf "%s\tMon Sep 14 00:00:00 2026\t1999999400\t%.2f\t1999992200\n", $1, c - 594 }' > "$samples"
+      cmd=""; for(i=5;i<=NF;i++) cmd=cmd (i>5 ? " " : "") $i
+      printf "%s\tMon Sep 14 00:00:00 2026\t1999999400\t%.2f\t1999992200\t%s\n", $1, c - 594, cmd }' > "$samples"
   ( date() { if [ "$*" = "+%s" ]; then echo 2000000000; else command date "$@"; fi; }
     ps() {
       case "$*" in
@@ -213,6 +214,8 @@ forged_runaway() (
       *) command ps "$@" ;;
     esac
   }
+  cmd=$(ps -o command= -p 911 | tr '\t\r\n' '   ' | awk '{$1=$1} 1')
+  printf '911\tMon Sep 14 00:00:00 2026\t1999999400\t9606\t1999992200\t%s\n' "$cmd" > "$samples"
   CC_RUNAWAY_SAMPLES_FILE="$samples" _cc_guard_runaway_protected_pids 80 60
   rm -f "$samples"
 )

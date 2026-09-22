@@ -51,7 +51,7 @@ properties made it dangerous beside interactive work.
   CPU time, tried next, was wrong both ways: CPU time sums every thread, so a multi-threaded
   server busy in its first minutes qualified on any later burst, and a stall late in a long life
   was diluted and never caught. Each run now records the CPU time of every process hot at that
-  moment in `~/.cc-reaper/state/runaway-samples.tsv`, keyed by PID and start time read under
+  moment in `~/.cc-reaper/state/runaway-samples.tsv`, keyed by PID, start time, and normalized MCP command read under
   `LC_ALL=C TZ=UTC`. An interval of at least a minute extends a process's hot streak only if it
   used at least `CC_RUNAWAY_CPU` percent of it, and the process is selected once the streak
   reaches `CC_RUNAWAY_MIN`. An interval over 20 minutes starts the streak over: CPU time sums

@@ -53,6 +53,7 @@ cat > "$T" <<'EOF'
 980004 1 980004 ?? 93.0 S 03:00:00 170:00.00 80000 93.0 npx -y @stripe/mcp --tools=all
 980005 1 980005 ?? 93.0 S 03:00:00 170:00.00 80000 93.0 npx -y @stripe/mcp --tools=all
 980006 1 980006 ?? 93.0 S 03:00:00 170:00.00 80000 93.0 npx -y @stripe/mcp --tools=all
+980007 1 980007 ?? 93.0 S 03:00:00 170:00.00 80000 93.0 npx -y @stripe/mcp --tools=all
 990001 1 990001 ?? 99.0 S 03:00:00 170:00.00 60000 99.0 npx chrome-devtools-mcp@latest --headless
 990002 1 990002 ?? 99.0 S 2-00:00:00 2700:00.00 150000 99.0 uvx chroma-mcp --client-type http
 990003 1 990003 ?? 95.0 S 01:05:00 56:00.00 250000 95.0 /Users/me/.cache/uv/x1/bin/python /Users/me/.cache/uv/x1/bin/chroma-mcp
@@ -88,6 +89,7 @@ cat > "$tmp/prior" <<'EOF'
 980004 S 600 93 120
 980005 S 600 93 120
 980006 S 600 93 120
+980007 S 600 93 120
 990001 S 600 99 45
 990002 S 600 2 120
 990003 S 600 1 5
@@ -105,8 +107,8 @@ cat > "$tmp/prior" <<'EOF'
 EOF
 awk -v now="$NOW" -v S="$S" -v R="$R" '
   function secs(t,   n, p, s) { n = split(t, p, ":"); s = p[n] + 0; if (n >= 2) s += p[n - 1] * 60; if (n >= 3) s += p[n - 2] * 3600; return s }
-  FNR == NR { used[$1] = secs($8); next }
-  { printf "%s\t%s\t%d\t%.2f\t%d\n", $1, ($2 == "R" ? R : S), now - $3, used[$1] - $4 * $3 / 100, now - $3 - $5 * 60 }
+  FNR == NR { used[$1] = secs($8); cmd[$1] = ""; for(i=11;i<=NF;i++) cmd[$1]=cmd[$1] (i>11 ? " " : "") $i; next }
+  { printf "%s\t%s\t%d\t%.2f\t%d\t%s\n", $1, ($2 == "R" ? R : S), now - $3, used[$1] - $4 * $3 / 100, now - $3 - $5 * 60, ($1==980007 ? "node /repo/previous-build.js" : cmd[$1]) }
 ' "$T" "$tmp/prior" > "$tmp/samples.before"
 mkdir -p "$tmp/cmds" "$tmp/home/.cc-reaper/logs"
 : > "$tmp/empty-snapshot"
@@ -251,6 +253,7 @@ expect_not_signalled 980003 "a PID a protect rule covers after the pause is not 
 expect_signalled     980004 "a second MCP server still hot at the re-check is signalled"
 expect_not_signalled 980005 "a reused PID with the same command is not signalled"
 expect_not_signalled 980006 "an unavailable start identity is not signalled"
+expect_not_signalled 980007 "exec to MCP cannot inherit a different command hot streak"
 expect_not_signalled 990001 "a server hot for 55 minutes across runs is not signalled"
 expect_not_signalled 990002 "a burst after an idle interval is not signalled, however hot the server's past"
 expect_not_signalled 990003 "a multi-threaded server busy early is not signalled on a later burst"

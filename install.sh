@@ -173,8 +173,8 @@ _cc_rc_hands_off() {
   elif [ -e "$SHELL_RC" ] && [ ! -w "$SHELL_RC" ]; then
     echo "is not writable"
   elif [ -e "$SHELL_RC" ]; then
-    links="$(stat -f %l "$SHELL_RC" 2>/dev/null)" || links=1
-    case "$links" in ''|*[!0-9]*) links=1 ;; esac
+    links="$(stat -f %l "$SHELL_RC" 2>/dev/null)" || links="$(stat -c %h "$SHELL_RC" 2>/dev/null)" || links=""
+    case "$links" in ''|*[!0-9]*) echo "has an unknown link count"; return 0 ;; esac
     [ "$links" -gt 1 ] && echo "has more than one hard link"
   fi
   return 0

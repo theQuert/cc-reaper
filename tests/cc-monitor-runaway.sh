@@ -253,7 +253,7 @@ chmod +x "$stub_dir/kill"
 # A sample from ten minutes ago that has 9594 hot for the two hours before.
 samples_file=$(mktemp "${TMPDIR:-/tmp}/cc-guard-samples.XXXXXX")
 now=$(date +%s)
-printf '9594\tMon Sep 14 00:00:00 2026\t%d\t%d\t%d\n' "$((now - 600))" "$((520 * 60 - 594))" "$((now - 7800))" > "$samples_file"
+printf '9594\tMon Sep 14 00:00:00 2026\t%d\t%d\t%d\tnode /usr/local/bin/mcp-server-supabase run abc\n' "$((now - 600))" "$((520 * 60 - 594))" "$((now - 7800))" > "$samples_file"
 cp "$samples_file" "$samples_file.before"
 out=$(PATH="$stub_dir:/usr/bin:/bin" CC_RUNAWAY_SAMPLES_FILE="$samples_file" bash -c '
   source "$1"

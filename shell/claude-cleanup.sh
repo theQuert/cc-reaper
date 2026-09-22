@@ -917,7 +917,7 @@ _cc_guard_samples_warn() {
 # least min_minutes and are at or above cpu_threshold %cpu now.
 #
 # "Stayed hot" is measured across claude-guard's runs. Each run samples the CPU time of every
-# process hot at that moment. An interval of at least a minute since the previous sample extends
+# eligible MCP server hot at that moment. An interval of at least a minute since the previous sample extends
 # the process's streak only if the process used at least cpu_threshold percent of it; a cooler
 # interval, a run that finds it below the threshold, or an interval over 20 minutes starts the
 # streak over. CPU time sums threads, so inside a long interval a multi-threaded server could idle
@@ -925,7 +925,7 @@ _cc_guard_samples_warn() {
 # about a minute, and a lifetime average of CPU time let a multi-threaded server busy in its first
 # minutes qualify on any later burst while a stall late in a long life was never caught.
 #
-# Samples are keyed by PID and start time, read under LC_ALL=C and TZ=UTC so the guard agent and
+# Samples are keyed by PID, start time and normalized command, read under LC_ALL=C and TZ=UTC so the guard agent and
 # an interactive shell write the same keys, and a reused PID starts fresh. With record=1 this
 # run's samples replace the file; a dry run or a listing leaves it alone. A lost file only
 # restarts streaks. A record dated after the run reading it, or whose streak starts after the
@@ -942,7 +942,7 @@ _cc_guard_samples_warn() {
 # flattened to one line, so argument text shaped like a row or a record adds no PID - the seam
 # session detection already uses.
 _cc_guard_runaway_protected_pids() {
-  local cpu_threshold=$1 min_minutes=$2 record=${3:-0} now samples tmp="" list rc pid etime cpu cmd started
+  local cpu_threshold=$1 min_minutes=$2 record=${3:-0} now samples tmp="" list rc pid etime cpu cmd started row
   now=$(date +%s)
   samples=$(_cc_guard_samples_path)
   # A path with no directory part names a file where claude-guard runs; `mkdir -p` on it would
@@ -957,7 +957,14 @@ _cc_guard_runaway_protected_pids() {
     return 2
   fi
   list=$(LC_ALL=C TZ=UTC ps -axo pid=,lstart=,etime=,time=,%cpu= 2>/dev/null |
-    awk -v now="$now" -v cpu="$cpu_threshold" -v min="$min_minutes" -v samples="$samples" -v out="$tmp" '
+    awk -v cpu="$cpu_threshold" 'NF == 9 && $9 + 0 >= cpu + 0 {$1=$1; print}' |
+    while IFS= read -r row; do
+      pid=${row%% *}
+      cmd=$(ps -o command= -p "$pid" 2>/dev/null | tr '\t\r\n' '   ' | awk '{$1=$1} 1')
+      _cc_guard_runaway_eligible "$cmd" || continue
+      printf '%s\t%s\n' "$row" "$cmd"
+    done |
+    awk -F '\t' -v now="$now" -v cpu="$cpu_threshold" -v min="$min_minutes" -v samples="$samples" -v out="$tmp" '
       function secs(t,   n, p, s) {
         n = split(t, p, ":")
         s = p[n] + 0
@@ -967,19 +974,20 @@ _cc_guard_runaway_protected_pids() {
       }
       BEGIN {
         while ((getline line < samples) > 0)
-          if (split(line, f, "\t") == 5 && f[3] + 0 <= now && f[5] + 0 <= f[3] + 0) {
-            k = f[1] "\t" f[2]; at[k] = f[3]; used[k] = f[4]; since[k] = f[5]
+          if (split(line, f, "\t") == 6 && f[6] != "" && f[3] + 0 <= now && f[5] + 0 <= f[3] + 0) {
+            k = f[1] "\t" f[2] "\t" f[6]; at[k] = f[3]; used[k] = f[4]; since[k] = f[5]
           }
       }
-      NF == 9 && $9 + 0 >= cpu + 0 {
-        key = $1 "\t" $2 " " $3 " " $4 " " $5 " " $6
-        c = secs($8)
+      NF == 2 && split($1, p, " ") == 9 {
+        started = p[2] " " p[3] " " p[4] " " p[5] " " p[6]
+        key = p[1] "\t" started "\t" $2
+        c = secs(p[8])
         if (!(key in at)) { t = now; u = c; h = now }
         else if (now - at[key] < 60) { t = at[key]; u = used[key]; h = since[key] }
         else if (now - at[key] > 1200) { t = now; u = c; h = now }
         else { t = now; u = c; h = ((c - used[key]) * 100 >= cpu * (now - at[key])) ? since[key] : now }
-        if (out != "") printf "%s\t%d\t%.2f\t%d\n", key, t, u, h > out
-        if (t - h >= min * 60) printf "%s\t%s\t%s\t%s %s %s %s %s\n", $1, $7, $9, $2, $3, $4, $5, $6
+        if (out != "") printf "%s\t%s\t%d\t%.2f\t%d\t%s\n", p[1], started, t, u, h, $2 > out
+        if (t - h >= min * 60) printf "%s\t%s\t%s\t%s\t%s\n", p[1], p[9], p[7], started, $2
       }')
   rc=$?
   if [ -n "$tmp" ]; then
@@ -999,15 +1007,7 @@ _cc_guard_runaway_protected_pids() {
   fi
   [ "$rc" = 0 ] || return 0
   [ -n "$list" ] || return 0
-  printf '%s\n' "$list" | while IFS=$'\t' read -r pid etime cpu started; do
-    cmd=$(ps -o command= -p "$pid" 2>/dev/null | tr '\n' ' ')
-    cmd=${cmd% }
-    # Immutable processes - system scanners, cc-reaper itself, ordinary Chrome - never
-    # qualify, however hot: SIGTERM-ing security software or a Spotlight reindex costs more
-    # than the CPU it would reclaim.
-    _cc_guard_runaway_eligible "$cmd" || continue
-    printf "%s\t%s\t%s\t%s\t%s\n" "$pid" "$cpu" "$etime" "$started" "$cmd"
-  done
+  printf '%s\n' "$list"
 }
 
 # Automatic session guard: kills bloated (RSS threshold) and idle sessions

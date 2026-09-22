@@ -263,6 +263,36 @@ completed "$H"; check "an install with a hard-linked rc file completes" $?
 check "a hard-linked rc file keeps both links, unchanged" $?
 grep -qF "$want_cleanup" "$H/install.out"; check "and the installer prints the replacement for it" $?
 
+# GNU stat rejects the BSD link-count form. Simulate its option contract while
+# the filesystem fixture remains a real hard link on macOS.
+GNU_STAT="$WORK/gnu-stat"
+mkdir -p "$GNU_STAT"
+cat > "$GNU_STAT/stat" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "-f %l") exit 1 ;;
+  "-c %h") shift 2; exec /usr/bin/stat -f %l "$@" ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
+EOF
+chmod +x "$GNU_STAT/stat"
+EXTRA_PATH="$GNU_STAT" install_into "$H"
+completed "$H"; check "GNU stat link-count fallback allows installation to finish" $?
+[ "$(stat -f %l "$H/.zshrc")" = 2 ] && cmp -s "$H/dotfiles/zshrc" "$H/original"
+check "GNU stat contract preserves the hard-linked rc and its target" $?
+
+cat > "$GNU_STAT/stat" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "-f %l"|"-c %h") exit 1 ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
+EOF
+EXTRA_PATH="$GNU_STAT" install_into "$H"
+completed "$H"; check "unknown link-count status does not abort deployment" $?
+cmp -s "$H/dotfiles/zshrc" "$H/original" && grep -q 'unknown link count' "$H/install.out"
+check "unknown link-count status leaves the rc unchanged and explains why" $?
+
 H="$(sandbox_home)"
 printf 'source "/gone/worktree/shell/claude-cleanup.sh"\n' > "$H/.zshrc"
 cp "$H/.zshrc" "$H/original"
