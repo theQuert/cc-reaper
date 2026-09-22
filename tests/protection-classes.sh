@@ -71,6 +71,15 @@ for cmd in "/Library/Bitdefender/AVP/product/bin/BDLDaemon" \
   fi
 done
 
+# Option values must never identify an unrelated script as a shared server.
+for cmd in 'node --conditions mcp-remote /repo/build.js' 'python -X chroma-mcp /repo/benchmark.py'; do
+  if _cc_guard_runaway_eligible "$cmd"; then
+    fail "option value incorrectly identifies MCP: $cmd"
+  else
+    pass "ambiguous interpreter option is protected: $cmd"
+  fi
+done
+
 # ─── Runaway selection ─────────────────────────────────────────────────────
 
 # Rows are pid etime cputime %cpu command. Each row also gets a sample from ten minutes ago that

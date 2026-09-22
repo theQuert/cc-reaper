@@ -245,7 +245,15 @@ _cc_monitor_mcp_server_program() {
       # an option nor a subcommand. No later argument identifies anything.
       if (b ~ /^(node|npx|npm|pnpm|yarn|bun|bunx|deno|uv|uvx|pipx|python[0-9.]*)$/) {
         i = 2
-        while (i <= NF && ($i ~ /^-/ || $i ~ /^(exec|x|dlx|run|tool)$/)) i++
+        while (i <= NF) {
+          if ($i == "--") { i++; break }
+          if ($i ~ /^(exec|x|dlx|run|tool)$/) { i++; continue }
+          if ($i !~ /^-/) break
+          # Unknown options may consume a value. That value cannot identify the
+          # executable (e.g. node --conditions mcp-remote /repo/build.js).
+          if (b ~ /^(npx|npm|pnpm|yarn|bun|bunx)$/ && $i ~ /^(-y|--yes)$/) { i++; continue }
+          exit 1
+        }
       }
       # What runs from inside an .app bundle is that application; an .app in a URL is not.
       if (index($1, ".app/") || index($i, ".app/")) exit 1

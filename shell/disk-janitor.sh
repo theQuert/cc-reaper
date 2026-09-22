@@ -651,12 +651,9 @@ _cc_dj_orbstack_clean() {
     _cc_dj_log "OrbStack builder cache: SKIP (protected builder consumer still exists: $holders)"
     return 0
   fi
-  # Keep the destructive subcommand assembled so the existing source guard cannot
-  # mistake this opt-in path for the forbidden broad system-prune shape.
-  local builder_subcommand
-  builder_subcommand="$(printf 'pru%s' ne)"
+  # This explicit, proof-gated builder-only operation is separate from --clean.
   _cc_dj_clean_target "OrbStack Docker builder cache (168h+)" \
-    docker builder "$builder_subcommand" --force --filter until=168h
+    docker builder prune --force --filter until=168h
 }
 
 # A drain proof is an explicit handoff from a lifecycle adapter (CI, a local

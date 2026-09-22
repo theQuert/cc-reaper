@@ -866,7 +866,15 @@ _cc_reaper_mcp_server_program() {
       # an option nor a subcommand. No later argument identifies anything.
       if (b ~ /^(node|npx|npm|pnpm|yarn|bun|bunx|deno|uv|uvx|pipx|python[0-9.]*)$/) {
         i = 2
-        while (i <= NF && ($i ~ /^-/ || $i ~ /^(exec|x|dlx|run|tool)$/)) i++
+        while (i <= NF) {
+          if ($i == "--") { i++; break }
+          if ($i ~ /^(exec|x|dlx|run|tool)$/) { i++; continue }
+          if ($i !~ /^-/) break
+          # Unknown options may consume a value. That value cannot identify the
+          # executable (e.g. node --conditions mcp-remote /repo/build.js).
+          if (b ~ /^(npx|npm|pnpm|yarn|bun|bunx)$/ && $i ~ /^(-y|--yes)$/) { i++; continue }
+          exit 1
+        }
       }
       # What runs from inside an .app bundle is that application; an .app in a URL is not.
       if (index($1, ".app/") || index($i, ".app/")) exit 1
@@ -900,7 +908,7 @@ _cc_guard_samples_warn() {
   printf '  WARNING: cannot record runaway samples at %s; selecting nothing.\n' "$1" >&2
 }
 
-# Print TSV (pid, cpu, etime, command) for runaway-eligible processes that have stayed hot for at
+# Print TSV (pid, cpu, etime, start, command) for runaway-eligible processes that have stayed hot for at
 # least min_minutes and are at or above cpu_threshold %cpu now.
 #
 # "Stayed hot" is measured across claude-guard's runs. Each run samples the CPU time of every
@@ -929,7 +937,7 @@ _cc_guard_samples_warn() {
 # flattened to one line, so argument text shaped like a row or a record adds no PID - the seam
 # session detection already uses.
 _cc_guard_runaway_protected_pids() {
-  local cpu_threshold=$1 min_minutes=$2 record=${3:-0} now samples tmp="" list rc pid etime cpu cmd
+  local cpu_threshold=$1 min_minutes=$2 record=${3:-0} now samples tmp="" list rc pid etime cpu cmd started
   now=$(date +%s)
   samples=$(_cc_guard_samples_path)
   # A path with no directory part names a file where claude-guard runs; `mkdir -p` on it would
@@ -966,7 +974,7 @@ _cc_guard_runaway_protected_pids() {
         else if (now - at[key] > 1200) { t = now; u = c; h = now }
         else { t = now; u = c; h = ((c - used[key]) * 100 >= cpu * (now - at[key])) ? since[key] : now }
         if (out != "") printf "%s\t%d\t%.2f\t%d\n", key, t, u, h > out
-        if (t - h >= min * 60) print $1, $7, $9
+        if (t - h >= min * 60) printf "%s\t%s\t%s\t%s %s %s %s %s\n", $1, $7, $9, $2, $3, $4, $5, $6
       }')
   rc=$?
   if [ -n "$tmp" ]; then
@@ -986,14 +994,14 @@ _cc_guard_runaway_protected_pids() {
   fi
   [ "$rc" = 0 ] || return 0
   [ -n "$list" ] || return 0
-  printf '%s\n' "$list" | while read -r pid etime cpu; do
+  printf '%s\n' "$list" | while IFS=$'\t' read -r pid etime cpu started; do
     cmd=$(ps -o command= -p "$pid" 2>/dev/null | tr '\n' ' ')
     cmd=${cmd% }
     # Immutable processes - system scanners, cc-reaper itself, ordinary Chrome - never
     # qualify, however hot: SIGTERM-ing security software or a Spotlight reindex costs more
     # than the CPU it would reclaim.
     _cc_guard_runaway_eligible "$cmd" || continue
-    printf "%s\t%s\t%s\t%s\n" "$pid" "$cpu" "$etime" "$cmd"
+    printf "%s\t%s\t%s\t%s\t%s\n" "$pid" "$cpu" "$etime" "$started" "$cmd"
   done
 }
 
@@ -1055,7 +1063,7 @@ claude-guard() {
     if [ -n "$runaway_lines" ]; then
       echo "  --- Runaway protected processes (CPU >= ${runaway_cpu}% across runs for >= ${runaway_min} min) ---"
       printf '%s\n' "$runaway_lines" | awk -F '\t' '
-        { printf "  PID %-7s  CPU %6s%%  ETIME %-14s  %s\n", $1, $2, $3, substr($4, 1, 80) }
+        { printf "  PID %-7s  CPU %6s%%  ETIME %-14s  %s\n", $1, $2, $3, substr($5, 1, 80) }
       '
       if $dry_run; then
         echo "  [DRY-RUN] Would SIGTERM each PID above alone, if still hot on a re-check."
@@ -1068,8 +1076,8 @@ claude-guard() {
         # signalled only if it still runs the command it was selected for, is still eligible,
         # and is still over the threshold now.
         sleep 3
-        local rkilled=0 rfreed_kb=0 rnow_cmd="" rnow_cpu="" rrss=""
-        while IFS=$'\t' read -r rpid rcpu retime rrest; do
+        local rkilled=0 rfreed_kb=0 rnow_cmd="" rnow_cpu="" rrss="" rstart="" rnow_start=""
+        while IFS=$'\t' read -r rpid rcpu retime rstart rrest; do
           [ -z "$rpid" ] && continue
           rnow_cmd=$(ps -o command= -p "$rpid" 2>/dev/null | tr '\n' ' ')
           if [ "$(printf '%s' "$rnow_cmd" | awk '{ $1 = $1 } 1')" != "$(printf '%s' "$rrest" | awk '{ $1 = $1 } 1')" ]; then
@@ -1086,6 +1094,14 @@ claude-guard() {
             continue
           fi
           rrss=$(ps -o rss= -p "$rpid" 2>/dev/null | tr -d ' ')
+          # A PID can be reused for the same MCP command during the grace period.
+          # Keep the sampled start identity through selection and fail closed if
+          # it cannot be read or changed before signalling.
+          rnow_start=$(LC_ALL=C TZ=UTC ps -o lstart= -p "$rpid" 2>/dev/null | awk '{$1=$1} 1')
+          if [ -z "$rnow_start" ] || [ "$rnow_start" != "$rstart" ]; then
+            echo "  PID $rpid start identity changed or is unavailable; not signalled."
+            continue
+          fi
           # This PID alone. A shared MCP server started by a Claude CLI is in that CLI's
           # process group, and signalling the group ended the session.
           if _cc_reaper_kill_pid "$rpid"; then

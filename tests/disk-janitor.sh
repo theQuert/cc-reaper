@@ -511,8 +511,8 @@ expect_yes "tool resolution: caller's PATH entry wins over the appended dirs" \
 # ---------------------------------------------------------------------------
 printf "\n# Test group 9: docker cleanup shape and skip accounting\n"
 
-expect_no "docker: no 'prune' invocation survives outside comments" \
-  bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -q "docker.*prune"' _ "$DJ"
+expect_no "docker: no broad system/image/container/volume prune invocation" \
+  bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -Eq "docker[[:space:]]+(system|image|container|volume)[[:space:]]+prune"' _ "$DJ"
 
 expect_no "docker: no volume removal survives outside comments" \
   bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -q "volume rm"' _ "$DJ"

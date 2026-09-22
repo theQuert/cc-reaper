@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Rebuildable-only cleanup targets
-The janitor SHALL clean only artifacts that rebuild automatically on next use: go-build cache (`go clean -cache`), Yarn cache, pip cache, Homebrew cleanup, bun install cache, Spotify cache, ShipIt updater cache, and CoreSimulator caches. Docker images and volumes SHALL be reported and never removed. No code path SHALL run `docker rmi`, `docker image rm`, `docker volume rm`, or any `docker ... prune`. The janitor SHALL NEVER touch user-data paths (`~/Documents`, `~/Downloads`, `~/Desktop`) or editor state (`~/.cursor/extensions`).
+The janitor SHALL clean only artifacts that rebuild automatically on next use: go-build cache (`go clean -cache`), Yarn cache, pip cache, Homebrew cleanup, bun install cache, Spotify cache, ShipIt updater cache, and CoreSimulator caches. Docker images and volumes SHALL be reported and never removed. No code path SHALL run `docker rmi`, `docker image rm`, `docker volume rm`, or broad system/image/container/volume pruning. The janitor SHALL NEVER touch user-data paths (`~/Documents`, `~/Downloads`, `~/Desktop`) or editor state (`~/.cursor/extensions`).
 
 #### Scenario: Weekly deep clean runs
 - **WHEN** the weekly launchd agent fires the janitor in clean mode
@@ -21,4 +21,9 @@ The janitor SHALL clean only artifacts that rebuild automatically on next use: g
 
 #### Scenario: Forbidden flags are structurally absent
 - **WHEN** the janitor source is inspected
-- **THEN** it contains no `docker rmi`, `docker image rm`, `docker volume rm`, or `prune` invocation, and no cleanup target resolves inside user-data paths
+- **THEN** it contains no `docker rmi`, `docker image rm`, `docker volume rm`, or broad system/image/container/volume prune invocation, and no cleanup target resolves inside user-data paths
+
+#### Scenario: Explicit drained builder cache cleanup
+- **WHEN** the operator enables builder cleanup and invokes `--orbstack-clean` with a valid short-lived host/context-bound drain proof and no protected consumers remain
+- **THEN** only builder cache unused for at least 168 hours may be pruned; the existing drain-proof, adapter, and protected-container rechecks remain mandatory
+- **AND** ordinary `--clean` never enters this path

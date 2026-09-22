@@ -23,7 +23,7 @@ shared MCP service SHALL be left to claude-guard's runaway phase.
 
 ### Requirement: Runaway re-checks before signalling
 Before signalling a selected PID, the runaway phase SHALL wait at least three seconds and read
-that PID again. It SHALL signal only when the PID still runs the command it was selected for,
+that PID again. It SHALL signal only when the PID still has the sampled start time and runs the command it was selected for,
 still classifies as a runaway-eligible service, and its CPU is still at or above
 `CC_RUNAWAY_CPU`. A PID that fails any of these SHALL NOT be signalled or counted.
 
@@ -39,10 +39,14 @@ still classifies as a runaway-eligible service, and its CPU is still at or above
 - **WHEN** the selected MCP server is still at or above the threshold on the re-sample
 - **THEN** it SHALL be signalled and counted
 
+#### Scenario: PID reused for an identical command during the pause
+- **WHEN** a selected PID has a different start time or its start time cannot be read at the re-check, even though its command is unchanged
+- **THEN** it SHALL NOT be signalled or counted
+
 ### Requirement: Runaway selects a shared MCP server by what it runs
 The runaway phase SHALL select a process only when the process itself is a known shared MCP
 server: its executable names one or, when its executable is a package runner or interpreter, the
-first word that is neither an option nor a subcommand does - compared whole, as a package with
+unambiguous executable operand does - compared whole, as a package with
 any version dropped, a program in a `bin` directory, or a package directory under `node_modules`.
 No other argument SHALL make a process eligible, so a name inside a JSON payload, a path to a
 checkout named after a server, and an argument of a Claude or Codex CLI do not; `codex mcp-server`
@@ -53,6 +57,10 @@ from a process listing that
 carries no argument text, with each command read per PID as one line, so no argument can add a
 candidate. cc-monitor SHALL name claude-guard as the remedy for a runaway only when it is
 eligible by the same test.
+
+#### Scenario: Interpreter option value names a known server
+- **WHEN** `node --conditions mcp-remote /repo/build.js` or `python -X chroma-mcp /repo/benchmark.py` meets the runaway thresholds
+- **THEN** neither SHALL be eligible; unknown options that may consume a value SHALL fail closed
 
 #### Scenario: Session whose settings name a protected service
 - **WHEN** a terminal-attached `claude --session-id … --settings {…claude-mem…}` meets the runaway thresholds

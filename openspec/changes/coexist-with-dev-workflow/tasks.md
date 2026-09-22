@@ -14,7 +14,7 @@
 
 - [x] 3.1 Red-verify: with dangling images listed, the clean invokes `docker rmi`
 - [x] 3.2 Report dangling images (count and review command); a failed inventory reports that nothing was examined
-- [x] 3.3 Structural check: no `docker rmi`, `image rm`, `volume rm` or `prune` invocation in the janitor
+- [x] 3.3 Structural check: no `docker rmi`, `image rm`, `volume rm` or broad system/image/container/volume prune invocation; preserve the separately enabled drain-proof-gated 168h builder-cache path
 
 ## 4. Stop hook
 

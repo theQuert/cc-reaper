@@ -51,6 +51,8 @@ cat > "$T" <<'EOF'
 980002 1 980002 ?? 90.0 S 03:00:00 170:00.00 110000 90.0 npm exec @upstash/context7-mcp
 980003 1 980003 ?? 92.0 S 03:00:00 170:00.00 70000 92.0 npx -y mcp-sequentialthinking-tools
 980004 1 980004 ?? 93.0 S 03:00:00 170:00.00 80000 93.0 npx -y @stripe/mcp --tools=all
+980005 1 980005 ?? 93.0 S 03:00:00 170:00.00 80000 93.0 npx -y @stripe/mcp --tools=all
+980006 1 980006 ?? 93.0 S 03:00:00 170:00.00 80000 93.0 npx -y @stripe/mcp --tools=all
 990001 1 990001 ?? 99.0 S 03:00:00 170:00.00 60000 99.0 npx chrome-devtools-mcp@latest --headless
 990002 1 990002 ?? 99.0 S 2-00:00:00 2700:00.00 150000 99.0 uvx chroma-mcp --client-type http
 990003 1 990003 ?? 95.0 S 01:05:00 56:00.00 250000 95.0 /Users/me/.cache/uv/x1/bin/python /Users/me/.cache/uv/x1/bin/chroma-mcp
@@ -84,6 +86,8 @@ cat > "$tmp/prior" <<'EOF'
 980002 S 600 90 120
 980003 S 600 92 120
 980004 S 600 93 120
+980005 S 600 93 120
+980006 S 600 93 120
 990001 S 600 99 45
 990002 S 600 2 120
 990003 S 600 1 5
@@ -136,6 +140,13 @@ ps() {
     # and have it fail for the defect rather than for the format.
     "-axo pid=,etime=,time=,%cpu=") awk '{ print $1, $7, $8, $5 }' "$T" ;;
     "-o command= -p "*) cmd_of "$(last_arg "$@")" ;;
+    "-o lstart= -p "*)
+      # Reuse for the same command and an unreadable identity must both veto.
+      case "$(last_arg "$@")" in
+        980005) printf '%s\n' "$r" ;;
+        980006) return 1 ;;
+        *) awk -v p="$(last_arg "$@")" -v S="$s" -v R="$r" '$1 == p {print ($6 == "R" ? R : S)}' "$T" ;;
+      esac ;;
     "-o %cpu= -p "*) awk -v p="$(last_arg "$@")" '$1 == p { print $10 }' "$T" ;;
     "-o pgid= -p "*) awk -v p="$(last_arg "$@")" '$1 == p { print $3 }' "$T" ;;
     "-eo pid,pgid") awk 'BEGIN { print "  PID  PGID" } { print $1, $3 }' "$T" ;;
@@ -238,6 +249,8 @@ expect_not_signalled 980001 "a server that cooled by the re-check is not signall
 expect_not_signalled 980002 "a PID running another command after the pause is not signalled"
 expect_not_signalled 980003 "a PID a protect rule covers after the pause is not signalled"
 expect_signalled     980004 "a second MCP server still hot at the re-check is signalled"
+expect_not_signalled 980005 "a reused PID with the same command is not signalled"
+expect_not_signalled 980006 "an unavailable start identity is not signalled"
 expect_not_signalled 990001 "a server hot for 55 minutes across runs is not signalled"
 expect_not_signalled 990002 "a burst after an idle interval is not signalled, however hot the server's past"
 expect_not_signalled 990003 "a multi-threaded server busy early is not signalled on a later burst"
