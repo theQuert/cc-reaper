@@ -454,14 +454,10 @@ mkdir -p "$PLIST_DIR"
 for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cleanup guard-runner; do
   _cc_deploy "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
 done
-cp "$SCRIPT_DIR/shell/chrome-clone-janitor.py" "$REAPER_DIR/"
-chmod +x "$REAPER_DIR/chrome-clone-janitor.py"
-cp "$SCRIPT_DIR/hooks/worktree-session-end.sh" "$REAPER_DIR/"
-chmod +x "$REAPER_DIR/worktree-session-end.sh"
-cp "$SCRIPT_DIR/hooks/lifecycle-reclaim.sh" "$REAPER_DIR/"
-chmod +x "$REAPER_DIR/lifecycle-reclaim.sh"
-cp "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$REAPER_DIR/"
-chmod +x "$REAPER_DIR/stop-cleanup-orphans.sh"
+_cc_deploy "$SCRIPT_DIR/shell/chrome-clone-janitor.py" "$REAPER_DIR/chrome-clone-janitor.py"
+for SCRIPT in worktree-session-end lifecycle-reclaim stop-cleanup-orphans; do
+  _cc_deploy "$SCRIPT_DIR/hooks/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
+done
 
 # The policy lives with cc-reaper, not in either harness's settings.  Preserve an
 # operator-edited policy on update; the repository copy remains the reviewable default.
@@ -521,7 +517,7 @@ echo "  disk-check:     read-only disk + TM-snapshot check every hour"
 echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
 echo "  worktree-janitor: every $WORKTREE_INTERVAL_SECONDS seconds + at load; 48h idle policy from ~/.cc-reaper/worktree-janitor.conf"
 echo "                    SessionEnd trigger: ~/.cc-reaper/worktree-session-end.sh <claude|codex>"
-echo "  guard:          runaway-MCP reaper every 10 min (SIGTERMs whitelisted MCP pinned >80% CPU for >60 min)"
+echo "  guard:          runaway-MCP reaper every 10 min (60+ minutes of sustained CPU samples; re-checks and signals each known MCP PID alone)"
 
 # Claude has one global hook file, so the installer can migrate it safely.  Codex hooks
 # are repository-owned; checked-in .codex/hooks.json files should invoke the same deployed

@@ -26,7 +26,24 @@ trap cleanup EXIT
 STUBS="$WORK/stubs"
 mkdir -p "$STUBS"
 for c in launchctl brew cargo osascript; do
-  printf '#!/bin/sh\nexit 0\n' > "$STUBS/$c"; chmod +x "$STUBS/$c"
+  if [ "$c" = launchctl ]; then
+    # The installer waits for `print` to fail after bootout before it bootstraps
+    # the replacement. Model that absence instead of making every retired job
+    # appear permanently present.
+    cat > "$STUBS/$c" <<'EOF'
+#!/bin/sh
+state="$(dirname "$0")/launchctl.state"
+case "$1" in
+  bootout) : > "$state"; rm -f "$state.present"; exit 0 ;;
+  bootstrap) : > "$state.present"; exit 0 ;;
+  print) [ -e "$state.present" ] && exit 0 || exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+  else
+    printf '#!/bin/sh\nexit 0\n' > "$STUBS/$c"
+  fi
+  chmod +x "$STUBS/$c"
 done
 # A cp that cannot write an rc backup, and copies everything else.
 NOBACKUP="$WORK/nobackup"
@@ -73,7 +90,7 @@ completed "$H"; check "a fresh install completes" $?
 # ─── Repeated install, and deploy by rename ───────────────────────────────────
 before_backups="$(backups "$H")"
 inode_cleanup="$(stat -f %i "$H/.cc-reaper/claude-cleanup.sh")"
-inode_hook="$(stat -f %i "$H/.claude/hooks/stop-cleanup-orphans.sh")"
+inode_hook="$(stat -f %i "$H/.cc-reaper/stop-cleanup-orphans.sh")"
 install_into "$H"
 completed "$H"; check "a repeated install completes" $?
 [ "$(count_line "$H/.zshrc" "$want_cleanup")" = 1 ] && [ "$(count_line "$H/.zshrc" "$want_monitor")" = 1 ]
@@ -82,7 +99,7 @@ check "a second install adds no second line" $?
 [ "$(stat -f %i "$H/.cc-reaper/claude-cleanup.sh")" != "$inode_cleanup" ] &&
   cmp -s "$H/.cc-reaper/claude-cleanup.sh" "$ROOT_DIR/shell/claude-cleanup.sh"
 check "a deployed script is replaced by rename, with the repository's content" $?
-[ "$(stat -f %i "$H/.claude/hooks/stop-cleanup-orphans.sh")" != "$inode_hook" ]
+[ "$(stat -f %i "$H/.cc-reaper/stop-cleanup-orphans.sh")" != "$inode_hook" ]
 check "the stop hook is replaced by rename" $?
 [ -z "$(ls -A "$H/.cc-reaper" | grep '^\.')" ] && [ -z "$(ls -A "$H/.claude/hooks" | grep '^\.')" ]
 check "no temporary file is left beside a deployed script" $?
