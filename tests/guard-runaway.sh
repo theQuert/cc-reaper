@@ -310,7 +310,7 @@ expect_sample 960001 "" "a process not hot now has no sample"
 cp "$tmp/samples.before" "$tmp/samples.tsv"
 CC_RUNAWAY_CPU=0 CC_RUNAWAY_MIN=0 guard --dry-run > "$tmp/dry.out" 2>&1
 listed="$(awk '$1 == "PID" { print $2 }' "$tmp/dry.out" | sort -n | tr '\n' ' ')"
-if [ "$listed" = "960002 980001 980002 980003 980004 990007 " ] && grep -qF 'CPU >= 80% across runs for >= 60 min' "$tmp/dry.out"; then
+if [ "$listed" = "960002 980001 980002 980003 980004 980005 980006 990007 " ] && grep -qF 'CPU >= 80% across runs for >= 60 min' "$tmp/dry.out"; then
   ok "zero thresholds fall back to 80% and 60 minutes"
 else
   bad "zero thresholds fall back to 80% and 60 minutes: listed $listed"
