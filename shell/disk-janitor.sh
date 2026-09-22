@@ -7,7 +7,7 @@
 
 _cc_dj_usage() {
   cat <<'EOF'
-Usage: disk-janitor --check | --clean | --orbstack-clean
+Usage: disk-janitor --check | --clean | --orbstack-clean [--drain-proof FILE]
 
 Disk space monitoring and rebuildable-cache cleanup for cc-reaper.
 
@@ -16,7 +16,7 @@ Modes:
             notify when below threshold (cooldown-gated). No deletions.
   --clean   Delete rebuildable caches and thin TM snapshots when below
             threshold.
-  --orbstack-clean  Explicit builder-cache prune after CI runner drain proof.
+  --orbstack-clean  Explicit builder-cache prune after a short-lived drain proof.
             Never removes images, containers or volumes.
 
 Options:
@@ -29,17 +29,38 @@ Environment:
   CC_DJ_COOLDOWN_SECS   Seconds between repeat --check notifications (default: 3600)
   CC_DJ_LOG             Log file path (default: ~/.cc-reaper/logs/disk-janitor.log)
   CC_DJ_STATE_DIR       State directory path (default: ~/.cc-reaper/state/)
+  CC_DJ_DRAIN_PROOF_MAX_AGE_SECONDS  Maximum proof age (default: 900)
+  CC_DJ_PROTECTED_CONTAINER_FILTERS  Newline/space-separated docker filters that
+                                    identify active builder consumers (default:
+                                    label=cc.reaper.protect=true)
 EOF
 }
 
 # ---------------------------------------------------------------------------
 # Config defaults
 # ---------------------------------------------------------------------------
+_cc_dj_config_file="${CC_DJ_CONFIG:-$HOME/.cc-reaper/disk-janitor.conf}"
+_cc_dj_proof_age_set="${CC_DJ_DRAIN_PROOF_MAX_AGE_SECONDS+x}"
+_cc_dj_proof_age_value="${CC_DJ_DRAIN_PROOF_MAX_AGE_SECONDS-}"
+_cc_dj_filters_set="${CC_DJ_PROTECTED_CONTAINER_FILTERS+x}"
+_cc_dj_filters_value="${CC_DJ_PROTECTED_CONTAINER_FILTERS-}"
+_cc_dj_proof_file_set="${CC_DJ_DRAIN_PROOF_FILE+x}"
+_cc_dj_proof_file_value="${CC_DJ_DRAIN_PROOF_FILE-}"
+if [ -r "$_cc_dj_config_file" ]; then . "$_cc_dj_config_file"; fi
+[ -z "$_cc_dj_proof_age_set" ] || CC_DJ_DRAIN_PROOF_MAX_AGE_SECONDS="$_cc_dj_proof_age_value"
+[ -z "$_cc_dj_filters_set" ] || CC_DJ_PROTECTED_CONTAINER_FILTERS="$_cc_dj_filters_value"
+[ -z "$_cc_dj_proof_file_set" ] || CC_DJ_DRAIN_PROOF_FILE="$_cc_dj_proof_file_value"
+unset _cc_dj_config_file _cc_dj_proof_age_set _cc_dj_proof_age_value
+unset _cc_dj_filters_set _cc_dj_filters_value _cc_dj_proof_file_set _cc_dj_proof_file_value
 CC_DJ_DISK_MIN_PCT="${CC_DJ_DISK_MIN_PCT:-15}"
 CC_DJ_TRIM_WORKTREES="${CC_DJ_TRIM_WORKTREES:-1}"
 CC_DJ_COOLDOWN_SECS="${CC_DJ_COOLDOWN_SECS:-3600}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
 CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
+CC_DJ_DRAIN_PROOF_MAX_AGE_SECONDS="${CC_DJ_DRAIN_PROOF_MAX_AGE_SECONDS:-900}"
+# A local adapter may choose a shorter proof lifetime, but never a longer one.
+CC_DJ_DRAIN_PROOF_HARD_MAX_SECONDS=900
+CC_DJ_PROTECTED_CONTAINER_FILTERS="${CC_DJ_PROTECTED_CONTAINER_FILTERS:-label=cc.reaper.protect=true}"
 # Abandoned scratch checkouts under the shared temp directory. Agents and review
 # sessions copy or clone a repository there and nothing ever revisits it; measured
 # 2026-08-31 on one host, twelve of them between 484 MB and 1.3 GB, 5.7 GB in total,
@@ -604,18 +625,30 @@ _cc_dj_orbstack_report() {
 _cc_dj_orbstack_clean() {
   _cc_dj_init_dirs || return 1
   _cc_dj_orbstack_report
-  if [ "${CC_DJ_ORBSTACK_DRAIN_CONFIRMED:-}" != "1" ]; then
-    _cc_dj_log "OrbStack builder cache: SKIP (requires CC_DJ_ORBSTACK_DRAIN_CONFIRMED=1 after CI runners are drained)"
+  local proof_file="${CC_DJ_DRAIN_PROOF_FILE:-}"
+  if [ -z "$proof_file" ]; then
+    _cc_dj_log "OrbStack builder cache: SKIP (requires CC_DJ_DRAIN_PROOF_FILE with a fresh drain proof)"
+    return 0
+  fi
+  if ! _cc_dj_drain_proof_valid "$proof_file"; then
+    _cc_dj_log "OrbStack builder cache: SKIP (drain proof invalid, stale, or for another host/context)"
     return 0
   fi
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     _cc_dj_log "OrbStack builder cache: SKIP (daemon unreachable)"
     return 0
   fi
-  local runners
-  runners="$(docker ps --filter 'name=ci-runner-' -q 2>/dev/null || true)"
-  if [ -n "$runners" ]; then
-    _cc_dj_log "OrbStack builder cache: SKIP (CI runner container still exists; no volume/image prune)"
+  local filter holders="" filter ids
+  while IFS= read -r filter; do
+    [ -n "$filter" ] || continue
+    ids="$(docker ps --filter "$filter" -q 2>/dev/null)" || {
+      _cc_dj_log "OrbStack builder cache: SKIP (protected-container inventory failed for filter=$filter)"
+      return 0
+    }
+    [ -z "$ids" ] || holders="$holders${holders:+ }$filter"
+  done < <(printf '%s\n' "$CC_DJ_PROTECTED_CONTAINER_FILTERS" | tr ' ' '\n')
+  if [ -n "$holders" ]; then
+    _cc_dj_log "OrbStack builder cache: SKIP (protected builder consumer still exists: $holders)"
     return 0
   fi
   # Keep the destructive subcommand assembled so the existing source guard cannot
@@ -624,6 +657,64 @@ _cc_dj_orbstack_clean() {
   builder_subcommand="$(printf 'pru%s' ne)"
   _cc_dj_clean_target "OrbStack Docker builder cache (168h+)" \
     docker builder "$builder_subcommand" --force --filter until=168h
+}
+
+# A drain proof is an explicit handoff from a lifecycle adapter (CI, a local
+# staging runner, or another orchestrator). It is deliberately short-lived and
+# bound to this host and Docker context, so a proof from yesterday or another
+# machine cannot authorize a prune today. Format is line-oriented and has no
+# shell-evaluated fields:
+#   schema=1
+#   scope=builder-cache
+#   host=<hostname>
+#   context=<docker-context>
+#   issued_at=<unix-seconds>
+#   expires_at=<unix-seconds>
+#   drained=1
+_cc_dj_drain_proof_valid() {
+  local file="$1" key value schema="" scope="" host="" context="" issued="" expires="" drained=""
+  local seen_schema=0 seen_scope=0 seen_host=0 seen_context=0 seen_issued=0 seen_expires=0 seen_drained=0
+  local now current_host current_context max_age
+  [ -r "$file" ] || return 1
+  while IFS='=' read -r key value; do
+    case "$key" in
+      schema) [ "$seen_schema" -eq 0 ] || return 1; seen_schema=1; schema="$value" ;;
+      scope) [ "$seen_scope" -eq 0 ] || return 1; seen_scope=1; scope="$value" ;;
+      host) [ "$seen_host" -eq 0 ] || return 1; seen_host=1; host="$value" ;;
+      context) [ "$seen_context" -eq 0 ] || return 1; seen_context=1; context="$value" ;;
+      issued_at) [ "$seen_issued" -eq 0 ] || return 1; seen_issued=1; issued="$value" ;;
+      expires_at) [ "$seen_expires" -eq 0 ] || return 1; seen_expires=1; expires="$value" ;;
+      drained) [ "$seen_drained" -eq 0 ] || return 1; seen_drained=1; drained="$value" ;;
+      '') ;;
+      *) return 1 ;;
+    esac
+  done < "$file" || return 1
+  [ "$seen_schema" -eq 1 ] && [ "$seen_scope" -eq 1 ] && [ "$seen_host" -eq 1 ] \
+    && [ "$seen_context" -eq 1 ] && [ "$seen_issued" -eq 1 ] \
+    && [ "$seen_expires" -eq 1 ] && [ "$seen_drained" -eq 1 ] || return 1
+  case "$schema:$scope:$drained:$issued:$expires" in
+    1:builder-cache:1:[0-9]*:[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "$host:$context" in
+    *[!A-Za-z0-9._:-]*:*|*:*[!A-Za-z0-9._/-]*) return 1 ;;
+  esac
+  max_age="${CC_DJ_DRAIN_PROOF_MAX_AGE_SECONDS:-900}"
+  case "$max_age" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$max_age" -le "$CC_DJ_DRAIN_PROOF_HARD_MAX_SECONDS" ] 2>/dev/null || return 1
+  now="$(date +%s)"
+  current_host="$(hostname -s 2>/dev/null || hostname 2>/dev/null)"
+  current_context="$(docker context show 2>/dev/null)"
+  case "$issued" in ''|*[!0-9]*) return 1 ;; esac
+  case "$expires" in ''|*[!0-9]*) return 1 ;; esac
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$host" = "$current_host" ] || return 1
+  [ "$context" = "$current_context" ] || return 1
+  [ "$issued" -le "$now" ] 2>/dev/null || return 1
+  [ "$expires" -gt "$now" ] 2>/dev/null || return 1
+  [ "$expires" -le $((issued + max_age)) ] 2>/dev/null || return 1
+  [ "$now" -le $((issued + max_age)) ] 2>/dev/null || return 1
+  return 0
 }
 
 _cc_dj_clean_dir() {
@@ -908,6 +999,12 @@ _cc_dj_clean() {
 # Entry point (only when executed, not sourced)
 # ---------------------------------------------------------------------------
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  if [ "${1:-}" = "--orbstack-clean" ] && [ "${2:-}" = "--drain-proof" ]; then
+    [ -n "${3:-}" ] || { _cc_dj_usage >&2; exit 1; }
+    CC_DJ_DRAIN_PROOF_FILE="$3"
+    shift 3
+    set -- --orbstack-clean
+  fi
   case "${1:-}" in
     --check)
       _cc_dj_check

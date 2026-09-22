@@ -315,6 +315,8 @@ cp "$SCRIPT_DIR/shell/chrome-clone-janitor.py" "$REAPER_DIR/"
 chmod +x "$REAPER_DIR/chrome-clone-janitor.py"
 cp "$SCRIPT_DIR/hooks/worktree-session-end.sh" "$REAPER_DIR/"
 chmod +x "$REAPER_DIR/worktree-session-end.sh"
+cp "$SCRIPT_DIR/hooks/lifecycle-reclaim.sh" "$REAPER_DIR/"
+chmod +x "$REAPER_DIR/lifecycle-reclaim.sh"
 cp "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$REAPER_DIR/"
 chmod +x "$REAPER_DIR/stop-cleanup-orphans.sh"
 
@@ -329,6 +331,17 @@ elif cmp -s "$SCRIPT_DIR/config/worktree-janitor.conf" "$WJ_CONFIG"; then
   echo "  worktree policy already current at $WJ_CONFIG"
 else
   echo "  worktree policy preserved at $WJ_CONFIG (repository default differs; review with diff)"
+fi
+
+DJ_CONFIG="$REAPER_DIR/disk-janitor.conf"
+if [ ! -e "$DJ_CONFIG" ]; then
+  cp "$SCRIPT_DIR/config/disk-janitor.conf" "$DJ_CONFIG"
+  chmod 600 "$DJ_CONFIG"
+  echo "  disk policy installed at $DJ_CONFIG"
+elif cmp -s "$SCRIPT_DIR/config/disk-janitor.conf" "$DJ_CONFIG"; then
+  echo "  disk policy already current at $DJ_CONFIG"
+else
+  echo "  disk policy preserved at $DJ_CONFIG (repository default differs; review with diff)"
 fi
 
 for AGENT in resource-watch disk-check weekly-clean guard worktree-janitor; do
