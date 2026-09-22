@@ -67,7 +67,7 @@ def scan(root, clean=False, min_age_days=3, now=None):
         if not NAME.fullmatch(path.name) or path.is_symlink() or not path.is_dir():
             continue
         count += 1
-        before = path.stat(follow_symlinks=False)
+        before = path.lstat()
         if now - before.st_mtime < min_age_days * 86400 or held(path):
             kept += 1
             print(f"KEEP {path.name} (recent or open/inconclusive)")
@@ -77,7 +77,7 @@ def scan(root, clean=False, min_age_days=3, now=None):
             continue
         # Recheck immediately before removal. An inode replacement or newly
         # opened clone fails closed. rmtree does not traverse directory symlinks.
-        current = path.stat(follow_symlinks=False)
+        current = path.lstat()
         if (current.st_dev, current.st_ino, current.st_mtime_ns) != (
                 before.st_dev, before.st_ino, before.st_mtime_ns) or held(path):
             kept += 1
