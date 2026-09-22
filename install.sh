@@ -311,6 +311,8 @@ for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cle
   cp "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/"
   chmod +x "$REAPER_DIR/$SCRIPT.sh"
 done
+cp "$SCRIPT_DIR/shell/chrome-clone-janitor.py" "$REAPER_DIR/"
+chmod +x "$REAPER_DIR/chrome-clone-janitor.py"
 cp "$SCRIPT_DIR/hooks/worktree-session-end.sh" "$REAPER_DIR/"
 chmod +x "$REAPER_DIR/worktree-session-end.sh"
 cp "$SCRIPT_DIR/hooks/stop-cleanup-orphans.sh" "$REAPER_DIR/"

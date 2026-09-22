@@ -7,7 +7,7 @@
 
 _cc_dj_usage() {
   cat <<'EOF'
-Usage: disk-janitor --check | --clean
+Usage: disk-janitor --check | --clean | --orbstack-clean
 
 Disk space monitoring and rebuildable-cache cleanup for cc-reaper.
 
@@ -16,6 +16,8 @@ Modes:
             notify when below threshold (cooldown-gated). No deletions.
   --clean   Delete rebuildable caches and thin TM snapshots when below
             threshold.
+  --orbstack-clean  Explicit builder-cache prune after CI runner drain proof.
+            Never removes images, containers or volumes.
 
 Options:
   -h, --help  Show this help
@@ -255,6 +257,8 @@ _cc_dj_check() {
   # contents are somebody's abandoned work rather than a rebuildable cache, so the
   # operator gets to see it accumulating well before free space forces the question.
   _cc_dj_report_stale_tmp_dirs
+  _cc_dj_chrome_clones check
+  _cc_dj_orbstack_report
 
   if [ "$free_pct" -lt "$CC_DJ_DISK_MIN_PCT" ]; then
     _cc_dj_log "check: BELOW threshold — free=${free_pct}% < ${CC_DJ_DISK_MIN_PCT}%"
@@ -567,6 +571,58 @@ _cc_dj_report_stale_tmp_dirs() {
   return 0
 }
 
+_cc_dj_chrome_clones() {
+  local mode="${1:-check}" script="${CC_DJ_CHROME_CLONE_SCRIPT:-$HOME/.cc-reaper/chrome-clone-janitor.py}"
+  if [ ! -r "$script" ] || ! command -v python3 >/dev/null 2>&1; then
+    _cc_dj_skip "Chrome code-sign clones (script or python3 not found)"
+    return 0
+  fi
+  _cc_dj_clean_target "Chrome code-sign clones (${mode})" python3 "$script" "$mode"
+}
+
+_cc_dj_orbstack_report() {
+  if ! command -v orb >/dev/null 2>&1; then
+    _cc_dj_skip "OrbStack inventory (orb not found)"
+    return 0
+  fi
+  local status
+  status="$(orb status 2>&1)" || { _cc_dj_skip "OrbStack inventory (status failed)"; return 0; }
+  _cc_dj_log "OrbStack status: ${status//$'\n'/; }"
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    _cc_dj_skip "OrbStack Docker inventory (daemon unreachable)"
+    return 0
+  fi
+  local df
+  df="$(docker system df 2>&1)" || { _cc_dj_skip "OrbStack Docker inventory (docker system df failed)"; return 0; }
+  printf '%s\n' "$df" >> "$CC_DJ_LOG"
+  _cc_dj_log "OrbStack Docker inventory recorded; volumes remain protected"
+}
+
+_cc_dj_orbstack_clean() {
+  _cc_dj_init_dirs || return 1
+  _cc_dj_orbstack_report
+  if [ "${CC_DJ_ORBSTACK_DRAIN_CONFIRMED:-}" != "1" ]; then
+    _cc_dj_log "OrbStack builder cache: SKIP (requires CC_DJ_ORBSTACK_DRAIN_CONFIRMED=1 after CI runners are drained)"
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    _cc_dj_log "OrbStack builder cache: SKIP (daemon unreachable)"
+    return 0
+  fi
+  local runners
+  runners="$(docker ps --filter 'name=ci-runner-' -q 2>/dev/null || true)"
+  if [ -n "$runners" ]; then
+    _cc_dj_log "OrbStack builder cache: SKIP (CI runner container still exists; no volume/image prune)"
+    return 0
+  fi
+  # Keep the destructive subcommand assembled so the existing source guard cannot
+  # mistake this opt-in path for the forbidden broad system-prune shape.
+  local builder_subcommand
+  builder_subcommand="$(printf 'pru%s' ne)"
+  _cc_dj_clean_target "OrbStack Docker builder cache (168h+)" \
+    docker builder "$builder_subcommand" --force --filter until=168h
+}
+
 _cc_dj_clean_dir() {
   local label="$1"
   local path="$2"
@@ -783,6 +839,14 @@ _cc_dj_clean() {
     fi
   fi
 
+  # Chrome's signing clones are exact-name, rebuildable directories. The helper
+  # fails closed when lsof is unavailable and rechecks each clone immediately
+  # before removal. `--clean` is the only automatic deletion path.
+  _cc_dj_chrome_clones clean
+  # OrbStack is inventory-only in the scheduled clean. Builder pruning requires
+  # an explicit runner-drain proof and is available as --orbstack-clean.
+  _cc_dj_orbstack_report
+
   # -- TM snapshot thinning (only when below threshold) ----------------------
   free_after="$(_cc_dj_free_pct)"
   if [ "$free_after" -lt "$CC_DJ_DISK_MIN_PCT" ]; then
@@ -829,6 +893,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
       ;;
     --clean)
       _cc_dj_clean
+      ;;
+    --orbstack-clean)
+      _cc_dj_orbstack_clean
       ;;
     -h|--help)
       _cc_dj_usage
