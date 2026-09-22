@@ -71,47 +71,167 @@ for cmd in "/Library/Bitdefender/AVP/product/bin/BDLDaemon" \
   fi
 done
 
+# Option values must never identify an unrelated script as a shared server.
+for cmd in 'node --conditions mcp-remote /repo/build.js' 'python -X chroma-mcp /repo/benchmark.py' 'node exec mcp-remote' 'python run chroma-mcp' 'npm run mcp-remote'; do
+  if _cc_guard_runaway_eligible "$cmd"; then
+    fail "option value incorrectly identifies MCP: $cmd"
+  else
+    pass "ambiguous interpreter option is protected: $cmd"
+  fi
+done
+
 # ─── Runaway selection ─────────────────────────────────────────────────────
 
+# Rows are pid etime cputime %cpu command. Each row also gets a sample from ten minutes ago that
+# has it hot for the two hours before, so these cases turn on eligibility alone; sampling itself
+# is tests/guard-runaway.sh's. The listing the guard reads carries no command column, and each
+# command is read per PID. The previous selection's format is answered too, so this suite can be
+# pointed at it and fail for the defect rather than the format.
 runaway_with() {
-  local table=$1
-  ( ps() {
-      if [ "$*" = "-axo pid=,etime=,%cpu=,command=" ]; then printf '%s' "$table"; else command ps "$@"; fi
+  local table=$1 samples
+  samples="$(mktemp "${TMPDIR:-/tmp}/ccr-samples.XXXXXX")"
+  printf '%s' "$table" | awk '{
+      n = split($3, p, ":"); c = p[n] + (n >= 2 ? p[n - 1] * 60 : 0) + (n >= 3 ? p[n - 2] * 3600 : 0)
+      cmd=""; for(i=5;i<=NF;i++) cmd=cmd (i>5 ? " " : "") $i
+      printf "%s\tMon Sep 14 00:00:00 2026\t1999999400\t%.2f\t1999992200\t%s\n", $1, c - 594, cmd }' > "$samples"
+  ( date() { if [ "$*" = "+%s" ]; then echo 2000000000; else command date "$@"; fi; }
+    ps() {
+      case "$*" in
+        "-axo pid=,lstart=,etime=,time=,%cpu=") printf '%s' "$table" | awk '{ print $1, "Mon Sep 14 00:00:00 2026", $2, $3, $4 }' ;;
+        "-o command= -p "*) printf '%s' "$table" | awk -v p="${!#}" '$1 == p { sub(/^[^ ]+ [^ ]+ [^ ]+ [^ ]+ /, ""); print }' ;;
+        "-axo pid=,etime=,time=,%cpu=") printf '%s' "$table" | awk '{ print $1, $2, $3, $4 }' ;;
+        *) command ps "$@" ;;
+      esac
     }
-    _cc_guard_runaway_protected_pids 80 60 )
+    CC_RUNAWAY_SAMPLES_FILE="$samples" _cc_guard_runaway_protected_pids 80 60 )
+  rm -f "$samples"
 }
 
-out=$(runaway_with "901 03:00:00 99.0 /Library/Bitdefender/AVP/product/bin/BDLDaemon
+out=$(runaway_with "901 03:00:00 170:00.00 99.0 /Library/Bitdefender/AVP/product/bin/BDLDaemon
 ")
 [ -z "$out" ] && pass "runaway skips Bitdefender" || fail "runaway selected Bitdefender"
 
-out=$(runaway_with "902 03:00:00 99.0 /System/Library/x/mdworker_shared
+out=$(runaway_with "902 03:00:00 170:00.00 99.0 /System/Library/x/mdworker_shared
 ")
 [ -z "$out" ] && pass "runaway skips mdworker" || fail "runaway selected mdworker"
 
-out=$(runaway_with "903 03:00:00 99.0 npx chrome-devtools-mcp@latest --autoConnect
+out=$(runaway_with "903 03:00:00 170:00.00 99.0 npx chrome-devtools-mcp@latest --autoConnect
 ")
 printf '%s' "$out" | grep -q '^903' && pass "runaway selects a shared MCP" || fail "runaway missed a shared MCP"
 
-out=$(runaway_with "904 03:00:00 99.0 /Applications/ChatGPT.app/Contents/Resources/codex
+# Applications, dev servers and process managers classify shared, but the phase runs
+# unattended and each is something a person is using. On the audited host it had
+# signalled ChatGPT.app and cmux.app, the terminal the sessions ran in.
+for row in "904 03:00:00 170:00.00 99.0 /Applications/ChatGPT.app/Contents/Resources/codex -c x" \
+           "907 15-13:40:59 18000:00.00 80.8 /Applications/cmux.app/Contents/MacOS/cmux" \
+           "908 03:00:00 170:00.00 99.0 node /repo/node_modules/.bin/next dev-server --port 3000" \
+           "909 03:00:00 170:00.00 99.0 pm2 God Daemon"; do
+  out=$(runaway_with "$row
 ")
-printf '%s' "$out" | grep -q '^904' && pass "runaway selects a shared application" || fail "runaway missed a shared application"
+  [ -z "$out" ] && pass "runaway never selects: ${row#* * * * }" || fail "runaway selected: ${row#* * * * }"
+done
 
-out=$(runaway_with "905 03:00:00 99.0 node /x/.bin/mcp-server-tauri
+out=$(runaway_with "910 03:00:00 170:00.00 99.0 npx -y @supabase/mcp-server-supabase@0.5.10 --read-only
+")
+printf '%s' "$out" | grep -q '^910' && pass "runaway selects a shared MCP launched through npx -y" \
+  || fail "runaway missed a shared MCP launched through npx -y"
+
+out=$(runaway_with "905 03:00:00 170:00.00 99.0 node /x/.bin/mcp-server-tauri
 ")
 [ -z "$out" ] && pass "runaway ignores an unprotected process" || fail "runaway selected an unprotected process"
 
 printf 'protect\tchrome-devtools-mcp\n' > "$rules_file"
-out=$(runaway_with "906 03:00:00 99.0 npx chrome-devtools-mcp@latest
+out=$(runaway_with "906 03:00:00 170:00.00 99.0 npx chrome-devtools-mcp@latest
 ")
 [ -z "$out" ] && pass "user protect rule keeps a process out of runaway" || fail "user protect rule ignored by runaway"
 : > "$rules_file"
 
-# ─── Runaway signalling ────────────────────────────────────────────────────
-# Group 500 holds the runaway MCP (500) and an idle sibling MCP (501).
+# Hot across runs but cool now: the signal stage would skip it, and the listing, which is
+# also what --dry-run prints, must not name it either.
+out=$(runaway_with "912 03:00:00 170:00.00 4.0 npx chrome-devtools-mcp@latest --autoConnect
+")
+[ -z "$out" ] && pass "runaway skips a server hot across runs but cool now" || fail "runaway selected a server that is cool now"
+
+# ─── Runaway eligibility: what the process runs, not names in its arguments ────
+# Review of 2026-09-15 reproduced the first five "not eligible" rows being signalled. The
+# class is a substring test over the whole command line, which errs safe for protection
+# and unsafe for a kill path; every row below classifies shared.
+eligible() {
+  if _cc_guard_runaway_eligible "$1"; then pass "eligible: ${1:0:64}"; else fail "should be eligible: ${1:0:64}"; fi
+}
+not_eligible() {
+  if _cc_guard_runaway_eligible "$1"; then fail "should not be eligible: ${1:0:64}"; else pass "not eligible: ${1:0:64}"; fi
+}
+
+eligible "uvx chroma-mcp --client-type persistent"
+eligible "npx -y @supabase/mcp-server-supabase@0.5.10 --read-only"
+eligible "npm exec @upstash/context7-mcp"
+eligible "npm exec mcp-sequentialthinking-tools"
+eligible "npx -y @stripe/mcp --tools=all"
+eligible "node /Users/me/.npm/_npx/9f/node_modules/@stripe/mcp/dist/index.js"
+eligible "node /Users/me/.npm/_npx/9f/node_modules/.bin/mcp-sequentialthinking-tools"
+eligible "npx mcp-remote@0.1.29 https://mcp.example.com/sse"
+# An .app in a URL is not an application bundle.
+eligible "npx -y mcp-remote https://mcp.linear.app/sse"
+eligible "/Users/me/.local/bin/chroma-mcp --client-type persistent"
+eligible "/Users/me/.cache/uv/archive-v0/x1/bin/python /Users/me/.cache/uv/archive-v0/x1/bin/chroma-mcp"
+eligible "codex mcp-server"
+eligible "node /Users/me/.npm/_npx/9f/node_modules/@openai/codex/bin/codex.js mcp-server"
+
+not_eligible 'claude --session-id 2222 --settings {"hooks":{"Stop":[{"type":"command","command":"node /Users/me/.claude/plugins/claude-mem/scripts/summary-hook.js"}]}}'
+not_eligible 'claude --output-format stream-json --mcp-config {"mcpServers":{"context7":{"command":"npx","args":["-y","@upstash/context7-mcp"]}}}'
+not_eligible "node /Users/me/GitHub/context7-docs-sync/node_modules/.bin/stryker run"
+not_eligible "python -m pytest /private/tmp/claude-501/-Users-me-GitHub-supabase-mcp-bench/tests"
+not_eligible "/Users/me/.local/bin/codex --yolo -c mcp_servers.github.command=npx"
+not_eligible "node /Users/me/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js --mcp-config /Users/me/mcp/context7-mcp"
+not_eligible "/Applications/Claude.app/Contents/Resources/node /x/node_modules/@upstash/context7-mcp/dist/index.js"
+# The runner is outside the bundle and what it runs is inside it, and the other way round.
+not_eligible "node /Applications/Claude.app/Contents/Resources/app.asar.unpacked/node_modules/@upstash/context7-mcp/dist/index.js"
+not_eligible "/Applications/ChatGPT.app/Contents/Resources/codex mcp-server"
+not_eligible "node /Users/me/GitHub/context7-mcp/dist/index.js"
+not_eligible "node /repo/node_modules/.bin/next dev-server --port 3000"
+# A path argument ending in a server's name is a checkout, not the server.
+not_eligible "python -m pytest /Users/me/GitHub/chroma-mcp"
+not_eligible "uv run --directory /Users/me/GitHub/chroma-mcp pytest"
+not_eligible "rg --files /Users/me/GitHub/context7-mcp"
+not_eligible "node /repo/scripts/bench.js --server mcp-remote"
+# A tool pointed at a server is not the server; only a package runner's operand counts.
+not_eligible "sample chroma-mcp 60 -file /tmp/chroma.sample"
+
+# ─── Argument text cannot add a runaway candidate ──────────────────────────────
+# A payload can carry a line shaped like a listing row, or like the TSV record the signal
+# stage reads. Only the listing without a command column names candidates, and each command
+# is flattened to one line.
+forged_runaway() (
+  samples="$(mktemp "${TMPDIR:-/tmp}/ccr-samples.XXXXXX")"
+  printf '911\tMon Sep 14 00:00:00 2026\t1999999400\t9606\t1999992200\n' > "$samples"
+  date() { if [ "$*" = "+%s" ]; then echo 2000000000; else command date "$@"; fi; }
+  ps() {
+    case "$*" in
+      "-axo pid=,lstart=,etime=,time=,%cpu=") printf '911 Mon Sep 14 00:00:00 2026 03:00:00 170:00.00 99.0\n' ;;
+      "-o command= -p 911") printf 'npx chrome-devtools-mcp@latest --payload {"a":"\n912 03:00:00 99.0 npx chrome-devtools-mcp@latest\n913\t99.0\t03:00:00\tnpx chrome-devtools-mcp@latest"}\n' ;;
+      "-axo pid=,etime=,time=,%cpu=") printf '911 03:00:00 170:00.00 99.0\n' ;;
+      *) command ps "$@" ;;
+    esac
+  }
+  cmd=$(ps -o command= -p 911 | tr '\t\r\n' '   ' | awk '{$1=$1} 1')
+  printf '911\tMon Sep 14 00:00:00 2026\t1999999400\t9606\t1999992200\t%s\n' "$cmd" > "$samples"
+  CC_RUNAWAY_SAMPLES_FILE="$samples" _cc_guard_runaway_protected_pids 80 60
+  rm -f "$samples"
+)
+forged_out=$(forged_runaway)
+if [ "$(printf '%s\n' "$forged_out" | grep -c .)" = 1 ] && printf '%s\n' "$forged_out" | grep -q '^911'; then
+  pass "argument text shaped like a row or a record adds no runaway candidate"
+else
+  fail "argument text shaped like a row or a record adds no runaway candidate: $(printf '%s\n' "$forged_out" | cut -c1-4 | tr '\n' ' ')"
+fi
+
+# ─── Process-group signalling ──────────────────────────────────────────────
+# Group 500 holds two shared MCP servers (500, 501) and an unprotected one (502). The
+# runaway phase never uses this path: see tests/guard-runaway.sh.
 
 kill_with() {
-  local target=$1 force=$2
+  local target=$1
   ( ps() { case "$*" in
         "-o command= -p 500") echo "npx chrome-devtools-mcp@latest --autoConnect" ;;
         "-o command= -p 501") echo "npm exec @upstash/context7-mcp" ;;
@@ -122,42 +242,37 @@ kill_with() {
         "-o rss= -p 502")     echo "  51200" ;;
         "-eo pid,pgid")       printf "500 500\n501 500\n502 500\n" ;;
         *) command ps "$@" ;; esac; }
-    _CC_REAPER_DRY_RUN=1 _claude_pgid_kill "$target" "$force" 2>&1 || true )
+    _CC_REAPER_DRY_RUN=1 _claude_pgid_kill "$target" 2>&1 || true )
 }
 
-out=$(kill_with 500 1)
-if printf '%s' "$out" | grep -q 'Would kill PID 500' \
+out=$(kill_with 500)
+if ! printf '%s' "$out" | grep -q 'Would kill PID 500' \
    && ! printf '%s' "$out" | grep -q 'Would kill PID 501'; then
-  pass "runaway target is signalled, shared sibling is spared"
+  pass "group cleanup spares every shared member, the target included"
 else
-  fail "runaway force-target behaviour wrong: $(printf '%s' "$out" | tr '\n' ' ')"
+  fail "group cleanup signalled a shared member: $(printf '%s' "$out" | tr '\n' ' ')"
 fi
 
 printf '%s' "$out" | grep -q 'Would kill PID 502' \
   && pass "unprotected group member is still signalled" \
   || fail "unprotected group member was spared"
 
-out=$(kill_with 500 0)
-printf '%s' "$out" | grep -q 'Would kill PID 500' \
-  && fail "shared target signalled without force" \
-  || pass "shared target is spared when not forced"
-
 # ─── Delivery counting ─────────────────────────────────────────────────────
 
 count_of() { printf '%s' "$1" | tail -1 | awk '{print $1}'; }
 freed_of() { printf '%s' "$1" | tail -1 | awk '{print $2}'; }
 
-out=$(kill_with 500 1)
-[ "$(count_of "$out")" = 2 ] && pass "count reports two deliveries" || fail "count wrong: $(count_of "$out")"
+out=$(kill_with 500)
+[ "$(count_of "$out")" = 1 ] && pass "count reports the one delivery" || fail "count wrong: $(count_of "$out")"
 
-# 500 (100 MB) and 502 (50 MB) are signalled; the spared sibling 501 (200 MB)
-# must not appear in the freed total.
-[ "$(freed_of "$out")" = 150 ] \
+# Only 502 (50 MB) is signalled; the spared 500 (100 MB) and 501 (200 MB) must not
+# appear in the freed total.
+[ "$(freed_of "$out")" = 50 ] \
   && pass "freed total counts only signalled processes" \
-  || fail "freed total wrong: $(freed_of "$out") (want 150)"
+  || fail "freed total wrong: $(freed_of "$out") (want 50)"
 
 printf 'protect\tchrome-devtools-mcp\n' > "$rules_file"
-out=$(kill_with 500 1 || true)
+out=$(kill_with 500 || true)
 [ "$(count_of "$out")" = 0 ] && pass "protected target reports zero deliveries" || fail "protected target counted: $(count_of "$out")"
 : > "$rules_file"
 
@@ -165,7 +280,7 @@ kill_immutable() {
   ( ps() { case "$*" in
         "-o command= -p 600") echo "/System/Library/x/mdworker_shared" ;;
         *) command ps "$@" ;; esac; }
-    _CC_REAPER_DRY_RUN=1 _claude_pgid_kill 600 1 2>&1 || true )
+    _CC_REAPER_DRY_RUN=1 _claude_pgid_kill 600 2>&1 || true )
 }
 out=$(kill_immutable)
 [ "$(count_of "$out")" = 0 ] && pass "immutable target reports zero deliveries" || fail "immutable target counted"

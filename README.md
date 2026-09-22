@@ -195,7 +195,7 @@ submodule gate still applies after the lease expires.
 
 #### Option A: LaunchAgent (zero-dependency, macOS only)
 
-Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1. As a final pass it also reaps a PPID=1 orphan that is **sustaining high CPU** (`CC_RUNAWAY_CPU`, default 80%) past `CC_RUNAWAY_ORPHAN_MIN_SEC` (default 180s) **even if its name is whitelisted** — a stuck shared MCP pegging a core is exactly what the name-based whitelist must not protect.
+Native macOS approach — no Homebrew or Rust required. Runs every 10 minutes, detects orphans by PPID=1. It does **not** select by CPU: background test runs, builds and experiments started from Claude Code are orphaned and hot by nature, and a CPU pass here killed them (removed 2026-09-15; `CC_RUNAWAY_ORPHAN_MIN_SEC` no longer does anything). A stuck shared MCP server is signalled by `claude-guard`'s runaway phase instead, which the guard LaunchAgent runs every 10 minutes. `install.sh` installs that agent and the manual steps below do not: a manual Option A install has no runaway coverage: `claude-guard` measures heat across its own runs, so only runs no more than 20 minutes apart - which the agent provides - ever select one.
 
 > **Install gotcha:** the `sed` below must resolve `$HOME` to a real path. If it expands empty (e.g. under `sudo`), the plist gets a broken `/.cc-reaper/...` `ProgramArguments` and the agent silently fails every run with `last exit code = 78` — verify with `launchctl print gui/$(id -u)/com.cc-reaper.orphan-monitor | grep program`. `install.sh` now fails fast rather than installing a broken path.
 
@@ -272,10 +272,9 @@ claude-guard --dry-run  # preview without killing
 | `CC_MAX_FD` | 10000 | File descriptor threshold; sessions exceeding this are killed as FD-leak |
 | `CC_AGENT_STALE_MINUTES` | 360 | Age threshold for stale agent-browser, Puppeteer Chrome, and detached Codex/MCP cleanup |
 | `CC_RUNAWAY_CPU` | 80 | CPU% above which a process is treated as stuck/runaway (combined with `CC_RUNAWAY_MIN`). Shared by both tools |
-| `CC_RUNAWAY_MIN` | **30** in `cc-monitor`, **60** in `claude-guard` | Minutes of elapsed time before a hot process is treated as runaway. The two defaults differ on purpose — the monitor only reports, the guard signals — and setting this env var overrides both at once |
-| `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds `claude-guard` waits (Ctrl+C to abort) before SIGTERM-ing runaway protected processes |
+| `CC_RUNAWAY_MIN` | **30** in `cc-monitor`, **60** in `claude-guard` | Monitor: elapsed age of a currently hot process. Guard: sustained CPU-time intervals across runs, keyed by PID and start time; setting this variable overrides both floors |
+| `CC_RUNAWAY_GRACE_SEC` | 5 | Initial wait before a further three-second re-check of each selected MCP server; only the same still-hot PID is signalled |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip `claude-guard`'s runaway phase entirely |
-| `CC_RUNAWAY_ORPHAN_MIN_SEC` | 180 | LaunchAgent monitor only: minimum **seconds** a PPID=1 orphan must have lived before its sustained-CPU burn (`CC_RUNAWAY_CPU`) can trigger the whitelist-override reap. Distinct from `CC_RUNAWAY_MIN` (minutes, for live protected processes). |
 
 Example: lower the thresholds for constrained machines:
 
@@ -406,7 +405,7 @@ Runaway is a claim about behaviour, so since 2026-08-30 **any** non-immutable pr
 | `cc-monitor` (reports, never kills) | CPU ≥ `CC_RUNAWAY_CPU` (`80`) for ≥ `CC_RUNAWAY_MIN` minutes (**`30`**) | any non-immutable process |
 | `claude-guard` (SIGTERMs) | CPU ≥ `CC_RUNAWAY_CPU` (`80`) for ≥ `CC_RUNAWAY_MIN` minutes (**`60`**) | whitelisted protected MCP servers only |
 
-Reporting earlier than the reaper acts is the point: the report costs a line an operator ignores, while the old shared floor meant a stuck loop held a core for a full hour before it could be named. `claude-guard`'s selection is a separate implementation with its own whitelist and its own default; nothing about which processes can be signalled changed.
+The monitor reports current heat and elapsed age. The guard requires CPU-time samples across runs for 60 minutes, resets after gaps over 20 minutes, and selects only a known shared MCP server executable. It rechecks identity and CPU, then signals that PID alone. Failed sample recording selects nothing and logs a warning.
 
 `cc-monitor` reclassifies the finding to family `runaway` / `ASK_BEFORE_KILL` and prints a dedicated section with a copy-pasteable kill line. The suggested action differs by protection status, because `claude-guard` filters through its whitelist and suggesting it for an unlisted process would name a remedy that does nothing:
 

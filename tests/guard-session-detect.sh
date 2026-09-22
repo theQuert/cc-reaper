@@ -186,8 +186,12 @@ guard_phase_runs_under() {
       claude-guard --dry-run 2>&1
     rm -rf "$tty_snap" "$cmd_dir"
   '
-  local out
-  out=$("$shell_bin" -c "$script" 2>&1) || true
+  local out opt=""
+  # Both shells read something on the way in - zsh `$ZDOTDIR/.zshenv`, bash `$BASH_ENV`, each even
+  # for `-c` - and the leg must not report whatever the person's own shell does. bash has no `-f`,
+  # hence the condition; `env -u` covers what the flag does not.
+  [ "${shell_bin##*/}" = zsh ] && opt=-f
+  out=$(env -u BASH_ENV -u ENV "$shell_bin" ${opt:+"$opt"} -c "$script" 2>&1) || true
   if printf '%s' "$out" | grep -q 'bad substitution'; then
     fail "$expect (bad substitution)"
     return
@@ -213,6 +217,22 @@ for sh_bin in bash zsh; do
   guard_phase_runs_under "$sh_bin" "CC_MAX_FD=1" "$sh_bin: fd-leak phase names a real PID"
   guard_phase_runs_under "$sh_bin" "CC_MAX_SESSIONS=0 CC_IDLE_THRESHOLD=100" "$sh_bin: idle phase names a real PID"
 done
+
+# A `.zshenv` or a `BASH_ENV` that puts a directory on PATH is an ordinary thing to have, and each
+# shell reads its own even for `-c`. Without that being dropped, the leg reports whatever the
+# person's shell happens to do rather than what the phase does.
+rcdir="$tmp_dir/shellrc"
+mkdir -p "$rcdir/bin"
+printf '#!/bin/sh\nexit 3\n' > "$rcdir/bin/awk"
+chmod +x "$rcdir/bin/awk"
+printf 'export PATH="%s/bin:$PATH"\n' "$rcdir" > "$rcdir/.zshenv"
+cp "$rcdir/.zshenv" "$rcdir/bashenv.sh"
+export ZDOTDIR="$rcdir" BASH_ENV="$rcdir/bashenv.sh"
+for sh_bin in bash zsh; do
+  command -v "$sh_bin" >/dev/null 2>&1 || continue
+  guard_phase_runs_under "$sh_bin" "CC_MAX_RSS_MB=1" "$sh_bin: a shell rc on the way in does not reach the phase"
+done
+unset ZDOTDIR BASH_ENV
 
 if [ "$failures" -gt 0 ]; then
   printf "%s validation failure(s)\n" "$failures"

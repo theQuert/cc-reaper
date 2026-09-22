@@ -158,6 +158,37 @@ sys.exit(0 if ok else 1)
 ' && ok "runaway action distinguishes protected from report-only candidates" \
   || fail "runaway action distinguishes protected from report-only candidates"
 
+# claude-guard signals only a known shared MCP server - never an application, a dev server, a
+# process manager or a session whose arguments name a protected service: on one host it had
+# signalled cmux.app, the terminal the sessions ran in. Naming it as the remedy for one of
+# those names a remedy that does nothing.
+apps_fixture="$(mktemp "${TMPDIR:-/tmp}/ccr-apps.XXXXXX")"
+printf "62199\t1\t62199\t??\t15:13:40\t80.8\t812000\t/Applications/cmux.app/Contents/MacOS/cmux\n" > "$apps_fixture"
+printf "70001\t1\t70001\t??\t01:30:00\t99.0\t100000\tnode /repo/node_modules/.bin/next dev-server --port 3000\n" >> "$apps_fixture"
+# Protected only because its settings payload names claude-mem.
+printf '70002\t70000\t70002\tttys906\t03:00:00\t95.0\t400000\t%s\n' 'claude --session-id 22222222-3333-4444-5555-666666666666 --settings {"hooks":{"Stop":[{"type":"command","command":"node /Users/me/.claude/plugins/claude-mem/scripts/summary-hook.js"}]}}' >> "$apps_fixture"
+apps_out=$(CC_MONITOR_SNAPSHOT_FILE="$apps_fixture" bash "$ROOT_DIR/shell/cc-monitor.sh" --once --json 2>/dev/null)
+printf '%s' "$apps_out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+by = {x.get("pid"): x for x in d.get("findings", [])}
+sys.exit(0 if all(p in by and by[p].get("family") == "runaway"
+                  and "claude-guard will not reap it" in (by[p].get("suggested_action") or "")
+                  for p in (62199, 70001, 70002)) else 1)
+' && ok "runaway action does not name claude-guard for an application, a dev server or a session" \
+  || fail "runaway action does not name claude-guard for an application, a dev server or a session"
+rm -f "$apps_fixture"
+
+# claude-guard selects with _cc_reaper_mcp_server_program. The monitor's copy has to be the
+# same program, or its suggestion names a remedy the guard does not apply.
+guard_prog=$(bash -c 'source "$1" >/dev/null 2>&1; _cc_reaper_mcp_server_program' _ "$ROOT_DIR/shell/claude-cleanup.sh" 2>/dev/null || true)
+monitor_prog=$(bash -c 'source "$1" >/dev/null 2>&1; _cc_monitor_mcp_server_program' _ "$ROOT_DIR/shell/cc-monitor.sh" 2>/dev/null || true)
+if [ -n "$guard_prog" ] && [ "$guard_prog" = "$monitor_prog" ]; then
+  ok "cc-monitor carries claude-guard's MCP server program unchanged"
+else
+  fail "cc-monitor carries claude-guard's MCP server program unchanged"
+fi
+
 #######################################################
 # Reclassification: family is runaway, classification is ASK_BEFORE_KILL
 #######################################################
@@ -198,9 +229,14 @@ cat > "$stub_dir/ps" <<'STUB'
 # Inject a fake runaway protected row when claude-guard asks for it.
 # Real ps invocations from elsewhere fall through to /bin/ps.
 case " $* " in
-  *" -axo pid=,etime=,%cpu=,command= "*)
-    echo "  9594 09:07:51 102.7 node /usr/local/bin/mcp-server-supabase run abc"
-    return 0
+  *" -axo pid=,lstart=,etime=,time=,%cpu= "*)
+    echo "  9594 Mon Sep 14 00:00:00 2026 09:07:51 520:00.00 102.7"
+    ;;
+  *" -o command= -p 9594 "*)
+    echo "node /usr/local/bin/mcp-server-supabase run abc"
+    ;;
+  *" -axo pid=,etime=,time=,%cpu= "*)
+    echo "  9594 09:07:51 520:00.00 102.7"
     ;;
   *)
     exec /bin/ps "$@"
@@ -214,7 +250,12 @@ echo "KILL:\$*" >> "$kill_log"
 STUB
 chmod +x "$stub_dir/kill"
 
-out=$(PATH="$stub_dir:/usr/bin:/bin" bash -c '
+# A sample from ten minutes ago that has 9594 hot for the two hours before.
+samples_file=$(mktemp "${TMPDIR:-/tmp}/cc-guard-samples.XXXXXX")
+now=$(date +%s)
+printf '9594\tMon Sep 14 00:00:00 2026\t%d\t%d\t%d\tnode /usr/local/bin/mcp-server-supabase run abc\n' "$((now - 600))" "$((520 * 60 - 594))" "$((now - 7800))" > "$samples_file"
+cp "$samples_file" "$samples_file.before"
+out=$(PATH="$stub_dir:/usr/bin:/bin" CC_RUNAWAY_SAMPLES_FILE="$samples_file" bash -c '
   source "$1"
   claude-guard --dry-run 2>&1
 ' _ "$ROOT_DIR/shell/claude-cleanup.sh")
@@ -230,7 +271,10 @@ echo "$out" | grep -q "DRY-RUN" \
 [ ! -s "$kill_log" ] \
   && ok "claude-guard --dry-run did not call kill" \
   || fail "claude-guard --dry-run invoked kill (log: $(cat "$kill_log"))"
-rm -rf "$stub_dir" "$kill_log"
+cmp -s "$samples_file" "$samples_file.before" \
+  && ok "claude-guard --dry-run records no samples" \
+  || fail "claude-guard --dry-run records no samples"
+rm -rf "$stub_dir" "$kill_log" "$samples_file" "$samples_file.before"
 
 #######################################################
 # claude-guard: CC_RUNAWAY_DISABLE=1 skips phase
@@ -240,9 +284,14 @@ kill_log=$(mktemp "${TMPDIR:-/tmp}/cc-guard-killlog.XXXXXX")
 cat > "$stub_dir/ps" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in
-  *" -axo pid=,etime=,%cpu=,command= "*)
-    echo "  9594 09:07:51 102.7 node /usr/local/bin/mcp-server-supabase run abc"
-    return 0
+  *" -axo pid=,lstart=,etime=,time=,%cpu= "*)
+    echo "  9594 Mon Sep 14 00:00:00 2026 09:07:51 520:00.00 102.7"
+    ;;
+  *" -o command= -p 9594 "*)
+    echo "node /usr/local/bin/mcp-server-supabase run abc"
+    ;;
+  *" -axo pid=,etime=,time=,%cpu= "*)
+    echo "  9594 09:07:51 520:00.00 102.7"
     ;;
   *)
     exec /bin/ps "$@"
