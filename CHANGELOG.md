@@ -38,6 +38,18 @@
 - **`.worktree-regenerable`** - a repository declares its own runtime byproducts, read from the fetched base (never the worktree), with patterns that name no path dropped and reported, and credential-shaped files inside declared directories or caches still keeping the worktree. The report names what keeps each one.
 
 ### Added
+- **`disk-janitor --check` says which path grew.** A fall in disk free named no path, so
+  every incident began with a manual `du` hunt. The hourly check now runs `growth-watch.py`
+  over the targets in `~/.cc-reaper/growth-targets.tsv` (label, path, owner, optional alert
+  GB): directories, glob-expanded directories sampled one key per match, and Docker
+  categories and volumes from one `docker system df` call each. A key is measured at most
+  once per `CC_DJ_GROWTH_INTERVAL_HOURS` (6), oldest first, under `nice`, within
+  `CC_DJ_GROWTH_BUDGET_SECONDS` (240) per run; samples stay 14 days in
+  `state/growth-samples.tsv`, and a target that cannot be read records its status, never
+  zero. A key or label total that grew by its threshold (default 5 GB) against a day-old
+  sample logs `ALERT:growth` with the owner and posts one cooldown-gated notification; each
+  sampling run logs its top three growers. Without `python3` the step is a counted `SKIP`.
+  The installer ships a generic targets file and keeps an edited copy.
 - **`resource-watch` flags a sudden fall in disk free.** Each run records `<epoch> <free GB>` in
   `~/.cc-reaper/state/disk-free-samples`, keeping the last 12, and when free space fell by at
   least `CC_RW_DISK_DROP_GB` (default 10; `0` disables) against the newest sample 25 to 45
