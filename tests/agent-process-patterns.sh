@@ -155,7 +155,9 @@ expect_yes "user protect rule blocks the group signal path" protected_group_send
 
 protected_runaway_is_not_returned() (
   samples="$(mktemp "${TMPDIR:-/tmp}/ccr-samples.XXXXXX")"
-  printf '901\tMon Sep 14 00:00:00 2026\t1999999400\t9606\t1999992200\n' > "$samples"
+  # Samples are bound to the command they were taken of (six fields since #43): a pid the
+  # kernel hands to a different program starts a new streak rather than inheriting this one.
+  printf '901\tMon Sep 14 00:00:00 2026\t1999999400\t9606\t1999992200\tnode chrome-devtools-mcp\n' > "$samples"
   export CC_RUNAWAY_SAMPLES_FILE="$samples"
   date() { if [ "$*" = "+%s" ]; then echo 2000000000; else command date "$@"; fi; }
   ps() {
