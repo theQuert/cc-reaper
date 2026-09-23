@@ -29,7 +29,8 @@ Environment:
   CC_DJ_LOG             Log file path (default: ~/.cc-reaper/logs/disk-janitor.log)
   CC_DJ_STATE_DIR       State directory path (default: ~/.cc-reaper/state/)
   CC_DJ_CONFIG          Overrides sourced first (default: ~/.cc-reaper/disk-janitor.conf)
-  CC_DJ_GO_CACHE_TRIM_DAYS  --clean deletes go build cache entries unused this many days (default: 3)
+  CC_DJ_GO_CACHE_TRIM_DAYS  --clean deletes go build cache entries unused this many days (default: 3);
+                        `off` when another reclaimer on the host owns that cache
   CC_DJ_GROWTH_TARGETS  Growth targets for --check (default: ~/.cc-reaper/growth-targets.tsv)
   CC_DJ_GROWTH_INTERVAL_HOURS / _BUDGET_SECONDS / _WINDOW_HOURS / _ALERT_GB / _KEY_TIMEOUT
                         Sampling interval per target (6), time budget per run (240),
@@ -616,6 +617,12 @@ _cc_dj_go_cache_trim() {
     return 0
   fi
   case "$CC_DJ_GO_CACHE_TRIM_DAYS" in
+    # Not a skip: the cache has one owner, and on this host it is not this janitor. Two
+    # reclaimers with different rules on one cache is how the top-level files came to be
+    # deleted by the other one while this one kept them.
+    off)
+      _cc_dj_log "go build cache: owned by another reclaimer here (CC_DJ_GO_CACHE_TRIM_DAYS=off)"
+      return 0 ;;
     ''|*[!0-9]*|0|0*)
       _cc_dj_skip "go build cache (CC_DJ_GO_CACHE_TRIM_DAYS=$CC_DJ_GO_CACHE_TRIM_DAYS is not a positive whole number)"
       return 0 ;;

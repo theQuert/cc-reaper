@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Changed
+- **`CC_DJ_GO_CACHE_TRIM_DAYS=off` leaves the go build cache to another reclaimer.** One
+  cache, one owner: where a faster reclaimer already trims it (on the reporting host, the
+  skills repository's `reclaim-byproducts`, every three hours), the weekly clean logs that
+  and does not run `go` at all. It is not counted as a `SKIP`.
 - **`disk-janitor --clean` trims the go build cache by age instead of emptying it.** The
   weekly `go clean -cache` removed 28.6 GB on 2026-09-13 and 10.8 GB on 2026-09-20 on one
   host, and every session rebuilt from cold: three days later 14 GB of the 27 GB cache was

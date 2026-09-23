@@ -23,6 +23,10 @@ while a build runs.
   or cgo process is running, the target removes nothing and is a counted `SKIP`.
 - An absent `go`, a `GOCACHE` that is not an absolute path, or an unusable retention value
   is a counted `SKIP`.
+- `CC_DJ_GO_CACHE_TRIM_DAYS=off` leaves the cache to another reclaimer. On the reporting
+  host the skills repository's `reclaim-byproducts` trims it every three hours, which the
+  cache's growth of several GB a day needs; one owner per cache, so this janitor steps
+  aside there instead of trimming the same cache by a second rule.
 
 ## Impact
 
