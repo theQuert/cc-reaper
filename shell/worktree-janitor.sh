@@ -66,6 +66,8 @@ Environment:
   CC_WJ_CODEX_LOCKS      Codex writer-lock registry (default: ~/.codex/thread-writer-locks)
   CC_WJ_CODEX_SESSIONS   Codex active rollout registry (default: ~/.codex/sessions)
   CC_WJ_CODEX_STATE_DB   Codex local state database (default: ~/.codex/state_5.sqlite)
+  CC_WJ_TOOL_DIRS        Directories appended to PATH when executed, for `gh` under launchd
+                         (default: /opt/homebrew/bin:/usr/local/bin:~/.local/bin; empty: none)
 
 A worktree is removable only when it holds nothing a command cannot rebuild, no process
 has it as a working directory or holds a file in it, its work has landed on the fetched
@@ -2502,9 +2504,12 @@ _cc_wj_lock() {
     echo "worktree-janitor: pid ${holder:-?} has held $lock for over 60 minutes; taking it over"
     live=0
   fi
+  # 2, not 1: a live holder is an apply sweep of this same repository behind the same
+  # gates, so this run defers to it rather than failing. Counting the deferral as a failure
+  # put 14 false `status=1` lines in one day's session log (2026-09-23).
   if [ "$live" -eq 1 ]; then
-    echo "worktree-janitor: another worktree-janitor sweep${holder:+ (pid $holder)} holds $lock; removed nothing in this repository"
-    return 1
+    echo "worktree-janitor: another worktree-janitor sweep${holder:+ (pid $holder)} holds $lock; deferred to it and removed nothing in this repository"
+    return 2
   fi
   rm -f "$lock/pid" "$lock/cmd"
   rmdir "$lock" 2>/dev/null
@@ -2761,10 +2766,15 @@ $CC_WJ_KEEP_PATH
 KEEP
   fi
 
-  local repo lock skipped=0
+  local repo lock lock_rc skipped=0
   # Declared once, outside the loop: zsh prints the value of an already-set local that is
   # declared again.
   local active lease landed idle classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes
+  # Said once, because the absence is otherwise silent: every squash-merged worktree just
+  # reads KEEP(unlanded). That is how the scheduled sweep went without landed=pr for weeks.
+  if [ "$trim" -eq 0 ] && ! command -v gh >/dev/null 2>&1; then
+    echo "worktree-janitor: gh is not on PATH, so this run cannot prove landing by a merged pull request; such worktrees stay kept"
+  fi
   for repo in "${repos[@]}"; do
     if [ ! -d "$repo" ]; then
       continue
@@ -2777,7 +2787,12 @@ KEEP
     lock=""
     if [ "$apply" -eq 1 ]; then
       lock="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/cc-reaper-worktree-janitor.lock"
-      _cc_wj_lock "$lock" || { skipped=1; continue; }
+      lock_rc=0
+      _cc_wj_lock "$lock" || lock_rc=$?
+      if [ "$lock_rc" -ne 0 ]; then
+        [ "$lock_rc" -eq 2 ] || skipped=1
+        continue
+      fi
     fi
 
     # Discovery also sees ordinary clones with no linked worktree. They have nothing this
@@ -3153,8 +3168,8 @@ KEEP
   fi
 
   # Finding repositories under one root does not make a denial on another harmless:
-  # the worktrees under the denied one were never even listed. A repository skipped for a
-  # held lock was not swept either.
+  # the worktrees under the denied one were never even listed. A repository whose lock could
+  # not be taken was not swept either; one a live sweep holds is being swept by that sweep.
   [ "$blind" -eq 1 ] && return 1
   [ "$skipped" -eq 1 ] && return 1
   [ "$activity_blind" -eq 1 ] && return 1
@@ -3313,7 +3328,25 @@ $CC_WJ_SESSION_DIR}" _cc_wj_run --repo "$main" $apply_flag || rc=$?
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
+# launchd hands an agent PATH=/usr/bin:/bin:/usr/sbin:/sbin, and `gh` installs outside it,
+# so the scheduled sweep could never prove landed=pr: measured 2026-09-23, 0 scheduled
+# proofs against 54 from session sweeps. Appended, never prepended, as in disk-janitor, so a
+# caller's toolchain and a test's stubs keep priority; only when executed, so a shell that
+# sources this file keeps its own PATH. CC_WJ_TOOL_DIRS empty makes PATH the whole answer.
+_cc_wj_append_tool_dirs() {
+  local dir
+  while IFS= read -r dir; do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    case ":$PATH:" in
+      *":$dir:"*) ;;
+      *) PATH="$PATH:$dir" ;;
+    esac
+  done <<< "$(printf '%s' "${CC_WJ_TOOL_DIRS-/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin}" | tr ':' '\n')"
+  export PATH
+}
+
 # Run if executed directly (not sourced)
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  _cc_wj_append_tool_dirs
   _cc_wj_run "$@"
 fi
