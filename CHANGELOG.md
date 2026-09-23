@@ -8,11 +8,15 @@
   never proved a squash-merged worktree landed by PR: 0 `landed=pr` in scheduled logs against 54
   from session sweeps on one day. An executed run now appends `CC_WJ_TOOL_DIRS` (default
   `/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin`) to PATH, never prepending, and a run that
-  still cannot find `gh` says so once. Sourcing the script leaves PATH alone.
-- **A sweep that defers to a live sweep exits 0.** Only apply sweeps take the per-repository
-  lock, so a live holder is sweeping the same repository behind the same gates. Counting the
-  deferral as a failure put 14 false `status=1` lines in one day's session log. A lock that
-  cannot be taken for any other reason still fails the run.
+  still cannot find `gh` says so once. Sourcing the script leaves PATH alone. With `gh` found,
+  the scheduled sweep also applies the abandoned rule (unlanded, clean, idle 168 hours, no pull
+  request ever opened) across every root; until now only session sweeps could, in their own
+  repository. Removal keeps the branch.
+- **A sweep that defers to a live sweep exits 0.** Removal and trim sweeps take the same
+  per-repository lock; a run that finds a live holder removes nothing there and leaves the
+  repository to the next sweep. Counting that as a failure put 14 false `status=1` lines in
+  one day's session log. A lock that cannot be taken, including one whose parent directory is
+  missing or unwritable, still fails the run.
 - **`disk-janitor --clean` prunes builder cache unused for a week.** It runs
   `docker builder prune --force --filter until=168h` when the daemon is reachable. BuildKit never
   prunes a record a running build holds, and anything used within 168 hours stays. This replaces

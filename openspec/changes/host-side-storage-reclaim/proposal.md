@@ -22,7 +22,9 @@ tests, and never did their job on the host they were built for:
 ## What Changes
 
 - worktree-janitor, when executed, appends the tool directories disk-janitor already appends,
-  and says once per run when `gh` still does not resolve.
+  and says once per run when `gh` still does not resolve. With `gh` found, the scheduled sweep
+  also applies the existing abandoned rule (clean, idle 168 hours, no pull request ever) across
+  every root, which until now only session sweeps could, in their own repository.
 - A sweep that defers to a live concurrent sweep logs the deferral and does not fail the run.
 - `disk-janitor --clean` prunes Docker builder cache the daemon reports unused for at least
   168 hours. `--orbstack-clean`, the drain proof and the protected-container filters go away.

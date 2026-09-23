@@ -2496,17 +2496,20 @@ _cc_wj_lock() {
   if [ -n "$holder" ] && [ -n "$recorded" ] &&
      [ "$(ps -o command= -p "$holder" 2>/dev/null)" = "$recorded" ]; then
     live=1
-  elif { [ -z "$holder" ] || [ -z "$recorded" ]; } &&
+  elif [ -d "$lock" ] && { [ -z "$holder" ] || [ -z "$recorded" ]; } &&
        [ -z "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
-    live=1   # a sweep between its mkdir and its writes
+    # A sweep between its mkdir and its writes. Only a directory can be that: when mkdir
+    # failed and nothing is there - an unwritable or missing parent - `find` prints nothing
+    # either, and this branch used to read that as a holder and defer.
+    live=1
   fi
   if [ "$live" -eq 1 ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
     echo "worktree-janitor: pid ${holder:-?} has held $lock for over 60 minutes; taking it over"
     live=0
   fi
-  # 2, not 1: a live holder is an apply sweep of this same repository behind the same
-  # gates, so this run defers to it rather than failing. Counting the deferral as a failure
-  # put 14 false `status=1` lines in one day's session log (2026-09-23).
+  # 2, not 1: a live holder is another removal or trim sweep of this repository, so this run
+  # leaves the repository to it and to the next sweep rather than failing. Counting the
+  # deferral as a failure put 14 false `status=1` lines in one day's session log (2026-09-23).
   if [ "$live" -eq 1 ]; then
     echo "worktree-janitor: another worktree-janitor sweep${holder:+ (pid $holder)} holds $lock; deferred to it and removed nothing in this repository"
     return 2
@@ -3169,7 +3172,7 @@ KEEP
 
   # Finding repositories under one root does not make a denial on another harmless:
   # the worktrees under the denied one were never even listed. A repository whose lock could
-  # not be taken was not swept either; one a live sweep holds is being swept by that sweep.
+  # not be taken was not swept either; one a live sweep holds was deferred, not failed.
   [ "$blind" -eq 1 ] && return 1
   [ "$skipped" -eq 1 ] && return 1
   [ "$activity_blind" -eq 1 ] && return 1

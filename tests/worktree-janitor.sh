@@ -1126,8 +1126,8 @@ mkdir -p "$S_LOCK"; echo "$HOLDER" > "$S_LOCK/pid"; ps -o command= -p "$HOLDER" 
 OUT_LOCK="$TMPDIR_ROOT/out-lock.txt"
 LOCK_RC=0
 PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$S_PRIMARY" --apply > "$OUT_LOCK" 2>&1 || LOCK_RC=$?
-# Only apply sweeps take the lock, so a live holder is sweeping this repository behind the
-# same gates: deferring to it is not a failure, and reporting one buried the real ones.
+# A live holder is another removal or trim sweep of this repository: deferring to it is not
+# a failure, and reporting one buried the real ones.
 expect_yes "a run that deferred to a live sweep exits 0" test "$LOCK_RC" -eq 0
 expect_yes "a live sweep's lock blocks removal, and the run says it deferred" \
   bash -c 'grep -q "another worktree-janitor sweep (pid [0-9]*) holds .*; deferred to it" "$1" && [ -d "$2" ]' \
@@ -1163,6 +1163,17 @@ expect_yes "and removes nothing" \
     _ "$OUT_LOCK3" "$S_ROOT/wt-locked"
 rm -f "$S_LOCK"
 _wj_idle --repo "$S_PRIMARY" --apply > /dev/null
+
+# mkdir can also fail with nothing there to defer to: a missing or unwritable parent, as
+# when the git common dir cannot be resolved and the lock lands at `/`. That must not read
+# as a sweep caught between its mkdir and its writes.
+LOCK_RO="$TMPDIR_ROOT/lock-ro"
+mkdir -p "$LOCK_RO"; chmod 555 "$LOCK_RO"
+for unlockable in "$TMPDIR_ROOT/no-such-dir/x.lock" "$LOCK_RO/x.lock"; do
+  expect_yes "a lock whose parent is missing or unwritable is a failure, not a deferral ($(basename "$(dirname "$unlockable")"))" \
+    bash -c 'source "$1" >/dev/null 2>&1; _cc_wj_lock "$2" > /dev/null; [ "$?" -eq 1 ]' _ "$WJ" "$unlockable"
+done
+chmod 755 "$LOCK_RO"
 
 
 # ─── The decision is asked again right before removal ────────────────────────

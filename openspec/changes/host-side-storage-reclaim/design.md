@@ -23,10 +23,24 @@ hook re-executes the script, so session sweeps get it too.
 
 ## A deferral is not a failure
 
-Only apply sweeps take the lock, so a live holder is sweeping the same repository behind the
-same gates. Exiting non-zero for that made launchd and the session log report a failure that
-had not happened, and buried the real ones. Base-preparation failures, a lock that cannot be
-taken, denied roots and activity blindness still fail the run.
+Removal and trim apply sweeps take the same per-repository lock, so a live holder is another
+sweep of the repository, not necessarily one doing this run's work. This run removes nothing
+there and leaves the repository to the next sweep: the six-hourly schedule or a session end
+for removal, the next pressured weekly clean for trim, whose deferral line lands in the
+disk-janitor log. Exiting non-zero for that made launchd and the session log report a
+failure that had not happened, and buried the real ones. Base-preparation failures, a lock
+that cannot be taken, denied roots and activity blindness still fail the run. A lock path
+that mkdir could not create and that does not exist is a lock that cannot be taken, never a
+holder caught between its mkdir and its writes.
+
+## gh reaches the abandoned rule too
+
+`gh` also answers the abandoned question: an unlanded worktree, clean, idle 168 hours, whose
+branch never opened a pull request. The scheduled sweep could not ask it either, so until
+this change only session sweeps, and only in the session's own repository, removed such
+worktrees. Fixing PATH makes the scheduled sweep apply the rule across every root, as its
+spec already said. Removal takes the checkout and keeps the branch, so the commits survive;
+the deployment smoke counts what the first scheduled apply will remove, by reason.
 
 ## Drop alert: a sample file, not the human log
 
