@@ -3,6 +3,23 @@
 ## [Unreleased]
 
 ### Changed
+- **Scheduled worktree sweeps can prove landing by merged PR.** launchd starts agents with
+  `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, where `gh` is not installed, so the six-hourly sweep
+  never proved a squash-merged worktree landed by PR: 0 `landed=pr` in scheduled logs against 54
+  from session sweeps on one day. An executed run now appends `CC_WJ_TOOL_DIRS` (default
+  `/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin`) to PATH, never prepending, and a run that
+  still cannot find `gh` says so once. Sourcing the script leaves PATH alone.
+- **A sweep that defers to a live sweep exits 0.** Only apply sweeps take the per-repository
+  lock, so a live holder is sweeping the same repository behind the same gates. Counting the
+  deferral as a failure put 14 false `status=1` lines in one day's session log. A lock that
+  cannot be taken for any other reason still fails the run.
+- **`disk-janitor --clean` prunes builder cache unused for a week.** It runs
+  `docker builder prune --force --filter until=168h` when the daemon is reachable. BuildKit never
+  prunes a record a running build holds, and anything used within 168 hours stays. This replaces
+  `--orbstack-clean`, which required a runner-drain proof nothing produced and refused while any
+  `ci-runner-*` container existed, which on the host that needed it was always. `--orbstack-clean`,
+  the drain-proof and protected-container settings, and `hooks/lifecycle-reclaim.sh`, which nothing
+  called, are removed; the installer deletes a deployed `lifecycle-reclaim.sh`.
 - **LaunchAgent replacement and private-temp recovery are fail-observable.** Installer updates now
   wait until an asynchronously retiring old job is actually absent before registering its
   replacement. Each janitor run also removes dead-owner transcript projection directories left
@@ -17,6 +34,11 @@
 - **`.worktree-regenerable`** - a repository declares its own runtime byproducts, read from the fetched base (never the worktree), with patterns that name no path dropped and reported, and credential-shaped files inside declared directories or caches still keeping the worktree. The report names what keeps each one.
 
 ### Added
+- **`resource-watch` flags a sudden fall in disk free.** Each run records `<epoch> <free GB>` in
+  `~/.cc-reaper/state/disk-free-samples`, keeping the last 12, and when free space fell by at
+  least `CC_RW_DISK_DROP_GB` (default 10; `0` disables) against the newest sample 25 to 45
+  minutes old, it logs `ALERT:disk-drop` and notifies under the per-metric cooldown. Fast growth
+  is flagged before the percentage floor is reached.
 - **Recent-session lease and `--claims` observability** — releasing a Claude pid or Codex writer lock no longer makes an already-old worktree immediately removable. Codex `updated_at`/`archived_at` and Claude transcript activity create a separate 48-hour lease (`CC_WJ_SESSION_GRACE_HOURS`), reported as `KEEP(recent-session)`. `worktree-janitor --claims [id|path]` shows live claims and recent leases with state, age, and remaining grace without fetching or changing anything.
 - **Shared Claude/Codex worktree policy** — `~/.cc-reaper/worktree-janitor.conf` owns the 48-hour window and separate SessionEnd/scheduled apply switches; `worktree-session-end.sh` is the thin hook for both harnesses. A low-priority LaunchAgent runs `--scheduled` every six hours plus at load. The installer migrates Claude's global hook, boots out and archives the legacy Claude worktree LaunchAgent, and can configure explicit Codex repositories through `CC_REAPER_CODEX_REPOS`; checked-in Codex hooks remain the preferred integration. `--landed PATH` exposes the same ancestry/content/exact-PR proof read-only to attached-resource reapers, and the cleanup task's own inventory tool calls no longer pin every path it examines (its cwd remains protected).
 - **`worktree-janitor --session`** - a SessionEnd hook that sweeps the session's repository detached (fork, then `setsid`), under a per-repository lock, with a run record (start, elapsed, free space before and after). Keeps the session's own checkout; reports unless `CC_WJ_SESSION_APPLY=1`. Closes the gap `janitors-that-can-see` recorded as needing a TCC-capable process: the session is one.
