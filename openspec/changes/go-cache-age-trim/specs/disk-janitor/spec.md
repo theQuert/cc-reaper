@@ -57,5 +57,9 @@ The weekly clean SHALL delete only go build cache entries - files named `*-a` or
 - **THEN** nothing is deleted and the target is logged as `SKIP` and counted
 
 #### Scenario: An unusable retention
-- **WHEN** `CC_DJ_GO_CACHE_TRIM_DAYS` is not a positive whole number
+- **WHEN** `CC_DJ_GO_CACHE_TRIM_DAYS` is not a positive whole number and not `off`
 - **THEN** nothing is deleted and the target is logged as `SKIP` naming the value
+
+#### Scenario: Another reclaimer owns the cache
+- **WHEN** `CC_DJ_GO_CACHE_TRIM_DAYS` is `off`
+- **THEN** nothing is deleted, `go` is not run, and the janitor logs that another reclaimer owns the cache; it is not a `SKIP`

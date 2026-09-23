@@ -436,6 +436,15 @@ done
 
 _gocache_fixture
 _reset_captures
+CC_DJ_GO_CACHE_TRIM_DAYS=off _run_dj --clean 80 0
+expect_yes "go cache: off leaves the cache to its owner" test -e "$FAKE_GOCACHE/0a/1111-a"
+expect_yes "go cache: and says so" \
+  grep -qF "go build cache: owned by another reclaimer here (CC_DJ_GO_CACHE_TRIM_DAYS=off)" "$SANDBOX/dj.log"
+expect_no "go cache: off is not a skip" grep -q "SKIP go build cache" "$SANDBOX/dj.log"
+expect_no "go cache: off runs no go at all" grep -q "env GOCACHE" "$GO_CAPTURE"
+
+_gocache_fixture
+_reset_captures
 CC_DJ_GO_CACHE_TRIM_DAYS=20 _run_dj --clean 80 0
 expect_yes "go cache: a longer retention keeps a 10-day-old entry" test -e "$FAKE_GOCACHE/0a/1111-a"
 
