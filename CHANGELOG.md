@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Changed
+- **`disk-janitor --clean` trims the go build cache by age instead of emptying it.** The
+  weekly `go clean -cache` removed 28.6 GB on 2026-09-13 and 10.8 GB on 2026-09-20 on one
+  host, and every session rebuilt from cold: three days later 14 GB of the 27 GB cache was
+  that rebuild, never used again, against a 6 GB hot set. It also ran beside builds in
+  progress and removed the subdirectories they write into. The target now deletes only
+  entries (`<hash>-a`, `<hash>-d` in the two-hex-digit subdirectories of `go env GOCACHE`)
+  unused for `CC_DJ_GO_CACHE_TRIM_DAYS` days, default 3 - the files Go's own five-day trim
+  removes, sooner - keeps the top-level files, and is a counted `SKIP` while a go build,
+  test or toolchain process runs, or when `go`, the cache path or the retention is unusable.
 - **Scheduled worktree sweeps can prove landing by merged PR.** launchd starts agents with
   `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, where `gh` is not installed, so the six-hourly sweep
   never proved a squash-merged worktree landed by PR: 0 `landed=pr` in scheduled logs against 54
