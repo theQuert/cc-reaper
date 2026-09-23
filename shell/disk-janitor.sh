@@ -29,6 +29,7 @@ Environment:
   CC_DJ_LOG             Log file path (default: ~/.cc-reaper/logs/disk-janitor.log)
   CC_DJ_STATE_DIR       State directory path (default: ~/.cc-reaper/state/)
   CC_DJ_CONFIG          Overrides sourced first (default: ~/.cc-reaper/disk-janitor.conf)
+  CC_DJ_GO_CACHE_TRIM_DAYS  --clean deletes go build cache entries unused this many days (default: 3)
   CC_DJ_GROWTH_TARGETS  Growth targets for --check (default: ~/.cc-reaper/growth-targets.tsv)
   CC_DJ_GROWTH_INTERVAL_HOURS / _BUDGET_SECONDS / _WINDOW_HOURS / _ALERT_GB / _KEY_TIMEOUT
                         Sampling interval per target (6), time budget per run (240),
@@ -47,6 +48,7 @@ unset _cc_dj_config_file
 CC_DJ_DISK_MIN_PCT="${CC_DJ_DISK_MIN_PCT:-15}"
 CC_DJ_TRIM_WORKTREES="${CC_DJ_TRIM_WORKTREES:-1}"
 CC_DJ_COOLDOWN_SECS="${CC_DJ_COOLDOWN_SECS:-3600}"
+CC_DJ_GO_CACHE_TRIM_DAYS="${CC_DJ_GO_CACHE_TRIM_DAYS:-3}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
 CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
 # growth-watch.py reads its settings from the environment, and the config file sets them
@@ -600,6 +602,40 @@ _cc_dj_chrome_clones() {
   _cc_dj_clean_target "Chrome code-sign clones (${mode})" python3 "$script" "$mode"
 }
 
+# The go build cache, trimmed by age and never emptied. `go clean -cache` every week removed
+# 28.6 GB on 2026-09-13 and 10.8 GB on 2026-09-20 on one host, and every session rebuilt
+# from cold: three days later 14 GB of the 27 GB cache was that rebuild, never used again,
+# against a 6 GB hot set. It also removed the subdirectories a running build writes into.
+# Go refreshes an entry's mtime when it uses it and deletes entries unused for five days
+# itself; this deletes the same files - `<hash>-a` and `<hash>-d` in the two-hex-digit
+# subdirectories - sooner, and not while a build runs. Top-level files stay: deleting an
+# old `testexpire.txt` would make test results it had expired valid again.
+_cc_dj_go_cache_trim() {
+  if ! command -v go >/dev/null 2>&1; then
+    _cc_dj_skip "go build cache (go not found)"
+    return 0
+  fi
+  case "$CC_DJ_GO_CACHE_TRIM_DAYS" in
+    ''|*[!0-9]*|0|0*)
+      _cc_dj_skip "go build cache (CC_DJ_GO_CACHE_TRIM_DAYS=$CC_DJ_GO_CACHE_TRIM_DAYS is not a positive whole number)"
+      return 0 ;;
+  esac
+  local dir
+  dir="$(go env GOCACHE 2>/dev/null)"
+  if [ "${dir#/}" = "$dir" ] || [ ! -d "$dir" ]; then
+    _cc_dj_skip "go build cache (go env GOCACHE is not a directory path: '${dir}')"
+    return 0
+  fi
+  # `(^|/)go `, so `cargo build` is not a go build.
+  if pgrep -f '(^|/)go (build|test|run|vet|install|generate)( |$)|/pkg/tool/[^ ]*/(compile|link|asm|cgo)( |$)' >/dev/null 2>&1; then
+    _cc_dj_skip "go build cache (a go build or test is running)"
+    return 0
+  fi
+  _cc_dj_clean_target "go build cache (unused ${CC_DJ_GO_CACHE_TRIM_DAYS}d+)" \
+    find "$dir" -mindepth 2 -maxdepth 2 -path "$dir/[0-9a-f][0-9a-f]/*" -type f \
+      \( -name '*-a' -o -name '*-d' \) -mmin +"$(( CC_DJ_GO_CACHE_TRIM_DAYS * 1440 ))" -delete
+}
+
 # Which configured path grew, and whose it is. Free space alone says only that something
 # did, so every incident used to start with a manual `du` hunt. growth-watch.py samples a
 # rotating, budgeted subset of targets per run and prints `ALERT:growth` lines; this logs
@@ -779,12 +815,7 @@ _cc_dj_clean() {
   free_before="$(_cc_dj_free_pct)"
   _cc_dj_log "clean: starting — disk free=${free_before}%"
 
-  # -- go clean -cache -------------------------------------------------------
-  if command -v go >/dev/null 2>&1; then
-    _cc_dj_clean_target "go clean -cache" go clean -cache
-  else
-    _cc_dj_skip "go clean -cache (go not found)"
-  fi
+  _cc_dj_go_cache_trim
 
   # Worktree-preserving pressure trim. The cc-reaper janitor owns the holder and
   # Claude/Codex claim checks; this caller only decides when to request the

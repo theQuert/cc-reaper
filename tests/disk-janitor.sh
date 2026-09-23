@@ -133,12 +133,24 @@ esac
 STUB
 chmod +x "$FAKE_BIN/docker"
 
-# go stub
+# go stub. `go env GOCACHE` answers FAKE_GOCACHE, so the age trim runs against a sandbox
+# cache; an unset FAKE_GOCACHE is a go that reports no cache.
+export FAKE_GOCACHE="$SANDBOX/gocache"
+mkdir -p "$FAKE_GOCACHE"
 cat > "$FAKE_BIN/go" <<STUB
 #!/usr/bin/env bash
 echo "\$*" >> "$GO_CAPTURE"
+[ "\$*" = "env GOCACHE" ] && printf '%s\\n' "\${FAKE_GOCACHE-}"
+exit 0
 STUB
 chmod +x "$FAKE_BIN/go"
+
+# pgrep stub: the go cache trim stands down while a build runs. FAKE_GO_BUSY=1 is a build.
+cat > "$FAKE_BIN/pgrep" <<'STUB'
+#!/usr/bin/env bash
+[ "${FAKE_GO_BUSY:-0}" = 1 ]
+STUB
+chmod +x "$FAKE_BIN/pgrep"
 
 # yarn stub
 cat > "$FAKE_BIN/yarn" <<STUB
@@ -373,6 +385,60 @@ expect_yes "clean: log contains freed= bytes entry" \
 # command -v bun returns false (command -v succeeds only when tool is executable
 # and on PATH — use a wrapper that exists but has a name that won't match
 # by using a separate bin dir where bun is absent and system PATH follows after).
+printf "\n# Test group 4a: --clean trims the go build cache by age\n"
+# Go names entries <hash>-a and <hash>-d inside two-hex-digit subdirectories and refreshes
+# an entry's mtime when it uses it. The trim takes entries older than the retention and
+# nothing else: not the top-level README, trim.txt or testexpire.txt, and never the cache.
+_gocache_fixture() {
+  rm -rf "$FAKE_GOCACHE"; mkdir -p "$FAKE_GOCACHE/0a" "$FAKE_GOCACHE/ff" "$FAKE_GOCACHE/fuzz/pkg"
+  local old; old="$(date -v-10d +%Y%m%d%H%M)"
+  # fuzz/: Go keeps generated fuzz corpora under GOCACHE and its own trim leaves them alone.
+  for f in 0a/1111-a 0a/1111-d ff/2222-d README trim.txt testexpire.txt fuzz/4444-d fuzz/pkg/5555-d; do
+    printf x > "$FAKE_GOCACHE/$f"; touch -t "$old" "$FAKE_GOCACHE/$f"
+  done
+  printf x > "$FAKE_GOCACHE/ff/3333-d"   # used just now
+}
+_gocache_fixture
+_reset_captures
+_run_dj --clean 80 0
+expect_no "go cache: an entry unused for 10 days is deleted" test -e "$FAKE_GOCACHE/0a/1111-a"
+expect_no "go cache: its data file too" test -e "$FAKE_GOCACHE/ff/2222-d"
+expect_yes "go cache: a recently used entry is kept" test -e "$FAKE_GOCACHE/ff/3333-d"
+expect_yes "go cache: top-level files are kept" \
+  bash -c 'test -e "$1/README" && test -e "$1/trim.txt" && test -e "$1/testexpire.txt"' _ "$FAKE_GOCACHE"
+expect_yes "go cache: nothing outside the hex subdirectories, whatever its name" \
+  bash -c 'test -e "$1/fuzz/4444-d" && test -e "$1/fuzz/pkg/5555-d"' _ "$FAKE_GOCACHE"
+expect_no "go cache: go clean is never run" grep -q "clean" "$GO_CAPTURE"
+expect_yes "go cache: the trim is a target that ran" \
+  grep -q "clean: target 'go build cache (unused 3d+)' done" "$SANDBOX/dj.log"
+
+_gocache_fixture
+_reset_captures
+FAKE_GO_BUSY=1 _run_dj --clean 80 0
+expect_yes "go cache: nothing is deleted while a build runs" test -e "$FAKE_GOCACHE/0a/1111-a"
+expect_yes "go cache: and the target is a SKIP" \
+  grep -q "SKIP go build cache (a go build or test is running)" "$SANDBOX/dj.log"
+
+_gocache_fixture
+_reset_captures
+FAKE_GOCACHE=off _run_dj --clean 80 0
+expect_yes "go cache: GOCACHE=off deletes nothing" test -e "$FAKE_GOCACHE/0a/1111-a"
+expect_yes "go cache: and is a SKIP" grep -q "SKIP go build cache (go env GOCACHE is not a directory path" "$SANDBOX/dj.log"
+
+for days in abc 0 -1; do
+  _gocache_fixture
+  _reset_captures
+  CC_DJ_GO_CACHE_TRIM_DAYS="$days" _run_dj --clean 80 0
+  expect_yes "go cache: retention '$days' deletes nothing" test -e "$FAKE_GOCACHE/0a/1111-a"
+  expect_yes "go cache: retention '$days' is a SKIP naming it" \
+    grep -qF "SKIP go build cache (CC_DJ_GO_CACHE_TRIM_DAYS=$days is not a positive whole number)" "$SANDBOX/dj.log"
+done
+
+_gocache_fixture
+_reset_captures
+CC_DJ_GO_CACHE_TRIM_DAYS=20 _run_dj --clean 80 0
+expect_yes "go cache: a longer retention keeps a 10-day-old entry" test -e "$FAKE_GOCACHE/0a/1111-a"
+
 printf "\n# Test group 4b: --clean SKIP logged for missing bun\n"
 _reset_captures
 
