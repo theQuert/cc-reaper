@@ -432,7 +432,7 @@ printf '#!/bin/sh\necho "find: permission denied" >&2\nexit 1\n' > "$FIND_STUB_W
 chmod +x "$FIND_STUB_WJ/find"
 
 expect_yes "an absent root is a skip, not a failure" \
-  bash -c 'CC_WJ_ROOT=/nope/does/not/exist bash "$1" >/dev/null 2>&1' _ "$WJ"
+  bash -c 'CC_WJ_ROOT=/nope/does/not/exist CC_WJ_HARNESS_ROOTS="$2/no-harness" bash "$1" >/dev/null 2>&1' _ "$WJ" "$TMPDIR_ROOT"
 
 expect_no "a root that exists and cannot be listed fails the run" \
   bash -c 'PATH="$3:$PATH" CC_WJ_ROOT="$2/denied" bash "$1" >/dev/null 2>&1' \
@@ -462,8 +462,8 @@ expect_yes "a denied root carries the trade-off and the alternative" \
     _ "$WJ" "$BLIND_ROOT" "$FIND_STUB_WJ"
 
 expect_yes "roots are plural" \
-  bash -c 'CC_WJ_ROOT="/nope/a:/nope/b" bash "$1" 2>&1 | grep -q "/nope/a,/nope/b"' \
-    _ "$WJ"
+  bash -c 'CC_WJ_ROOT="/nope/a:/nope/b" CC_WJ_HARNESS_ROOTS="$2/no-harness" bash "$1" 2>&1 | grep -q "/nope/a,/nope/b"' \
+    _ "$WJ" "$TMPDIR_ROOT"
 
 
 # ─── A detached HEAD is the one removal this script cannot undo ───────────────
@@ -812,6 +812,34 @@ expect_yes "a PR merged at this exact head lands work that was later reverted" \
 expect_yes "a PR recorded at a different head does not count" \
   file_after "$OUT_L" "wt-pr-other$" 2 "KEEP(unlanded)"
 
+# launchd hands an agent PATH=/usr/bin:/bin:/usr/sbin:/sbin, where gh is not installed, so
+# every scheduled sweep lost the merged-PR proof while session sweeps had it (0 against
+# 54 landed=pr in one day's logs). An executed run appends the tool directories; the
+# fixture's gh lives only in one of them.
+LAUNCHD_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+TOOL_GH="$TMPDIR_ROOT/tooldir-gh"
+NO_GH="$TMPDIR_ROOT/stubs-no-gh"
+mkdir -p "$TOOL_GH" "$NO_GH"
+cp "$STUBS_IDLE/gh" "$TOOL_GH/gh"
+for f in "$STUBS_IDLE"/*; do
+  [ "$(basename "$f")" = gh ] || cp "$f" "$NO_GH/"
+done
+OUT_LP="$TMPDIR_ROOT/out-launchd-path.txt"
+PATH="$NO_GH:$LAUNCHD_PATH" CC_WJ_TOOL_DIRS="$TOOL_GH" bash "$WJ" --repo "$L_PRIMARY" > "$OUT_LP" 2>&1 || true
+expect_yes "under launchd's PATH, gh in a tool directory still proves landed=pr" \
+  file_after "$OUT_LP" "wt-pr$" 2 "landed=pr"
+
+OUT_NOGH="$TMPDIR_ROOT/out-no-gh.txt"
+PATH="$NO_GH:$LAUNCHD_PATH" CC_WJ_TOOL_DIRS="" bash "$WJ" --repo "$L_PRIMARY" > "$OUT_NOGH" 2>&1 || true
+expect_yes "with gh nowhere, the run says once that it cannot prove landing by PR" \
+  test "$(grep -c "gh is not on PATH" "$OUT_NOGH")" -eq 1
+expect_yes "and keeps what only a PR could prove landed" \
+  file_after "$OUT_NOGH" "wt-pr$" 2 "KEEP(unlanded)"
+
+expect_yes "sourcing the janitor leaves the caller's PATH unchanged" \
+  env -i HOME="$HOME" PATH="$LAUNCHD_PATH" WJ="$WJ" /bin/bash -c \
+    'source "$WJ" >/dev/null 2>&1; [ "$PATH" = "/usr/bin:/bin:/usr/sbin:/sbin" ]'
+
 # The PR proof must not outlive the base: the merge commit has to be on what was fetched.
 printf '%s %s %s main\n' "$PR_HEAD" "$PR_HEAD" "1111111111111111111111111111111111111111" > "$GH_PULLS_FILE"
 OUT_L2="$TMPDIR_ROOT/out-landed2.txt"
@@ -1098,9 +1126,11 @@ mkdir -p "$S_LOCK"; echo "$HOLDER" > "$S_LOCK/pid"; ps -o command= -p "$HOLDER" 
 OUT_LOCK="$TMPDIR_ROOT/out-lock.txt"
 LOCK_RC=0
 PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$S_PRIMARY" --apply > "$OUT_LOCK" 2>&1 || LOCK_RC=$?
-expect_yes "a run that skipped a locked repository exits non-zero" test "$LOCK_RC" -ne 0
-expect_yes "a live sweep's lock blocks removal" \
-  bash -c 'grep -q "another worktree-janitor sweep (pid [0-9]*) holds" "$1" && [ -d "$2" ]' \
+# A live holder is another removal or trim sweep of this repository: deferring to it is not
+# a failure, and reporting one buried the real ones.
+expect_yes "a run that deferred to a live sweep exits 0" test "$LOCK_RC" -eq 0
+expect_yes "a live sweep's lock blocks removal, and the run says it deferred" \
+  bash -c 'grep -q "another worktree-janitor sweep (pid [0-9]*) holds .*; deferred to it" "$1" && [ -d "$2" ]' \
     _ "$OUT_LOCK" "$S_ROOT/wt-locked"
 # A live pid that no longer runs the command recorded with it is not a sweep.
 echo "bash /somewhere/worktree-janitor.sh --apply" > "$S_LOCK/cmd"
@@ -1118,6 +1148,32 @@ expect_no "a dead holder's lock is taken over" \
   test -d "$S_ROOT/wt-locked"
 expect_no "and released afterwards" \
   test -d "$S_LOCK"
+
+# A lock that cannot be taken at all is still a failure: a stale regular file where the
+# lock directory belongs has no holder to defer to, and mkdir cannot replace it.
+sgit worktree add -q "$S_ROOT/wt-locked" -b locked3 origin/main 2>/dev/null
+: > "$S_LOCK"
+touch -t "$(date -v-5M +%Y%m%d%H%M)" "$S_LOCK"
+OUT_LOCK3="$TMPDIR_ROOT/out-lock3.txt"
+LOCK3_RC=0
+PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$S_PRIMARY" --apply > "$OUT_LOCK3" 2>&1 || LOCK3_RC=$?
+expect_yes "a lock that cannot be taken still exits non-zero" test "$LOCK3_RC" -ne 0
+expect_yes "and removes nothing" \
+  bash -c 'grep -q "could not be taken; removed nothing" "$1" && [ -d "$2" ]' \
+    _ "$OUT_LOCK3" "$S_ROOT/wt-locked"
+rm -f "$S_LOCK"
+_wj_idle --repo "$S_PRIMARY" --apply > /dev/null
+
+# mkdir can also fail with nothing there to defer to: a missing or unwritable parent, as
+# when the git common dir cannot be resolved and the lock lands at `/`. That must not read
+# as a sweep caught between its mkdir and its writes.
+LOCK_RO="$TMPDIR_ROOT/lock-ro"
+mkdir -p "$LOCK_RO"; chmod 555 "$LOCK_RO"
+for unlockable in "$TMPDIR_ROOT/no-such-dir/x.lock" "$LOCK_RO/x.lock"; do
+  expect_yes "a lock whose parent is missing or unwritable is a failure, not a deferral ($(basename "$(dirname "$unlockable")"))" \
+    bash -c 'source "$1" >/dev/null 2>&1; _cc_wj_lock "$2" > /dev/null; [ "$?" -eq 1 ]' _ "$WJ" "$unlockable"
+done
+chmod 755 "$LOCK_RO"
 
 
 # ─── The decision is asked again right before removal ────────────────────────

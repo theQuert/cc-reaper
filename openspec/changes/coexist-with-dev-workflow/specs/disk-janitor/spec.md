@@ -23,7 +23,6 @@ The janitor SHALL clean only artifacts that rebuild automatically on next use: g
 - **WHEN** the janitor source is inspected
 - **THEN** it contains no `docker rmi`, `docker image rm`, `docker volume rm`, or broad system/image/container/volume prune invocation, and no cleanup target resolves inside user-data paths
 
-#### Scenario: Explicit drained builder cache cleanup
-- **WHEN** the operator enables builder cleanup and invokes `--orbstack-clean` with a valid short-lived host/context-bound drain proof and no protected consumers remain
-- **THEN** only builder cache unused for at least 168 hours may be pruned; the existing drain-proof, adapter, and protected-container rechecks remain mandatory
-- **AND** ordinary `--clean` never enters this path
+#### Scenario: Weekly builder cache prune
+- **WHEN** the weekly clean runs with a reachable daemon
+- **THEN** only builder cache unused for at least 168 hours is pruned, through `docker builder prune --force --filter until=168h`, and no image, container or volume is removed

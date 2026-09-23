@@ -392,6 +392,85 @@ expect_yes "T10: compressor_gb derived from occupied pages (0.76GB)" \
 expect_no "T10: compressor_gb is NOT the stored-in value (1.60GB)" \
   test "$t10_comp_gb" = "1.60"
 
+# ─── T11: sudden disk-free drop against a 25-45 minute old sample ───────────
+# The df stub reports 100.0GB free. seed_drop writes the sample file a case
+# starts from; drop_case runs one snapshot against that case's directory.
+seed_drop() {
+  local dir
+  dir=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+  mkdir -p "$dir/state"
+  printf '%s\n' "$@" > "$dir/state/disk-free-samples"
+  echo "$dir"
+}
+
+drop_case() {
+  local dir=$1
+  shift
+  (
+    export PATH="$stub_dir:$PATH"
+    export CC_RW_LOG="$dir/resource-watch.log"
+    export CC_RW_STATE_DIR="$dir/state"
+    export CC_RW_OSASCRIPT_LOG="$dir/osascript"
+    for pair in "$@"; do
+      export "$pair"
+    done
+    bash "$ROOT_DIR/shell/resource-watch.sh"
+  ) || true
+  touch "$dir/osascript"
+}
+
+t11_now=$(date +%s)
+
+t11a=$(seed_drop "$((t11_now - 1800)) 115.0")
+drop_case "$t11a"
+expect_yes "T11a: a 15GB fall against a 30-minute-old sample logs ALERT:disk-drop" \
+  grep -q 'ALERT:disk-drop' "$t11a/resource-watch.log"
+expect_yes "T11a: the notification names the fall" \
+  grep -q 'fell 15.0GB' "$t11a/osascript"
+expect_yes "T11a: the drop has its own cooldown" \
+  test -f "$t11a/state/cooldown-disk-drop"
+drop_case "$t11a"
+expect_yes "T11a: a repeat inside the cooldown is still logged" \
+  test "$(grep -c 'ALERT:disk-drop' "$t11a/resource-watch.log")" -eq 2
+expect_yes "T11a: but notified only once" \
+  test "$(wc -l < "$t11a/osascript")" -eq 1
+
+t11b=$(seed_drop "$((t11_now - 1800)) 105.0")
+drop_case "$t11b"
+expect_no "T11b: a 5GB fall raises nothing" \
+  grep -q 'ALERT:disk-drop' "$t11b/resource-watch.log"
+expect_no "T11b: and notifies nothing" \
+  test -s "$t11b/osascript"
+
+t11c=$(seed_drop "$((t11_now - 7200)) 150.0" "$((t11_now - 300)) 150.0")
+drop_case "$t11c"
+expect_no "T11c: no sample 25-45 minutes old means nothing is compared" \
+  grep -q 'ALERT:disk-drop' "$t11c/resource-watch.log"
+
+t11d=$(seed_drop "$((t11_now - 2600)) 150.0" "$((t11_now - 1600)) 105.0")
+drop_case "$t11d"
+expect_no "T11d: the newest sample in the window is the one compared" \
+  grep -q 'ALERT:disk-drop' "$t11d/resource-watch.log"
+
+t11e=$(seed_drop "$((t11_now - 1800)) 115.0")
+drop_case "$t11e" "CC_RW_DISK_DROP_GB=0"
+expect_no "T11e: CC_RW_DISK_DROP_GB=0 disables the drop alert" \
+  grep -q 'ALERT:disk-drop' "$t11e/resource-watch.log"
+
+t11f_seed=()
+for i in $(seq 1 15); do
+  t11f_seed+=("$((t11_now - 7200 + i * 60)) 100.0")
+done
+t11f=$(seed_drop "${t11f_seed[@]}")
+drop_case "$t11f"
+expect_yes "T11f: the sample file keeps the last 12 samples" \
+  test "$(wc -l < "$t11f/state/disk-free-samples")" -eq 12
+expect_yes "T11f: and the newest is this run's" \
+  awk -v now="$t11_now" 'END { exit !($1 >= now && $2 == "100.0") }' "$t11f/state/disk-free-samples"
+
+expect_yes "T11g: a first run starts the sample file with one sample" \
+  test "$(wc -l < "$(cat "$t1_oascript.statedir")/disk-free-samples")" -eq 1
+
 if [ "$failures" -gt 0 ]; then
   printf "%s test failure(s)\n" "$failures"
   exit 1

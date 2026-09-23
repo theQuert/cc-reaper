@@ -57,7 +57,9 @@ cache (`go clean -cache`), Yarn cache, pip cache, Homebrew cleanup, bun install 
 Spotify cache, ShipIt updater cache, CoreSimulator caches, and dangling docker images — those
 no tag points at.
 
-The janitor SHALL NOT invoke any `prune` verb. `docker system prune -af` removes every
+The janitor SHALL NOT invoke any `prune` verb other than the weekly
+`docker builder prune --force --filter until=168h`, which removes only build cache unused for a
+week and nothing else. `docker system prune -af` removes every
 image not currently held by a running container, which on a development host includes
 images that take hours to rebuild and pinned versions kept deliberately; a tool whose
 stated contract is "rebuilds automatically on next use" cannot reach them. Docker
@@ -86,9 +88,9 @@ or editor state (`~/.cursor/extensions`).
 - **WHEN** the docker cleanup target runs
 - **THEN** no code path SHALL invoke `docker volume rm`
 
-#### Scenario: Forbidden verbs are structurally absent
+#### Scenario: Forbidden flags are structurally absent
 - **WHEN** the janitor source is inspected
-- **THEN** no code path SHALL produce a `docker` invocation containing `prune`, and no cleanup target SHALL resolve inside user-data paths
+- **THEN** no code path SHALL produce a `docker` invocation containing `prune` other than `docker builder prune --force --filter until=168h`, and no cleanup target SHALL resolve inside user-data paths
 
 ### Requirement: Per-target freed bytes are measured
 Each cleanup target SHALL report the space it actually freed, measured from the volume's

@@ -2,15 +2,16 @@
 
 ## Purpose
 
-Disk hygiene: hourly read-only free-space + TM-snapshot-pin checks, weekly cleanup of rebuildable-only caches, and gated Time Machine local-snapshot thinning. Chrome code-sign clones and OrbStack builder cache are handled by separate fail-closed gates.
+Disk hygiene: hourly read-only free-space + TM-snapshot-pin checks, weekly cleanup of rebuildable-only caches, and gated Time Machine local-snapshot thinning. Chrome code-sign clones are reclaimed behind a separate fail-closed gate, and builder cache unused for a week is pruned by the weekly clean.
+
+## Requirements
 
 ### Requirement: Chrome code-sign clones are reclaimed only when unheld
 The janitor SHALL inspect only directories named `code_sign_clone.<token>` beneath Chrome's exact code-sign clone root. It SHALL keep recent clones, clones with an open handle, and every clone when `lsof` cannot prove a usable inventory. Clean mode SHALL recheck identity and open handles immediately before removal.
 
-### Requirement: OrbStack builder cleanup requires runner drain proof
-The janitor SHALL always record OrbStack and Docker inventory when available. It SHALL never prune Docker volumes, running containers, or tagged images. Builder-cache pruning SHALL require `CC_DJ_ORBSTACK_DRAIN_CONFIRMED=1` and SHALL refuse while any `ci-runner-*` container exists; ordinary scheduled clean remains report-only for OrbStack.
-
-## Requirements
+#### Scenario: A clone is recent, open, or unprovable
+- **WHEN** a clone is recent, has an open handle, or `lsof` cannot prove a usable inventory
+- **THEN** it is kept, and clean mode rechecks identity and open handles immediately before removing any other clone
 
 ### Requirement: Rebuildable-only cleanup targets
 The janitor SHALL clean only artifacts that rebuild automatically on next use: go-build cache (`go clean -cache`), Yarn cache, pip cache, Homebrew cleanup, bun install cache, Spotify cache, ShipIt updater cache, CoreSimulator caches, and docker build cache via `docker system prune -af`. The janitor SHALL NEVER pass `--volumes` to docker prune, and SHALL NEVER touch user-data paths (`~/Documents`, `~/Downloads`, `~/Desktop`) or editor state (`~/.cursor/extensions`).
