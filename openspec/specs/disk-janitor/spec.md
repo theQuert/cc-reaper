@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Disk hygiene: hourly read-only free-space + TM-snapshot-pin checks, weekly cleanup of rebuildable-only caches, and gated Time Machine local-snapshot thinning. Chrome code-sign clones are reclaimed behind a separate fail-closed gate, and builder cache unused for a week is pruned by the weekly clean.
+Disk hygiene: hourly read-only free-space + TM-snapshot-pin checks, weekly cleanup of rebuildable-only caches, and gated Time Machine local-snapshot thinning. Chrome code-sign clones are reclaimed behind a separate fail-closed gate, builder cache unused for a week is pruned by the weekly clean, and the hourly check samples configured growth targets within a time budget and flags abnormal growth with the owner of the path that grew.
 
 ## Requirements
 

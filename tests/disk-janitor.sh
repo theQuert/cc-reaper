@@ -287,6 +287,48 @@ expect_no "check above threshold: tmutil deletelocalsnapshots NOT called" \
 # TEST 4: --clean runs all available targets, SKIP logged for missing tool,
 #          freed bytes logged
 # ---------------------------------------------------------------------------
+printf "\n# Test group 3b: --check growth watch\n"
+# The watch's own behaviour is tests/growth-watch.sh. Here only the contract with --check:
+# its lines reach the log, an ALERT raises one notification per cooldown, a missing script
+# is a counted SKIP, and a failing watch is said to have failed.
+FAKE_GROWTH="$SANDBOX/fake-growth.py"
+cat > "$FAKE_GROWTH" <<'PYSTUB'
+import os, sys
+print("growth: budget=" + os.environ.get("CC_DJ_GROWTH_BUDGET_SECONDS", "unset"))
+for line in os.environ.get("FAKE_GROWTH_LINES", "").split("|"):
+    if line:
+        print(line)
+sys.exit(int(os.environ.get("FAKE_GROWTH_RC", "0")))
+PYSTUB
+export CC_DJ_GROWTH_SCRIPT="$FAKE_GROWTH"
+export FAKE_GROWTH_LINES="growth: sampled 2 target(s)|ALERT:growth key=wt/a owner=dev +6.0GB in 24.0h now=8.0GB"
+_reset_captures
+rm -f "$SANDBOX/state/cooldown-growth"
+_run_dj --check 80 0
+expect_yes "growth: the watch's lines reach the log" \
+  bash -c 'grep -q "growth: sampled 2 target(s)" "$1" && grep -q "ALERT:growth key=wt/a owner=dev" "$1"' _ "$SANDBOX/dj.log"
+expect_yes "growth: an ALERT raises one notification naming it" \
+  bash -c '[ "$(grep -c "storage grew: key=wt/a owner=dev" "$1")" = 1 ]' _ "$OSASCRIPT_CAPTURE"
+_reset_captures
+_run_dj --check 80 "$(date +%s)"   # the stat stub reports the cooldown file as just touched
+expect_no "growth: a repeat inside the cooldown is not notified" grep -q "storage grew" "$OSASCRIPT_CAPTURE"
+expect_yes "growth: and says it was suppressed" grep -q "growth: notification suppressed" "$SANDBOX/dj.log"
+_reset_captures
+FAKE_GROWTH_RC=3 _run_dj --check 80 0
+expect_yes "growth: a failing watch is logged as failed" grep -q "growth: watch exited rc=3" "$SANDBOX/dj.log"
+_reset_captures
+printf ': "${CC_DJ_GROWTH_BUDGET_SECONDS:=77}"\n' > "$SANDBOX/growth.conf"
+CC_DJ_CONFIG="$SANDBOX/growth.conf" _run_dj --check 10 0
+expect_yes "growth: a budget set in the config file reaches the watch" grep -q "growth: budget=77" "$SANDBOX/dj.log"
+expect_yes "growth: the watch runs after the free-space verdict" \
+  bash -c 'awk "/BELOW threshold/{b=NR} /growth: budget=/{g=NR} END{exit !(b && g > b)}" "$1"' _ "$SANDBOX/dj.log"
+_reset_captures
+CC_DJ_GROWTH_SCRIPT="$SANDBOX/no-such-growth.py" _run_dj --check 80 0
+expect_yes "growth: a missing script is a SKIP" \
+  grep -q "SKIP growth watch (script or python3 not found)" "$SANDBOX/dj.log"
+unset CC_DJ_GROWTH_SCRIPT FAKE_GROWTH_LINES
+rm -f "$SANDBOX/state/cooldown-growth"
+
 printf "\n# Test group 4: --clean all targets present\n"
 _reset_captures
 

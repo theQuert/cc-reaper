@@ -453,9 +453,44 @@ Beyond process hygiene, cc-reaper ships three system-level janitors (added after
 | Script | Schedule | What it does |
 |---|---|---|
 | `resource-watch.sh` | every 10 min (launchd) | Single-pass snapshot (load / CPU idle / memory / disk) to `~/.cc-reaper/logs/resource-watch.log`; macOS notification when load > 2× cores, disk free < 15%, disk free fell 10 GB or more against the sample from about 30 minutes earlier (`ALERT:disk-drop`), or memory is critically tight. Per-metric 60-min cooldown. |
-| `disk-janitor.sh --check` | hourly (launchd) | **Read-only**: disk free % + Time Machine local-snapshot pin detection (snapshots holding freed space hostage after big deletes), plus a **report** of stale scratch checkouts under `/private/tmp` — directories nothing has open, holding no git repository, older than `CC_DJ_TMP_AGE_DAYS` and over `CC_DJ_TMP_MIN_MB`. It names them and never removes them: `/private/tmp` is world-writable and age plus size does not establish that something is abandoned. Alerts, never deletes. |
+| `disk-janitor.sh --check` | hourly (launchd) | **Read-only**: disk free % + Time Machine local-snapshot pin detection (snapshots holding freed space hostage after big deletes), plus a **report** of stale scratch checkouts under `/private/tmp` — directories nothing has open, holding no git repository, older than `CC_DJ_TMP_AGE_DAYS` and over `CC_DJ_TMP_MIN_MB`. It names them and never removes them: `/private/tmp` is world-writable and age plus size does not establish that something is abandoned. It also runs the [growth watch](#growth-watch). Alerts, never deletes. |
 | `disk-janitor.sh --clean` | Sunday 04:00 (launchd) | Cleans **rebuildable-only** targets: go-build / yarn / pip / brew / bun caches, Spotify / ShipIt / CoreSimulator caches, a **report** of docker dangling images and of unreferenced volumes with docker-generated-looking names, which are never deleted, TM snapshot thinning (dated `com.apple.TimeMachine.*` only, only when disk is below threshold). When the disk is below `CC_DJ_DISK_MIN_PCT`, it also delegates worktree-preserving cache trimming to `worktree-janitor.sh --trim-regenerable --apply`; holder, active-session, recent-claim and credential checks remain in that janitor. Tools are resolved from a known directory list, not the caller's `PATH`, because launchd supplies neither Homebrew nor Docker. Docker builder cache unused for at least 168 hours is pruned with `docker builder prune --force --filter until=168h`; images, containers and volumes are never removed. |
 | `worktree-janitor.sh` | every 6 hours by default, Claude/Codex SessionEnd, or manual | Inventories ordinary source roots plus `~/.claude/worktrees` and `~/.codex/worktrees`, deduplicated by git common directory. A worktree is REMOVABLE only when **all** checks succeed: only regenerable content remains; no process has a cwd or open file there; no verified-live Claude/Codex session claims it by cwd or structured tool call; no mapped harness activity falls within the **48-hour recent-session lease**; its work landed on the freshly fetched base by ancestry, content, or exact-head merged PR; it has been untouched for **48 hours**; and it is neither locked nor carrying a populated submodule. The same activity, content, HEAD, idle and git-state gates are repeated immediately before removal. Direct invocation is dry-run unless `--apply`; the installed policy separately opts SessionEnd and the scheduled run into apply. `--trim-regenerable` is a narrower pressure pass: it removes only ignored built-in cache directories from an unheld, unclaimed worktree and keeps the branch and worktree. It is report-only without `--apply`, and rechecks holders and claims before each directory. `--claims [id\|path]` exposes live and recent claims read-only; `--landed PATH` exposes the shared landed proof. The installer boots out and archives the legacy Claude worktree LaunchAgent so two destructive policies cannot race. Branches are never deleted and removal never uses `--force`. Policy lives in `~/.cc-reaper/worktree-janitor.conf`, not Claude or Codex settings. See [the reclamation method](docs/worktree-reclamation.md). |
+
+### Growth watch
+
+A fall in disk free says space went somewhere; it does not say where. Every hourly `--check`
+runs `growth-watch.py`, which samples the targets in `~/.cc-reaper/growth-targets.tsv`
+(`CC_DJ_GROWTH_TARGETS`) and flags the ones that grew. It is read-only.
+
+One row per target, tab-separated: `label`, `path`, `owner`, and an optional alert threshold
+in GB. A path with a glob wildcard is sampled one key per matching directory
+(`claude-worktrees/<name>`), and the label records their total; `docker:<type>` reads one
+category of `docker system df` (`Images`, `Containers`, `Local Volumes`, `Build Cache`) and
+`docker:volumes/<glob>` reads matching volumes from one `docker system df -v`. `~` and `{uid}`
+are expanded. The owner is free text printed on the alert - the CI volume, the hook or the
+reclaimer that produces the growth - so the investigation starts from a component rather
+than a path. The installer ships a generic `config/growth-targets.tsv` and never replaces an
+edited copy; add the roots your own tools write to.
+
+Walking a large tree is expensive (one 91 GB worktree root took more than six minutes at
+background priority), so a key is measured at most once per `CC_DJ_GROWTH_INTERVAL_HOURS`
+(6), never-measured and oldest first, under `nice`, with no new measurement after
+`CC_DJ_GROWTH_BUDGET_SECONDS` (240) and each `du` stopped at `CC_DJ_GROWTH_KEY_TIMEOUT` (900).
+A backlog drains over several runs. Samples go to `~/.cc-reaper/state/growth-samples.tsv`
+for 14 days; a target that cannot be read records `denied`, `absent`, `timeout` or `error`,
+never a size.
+
+Growth is measured against the newest sample at least `CC_DJ_GROWTH_WINDOW_HOURS` (24) old,
+or before a day of history the oldest one at least 3 hours old. A key or total that grew by
+its threshold (`CC_DJ_GROWTH_ALERT_GB`, 5; `0` on a row disables it) logs
+`ALERT:growth key=<key> owner=<owner> +<GB>GB in <hours>h now=<GB>GB` to `disk-janitor.log`
+and posts one notification per cooldown; every sampling run logs its three largest growers.
+
+```bash
+grep 'growth:' ~/.cc-reaper/logs/disk-janitor.log | tail   # what was sampled and what grew
+grep 'ALERT:growth' ~/.cc-reaper/logs/disk-janitor.log      # thresholds crossed
+```
 
 ### Worktree schedule
 
@@ -722,7 +757,8 @@ cc-reaper/
 │   ├── stop-cleanup-orphans.sh     # Session orphan filtering + pattern fallback
 │   └── worktree-session-end.sh     # Shared Claude/Codex SessionEnd trigger
 ├── config/
-│   └── worktree-janitor.conf       # 48h + scheduled/session apply policy
+│   ├── worktree-janitor.conf       # 48h + scheduled/session apply policy
+│   └── growth-targets.tsv          # Growth watch targets template
 ├── launchd/
 │   ├── cc-reaper-monitor.sh        # LaunchAgent monitor script (PGID + PPID=1 fallback)
 │   ├── com.cc-reaper.orphan-monitor.plist  # LaunchAgent config (10-min interval)
@@ -737,6 +773,7 @@ cc-reaper/
 │   ├── claude-cleanup.sh           # Shell functions (claude-ram, claude-fd, claude-cleanup, claude-sessions, claude-guard)
 │   ├── resource-watch.sh           # System snapshot + threshold alerting
 │   ├── disk-janitor.sh             # Disk check (--check) / rebuildable-cache clean (--clean)
+│   ├── growth-watch.py             # Budgeted per-target size samples + growth alerts
 │   └── worktree-janitor.sh         # Git worktree inventory + gated removal (dry-run default)
 ├── tests/
 │   ├── agent-process-patterns.sh   # Cleanup-candidate matcher validation
@@ -745,6 +782,7 @@ cc-reaper/
 │   ├── ppid-fallback.sh            # PPID=1 fallback kill + whitelist validation
 │   ├── resource-watch.sh           # Snapshot / threshold / cooldown tests (stubbed)
 │   ├── disk-janitor.sh             # Read-only check / forbidden-flag / thinning tests (stubbed)
+│   ├── growth-watch.sh             # Sampling order / budget / status / growth alert tests (stubbed)
 │   └── worktree-janitor.sh         # Fixture-repo gate + apply tests
 └── README.md
 ```

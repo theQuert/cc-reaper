@@ -1,0 +1,23 @@
+# Storage growth targets sampled by `disk-janitor --check` (growth-watch.py). Read-only.
+# One row per target, tab-separated: label<TAB>path<TAB>owner[<TAB>alert GB]
+#
+# A path with a glob wildcard samples each matching directory as its own key, and the
+# label is their total, so an alert names the one worktree or scratchpad that grew.
+# `~` and {uid} are expanded. `docker:<type>` reads a `docker system df` row (Images,
+# Containers, Local Volumes, Build Cache); `docker:volumes/<glob>` reads matching volumes
+# from `docker system df -v`, which takes minutes on a busy daemon. The owner is printed
+# on the alert: name whoever produces the growth, not the path.
+claude-worktrees	~/.claude/worktrees/*	harness-worktrees
+codex-worktrees	~/.codex/worktrees/*	harness-worktrees
+claude-scratchpads	/private/tmp/claude-{uid}/*/*	session-scratchpads
+tmp	/private/tmp	temp
+user-caches	~/Library/Caches	caches
+xdg-cache	~/.cache	caches
+npm-cache	~/.npm	caches
+claude-transcripts	~/.claude/projects	harness-transcripts
+codex-sessions	~/.codex/sessions	harness-transcripts
+trash	~/.Trash	user
+docker-images	docker:Images	docker
+docker-containers	docker:Containers	docker
+docker-volumes	docker:Local Volumes	docker
+docker-build-cache	docker:Build Cache	docker

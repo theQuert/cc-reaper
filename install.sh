@@ -455,6 +455,7 @@ for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cle
   _cc_deploy "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
 done
 _cc_deploy "$SCRIPT_DIR/shell/chrome-clone-janitor.py" "$REAPER_DIR/chrome-clone-janitor.py"
+_cc_deploy "$SCRIPT_DIR/shell/growth-watch.py" "$REAPER_DIR/growth-watch.py"
 for SCRIPT in worktree-session-end stop-cleanup-orphans; do
   _cc_deploy "$SCRIPT_DIR/hooks/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
 done
@@ -484,6 +485,18 @@ elif cmp -s "$SCRIPT_DIR/config/disk-janitor.conf" "$DJ_CONFIG"; then
   echo "  disk policy already current at $DJ_CONFIG"
 else
   echo "  disk policy preserved at $DJ_CONFIG (repository default differs; review with diff)"
+fi
+
+# Growth targets are host-specific (which worktree roots, which Docker volumes), so an
+# operator-edited list survives updates exactly as the policies above do.
+GW_TARGETS="$REAPER_DIR/growth-targets.tsv"
+if [ ! -e "$GW_TARGETS" ]; then
+  cp "$SCRIPT_DIR/config/growth-targets.tsv" "$GW_TARGETS"
+  echo "  growth targets installed at $GW_TARGETS"
+elif cmp -s "$SCRIPT_DIR/config/growth-targets.tsv" "$GW_TARGETS"; then
+  echo "  growth targets already current at $GW_TARGETS"
+else
+  echo "  growth targets preserved at $GW_TARGETS (repository default differs; review with diff)"
 fi
 
 for AGENT in resource-watch disk-check weekly-clean guard worktree-janitor; do

@@ -29,6 +29,10 @@ Environment:
   CC_DJ_LOG             Log file path (default: ~/.cc-reaper/logs/disk-janitor.log)
   CC_DJ_STATE_DIR       State directory path (default: ~/.cc-reaper/state/)
   CC_DJ_CONFIG          Overrides sourced first (default: ~/.cc-reaper/disk-janitor.conf)
+  CC_DJ_GROWTH_TARGETS  Growth targets for --check (default: ~/.cc-reaper/growth-targets.tsv)
+  CC_DJ_GROWTH_INTERVAL_HOURS / _BUDGET_SECONDS / _WINDOW_HOURS / _ALERT_GB / _KEY_TIMEOUT
+                        Sampling interval per target (6), time budget per run (240),
+                        growth window (24), default alert GB (5), per-target timeout (900)
 EOF
 }
 
@@ -45,6 +49,10 @@ CC_DJ_TRIM_WORKTREES="${CC_DJ_TRIM_WORKTREES:-1}"
 CC_DJ_COOLDOWN_SECS="${CC_DJ_COOLDOWN_SECS:-3600}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
 CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
+# growth-watch.py reads its settings from the environment, and the config file sets them
+# without exporting them. An unset name stays unset and the watch uses its default.
+export CC_DJ_STATE_DIR CC_DJ_GROWTH_TARGETS CC_DJ_GROWTH_INTERVAL_HOURS CC_DJ_GROWTH_BUDGET_SECONDS \
+  CC_DJ_GROWTH_WINDOW_HOURS CC_DJ_GROWTH_ALERT_GB CC_DJ_GROWTH_KEY_TIMEOUT
 # Abandoned scratch checkouts under the shared temp directory. Agents and review
 # sessions copy or clone a repository there and nothing ever revisits it; measured
 # 2026-08-31 on one host, twelve of them between 484 MB and 1.3 GB, 5.7 GB in total,
@@ -214,9 +222,10 @@ _cc_dj_tm_snapshots() {
     | sed 's/com\.apple\.TimeMachine\.\(.*\)\.local/\1/'
 }
 
-# Cooldown: returns 0 when notification is allowed (no state file or cooldown expired); 1 to suppress
+# Cooldown: returns 0 when notification is allowed (no state file or cooldown expired); 1 to suppress.
+# $1 names the alert, so the growth watch and the free-space floor do not silence each other.
 _cc_dj_cooldown_ok() {
-  local state_file="$CC_DJ_STATE_DIR/cooldown-disk"
+  local state_file="$CC_DJ_STATE_DIR/cooldown-${1:-disk}"
   if [ ! -f "$state_file" ]; then
     return 0  # no prior record → allow
   fi
@@ -232,7 +241,7 @@ _cc_dj_cooldown_ok() {
 }
 
 _cc_dj_cooldown_touch() {
-  local state_file="$CC_DJ_STATE_DIR/cooldown-disk"
+  local state_file="$CC_DJ_STATE_DIR/cooldown-${1:-disk}"
   touch "$state_file"
 }
 
@@ -283,6 +292,9 @@ _cc_dj_check() {
   else
     _cc_dj_log "check: OK — free=${free_pct}% >= ${CC_DJ_DISK_MIN_PCT}%"
   fi
+  # Last, because it can spend its budget plus one per-target timeout, and a disk that is
+  # filling must not wait that long for its alert.
+  _cc_dj_growth_watch
 }
 
 # ---------------------------------------------------------------------------
@@ -586,6 +598,35 @@ _cc_dj_chrome_clones() {
     return 0
   fi
   _cc_dj_clean_target "Chrome code-sign clones (${mode})" python3 "$script" "$mode"
+}
+
+# Which configured path grew, and whose it is. Free space alone says only that something
+# did, so every incident used to start with a manual `du` hunt. growth-watch.py samples a
+# rotating, budgeted subset of targets per run and prints `ALERT:growth` lines; this logs
+# them and raises one notification per cooldown. Read-only.
+_cc_dj_growth_watch() {
+  local script="${CC_DJ_GROWTH_SCRIPT:-$HOME/.cc-reaper/growth-watch.py}" out line alert="" rc=0
+  if [ ! -r "$script" ] || ! command -v python3 >/dev/null 2>&1; then
+    _cc_dj_skip "growth watch (script or python3 not found)"
+    return 0
+  fi
+  out="$(python3 "$script" 2>&1)" || rc=$?
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    _cc_dj_log "$line"
+    case "$line" in
+      ALERT:growth*) [ -n "$alert" ] || alert="${line#ALERT:growth }" ;;
+    esac
+  done <<< "$out"
+  [ "$rc" -eq 0 ] || _cc_dj_log "growth: watch exited rc=$rc; its samples may be incomplete"
+  if [ -n "$alert" ]; then
+    if _cc_dj_cooldown_ok growth; then
+      _cc_dj_notify "storage grew: $alert"
+      _cc_dj_cooldown_touch growth
+    else
+      _cc_dj_log "growth: notification suppressed (within cooldown)"
+    fi
+  fi
 }
 
 _cc_dj_orbstack_report() {
