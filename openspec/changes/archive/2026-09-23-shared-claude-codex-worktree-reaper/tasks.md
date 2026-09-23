@@ -41,4 +41,4 @@
 - [x] 4.2 Point the stima Codex SessionEnd adapter at cc-reaper; provide the Claude hook command.
 - [x] 4.3 Run shell syntax checks and the full repository test suite.
 - [x] 4.4 Run strict OpenSpec validation and a real report-only inventory.
-- [ ] 4.5 Record activation as pending until reviewed changes reach clean canonical main.
+- [x] 4.5 Record activation as pending until reviewed changes reach clean canonical main.

@@ -20,5 +20,5 @@
 
 ## 4. Verification
 
-- [ ] 4.1 Run the full cc-reaper shell suite from a clean process table.
-- [ ] 4.2 Validate the OpenSpec change and review the diff for destructive scope.
+- [x] 4.1 Run the full cc-reaper shell suite from a clean process table.
+- [x] 4.2 Validate the OpenSpec change and review the diff for destructive scope.

@@ -259,6 +259,24 @@ over the destination. A process already reading the previous version SHALL keep 
 - **WHEN** `install.sh` runs over an existing `~/.cc-reaper/claude-cleanup.sh`
 - **THEN** the path SHALL name a new inode with the repository's content, and no temporary file SHALL remain
 
+### Requirement: MCP command identity owns its hot streak
+Only eligible shared MCP commands SHALL be sampled. A changed command or a legacy sample without command identity SHALL start a new streak even when PID and process start time remain unchanged.
+
+#### Scenario: A build execs an MCP server
+- **WHEN** a hot build execs a known MCP server while retaining its PID, start time, and CPU time
+- **THEN** the MCP server SHALL NOT inherit the build hot streak
+
+### Requirement: Unknown rc link count preserves the file
+The installer SHALL use the platform file link-count operation, including GNU stat when BSD stat is unsupported. If neither operation can establish the link count, it SHALL leave the rc unchanged and report why while continuing script deployment.
+
+#### Scenario: GNU stat on a hard-linked rc
+- **WHEN** the rc file has multiple hard links and the platform rejects BSD stat flags
+- **THEN** GNU link-count inspection SHALL preserve the file and its links
+
+#### Scenario: Link count cannot be read
+- **WHEN** both platform link-count operations fail or return nonnumeric output
+- **THEN** the rc file SHALL remain unchanged
+
 ## MODIFIED Requirements
 
 ### Requirement: One protection classification owns all three paths
@@ -489,21 +507,3 @@ No other process is signalled, so no other process's memory is counted.
 #### Scenario: A signal that is not delivered
 - **WHEN** the signal to a selected PID fails because the process has already exited
 - **THEN** the summary SHALL NOT count it, and its RSS SHALL NOT be added to the freed total
-
-### Requirement: MCP command identity owns its hot streak
-Only eligible shared MCP commands SHALL be sampled. A changed command or a legacy sample without command identity SHALL start a new streak even when PID and process start time remain unchanged.
-
-#### Scenario: A build execs an MCP server
-- **WHEN** a hot build execs a known MCP server while retaining its PID, start time, and CPU time
-- **THEN** the MCP server SHALL NOT inherit the build hot streak
-
-### Requirement: Unknown rc link count preserves the file
-The installer SHALL use the platform file link-count operation, including GNU stat when BSD stat is unsupported. If neither operation can establish the link count, it SHALL leave the rc unchanged and report why while continuing script deployment.
-
-#### Scenario: GNU stat on a hard-linked rc
-- **WHEN** the rc file has multiple hard links and the platform rejects BSD stat flags
-- **THEN** GNU link-count inspection SHALL preserve the file and its links
-
-#### Scenario: Link count cannot be read
-- **WHEN** both platform link-count operations fail or return nonnumeric output
-- **THEN** the rc file SHALL remain unchanged
