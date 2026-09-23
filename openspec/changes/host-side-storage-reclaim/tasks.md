@@ -35,8 +35,8 @@
 
 ## 6. Verification and delivery
 
-- [ ] 6.1 Full shell suite, `bash -n` and `zsh -n`, `openspec validate --all --strict`; independent
+- [x] 6.1 Full shell suite, `bash -n` and `zsh -n`, `openspec validate --all --strict`; independent
   review of the exact head.
-- [ ] 6.2 Deploy by rename with a rollback manifest; live digests equal main; smoke `--check`, a
+- [x] 6.2 Deploy by rename with a rollback manifest; live digests equal main; smoke `--check`, a
   report-only janitor run under launchd's PATH, and a resource-watch run; no LaunchAgent reload and
   no active session restarted.
