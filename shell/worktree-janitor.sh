@@ -2514,7 +2514,7 @@ _cc_wj_lock() {
     echo "worktree-janitor: another worktree-janitor sweep${holder:+ (pid $holder)} holds $lock; deferred to it and removed nothing in this repository"
     return 2
   fi
-  rm -f "$lock/pid" "$lock/cmd"
+  rm -f "$lock/pid" "$lock/cmd" 2>/dev/null
   rmdir "$lock" 2>/dev/null
   if ! mkdir "$lock" 2>/dev/null; then
     echo "worktree-janitor: the sweep lock $lock could not be taken; removed nothing in this repository"
