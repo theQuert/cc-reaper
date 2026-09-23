@@ -115,4 +115,4 @@
 
 - [x] 14.1 All suites, `bash -n`, `zsh -n`, `openspec validate coexist-with-dev-workflow --strict`
 - [x] 14.2 Independent review until no actionable findings
-- [ ] 14.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions
+- [x] 14.3 Deploy by rename with backups of the replaced files; repair this host's rc lines with a backup; verify the running copies match main and a new shell loads the functions

@@ -282,7 +282,7 @@ working directory, so that one deployed entrypoint can serve Claude and Codex Se
 
 #### Scenario: Concurrent sweeps
 - **WHEN** a removal sweep of a repository starts while another live `worktree-janitor` holds that repository's lock
-- **THEN** it removes nothing in that repository, logs that another sweep holds the lock, and the run exits non-zero; a lock whose pid is dead or no longer runs the command that took it, or untouched for more than 60 minutes, is taken over, and a sweep refreshes its lock on every removal
+- **THEN** it removes nothing in that repository and logs that it deferred to the sweep holding the lock, and that deferral alone does not make the run exit non-zero; a lock that cannot be taken for any other reason still does. A lock whose pid is dead or no longer runs the command that took it, or untouched for more than 60 minutes, is taken over, and a sweep refreshes its lock on every removal
 
 #### Scenario: Run record
 - **WHEN** a session sweep runs
@@ -299,3 +299,221 @@ command's whole process group, and a timed-out command SHALL be treated as a fai
 #### Scenario: A hung command
 - **WHEN** a bounded command exceeds its timeout
 - **THEN** it and its descendants are terminated and the caller receives exit status 124
+
+### Requirement: The worktree inventory stays manual, and says why
+The inventory SHALL NOT be installed as a LaunchAgent, and the installer SHALL state the
+reason rather than leaving its absence to look like an oversight.
+
+A LaunchAgent cannot read `~/Documents`. Measured 2026-08-30 with a probe agent loaded
+through `launchctl bootstrap`: `ls ~/Documents/GitHub` returned `DENIED`, and
+`git -C ~/Documents/GitHub/stima-api rev-parse` returned `fatal: Unable to read current
+working directory: Operation not permitted`. `_cc_wj_root` defaults to
+`$HOME/Documents/GitHub`, so a scheduled run would traverse nothing and report nothing —
+a silent empty report, which is the failure shape this whole change exists to remove.
+
+The gap it was meant to close stays open and is recorded as such: the reclaim hook
+derives its root from the session's working directory, so nothing sweeps a repository
+nobody is sitting in. On this host that left 83 live worktrees in one repository. Closing
+it needs a TCC-capable host process, which this project does not have.
+
+#### Scenario: Installing cc-reaper
+- **WHEN** `install.sh` runs
+- **THEN** it SHALL NOT install a worktree-report agent, and SHALL print that the inventory is manual and why
+
+#### Scenario: An operator wants the inventory
+- **WHEN** an operator runs `~/.cc-reaper/worktree-janitor.sh`
+- **THEN** it SHALL report, and SHALL remove nothing without `--apply`
+
+### Requirement: Report-only mode does not mutate the repository
+Report mode SHALL NOT run `git worktree prune`. Removing administrative records is a
+removal, and this tool's own contract is that removal requires `--apply`.
+
+The report already prints `[cue: git worktree prune]` for a missing directory, so the
+finding survives; only the unrequested action does not. Left ungated, the scheduled agent —
+which never passes `--apply` — deleted metadata daily under the name "report-only".
+
+#### Scenario: A worktree directory is missing during a report
+- **WHEN** the inventory runs without `--apply` and finds a registered worktree whose directory is gone
+- **THEN** it SHALL report the finding and the administrative record SHALL survive
+
+#### Scenario: The same repository under --apply
+- **WHEN** the inventory runs with `--apply`
+- **THEN** the stale record SHALL be pruned, so the capability is gated rather than removed
+
+### Requirement: The runner bounds any launchd log pair written on its behalf
+The runner SHALL bound the `launchd-worktree-report-{stdout,stderr}.log` pair, at the top of
+every run, on the same terms as every other cc-reaper runner.
+
+Kept although the agent that would write them is not installed: the bounding is where a
+future scheduled or user-installed invocation needs it, and it costs two `stat` calls. It is
+placed at the top of `_cc_wj_run` because a report-only run never reaches `_cc_wj_log_write`,
+where bounding it would be unreachable for the only caller that produces those files.
+
+#### Scenario: Either file crosses the cap
+- **WHEN** the inventory runs and either file exceeds the cap
+- **THEN** it SHALL be bounded the same way the runner bounds its own log
+
+#### Scenario: Inventory finds reclaimable worktrees
+- **WHEN** the report identifies worktrees above the notification threshold
+- **THEN** it SHALL surface them, and SHALL leave removal to an operator running `--apply`
+
+### Requirement: Attached-resource reapers share landed policy
+
+The system SHALL expose a read-only single-worktree query that uses the same ancestry,
+content-equivalence, and exact-head merged-PR proofs as worktree reclamation.
+
+#### Scenario: A squash-merged stack is no longer retained by ancestry-only logic
+- **WHEN** a resource reaper queries a worktree whose content landed with a different commit
+- **THEN** the query succeeds and reports `content`
+- **AND** the query does not remove the worktree
+
+### Requirement: Active harness session veto
+
+No verified active Claude or Codex session may claim a removable worktree by cwd or by a
+structured tool-call input in its current two human user turns. Stale registry artifacts SHALL NOT become claims, and an
+unmappable verified-live claim SHALL make the destructive run fail closed.
+
+#### Scenario: Active Claude session
+- **WHEN** a live PID-named Claude session record maps to a worktree, or its unique transcript contains a structured tool call naming that worktree
+- **THEN** the worktree is kept with an active Claude reason
+
+#### Scenario: Active Codex task
+- **WHEN** an open Codex thread writer lock maps to a worktree, or its rollout contains a structured tool call naming that worktree
+- **THEN** the worktree is kept with an active Codex reason
+
+#### Scenario: Stale registry artifact
+- **WHEN** a Claude PID record is dead or reused, or a Codex lock file exists but is not open
+- **THEN** that artifact alone does not claim a worktree
+
+#### Scenario: Live claim cannot be mapped
+- **WHEN** a verified live record cannot be parsed or mapped uniquely to cwd and transcript
+- **THEN** no worktree is removed and the run states which claim was unknowable
+
+#### Scenario: Session starts during a sweep
+- **WHEN** a session claim appears after classification but before removal
+- **THEN** the janitor's pre-removal refresh keeps the worktree
+
+#### Scenario: Codex task archives while its claim is inspected
+- **WHEN** a Codex writer lock closes and its rollout moves to the archive while the janitor is inspecting it
+- **THEN** the janitor remaps the task through current Codex state
+- **AND** only the task's cwd or current-two-turn structured tool paths receive its bounded recent-session protection
+- **AND** a missing or renamed recorded cwd does not discard current structured tool-path evidence for another existing worktree
+- **AND** unrelated worktrees are not reported as actively claimed by that task
+
+#### Scenario: Transcript evidence is shared across candidates
+- **WHEN** several candidate worktrees are judged from the same activity snapshot
+- **THEN** each transcript's current-two-user-turn window is indexed at most once for that snapshot
+- **AND** its normalized structured tool inputs are materialized at most once for that snapshot
+- **AND** matching another candidate does not start another interpreter for that transcript
+- **AND** malformed relevant evidence still uses the exact parser and fails closed
+- **AND** non-UTF-8 filesystem path bytes round-trip through normalized evidence
+- **AND** cache-key collisions and projection lookup failures cannot answer no-claim
+- **AND** normal completion or an interrupt removes the private projection directory
+- **AND** interruption restores and runs the invoking Bash caller's existing signal and exit cleanup
+- **AND** a later start removes a private projection directory whose owner was force-killed
+- **AND** early-return and sourced/background invocations still recover dead-owner projections
+- **AND** the pre-removal activity refresh builds a new snapshot before destructive action
+- **AND** structured active and recent transcript matching is skipped when a cheaper gate already keeps the worktree
+
+#### Scenario: Unchanged transcript evidence is reused across scheduled sweeps
+- **WHEN** a later scheduled sweep sees the same transcript path, device, inode, size, and modification time
+- **THEN** it reuses the offset-only persistent index without rereading the transcript window
+- **AND** any identity or content change rebuilds the evidence before it can authorize removal
+
+#### Scenario: Cleanup task inventories another worktree
+- **WHEN** the task running the janitor names a target in its own structured tool call
+- **THEN** that self-reference does not claim the target
+- **AND** the task's verified cwd still protects its actual checkout
+
+### Requirement: Installed unattended cleanup policy
+
+The installed cc-reaper policy SHALL use a 48-hour idle window. Direct invocation SHALL
+remain report-only without `--apply`; `--session` and `--scheduled` MAY apply only when
+their separate cc-reaper config switches are exactly `1`.
+
+#### Scenario: Scheduled guarantee
+- **WHEN** the installed LaunchAgent runs every six hours with `CC_WJ_SCHEDULE_APPLY=1`
+- **THEN** it removes only worktrees that pass every existing gate and have been idle at least 48 hours
+
+#### Scenario: Legacy destructive schedule exists
+- **WHEN** the shared policy is installed over a Claude-owned worktree LaunchAgent
+- **THEN** the legacy agent is unloaded and moved to a recoverable migration archive
+- **AND** only the shared policy remains scheduled to remove worktrees
+
+#### Scenario: Missing scheduled opt-in
+- **WHEN** `--scheduled` runs without `CC_WJ_SCHEDULE_APPLY=1`
+- **THEN** it reports only
+
+#### Scenario: Scheduled run evidence is bounded and delimited
+- **WHEN** the LaunchAgent starts a scheduled sweep
+- **THEN** the actual LaunchAgent stdout and stderr files are bounded
+- **AND** stdout records start time, end time, elapsed seconds, pid, and exit status for that run
+
+### Requirement: Harness-neutral SessionEnd trigger
+
+`worktree-janitor --session` SHALL accept SessionEnd payloads from Claude or Codex through
+one deployed cc-reaper entrypoint.
+
+#### Scenario: Either harness ends a session
+- **WHEN** Claude or Codex invokes `worktree-session-end.sh <harness>`
+- **THEN** the hook returns promptly, the detached sweep logs the harness, and the same policy implementation runs
+
+### Requirement: Harness-owned repository discovery
+
+The janitor SHALL discover repositories in ordinary configured source roots and in the
+Claude and Codex harness worktree roots, deduplicating clones/worktrees by git common
+directory.
+
+#### Scenario: Harness-owned second clone
+- **WHEN** a harness-owned checkout is not registered under an ordinary source root
+- **THEN** it is still present in the report and evaluated by the same gates
+
+### Requirement: Worktree-preserving regenerable trim
+
+The janitor SHALL support an explicit `--trim-regenerable` mode that reports, and only with
+`--apply` removes, ignored directories from the built-in regenerable set while retaining the
+worktree, branch, tracked content, untracked authored content, and non-regenerable ignored content.
+
+#### Scenario: Trim report is read-only
+
+- **WHEN** the janitor runs with `--trim-regenerable` without `--apply`
+- **THEN** it lists candidate directories and byte estimates
+- **AND** it does not remove a directory, worktree, branch, or git administrative record
+
+#### Scenario: Active worktree is never trimmed
+
+- **WHEN** a process holder, verified live Claude/Codex claim, recent-session lease, locked state,
+  or unreadable safety probe names the worktree
+- **THEN** the janitor keeps every regenerable directory in that worktree
+
+#### Scenario: Apply trims only selected regenerable directories
+
+- **WHEN** `--trim-regenerable --apply` has a clean, unlocked worktree with successful holder and
+  harness scans and an ignored built-in regenerable directory without a credential-shaped file
+- **THEN** that directory may be removed
+- **AND** the worktree and branch remain present
+- **AND** tracked, untracked authored, and non-regenerable ignored content remain present
+
+#### Scenario: Claim appears before a later directory
+
+- **WHEN** a holder or live/recent session claim appears after one cache directory was trimmed but
+  before another selected directory is removed
+- **THEN** the janitor keeps the remaining directory and reports the recheck reason
+
+### Requirement: Tools resolve under a minimal PATH
+When executed, the janitor SHALL append each directory in `CC_WJ_TOOL_DIRS` (default
+`/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin`) that exists and is not already on PATH, and
+SHALL NOT prepend them. When `gh` still does not resolve, the run SHALL say once that landing by
+a merged pull request cannot be proven. Sourcing the file SHALL NOT change the caller's PATH.
+
+#### Scenario: Scheduled run under launchd
+- **WHEN** the LaunchAgent runs the janitor with `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and `gh` is installed in a listed directory
+- **THEN** `gh` resolves, and a worktree whose exact head a merged pull request delivered can be shown `landed=pr`
+
+#### Scenario: gh is not installed
+- **WHEN** `gh` resolves nowhere
+- **THEN** the run prints one line saying landing by a merged pull request cannot be proven, and such worktrees stay kept
+
+#### Scenario: The caller's tool comes first
+- **WHEN** PATH already holds a `gh` ahead of the listed directories
+- **THEN** that `gh` is the one used
