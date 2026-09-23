@@ -16,6 +16,8 @@ Lightweight system snapshot with threshold-gated macOS notifications.
 Takes one snapshot of load avg, CPU idle %, memory free %, compressor size,
 and Data-volume disk free, then appends a structured log line and fires
 osascript notifications when thresholds are breached (per-metric cooldown).
+A fall in disk free against the sample from about 30 minutes earlier raises
+ALERT:disk-drop, so fast growth is flagged before the percentage floor is hit.
 
 Options:
   -h, --help    Show this help
@@ -27,6 +29,7 @@ Environment:
   CC_RW_LOAD_FACTOR    Load-1 alert factor × logical-core count (default: 2)
   CC_RW_DISK_MIN_PCT   Disk free % below which alert fires (default: 15)
   CC_RW_MEM_MIN_PCT    Memory free % below which alert fires when compressor also high (default: 5)
+  CC_RW_DISK_DROP_GB   Disk free fall in GB, against a 25-45 minute old sample, that alerts; 0 disables (default: 10)
 EOF
 }
 
@@ -63,6 +66,12 @@ _cc_rw_disk_min_pct() {
 _cc_rw_mem_min_pct() {
   local v="${CC_RW_MEM_MIN_PCT:-5}"
   [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] || v=5
+  echo "$v"
+}
+
+_cc_rw_disk_drop_gb() {
+  local v="${CC_RW_DISK_DROP_GB:-10}"
+  [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] || v=10
   echo "$v"
 }
 
@@ -178,6 +187,26 @@ _cc_rw_collect_disk() {
       }'
 }
 
+# Record this sample, and print how far disk free fell since the newest stored sample
+# 25-45 minutes old when that fall reaches the threshold. The log's timestamps are local
+# time and macOS awk has no mktime, so samples live in their own `<epoch> <free GB>` file,
+# trimmed to the last 12 (two hours at the ten-minute cadence). After sleep no sample is
+# in the window, so nothing is compared rather than something false being raised.
+# Args: <samples file> <now epoch> <free GB> <threshold GB, 0 disables>
+_cc_rw_disk_drop() {
+  local file=$1 now=$2 free=$3 threshold=$4
+  [[ "$free" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+  [ -f "$file" ] && awk -v now="$now" -v free="$free" -v t="$threshold" '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+([.][0-9]+)?$/ {
+      age = now - $1
+      if (age >= 1500 && age <= 2700 && (!found || $1 > best)) { best = $1; prev = $2; found = 1 }
+    }
+    END { if (t + 0 > 0 && found && prev - free >= t + 0) printf "%.1f\n", prev - free }' "$file"
+  { [ -f "$file" ] && tail -n 11 "$file"; printf '%s %s\n' "$now" "$free"; } > "$file.tmp" 2>/dev/null \
+    && mv -f "$file.tmp" "$file" 2>/dev/null
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Cooldown helpers
 # ---------------------------------------------------------------------------
@@ -291,10 +320,15 @@ _cc_rw_snapshot() {
                -v cgb="$compressor_gb"    -v cth="$comp_threshold_gb" \
     'BEGIN { print (mfp+0 < mmin+0 && cgb+0 > cth+0) ? "true" : "false" }')
 
+  local drop_gb
+  drop_gb=$(_cc_rw_disk_drop "${state_dir}/disk-free-samples" "$now" "$disk_free_gb" \
+    "$(_cc_rw_disk_drop_gb)")
+
   # --- build markers (MED-2: remove dead alert_tag variable) ---
   local markers=""
   [ "$load_breach" = "true" ] && markers="${markers} ALERT:load"
   [ "$disk_breach" = "true" ] && markers="${markers} ALERT:disk"
+  [ -n "$drop_gb" ]           && markers="${markers} ALERT:disk-drop"
   [ "$mem_breach"  = "true" ] && markers="${markers} ALERT:mem"
   markers="${markers# }"   # ltrim space
 
@@ -314,6 +348,9 @@ _cc_rw_snapshot() {
 
   [ "$disk_breach" = "true" ] && _cc_rw_maybe_notify "disk" \
     "disk free ${disk_free_pct}% (${disk_free_gb}GB) below ${disk_min_pct}% threshold" "$now"
+
+  [ -n "$drop_gb" ] && _cc_rw_maybe_notify "disk-drop" \
+    "disk free fell ${drop_gb}GB within 45 minutes, now ${disk_free_gb}GB" "$now"
 
   [ "$mem_breach"  = "true" ] && _cc_rw_maybe_notify "mem" \
     "mem free ${mem_free_pct}% below ${mem_min_pct}% and compressor ${compressor_gb}GB above ${comp_threshold_gb}GB" "$now"
