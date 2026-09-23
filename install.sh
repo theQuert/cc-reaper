@@ -455,9 +455,12 @@ for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cle
   _cc_deploy "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
 done
 _cc_deploy "$SCRIPT_DIR/shell/chrome-clone-janitor.py" "$REAPER_DIR/chrome-clone-janitor.py"
-for SCRIPT in worktree-session-end lifecycle-reclaim stop-cleanup-orphans; do
+for SCRIPT in worktree-session-end stop-cleanup-orphans; do
   _cc_deploy "$SCRIPT_DIR/hooks/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
 done
+# Retired 2026-09-23: nothing ever called it, and the builder prune it gated now runs in
+# `disk-janitor --clean`. A stale copy would still name the removed --orbstack-clean mode.
+rm -f "$REAPER_DIR/lifecycle-reclaim.sh"
 
 # The policy lives with cc-reaper, not in either harness's settings.  Preserve an
 # operator-edited policy on update; the repository copy remains the reviewable default.

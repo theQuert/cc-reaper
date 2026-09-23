@@ -17,4 +17,4 @@ builder-cleanup mode, drain proof or protected-container gate.
 
 #### Scenario: Daemon unreachable
 - **WHEN** docker is not installed or `docker info` fails
-- **THEN** the builder prune is logged as skipped and counted, and no other docker command runs
+- **THEN** the docker step, builder prune included, is logged as skipped and counted, and no docker command runs beyond the reachability probe

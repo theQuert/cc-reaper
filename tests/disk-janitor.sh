@@ -310,11 +310,14 @@ expect_yes "clean: bun called" \
 expect_yes "clean: docker called" \
   test -s "$DOCKER_CAPTURE"
 
-# An allowlist, not a list of removal verbs: `image remove`, `builder prune` and
-# `container prune` all passed the old pattern. Only the read-only calls the reports make
-# may reach docker.
-expect_no "clean: docker receives only the read-only calls the reports make" \
-  grep -vqE '^(info|images -f dangling=true -q|volume ls --format .+|ps -aq|inspect .+)$' "$DOCKER_CAPTURE"
+# An allowlist, not a list of removal verbs: `image remove` and `container prune` both
+# passed the old pattern. Only the read-only calls the reports make, and the one builder
+# prune in its exact reviewed shape, may reach docker.
+expect_no "clean: docker receives only the report calls and the one builder prune" \
+  grep -vqE '^(info|images -f dangling=true -q|volume ls --format .+|ps -aq|inspect .+|builder prune --force --filter until=168h)$' "$DOCKER_CAPTURE"
+
+expect_yes "clean: the builder prune runs once, limited to cache unused for 168h" \
+  test "$(grep -cx 'builder prune --force --filter until=168h' "$DOCKER_CAPTURE")" -eq 1
 
 # The allowlist proves something only if the volume report got as far as a volume it could
 # have removed: it asks for containers only once it has one.
@@ -369,6 +372,29 @@ SAFE_SYS_PATH="/bin:/usr/bin:/usr/sbin:/sbin"
 
 expect_yes "clean: SKIP logged for missing bun" \
   grep -q 'SKIP bun' "$SANDBOX/dj-nobun.log"
+
+# Unreachable daemon: the reachability probe is the only docker call, so the builder prune
+# never runs, and the skip is counted on the final line rather than read as a clean.
+printf "\n# Test group 4c: --clean with the Docker daemon unreachable\n"
+_reset_captures
+DEAD_BIN="$SANDBOX/bin-deaddocker"
+mkdir -p "$DEAD_BIN"
+cp "$FAKE_BIN"/* "$DEAD_BIN"/
+cat > "$DEAD_BIN/docker" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$DOCKER_CAPTURE"
+exit 1
+STUB
+chmod +x "$DEAD_BIN/docker"
+( FAKE_BIN="$DEAD_BIN"; _run_dj --clean 80 0 ) || true
+
+expect_yes "clean, daemon unreachable: docker was probed" \
+  grep -qx 'info' "$DOCKER_CAPTURE"
+expect_no "clean, daemon unreachable: nothing beyond the probe reaches docker" \
+  grep -vqx 'info' "$DOCKER_CAPTURE"
+expect_yes "clean, daemon unreachable: the docker step is a counted skip" \
+  bash -c 'grep -q "SKIP docker (daemon unreachable)" "$1" && ! grep -q "SKIPPED=0 " "$1"' \
+    _ "$SANDBOX/dj.log"
 
 # ---------------------------------------------------------------------------
 # TEST 5: TM thinning only fires when below threshold AND only passes
@@ -513,6 +539,10 @@ printf "\n# Test group 9: docker cleanup shape and skip accounting\n"
 
 expect_no "docker: no broad system/image/container/volume prune invocation" \
   bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -Eq "docker[[:space:]]+(system|image|container|volume)[[:space:]]+prune"' _ "$DJ"
+
+expect_yes "docker: the one prune invocation is the builder prune limited to until=168h" \
+  bash -c 'test "$(grep -vE "^[[:space:]]*#" "$1" | grep -c "docker[[:space:]].*prune")" -eq 1 &&
+    grep -vE "^[[:space:]]*#" "$1" | grep -q "docker builder prune --force --filter until=168h$"' _ "$DJ"
 
 expect_no "docker: no volume removal survives outside comments" \
   bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -q "volume rm"' _ "$DJ"
