@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Changed
+- **The growth targets template no longer lists `~/.Trash`.** macOS privacy protection
+  denies it to a LaunchAgent without Full Disk Access, so the first scheduled run recorded
+  `denied` for it and would have every six hours after; an interactive `du` of the same
+  path prints a silent 0.
 - **`CC_DJ_GO_CACHE_TRIM_DAYS=off` leaves the go build cache to another reclaimer.** One
   cache, one owner: where a faster reclaimer already trims it (on the reporting host, the
   skills repository's `reclaim-byproducts`, every three hours), the weekly clean logs that
