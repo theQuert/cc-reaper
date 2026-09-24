@@ -55,6 +55,16 @@
 - **`.worktree-regenerable`** - a repository declares its own runtime byproducts, read from the fetched base (never the worktree), with patterns that name no path dropped and reported, and credential-shaped files inside declared directories or caches still keeping the worktree. The report names what keeps each one.
 
 ### Added
+- **`archive:` lines in `.worktree-regenerable` let a hand-written record leave with its
+  worktree.** stima-api's staging preflight requires an ignored, hand-written
+  `.canary-window-plan` in every task worktree. Nothing rebuilds it, so it kept 14 landed
+  worktrees on 2026-09-24, and ten more each day. A file named by `archive:<pattern>` no
+  longer keeps its worktree when it is a regular file, is not credential-shaped, and is at
+  most `CC_WJ_ARCHIVE_MAX_BYTES` (1 MiB). Before `--apply` removes the worktree, the janitor
+  copies the file into a new directory under `CC_WJ_ARCHIVE_DIR` (default
+  `~/.cc-reaper/archive`), compares the copy byte for byte, and records it in `index.tsv`.
+  Any failure keeps the worktree. The list comes from the same fresh read as the recheck
+  before the removal. An older janitor drops the line as a pattern that names no path.
 - **An accepted task's worktree is reclaimed without the idle and session windows.** A dev
   loop that knows a task was accepted and is live writes `claude-task-done` into the
   worktree's git dir, beside `claude-task-worktree`; only its `head=` line is read. When the

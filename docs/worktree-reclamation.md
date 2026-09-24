@@ -127,6 +127,36 @@ Three rules make this safe:
 And **name what keeps a worktree**. A report that says "unrebuildable=1" sent someone on a
 separate investigation to find the 0-byte log that was holding 45 worktrees.
 
+### Records a person wrote: `archive:`
+
+Some ignored files are records, not byproducts. stima-api's staging preflight refuses to run
+without a hand-written `.canary-window-plan` in the worktree. Nothing rebuilds one, so the
+janitor rightly keeps the worktree: 14 of them on 2026-09-24, and ten more a day. Declaring
+the file regenerable would delete the record. Declare it `archive:` instead:
+
+```
+archive:.canary-window-plan
+```
+
+With `--apply`, after every recheck and right before the removal, the janitor:
+
+- copies each such file into
+  `~/.cc-reaper/archive/<repository>/<worktree>-<UTC time>.<random>/` (set with
+  `CC_WJ_ARCHIVE_DIR`);
+- compares every copy with its source, byte for byte;
+- appends a row to `index.tsv` in the archive directory.
+
+If any step fails, the worktree stays. It takes the list of files from the same fresh read
+as the recheck, so a file written after the inventory is copied too. A dry run shows
+`archive on removal:` for each removable worktree that holds such files.
+
+It copies only a regular file that is not a symlink, is not credential-shaped, and is no
+larger than `CC_WJ_ARCHIVE_MAX_BYTES` (1 MiB), because the archive is for what a person wrote.
+A file that fails one of these keeps its worktree, and the report says which condition it
+failed. The janitor never deletes anything from the archive; that is yours to do. An older
+janitor drops the line as a pattern that names no path, so the file goes on keeping its
+worktree.
+
 ## Where to run it
 
 - **From cc-reaper's six-hour LaunchAgent** for repositories under the installed `~/GitHub`
