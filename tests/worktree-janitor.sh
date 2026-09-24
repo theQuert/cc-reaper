@@ -1670,6 +1670,228 @@ long_input_bounded() {
 }
 expect_yes "hook input past the size bound is not trusted" long_input_bounded
 
+# ─── An accepted task: the claude-task-done annotation ───────────────────────
+#
+# The dev loop writes `claude-task-done` beside `claude-task-worktree`, in the worktree's own
+# git dir, once its task is accepted and live. That worktree is then judged without its
+# recent-session lease and without the idle window, and by every other gate as before. Each
+# fixture is landed and was written seconds ago, inside the 48-hour window these runs use,
+# and most carry a recent Claude session of their own, so every one of them is kept unless a
+# valid annotation releases it.
+
+D_ROOT="$TMPDIR_ROOT/done"
+D_PRIMARY="$D_ROOT/primary"
+D_PROJECTS="$D_ROOT/claude-projects"
+D_SESSIONS="$D_ROOT/claude-sessions"
+mkdir -p "$D_PROJECTS/p" "$D_SESSIONS"
+git init -q --bare "$D_ROOT/origin.git" -b main
+git clone -q "$D_ROOT/origin.git" "$D_PRIMARY" 2>/dev/null
+dgit() { git -C "$D_PRIMARY" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$D_PRIMARY/README"; dgit add README; dgit commit -qm base
+echo y > "$D_PRIMARY/second"; dgit add second; dgit commit -qm second; dgit push -q origin main
+D_OLD="$(dgit rev-parse HEAD~1)"
+
+d_wt() { dgit worktree add -q -b "$1" "$D_ROOT/$1" origin/main 2>/dev/null; }
+d_head() { git -C "$1" rev-parse HEAD; }
+# The annotation as the dev loop writes it. A second argument replaces its head= line.
+d_annotate() {
+  printf 'issue=2548\n%s\nstate=done\nat=2026-09-24T04:00:00Z\n' "${2:-head=$(d_head "$1")}" \
+    > "$(git -C "$1" rev-parse --absolute-git-dir)/claude-task-done"
+}
+d_sid() { printf 'dddddddd-0000-4000-8000-%012d' "$1"; }
+# A recent Claude session that last stood in the worktree: a lease by cwd.
+d_cwd_lease() {
+  printf '{"type":"system","sessionId":"%s","cwd":"%s"}\n' "$(d_sid "$2")" "$1" \
+    > "$D_PROJECTS/p/$(d_sid "$2").jsonl"
+}
+# One that stood in the primary checkout and named the worktree in a tool call.
+d_tool_lease() {
+  local sid
+  sid="$(d_sid "$2")"
+  printf '%s\n' \
+    "{\"type\":\"user\",\"sessionId\":\"$sid\",\"cwd\":\"$D_PRIMARY\",\"message\":{\"content\":\"finish task\"}}" \
+    "{\"type\":\"assistant\",\"sessionId\":\"$sid\",\"cwd\":\"$D_PRIMARY\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"input\":{\"workdir\":\"$1\"}}]}}" \
+    > "$D_PROJECTS/p/$sid.jsonl"
+}
+
+d_wt leased-plain;   d_cwd_lease "$D_ROOT/leased-plain" 1
+d_wt leased-done;    d_cwd_lease "$D_ROOT/leased-done" 2;    d_annotate "$D_ROOT/leased-done"
+# Old, or the idle gate keeps it first: a structured-tool-call lease is asked only of a
+# worktree every cheaper gate would let go.
+d_wt tool-plain;     d_tool_lease "$D_ROOT/tool-plain" 3;    age_tree "$D_ROOT/tool-plain"
+d_wt tool-done;      d_tool_lease "$D_ROOT/tool-done" 4;     d_annotate "$D_ROOT/tool-done"
+d_wt stale-done;     d_cwd_lease "$D_ROOT/stale-done" 5;     d_annotate "$D_ROOT/stale-done" "head=$D_OLD"
+d_wt malformed-done; d_cwd_lease "$D_ROOT/malformed-done" 6
+d_annotate "$D_ROOT/malformed-done" "head=$(d_head "$D_ROOT/malformed-done" | tr a-f A-F)"
+dgit worktree add -q --detach "$D_ROOT/detached-done" origin/main 2>/dev/null
+d_cwd_lease "$D_ROOT/detached-done" 7; d_annotate "$D_ROOT/detached-done"
+d_wt dirty-done;     d_annotate "$D_ROOT/dirty-done";        echo wip > "$D_ROOT/dirty-done/wip.txt"
+d_wt unlanded-done;  echo u > "$D_ROOT/unlanded-done/u.txt"
+git -C "$D_ROOT/unlanded-done" -c user.email=t@t -c user.name=t add u.txt
+git -C "$D_ROOT/unlanded-done" -c user.email=t@t -c user.name=t commit -qm "not on the base"
+d_annotate "$D_ROOT/unlanded-done"
+d_wt held-done;      d_annotate "$D_ROOT/held-done"
+d_wt claimed-done;   d_annotate "$D_ROOT/claimed-done"
+# A live Claude session standing in claimed-done: its pid is alive and its command line
+# carries its session id, which is what the registry scan verifies.
+D_LIVE_SID="$(d_sid 99)"
+python3 -c 'import time; time.sleep(120)' "$D_LIVE_SID" </dev/null >/dev/null 2>&1 &
+D_LIVE_PID=$!
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s"}\n' "$D_LIVE_PID" "$D_LIVE_SID" "$D_ROOT/claimed-done" \
+  > "$D_SESSIONS/$D_LIVE_PID.json"
+printf '{"type":"system","sessionId":"%s","cwd":"%s"}\n' "$D_LIVE_SID" "$D_ROOT/claimed-done" \
+  > "$D_PROJECTS/p/$D_LIVE_SID.jsonl"
+
+# Isolated from the installed policy file. D_STUBS, when set, goes ahead of the usual stubs.
+_wj_done() {
+  CC_WJ_CONFIG="$D_ROOT/no-config" CC_WJ_IDLE_HOURS=48 CC_WJ_SESSION_GRACE_HOURS=48 \
+    CC_WJ_CLAUDE_PROJECTS="$D_PROJECTS" CC_WJ_CLAUDE_SESSIONS="$D_SESSIONS" \
+    PATH="${D_STUBS:+$D_STUBS:}$STUBS_IDLE:$PATH" bash "$WJ" "$@" 2>&1
+}
+# One worktree's lines of a report: its WORKTREE line up to the next one.
+d_block() {
+  awk -v tail="/$2" '
+    /^  WORKTREE  / { on = (substr($0, length($0) - length(tail) + 1) == tail) }
+    /^$/ { on = 0 }
+    on' "$1"
+}
+d_says() { d_block "$1" "$2" | grep -qF -- "$3"; }
+# <report> <worktree> <classification> <done line: yes|no>. Both are asked of the same
+# block, so a worktree missing from the report fails instead of passing the "no" half.
+d_judged() {
+  local block
+  block="$(d_block "$1" "$2")"
+  printf '%s\n' "$block" | grep -qxF "    classification: $3" || return 1
+  if [ "$4" = yes ]; then
+    printf '%s\n' "$block" |
+      grep -qxF "    done: claude-task-done at HEAD $(d_head "$D_ROOT/$2" | cut -c1-12)"
+  else
+    ! printf '%s\n' "$block" | grep -q 'done:'
+  fi
+}
+
+printf 'p1\nn/\np4343\nn%s\n' "$(phys "$D_ROOT/held-done")" > "$LSOF_CWD_FILE"
+OUT_D="$TMPDIR_ROOT/out-done.txt"
+_wj_done --repo "$D_PRIMARY" > "$OUT_D"
+
+# The fixtures are evidence only if they produce the leases and the claim they describe.
+expect_yes "the cwd lease fixture is a recent Claude session lease" \
+  d_says "$OUT_D" leased-plain "session lease: recent Claude session $(d_sid 1)"
+expect_yes "the tool lease fixture is a structured-tool-call lease" \
+  d_says "$OUT_D" tool-plain "scope=structured-tool-call"
+expect_yes "without the annotation a leased worktree is kept, as before" \
+  d_judged "$OUT_D" leased-plain "KEEP(recent-session)" no
+expect_yes "an accepted task is removable although a session named it and it changed within the idle window" \
+  d_judged "$OUT_D" leased-done REMOVABLE yes
+expect_yes "a structured-tool-call lease keeps a worktree without the annotation" \
+  d_judged "$OUT_D" tool-plain "KEEP(recent-session)" no
+expect_yes "and does not keep an accepted one" \
+  d_judged "$OUT_D" tool-done REMOVABLE yes
+expect_yes "an annotation naming an earlier commit is ignored" \
+  d_judged "$OUT_D" stale-done "KEEP(recent-session)" no
+expect_yes "a malformed annotation is ignored" \
+  d_judged "$OUT_D" malformed-done "KEEP(recent-session)" no
+expect_yes "an annotation on a detached HEAD is ignored" \
+  d_judged "$OUT_D" detached-done "KEEP(recent-session)" no
+expect_yes "an annotated worktree holding uncommitted work is kept, and not taken as done" \
+  d_judged "$OUT_D" dirty-done "KEEP(unrebuildable=1)" no
+expect_yes "an annotated worktree whose work has not landed is kept" \
+  d_judged "$OUT_D" unlanded-done "KEEP(unlanded)" yes
+expect_yes "an annotated worktree a process holds is kept" \
+  d_judged "$OUT_D" held-done "KEEP(active-session)" yes
+expect_yes "an annotated worktree a live session claims is kept" \
+  d_judged "$OUT_D" claimed-done "KEEP(active-session)" yes
+expect_yes "and the claim that kept it is the live session's" \
+  d_says "$OUT_D" claimed-done "active claim: active Claude session $D_LIVE_SID"
+
+OUT_DA="$TMPDIR_ROOT/out-done-apply.txt"
+_wj_done --repo "$D_PRIMARY" --apply > "$OUT_DA"
+lsof_default
+expect_yes "--apply removes the accepted task's worktree" \
+  d_says "$OUT_DA" leased-done "→ removed"
+expect_no "which is gone" test -d "$D_ROOT/leased-done"
+expect_yes "and the accepted one a tool call named" \
+  d_says "$OUT_DA" tool-done "→ removed"
+expect_no "which is gone too" test -d "$D_ROOT/tool-done"
+expect_yes "and leaves both branches" \
+  bash -c 'git -C "$1" show-ref --verify --quiet refs/heads/leased-done &&
+           git -C "$1" show-ref --verify --quiet refs/heads/tool-done' _ "$D_PRIMARY"
+d_all_kept() {
+  local n
+  for n in leased-plain tool-plain stale-done malformed-done detached-done dirty-done \
+           unlanded-done held-done claimed-done; do
+    [ -d "$D_ROOT/$n" ] || { printf '# removed: %s\n' "$n"; return 1; }
+  done
+}
+expect_yes "and removes no worktree it kept" d_all_kept
+kill "$D_LIVE_PID" 2>/dev/null
+wait "$D_LIVE_PID" 2>/dev/null
+
+# The annotation waives two of the questions asked again right before a removal, so it has
+# to hold then too. Withdrawn while the sweep refreshes its session scan for that removal,
+# the worktree is judged by its lease again, and kept.
+DR_ROOT="$TMPDIR_ROOT/done-race"
+git init -q --bare "$DR_ROOT/origin.git" -b main
+git clone -q "$DR_ROOT/origin.git" "$DR_ROOT/primary" 2>/dev/null
+git -C "$DR_ROOT/primary" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+git -C "$DR_ROOT/primary" push -q origin main
+git -C "$DR_ROOT/primary" worktree add -q -b race-done "$DR_ROOT/race-done" origin/main 2>/dev/null
+d_cwd_lease "$DR_ROOT/race-done" 8; d_annotate "$DR_ROOT/race-done"
+mkdir -p "$DR_ROOT/codex-locks"
+D_RACE_STUBS="$TMPDIR_ROOT/stubs-done-race"
+D_RACE_COUNT="$TMPDIR_ROOT/done-race-count"
+mkdir -p "$D_RACE_STUBS"
+: > "$D_RACE_COUNT"
+export D_RACE_COUNT
+# Every session scan lists the (empty) Codex lock registry once. The second listing is the
+# refresh taken right before the removal, and it withdraws the annotation.
+cat > "$D_RACE_STUBS/lsof" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" +D "*)
+    echo x >> "$D_RACE_COUNT"
+    [ "$(wc -l < "$D_RACE_COUNT")" -eq 2 ] && eval "$RACE_ACTION" >/dev/null 2>&1
+    exit 1 ;;
+  *" -d cwd "*) printf 'p1\nn/\n' ;;
+  *) printf 'p1\nn/dev/null\n' ;;
+esac
+STUB
+chmod +x "$D_RACE_STUBS/lsof"
+OUT_DR="$TMPDIR_ROOT/out-done-race.txt"
+D_STUBS="$D_RACE_STUBS" CC_WJ_CODEX_LOCKS="$DR_ROOT/codex-locks" \
+  RACE_ACTION="rm -f '$(git -C "$DR_ROOT/race-done" rev-parse --absolute-git-dir)/claude-task-done'" \
+  _wj_done --repo "$DR_ROOT/primary" --apply > "$OUT_DR"
+expect_yes "the annotation held when the worktree was judged" \
+  d_says "$OUT_DR" race-done "classification: REMOVABLE"
+expect_yes "an annotation withdrawn before the removal leaves the worktree to its lease" \
+  bash -c 'grep -q "recent-session lease appeared before removal" "$1" && [ -d "$2" ]' \
+    _ "$OUT_DR" "$DR_ROOT/race-done"
+
+# The validity rule itself, one annotation at a time.
+git -C "$DR_ROOT/primary" worktree add -q -b unit-done "$DR_ROOT/unit-done" origin/main 2>/dev/null
+U_WT="$DR_ROOT/unit-done"
+U_GD="$(git -C "$U_WT" rev-parse --absolute-git-dir)"
+U_HEAD="$(d_head "$U_WT")"
+done_is() { # <want> <annotation content, or - for none>
+  rm -f "$U_GD/claude-task-done"
+  [ "$2" = - ] || printf '%s' "$2" > "$U_GD/claude-task-done"
+  [ "$(_cc_wj_done "$U_WT")" = "$1" ]
+}
+expect_yes "no annotation is not done"                       done_is no -
+expect_yes "one head= naming HEAD, on a branch, is done"     done_is yes "head=$U_HEAD"$'\n'
+expect_yes "so is one without a final newline"               done_is yes "issue=1"$'\n'"head=$U_HEAD"
+expect_yes "an empty annotation is not done"                 done_is no ""
+expect_yes "an annotation without head= is not done"         done_is no $'issue=1\nstate=done\n'
+expect_yes "a short head is not done"                        done_is no "head=${U_HEAD:0:39}"$'\n'
+expect_yes "an uppercase head is not done" \
+  done_is no "head=$(printf '%s' "$U_HEAD" | tr a-f A-F)"$'\n'
+expect_yes "a head ending in a carriage return is not done"  done_is no "head=$U_HEAD"$'\r\n'
+expect_yes "a head followed by more text is not done"        done_is no "head=$U_HEAD x"$'\n'
+expect_yes "two head= lines are not done, even agreeing"     done_is no "head=$U_HEAD"$'\n'"head=$U_HEAD"$'\n'
+expect_yes "a well-formed head that is not HEAD is not done" done_is no "head=$D_OLD"$'\n'
+git -C "$U_WT" checkout -q --detach 2>/dev/null
+expect_yes "the annotated commit on a detached HEAD is not done" done_is no "head=$U_HEAD"$'\n'
+
 # ─── Final result ─────────────────────────────────────────────────────────────
 
 if [ "$failures" -gt 0 ]; then

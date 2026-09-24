@@ -33,6 +33,29 @@ is working in the directory right now. Check holders before tidiness, not after.
 tree can mean the opposite of finished: an abandoned worktree whose uncommitted diff is the
 only copy of sixty files of work is also "not merged".
 
+### A task someone accepted need not wait out the windows
+
+The idle window and the session lease exist because a clean, landed tree can still be work
+somebody is about to resume. A dev loop that knows the task was accepted and is live can say
+so. It writes `claude-task-done` into the worktree's own git dir
+(`git -C <wt> rev-parse --absolute-git-dir`), beside the `claude-task-worktree` marker, as
+key=value lines of which only `head=` is read:
+
+```
+issue=2548
+head=<40-hex sha>
+state=done
+at=2026-09-24T04:00:00Z
+```
+
+For that worktree cc-reaper then skips the session lease, uses an idle window of 0 hours and
+prints `done: claude-task-done at HEAD <sha>`. It counts only when the tree is clean and the
+file holds exactly one well-formed `head=` naming the current HEAD, on a branch: an
+annotation left from an earlier commit says nothing about the work in the tree now. A stale,
+malformed or detached one is ignored. Everything else still decides: holders, live claims,
+contents, landing, git state, and the rechecks before removal, which read the annotation
+again. Waiving a lease never hides a live claim, even one read after the lease.
+
 ## Proving "landed"
 
 Against a base fetched in the same run, through an explicit refspec

@@ -805,6 +805,50 @@ esac
 count="$(printf '%s\n' "$out" | grep -cF "WORKTREE  $WT_PHYS")"
 check "harness discovery deduplicates linked worktrees by git common directory" test "$count" -eq 1
 
+# An accepted task's annotation (`claude-task-done`, beside the `claude-task-worktree`
+# marker) waives its worktree's recent-session lease, never a live claim. A Codex task that
+# archives while its claim is read answers "lease" before the live tasks listed after it
+# have been read. Prints the report for a fresh worktree carrying the annotation.
+done_archive_race() { # <fixture> <yes: a live Codex task listed after it names the worktree>
+  local tid=47474747-5555-7666-8777-888888888888 live=48484848-5555-7666-8777-888888888888
+  local old_rollout new_rollout hook
+  new_fixture "$1"
+  make_codex_state
+  old_rollout="$CASE/moving-rollout.jsonl"
+  new_rollout="$CASE/archived-rollout.jsonl"
+  printf '{"path":"%s"\n' "$WT" > "$old_rollout"
+  printf '%s\n' \
+    '{"type":"response_item","payload":{"type":"message","role":"user","content":"finish"}}' \
+    "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"input\":\"workdir=$WT\"}}" > "$new_rollout"
+  : > "$CODEX_LOCKS/$tid.lock"
+  printf 'p9\nn%s\n' "$CODEX_LOCKS/$tid.lock" > "$LSOF_LOCK_FILE"
+  sqlite3 "$CODEX_STATE" "insert into threads(id,cwd,rollout_path) values ('$tid','$PRIMARY','$old_rollout');"
+  if [ "$2" = yes ]; then
+    cp "$new_rollout" "$CASE/live-rollout.jsonl"
+    : > "$CODEX_LOCKS/$live.lock"
+    printf 'p10\nn%s\n' "$CODEX_LOCKS/$live.lock" >> "$LSOF_LOCK_FILE"
+    sqlite3 "$CODEX_STATE" "insert into threads(id,cwd,rollout_path) values ('$live','$PRIMARY','$CASE/live-rollout.jsonl');"
+  fi
+  hook="$CASE/archive-task.sh"
+  cat > "$hook" <<HOOK
+#!/usr/bin/env bash
+sqlite3 "$CODEX_STATE" "update threads set rollout_path='$new_rollout', updated_at=strftime('%s','now'), archived=1, archived_at=strftime('%s','now') where id='$tid';"
+HOOK
+  chmod +x "$hook"
+  printf 'head=%s\n' "$(git -C "$WT" rev-parse HEAD)" > "$(git -C "$WT" rev-parse --absolute-git-dir)/claude-task-done"
+  LSOF_EXACT_CLOSED=1 LSOF_EXACT_CLOSED_HOOK="$hook" run_wj 2>&1
+}
+out="$(done_archive_race done-archive-race no)"
+case "$out" in
+  *'classification: REMOVABLE'*'done: claude-task-done at HEAD'*) ok "an accepted task is not kept by the lease an archive race turns its claim into" ;;
+  *) bad "an accepted task is not kept by the lease an archive race turns its claim into"; printf '# output: %s\n' "$out" ;;
+esac
+out="$(done_archive_race done-archive-race-live yes)"
+case "$out" in
+  *'classification: KEEP(active-session)'*'active Codex session 48484848-5555-7666-8777-888888888888'*) ok "and is still kept by a live claim read after that lease" ;;
+  *) bad "and is still kept by a live claim read after that lease"; printf '# output: %s\n' "$out" ;;
+esac
+
 if [ "$failures" -gt 0 ]; then
   printf '%d test failure(s)\n' "$failures"
   exit 1
