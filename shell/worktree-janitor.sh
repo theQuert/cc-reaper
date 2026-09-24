@@ -72,6 +72,8 @@ Environment:
 A worktree is removable only when it holds nothing a command cannot rebuild, no process
 has it as a working directory or holds a file in it, its work has landed on the fetched
 base branch, and nothing in it changed within CC_WJ_IDLE_HOURS. Branches are never deleted.
+A clean worktree whose claude-task-done annotation names its HEAD, on a branch, is judged
+without that window and without the recent-session lease.
 `--trim-regenerable` uses the same holder and harness claim vetoes but does not require
 landing; it never removes tracked or non-regenerable content.
 EOF
@@ -2245,6 +2247,48 @@ _cc_wj_git_keep() {
   return 0
 }
 
+# ─── An accepted task ─────────────────────────────────────────────────────────
+
+# yes when worktree $1 carries its dev loop's acceptance of the commit it has checked out,
+# no otherwise. The loop writes `claude-task-done` beside the `claude-task-worktree` marker,
+# in the worktree's own git dir, once the task is accepted and live. Of its key=value lines
+# only `head=` is read.
+#
+# It stands in for the two gates that exist only because nobody said the work was finished,
+# the recent-session lease and the idle window, so it has to be about this checkout: exactly
+# one well-formed `head=`, naming the current HEAD, on a branch. An annotation left from an
+# earlier commit says nothing about the work in the tree now, and the task's branch is what
+# keeps its commits once the checkout goes. Anything else is no, and the worktree is judged
+# as if there were no file. The caller asks it only of a clean worktree.
+_cc_wj_done() {
+  local wt="$1" gd f head
+  gd="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" || { echo no; return 0; }
+  f="$gd/claude-task-done"
+  if [ -f "$f" ] && [ "$(LC_ALL=C grep -c '^head=' "$f" 2>/dev/null)" = 1 ] &&
+     head="$(LC_ALL=C grep -xE 'head=[0-9a-f]{40}' "$f" 2>/dev/null)" &&
+     [ "${head#head=}" = "$(git -C "$wt" rev-parse --verify --quiet HEAD 2>/dev/null)" ] &&
+     git -C "$wt" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+    echo yes
+  else
+    echo no
+  fi
+}
+
+# `_cc_wj_active_claim`, with its lease answer waived when $1 is yes. That 3 is a Codex task
+# that archived while its claim was read, and it comes back as soon as that one task is
+# reconciled - before the live transcripts listed after it have been read. The reconcile
+# dropped the task from the live list, so asking again reads only the rest, and the answer
+# that ends the loop is a live claim (0), one that cannot be read (2) or none (1). Waiving a
+# lease never waives a live claim.
+_cc_wj_live_claim() { # <waive: yes|no> <worktree> [all|cwd|tool]
+  local waive="$1" rc
+  shift
+  while :; do
+    _cc_wj_active_claim "$@"; rc=$?
+    [ "$rc" -eq 3 ] && [ "$waive" = yes ] || return "$rc"
+  done
+}
+
 # ─── Classification ───────────────────────────────────────────────────────────
 
 # Print KEEP(<reason>) or REMOVABLE. Every gate that was not shown to hold keeps: an empty
@@ -2772,7 +2816,7 @@ KEEP
   local repo lock lock_rc skipped=0
   # Declared once, outside the loop: zsh prints the value of an already-set local that is
   # declared again.
-  local active lease landed idle classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes
+  local active lease landed idle classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes task_done wt_idle_hours
   # Said once, because the absence is otherwise silent: every squash-merged worktree just
   # reads KEEP(unlanded). That is how the scheduled sweep went without landed=pr for weeks.
   if [ "$trim" -eq 0 ] && ! command -v gh >/dev/null 2>&1; then
@@ -2852,6 +2896,13 @@ KEEP
       active_detail="-"
       lease="n/a"
       lease_detail="-"
+      # An accepted task (`_cc_wj_done`) is judged without its recent-session lease and
+      # without the idle window; every other gate below, and every recheck before a
+      # removal, still decides. Not asked in a trim pass, which judges nothing for removal.
+      task_done="no"
+      [ "$trim" -eq 0 ] && [ "$dirty" = "0" ] && task_done="$(_cc_wj_done "$wt_path")"
+      wt_idle_hours="$idle_hours"
+      [ "$task_done" = yes ] && wt_idle_hours=0
       # A dirty or unreadable git state already keeps the worktree. Do not spend seconds
       # rereading large harness transcripts to prove an additional keep reason that cannot
       # change the outcome. Clean candidates still take every holder/session veto below.
@@ -2867,7 +2918,10 @@ KEEP
         else
           # A direct recent cwd lease is an in-memory lookup and already vetoes removal.
           # Ask it before parsing every live transcript for structured tool paths.
-          _cc_wj_recent_claim "$wt_path" "$session_grace_hours" cwd; recent_rc=$?
+          recent_rc=1
+          if [ "$task_done" != yes ]; then
+            _cc_wj_recent_claim "$wt_path" "$session_grace_hours" cwd; recent_rc=$?
+          fi
           case "$recent_rc" in
             0) lease="yes"; lease_detail="$_CC_WJ_RECENT_REASON" ;;
             2) active="yes"; active_detail="$_CC_WJ_ACTIVE_ERROR"; ACTIVE_OK="no"; activity_blind=1 ;;
@@ -2875,7 +2929,7 @@ KEEP
           if [ "$active" = "no" ] && [ "$lease" = "no" ]; then
             # Direct cwd claims are an in-memory lookup. Structured transcript matching
             # is deferred until the other gates prove this worktree could be removed.
-            _cc_wj_active_claim "$wt_path" cwd; active_rc=$?
+            _cc_wj_live_claim "$task_done" "$wt_path" cwd; active_rc=$?
             case "$active_rc" in
               0) active="yes"; active_detail="$_CC_WJ_ACTIVE_REASON" ;;
               2) active="yes"; active_detail="$_CC_WJ_ACTIVE_ERROR"; ACTIVE_OK="no"; activity_blind=1 ;;
@@ -2937,7 +2991,7 @@ KEEP
       if [ "$dirty" = "0" ] && [ "$active" = "no" ] && [ "$lease" = "no" ]; then
         landed="$(_cc_wj_landed "$wt_path")"
         case "$landed" in
-          ancestor|content|pr) idle="$(_cc_wj_idle "$wt_path" "$idle_hours")" ;;
+          ancestor|content|pr) idle="$(_cc_wj_idle "$wt_path" "$wt_idle_hours")" ;;
           unfetched) ;;
           *)
             # The abandoned question, asked in cost order: the tree walk before the network
@@ -2985,13 +3039,13 @@ KEEP
          { [ "$landed" = ancestor ] || [ "$landed" = content ] || [ "$landed" = pr ] ||
            [ "$abandoned" = "yes" ]; } &&
          [ "$idle" = "yes" ]; then
-        _cc_wj_active_claim "$wt_path" tool; active_rc=$?
+        _cc_wj_live_claim "$task_done" "$wt_path" tool; active_rc=$?
         case "$active_rc" in
           0) active="yes"; active_detail="$_CC_WJ_ACTIVE_REASON" ;;
           2) active="yes"; active_detail="$_CC_WJ_ACTIVE_ERROR"; ACTIVE_OK="no"; activity_blind=1 ;;
           3) lease="yes"; lease_detail="$_CC_WJ_RECENT_REASON" ;;
         esac
-        if [ "$active" = "no" ] && [ "$lease" = "no" ]; then
+        if [ "$active" = "no" ] && [ "$lease" = "no" ] && [ "$task_done" != yes ]; then
           _cc_wj_recent_claim "$wt_path" "$session_grace_hours" tool; recent_rc=$?
           case "$recent_rc" in
             0) lease="yes"; lease_detail="$_CC_WJ_RECENT_REASON" ;;
@@ -3008,6 +3062,7 @@ KEEP
       printf "    classification: %s\n" "$classification"
       [ "$active_detail" = "-" ] || printf "    active claim: %s\n" "$active_detail"
       [ "$lease_detail" = "-" ] || printf "    session lease: %s\n" "$lease_detail"
+      [ "$task_done" != yes ] || printf "    done: claude-task-done at HEAD %s\n" "${head0:0:12}"
       if [ "$dirty" != "0" ] && [ "${pins:--}" != "-" ]; then
         printf "    kept by: %s\n" "$pins"
         case "$pins" in
@@ -3037,7 +3092,13 @@ KEEP
               total_kept=$((total_kept + 1))
               continue
             fi
-            _cc_wj_active_claim "$wt_path"; active_rc=$?
+            # The annotation waives two of the questions below, so it has to hold now too.
+            # Read again, it can only withdraw a waiver the inventory granted.
+            if [ "$task_done" = yes ]; then
+              task_done="$(_cc_wj_done "$wt_path")"
+              [ "$task_done" = yes ] || wt_idle_hours="$idle_hours"
+            fi
+            _cc_wj_live_claim "$task_done" "$wt_path"; active_rc=$?
             case "$active_rc" in
               0)
                 printf "    → kept: %s; claim appeared before removal\n" "$_CC_WJ_ACTIVE_REASON"
@@ -3051,7 +3112,10 @@ KEEP
                 continue
                 ;;
             esac
-            _cc_wj_recent_claim "$wt_path" "$session_grace_hours"; recent_rc=$?
+            recent_rc=1
+            if [ "$task_done" != yes ]; then
+              _cc_wj_recent_claim "$wt_path" "$session_grace_hours"; recent_rc=$?
+            fi
             case "$recent_rc" in
               0)
                 printf "    → kept: %s; recent-session lease appeared before removal\n" "$_CC_WJ_RECENT_REASON"
@@ -3076,7 +3140,7 @@ KEEP
             fi
             if _cc_wj_held "$work" "$wt_path" ||
                [ "$(_cc_wj_undiscounted_count "$wt_path")" != "0" ] ||
-               [ "$(_cc_wj_idle "$wt_path" "$idle_hours")" != "yes" ] ||
+               [ "$(_cc_wj_idle "$wt_path" "$wt_idle_hours")" != "yes" ] ||
                [ -z "$head0" ] ||
                [ "$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)" != "$head0" ] ||
                [ -n "$(_cc_wj_git_keep "$wt_path")" ]; then

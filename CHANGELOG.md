@@ -55,6 +55,15 @@
 - **`.worktree-regenerable`** - a repository declares its own runtime byproducts, read from the fetched base (never the worktree), with patterns that name no path dropped and reported, and credential-shaped files inside declared directories or caches still keeping the worktree. The report names what keeps each one.
 
 ### Added
+- **An accepted task's worktree is reclaimed without the idle and session windows.** A dev
+  loop that knows a task was accepted and is live writes `claude-task-done` into the
+  worktree's git dir, beside `claude-task-worktree`; only its `head=` line is read. When the
+  tree is clean and the file holds exactly one well-formed `head=` naming the current HEAD, on
+  a branch, the sweep does not ask for the recent-session lease and uses an idle window of 0
+  hours, and the report prints `done: claude-task-done at HEAD <sha>`. Holders, live claims
+  (including one read after a lease answer), contents, landing, git state and the rechecks
+  before removal still decide, and the annotation is read again before removal. A stale,
+  malformed or detached annotation is ignored. The branch is kept.
 - **`disk-janitor --check` says which path grew.** A fall in disk free named no path, so
   every incident began with a manual `du` hunt. The hourly check now runs `growth-watch.py`
   over the targets in `~/.cc-reaper/growth-targets.tsv` (label, path, owner, optional alert
