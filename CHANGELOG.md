@@ -64,7 +64,8 @@
   copies the file into a new directory under `CC_WJ_ARCHIVE_DIR` (default
   `~/.cc-reaper/archive`), compares the copy byte for byte, and records it in `index.tsv`.
   Any failure keeps the worktree. The list comes from the same fresh read as the recheck
-  before the removal. An older janitor drops the line as a pattern that names no path.
+  before the removal. `archive:` is asked before a plain declaration, and a directory a plain
+  line discounts whole keeps its worktree while an `archive:` pattern may name a path inside it. An older janitor drops the line as a pattern that names no path.
 - **An accepted task's worktree is reclaimed without the idle and session windows.** A dev
   loop that knows a task was accepted and is live writes `claude-task-done` into the
   worktree's git dir, beside `claude-task-worktree`; only its `head=` line is read. When the

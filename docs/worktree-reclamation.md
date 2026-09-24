@@ -153,7 +153,10 @@ as the recheck, so a file written after the inventory is copied too. A dry run s
 It copies only a regular file that is not a symlink, is not credential-shaped, and is no
 larger than `CC_WJ_ARCHIVE_MAX_BYTES` (1 MiB), because the archive is for what a person wrote.
 A file that fails one of these keeps its worktree, and the report says which condition it
-failed. The janitor never deletes anything from the archive; that is yours to do. An older
+failed. An `archive:` line is asked before a plain one, so `*.log` beside `archive:keep.log` still
+copies `keep.log` out. A directory a plain line would discount whole (`logs`) keeps its worktree
+while an `archive:` pattern may name a path inside it (`logs/notes.md`, `*.md`), because the
+directory is never walked for them. The janitor never deletes anything from the archive; that is yours to do. An older
 janitor drops the line as a pattern that names no path, so the file goes on keeping its
 worktree.
 

@@ -1908,7 +1908,7 @@ mkdir -p "$A_ROOT"
 git init -q --bare "$A_ROOT/origin.git" -b main
 git clone -q "$A_ROOT/origin.git" "$A_PRIMARY" 2>/dev/null
 agit() { git -C "$A_PRIMARY" -c user.email=t@t -c user.name=t "$@"; }
-printf '.canary-window-plan\n*.plan\n*.key\n' > "$A_PRIMARY/.gitignore"
+printf '.canary-window-plan\n*.plan\n*.key\nnotes.md\n' > "$A_PRIMARY/.gitignore"
 # A tracked file in sub/, or git collapses it to `!! sub/` and no name inside is seen.
 mkdir -p "$A_PRIMARY/sub"; echo s > "$A_PRIMARY/sub/README"
 printf '# kept as a copy\narchive: /.canary-window-plan\narchive:*.plan\narchive:*.key\narchive:*\n' \
@@ -1921,6 +1921,8 @@ printf 'nested\n' > "$A_PLAN/sub/x.plan"
 A_BIG=$(a_wt wt-big);   head -c 2048 /dev/zero > "$A_BIG/big.plan"
 A_KEY=$(a_wt wt-key);   echo k > "$A_KEY/deploy.key"
 A_LINK=$(a_wt wt-link); ln -s "$A_PLAN/.canary-window-plan" "$A_LINK/link.plan"
+# Named by nothing but `archive:*`, which names no path and must discount nothing.
+A_NOTES=$(a_wt wt-notes); echo n > "$A_NOTES/notes.md"
 
 # A_AT replaces the archive directory, A_MAX the size limit, A_STUBS goes ahead of the stubs.
 _wj_arc() {
@@ -1942,7 +1944,30 @@ expect_yes "nor is a symlink" \
   d_says "$OUT_A" wt-link "link.plan (declared archive:, but not a regular file)"
 expect_yes "an archive: pattern that names no path is dropped, and said so with its prefix" \
   file_has "$OUT_A" "name no path: archive:\\*"
+expect_yes "a file only a pattern naming no path would match keeps its worktree" \
+  d_says "$OUT_A" wt-notes "kept by: !! notes.md"
 expect_yes "a report copies nothing" test ! -e "$A_STORE"
+
+# The copy list is all that stands between a discounted record and its deletion, so a
+# record that cannot be listed keeps the worktree - and says so without stray noise.
+append_failure_pins() {
+  local out
+  out="$(_CC_WJ_ARCHIVED=.canary-window-plan _cc_wj_pins "$A_PLAN" "$A_ROOT/no-such-dir/list" 2>&1)"
+  printf '%s\n' "$out" |
+    grep -qF '!! .canary-window-plan (declared archive:, but it could not be listed for the copy)' &&
+    ! printf '%s\n' "$out" | grep -q 'No such file'
+}
+expect_yes "a record the copy list cannot hold keeps the worktree, quietly" append_failure_pins
+
+# Named after the repository itself, whatever spelling of its path the run was given.
+archive_dir_names_the_repo() {
+  printf '.canary-window-plan\n' > "$A_ROOT/unit-list"
+  CC_WJ_ARCHIVE_DIR="$A_ROOT/unit-store" \
+    _cc_wj_archive_files "$A_PRIMARY/." "$A_PLAN" "$A_ROOT/unit-list" >/dev/null 2>&1 || return 1
+  case "$_CC_WJ_ARCHIVE_DEST" in "$A_ROOT/unit-store/primary/wt-plan-"*) ;; *) return 1 ;; esac
+}
+expect_yes "the archive directory is the repository's name, not a spelling of its path" \
+  archive_dir_names_the_repo
 
 OUT_AMAX="$TMPDIR_ROOT/out-archive-max.txt"
 A_MAX=1MB _wj_arc > "$OUT_AMAX"
@@ -2015,6 +2040,40 @@ expect_yes "and its branch remains" agit show-ref --verify -q refs/heads/wt-plan
 expect_yes "the worktrees whose records could not be copied remain" \
   bash -c '[ -e "$1/big.plan" ] && [ -e "$2/deploy.key" ] && [ -L "$3/link.plan" ]' \
   _ "$A_BIG" "$A_KEY" "$A_LINK"
+
+# A plain line naming the same record must not delete it uncopied: archive: is asked first,
+# and a directory a plain line discounts whole is kept while an archive: pattern may reach
+# into it.
+O_ROOT="$TMPDIR_ROOT/archive-overlap"
+O_PRIMARY="$O_ROOT/primary"
+mkdir -p "$O_ROOT"
+git init -q --bare "$O_ROOT/origin.git" -b main
+git clone -q "$O_ROOT/origin.git" "$O_PRIMARY" 2>/dev/null
+ogit() { git -C "$O_PRIMARY" -c user.email=t@t -c user.name=t "$@"; }
+printf '*.log\nlogs/\n' > "$O_PRIMARY/.gitignore"
+printf '*.log\nlogs\narchive:keep.log\narchive:logs/notes.md\n' > "$O_PRIMARY/.worktree-regenerable"
+ogit add -A; ogit commit -qm base; ogit push -q origin main
+o_wt() { ogit worktree add -q -b "$1" "$O_ROOT/$1" origin/main 2>/dev/null; echo "$O_ROOT/$1"; }
+O_FILE=$(o_wt wt-ofile); echo keep > "$O_FILE/keep.log"; echo other > "$O_FILE/other.log"
+O_DIR=$(o_wt wt-odir); mkdir -p "$O_DIR/logs"; echo n > "$O_DIR/logs/notes.md"; : > "$O_DIR/logs/api.log"
+_wj_over() {
+  CC_WJ_ARCHIVE_DIR="$O_ROOT/store" PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$O_PRIMARY" "$@" 2>&1
+}
+OUT_O="$TMPDIR_ROOT/out-archive-overlap.txt"
+_wj_over > "$OUT_O"
+expect_yes "a record a plain line also names is copied, not deleted" \
+  d_says "$OUT_O" wt-ofile "archive on removal: keep.log"
+expect_yes "and what only the plain line names is still discounted without a copy" \
+  d_judged "$OUT_O" wt-ofile REMOVABLE no
+expect_yes "a declared directory an archive: pattern reaches into keeps the worktree" \
+  d_says "$OUT_O" wt-odir "logs/ (declared, but an archive: pattern may name a path inside it)"
+OUT_OA="$TMPDIR_ROOT/out-archive-overlap-apply.txt"
+_wj_over --apply > "$OUT_OA"
+O_DEST="$(find "$O_ROOT/store/primary" -mindepth 1 -maxdepth 1 -type d -name 'wt-ofile-*' 2>/dev/null)"
+expect_yes "--apply copies the overlapping record and nothing the plain line owns" \
+  bash -c '[ "$(cat "$1/keep.log")" = keep ] && [ ! -e "$1/other.log" ] && [ ! -e "$2" ]' \
+  _ "$O_DEST" "$O_FILE"
+expect_yes "and keeps the directory an archive: pattern reaches into" test -f "$O_DIR/logs/notes.md"
 
 # ─── Final result ─────────────────────────────────────────────────────────────
 

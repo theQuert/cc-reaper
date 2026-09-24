@@ -20,7 +20,8 @@ that day, is the toil the janitor exists to remove.
   declares anything regenerable.
 - **Which files the pattern discounts.** An ignored entry git lists as a file is not counted
   as unrebuildable content when all of these hold:
-  - it matches an `archive:` pattern and no plain declaration;
+  - it matches an `archive:` pattern (asked before any plain declaration, so a plain line
+    naming the same file cannot delete it uncopied);
   - it is a regular file, not a symlink;
   - it is not credential-shaped;
   - its name holds no tab or newline;
@@ -31,7 +32,7 @@ that day, is the toil the janitor exists to remove.
   file archivable.
 - **What `--apply` does with them.** After every recheck, and immediately before a removal,
   the janitor copies each such file into a new directory,
-  `<CC_WJ_ARCHIVE_DIR>/<repository name>/<worktree name>-<UTC time>/<relative path>`
+  `<CC_WJ_ARCHIVE_DIR>/<repository name>/<worktree name>-<UTC time>.<random>/<relative path>`
   (default `~/.cc-reaper/archive`). The list of files comes from the same fresh status read
   as the recheck. The janitor then compares every copy byte for byte with its source and
   appends a row to `<CC_WJ_ARCHIVE_DIR>/index.tsv`. Any failure keeps the worktree and says
@@ -39,7 +40,8 @@ that day, is the toil the janitor exists to remove.
 - **The report.** A REMOVABLE worktree holding such files prints
   `    archive on removal: <paths>`.
 - **Unchanged:**
-  - plain declarations, and directories: an `archive:` pattern discounts files only;
+  - plain declarations, except that a directory a plain line discounts whole is kept while an
+    `archive:` pattern may name a path inside it; an `archive:` pattern discounts files only;
   - the credential rules;
   - every gate and every recheck before a removal;
   - branches, which are never deleted;

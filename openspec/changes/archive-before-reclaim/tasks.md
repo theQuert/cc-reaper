@@ -19,7 +19,11 @@
   - skipping the byte comparison;
   - dropping the size limit;
   - dropping the credential check;
-  - removing the worktree after a failed copy.
+  - removing the worktree after a failed copy;
+  - applying an `archive:` pattern that names no path;
+  - dropping the pin when the copy list cannot be written;
+  - asking a plain declaration before `archive:`;
+  - discounting a declared directory an `archive:` pattern may reach into.
 
 ## 3. Verification and delivery
 
