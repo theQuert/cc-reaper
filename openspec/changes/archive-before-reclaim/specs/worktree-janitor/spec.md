@@ -19,7 +19,7 @@ A matching file that fails any of these SHALL keep the worktree, and the report 
 condition that failed. An ignored directory that a plain declaration would discount whole SHALL
 keep the worktree when the text of some `archive:` pattern before its first wildcard is empty,
 is a prefix of the directory's path followed by `/`, or begins with that path followed by `/`,
-and the report SHALL say so. A value of `CC_WJ_ARCHIVE_MAX_BYTES` that is not a decimal integer SHALL
+or when that cannot be determined, and the report SHALL say so. A value of `CC_WJ_ARCHIVE_MAX_BYTES` that is not a decimal integer SHALL
 make no file archivable.
 
 With `--apply`, after every recheck and immediately before removing a worktree, the janitor

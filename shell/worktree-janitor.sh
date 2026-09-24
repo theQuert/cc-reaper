@@ -1770,8 +1770,9 @@ _cc_wj_archivable() {
 }
 
 # A declared ignored directory: 0 disposable, 1 not declared, 2 declared but holding a
-# credential-shaped file, 3 declared but within reach of an archive: pattern. A build copies `.env` into its output at whatever depth it
-# likes, so a declared directory is searched to the bottom, package trees aside.
+# credential-shaped file, 3 declared but within reach of an archive: pattern. A build
+# copies `.env` into its output at whatever depth it likes, so a declared directory is
+# searched to the bottom, package trees aside.
 _cc_wj_declared_dir() {
   local wt="$1" d="$2"
   [ -n "$_CC_WJ_DECLARED" ] || return 1
@@ -1781,21 +1782,28 @@ _cc_wj_declared_dir() {
     _cc_wj_declared_contents "$wt" "$d" || return $?
   fi
   # 3: discounted whole, it would take an archive:-declared file inside it along uncopied.
-  # Asked of the patterns' text, not the tree, so the directory is never walked for it.
-  _cc_wj_archive_may_reach "$d" && return 3
+  # Only a clean "cannot reach" discounts it: a check that failed answered nothing.
+  _cc_wj_archive_may_reach "$d"
+  [ $? -eq 1 ] || return 3
   return 0
 }
 
-# Whether an archive: pattern could name a path inside directory $1: its text before the
-# first wildcard is empty, is a prefix of `$1/`, or starts with `$1/`. `*.md` and `logs*`
-# can reach into `logs/`; `.canary-window-plan` cannot.
+# Whether an archive: pattern could name a path inside directory $1: 0 yes, 1 no, anything
+# else unknown. Yes when its text before the first wildcard is empty, is a prefix of `$1/`,
+# or starts with `$1/`: `*.md` and `logs*` can reach into `logs/`; `.canary-window-plan`
+# cannot.
+# ponytail: judged from the patterns' text, so `archive:logs/notes.md` keeps every worktree
+# with a declared `logs/`, and `archive:*.plan` every one with a declared ignored directory;
+# walk the directory, bounded as `_cc_wj_declared_contents` is, if that keeps too much.
 _cc_wj_archive_may_reach() {
   [ -n "$_CC_WJ_ARCHIVED" ] || return 1
-  # `p == ""` spelled out: index() of an empty string is 1 in BSD awk and 0 in gawk.
-  printf '%s\n' "$_CC_WJ_ARCHIVED" | awk -v d="$1/" 'NF {
+  # The directory goes in through the environment: `-v` expands its escapes, and BSD awk
+  # refuses a newline in it outright. `p == ""` spelled out: index() of an empty string is
+  # 1 in BSD awk and 0 in gawk.
+  printf '%s\n' "$_CC_WJ_ARCHIVED" | D="$1/" awk 'NF {
       p = $0; i = match(p, /[*?]/); if (i) p = substr(p, 1, i - 1)
-      if (p == "" || index(d, p) == 1 || index(p, d) == 1) f = 1
-    } END { exit !f }'
+      if (p == "" || index(ENVIRON["D"], p) == 1 || index(p, ENVIRON["D"]) == 1) f = 1
+    } END { exit !f }' 2>/dev/null
 }
 
 # git collapses a wholly ignored directory to one `!! dir/` entry, so a declaration naming

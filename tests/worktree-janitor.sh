@@ -2075,6 +2075,44 @@ expect_yes "--apply copies the overlapping record and nothing the plain line own
   _ "$O_DEST" "$O_FILE"
 expect_yes "and keeps the directory an archive: pattern reaches into" test -f "$O_DIR/logs/notes.md"
 
+# The reach check fails closed. A declared directory whose name awk cannot take (a newline)
+# and one discounted file by file rather than whole are both kept while an archive: pattern
+# may name a path inside them.
+RCH_ROOT="$TMPDIR_ROOT/archive-reach"
+RCH_PRIMARY="$RCH_ROOT/primary"
+mkdir -p "$RCH_ROOT"
+git init -q --bare "$RCH_ROOT/origin.git" -b main
+git clone -q "$RCH_ROOT/origin.git" "$RCH_PRIMARY" 2>/dev/null
+rchgit() { git -C "$RCH_PRIMARY" -c user.email=t@t -c user.name=t "$@"; }
+printf 'nl*\nnotes/\n' > "$RCH_PRIMARY/.gitignore"
+printf 'nl*\nnotes/*.md\narchive:*.md\n' > "$RCH_PRIMARY/.worktree-regenerable"
+rchgit add -A; rchgit commit -qm base; rchgit push -q origin main
+rch_wt() { rchgit worktree add -q -b "$1" "$RCH_ROOT/$1" origin/main 2>/dev/null; echo "$RCH_ROOT/$1"; }
+RCH_NL=$(rch_wt wt-newline)
+mkdir -p "$RCH_NL/nl"$'\n'"x"; echo n > "$RCH_NL/nl"$'\n'"x/n.md"
+RCH_EACH=$(rch_wt wt-each); mkdir -p "$RCH_EACH/notes"; echo a > "$RCH_EACH/notes/a.md"
+OUT_RCH="$TMPDIR_ROOT/out-archive-reach.txt"
+CC_WJ_ARCHIVE_DIR="$RCH_ROOT/store" PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$RCH_PRIMARY" > "$OUT_RCH" 2>&1
+expect_yes "a declared directory whose name awk cannot take is kept, not discounted" \
+  d_says "$OUT_RCH" wt-newline "nl?x/ (declared, but an archive: pattern may name a path inside it)"
+expect_no "and the check writes nothing to stderr" file_has "$OUT_RCH" "newline in string"
+expect_yes "a directory discounted file by file is kept while an archive: pattern may reach in" \
+  d_says "$OUT_RCH" wt-each "notes/ (declared, but an archive: pattern may name a path inside it)"
+# And a reach check that fails, for whatever reason, answers nothing: the directory stays.
+RCH_STUBS="$RCH_ROOT/stubs-awk"
+mkdir -p "$RCH_STUBS"
+cat > "$RCH_STUBS/awk" <<STUB
+#!/usr/bin/env bash
+case "\$*" in *'ENVIRON["D"]'*) exit 2 ;; esac
+exec "$(command -v awk)" "\$@"
+STUB
+chmod +x "$RCH_STUBS/awk"
+OUT_RCH_FAIL="$TMPDIR_ROOT/out-archive-reach-fail.txt"
+CC_WJ_ARCHIVE_DIR="$RCH_ROOT/store" PATH="$RCH_STUBS:$STUBS_IDLE:$PATH" \
+  bash "$WJ" --repo "$RCH_PRIMARY" > "$OUT_RCH_FAIL" 2>&1
+expect_yes "a reach check that fails keeps the directory" \
+  d_says "$OUT_RCH_FAIL" wt-each "notes/ (declared, but an archive: pattern may name a path inside it)"
+
 # ─── Final result ─────────────────────────────────────────────────────────────
 
 if [ "$failures" -gt 0 ]; then
