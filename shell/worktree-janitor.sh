@@ -68,8 +68,12 @@ Environment:
   CC_WJ_CODEX_STATE_DB   Codex local state database (default: ~/.codex/state_5.sqlite)
   CC_WJ_TOOL_DIRS        Directories appended to PATH when executed, for `gh` under launchd
                          (default: /opt/homebrew/bin:/usr/local/bin:~/.local/bin; empty: none)
+  CC_WJ_ARCHIVE_DIR      Where --apply copies archive:-declared files before a removal
+                         (default: ~/.cc-reaper/archive)
+  CC_WJ_ARCHIVE_MAX_BYTES Largest file an archive: declaration lets leave (default: 1048576)
 
-A worktree is removable only when it holds nothing a command cannot rebuild, no process
+A worktree is removable only when it holds nothing a command cannot rebuild - or that an
+archive: line in .worktree-regenerable lets --apply copy out first - no process
 has it as a working directory or holds a file in it, its work has landed on the fetched
 base branch, and nothing in it changed within CC_WJ_IDLE_HOURS. Branches are never deleted.
 A clean worktree whose claude-task-done annotation names its HEAD, on a branch, is judged
@@ -1705,34 +1709,101 @@ _cc_wj_find_credential() {
 # on the way to having it deleted.
 _CC_WJ_DECLARED=""
 
-# Whether repository-relative path $1 is declared. Unquoted patterns on purpose - they
-# are globs, and `$pat/*` lets a declared directory cover what is inside it. zsh does not
-# treat an expanded parameter as a pattern unless told to.
-_cc_wj_declared() {
-  local p="$1" pat
-  [ -n "$_CC_WJ_DECLARED" ] || return 1
+# Patterns from `archive:<pattern>` lines, set alongside. They name records a person wrote -
+# stima-api's `.canary-window-plan` kept 14 landed worktrees on 2026-09-24 - that nothing
+# rebuilds but that a copy preserves: such a file leaves with its worktree once the removal
+# has copied it out.
+_CC_WJ_ARCHIVED=""
+
+# Whether repository-relative path $2 matches a pattern in newline-separated list $1.
+# Unquoted patterns on purpose - they are globs, and `$pat/*` lets a declared directory
+# cover what is inside it. zsh does not treat an expanded parameter as a pattern unless
+# told to.
+_cc_wj_matches() {
+  local list="$1" p="$2" pat
+  [ -n "$list" ] || return 1
   [ -n "${ZSH_VERSION:-}" ] && setopt local_options glob_subst
   while IFS= read -r pat; do
     [ -n "$pat" ] || continue
     # shellcheck disable=SC2254
     case "$p" in $pat|$pat/*) return 0 ;; esac
   done <<DECL
-$_CC_WJ_DECLARED
+$list
 DECL
   return 1
 }
 
+# Whether repository-relative path $1 is declared regenerable.
+_cc_wj_declared() { _cc_wj_matches "$_CC_WJ_DECLARED" "$1"; }
+
+# Whether ignored file $2 in worktree $1 may leave with the worktree once copied out: 0 yes,
+# 1 no archive: pattern names it, 2 one does but it is not copied (why in
+# _CC_WJ_ARCHIVE_WHY). A regular file only; never a credential, since the archive would be
+# a second home for it; never a name the line-oriented copy list would split; and never
+# past CC_WJ_ARCHIVE_MAX_BYTES, because the archive is for what a person wrote, and a
+# database copied out reclaims nothing.
+_cc_wj_archivable() {
+  local wt="$1" rel="$2" max="${CC_WJ_ARCHIVE_MAX_BYTES:-1048576}" size=""
+  _CC_WJ_ARCHIVE_WHY=""
+  _cc_wj_matches "$_CC_WJ_ARCHIVED" "$rel" || return 1
+  if [ -L "$wt/$rel" ] || [ ! -f "$wt/$rel" ]; then
+    _CC_WJ_ARCHIVE_WHY="not a regular file"
+  elif _cc_wj_sensitive_name "${rel##*/}"; then
+    _CC_WJ_ARCHIVE_WHY="credential-shaped"
+  else
+    case "$rel" in
+      *$'\t'*|*$'\n'*) _CC_WJ_ARCHIVE_WHY="its name holds a tab or newline" ;;
+      *)
+        case "$max" in
+          ''|*[!0-9]*) _CC_WJ_ARCHIVE_WHY="CC_WJ_ARCHIVE_MAX_BYTES is not a number" ;;
+          *)
+            size="$(wc -c < "$wt/$rel" 2>/dev/null)" || size=""
+            size="${size//[[:space:]]/}"
+            case "$size" in
+              ''|*[!0-9]*) _CC_WJ_ARCHIVE_WHY="its size could not be read" ;;
+              *) [ "$size" -le "$max" ] || _CC_WJ_ARCHIVE_WHY="larger than $max bytes" ;;
+            esac ;;
+        esac ;;
+    esac
+  fi
+  [ -z "$_CC_WJ_ARCHIVE_WHY" ] || return 2
+}
+
 # A declared ignored directory: 0 disposable, 1 not declared, 2 declared but holding a
-# credential-shaped file. A build copies `.env` into its output at whatever depth it
-# likes, so a declared directory is searched to the bottom, package trees aside.
+# credential-shaped file, 3 declared but within reach of an archive: pattern. A build
+# copies `.env` into its output at whatever depth it likes, so a declared directory is
+# searched to the bottom, package trees aside.
 _cc_wj_declared_dir() {
   local wt="$1" d="$2"
   [ -n "$_CC_WJ_DECLARED" ] || return 1
   if _cc_wj_declared "$d"; then
     _cc_wj_find_credential "$wt/$d" && return 2
-    return 0
+  else
+    _cc_wj_declared_contents "$wt" "$d" || return $?
   fi
-  _cc_wj_declared_contents "$wt" "$d"
+  # 3: discounted whole, it would take an archive:-declared file inside it along uncopied.
+  # Only a clean "cannot reach" discounts it: a check that failed answered nothing.
+  _cc_wj_archive_may_reach "$d"
+  [ $? -eq 1 ] || return 3
+  return 0
+}
+
+# Whether an archive: pattern could name a path inside directory $1: 0 yes, 1 no, anything
+# else unknown. Yes when its text before the first wildcard is empty, is a prefix of `$1/`,
+# or starts with `$1/`: `*.md` and `logs*` can reach into `logs/`; `.canary-window-plan`
+# cannot.
+# ponytail: judged from the patterns' text, so `archive:logs/notes.md` keeps every worktree
+# with a declared `logs/`, and `archive:*.plan` every one with a declared ignored directory;
+# walk the directory, bounded as `_cc_wj_declared_contents` is, if that keeps too much.
+_cc_wj_archive_may_reach() {
+  [ -n "$_CC_WJ_ARCHIVED" ] || return 1
+  # The directory goes in through the environment: `-v` expands its escapes, and BSD awk
+  # refuses a newline in it outright. `p == ""` spelled out: index() of an empty string is
+  # 1 in BSD awk and 0 in gawk.
+  printf '%s\n' "$_CC_WJ_ARCHIVED" | D="$1/" awk 'NF {
+      p = $0; i = match(p, /[*?]/); if (i) p = substr(p, 1, i - 1)
+      if (p == "" || index(ENVIRON["D"], p) == 1 || index(p, ENVIRON["D"]) == 1) f = 1
+    } END { exit !f }' 2>/dev/null
 }
 
 # git collapses a wholly ignored directory to one `!! dir/` entry, so a declaration naming
@@ -1795,8 +1866,11 @@ _cc_wj_pin() {
 # would strip the NULs `-z` produces. The file also keeps git's exit status apart from
 # the loop's. Nothing here is named `status` or `path`: both are reserved in zsh, and
 # this file is sourceable.
+#
+# With $2, each archivable file this read discounts is appended to that file, one path per
+# line, so a removal copies out exactly what the read that cleared it saw.
 _cc_wj_pins() {
-  local wt="$1" sf rec code rest base skip_next=0 drc status_timeout status_rc=0
+  local wt="$1" archive_to="${2:-}" sf rec code rest base skip_next=0 drc arc status_timeout status_rc=0
   status_timeout="$(_cc_wj_git_status_timeout_seconds)" || {
     _cc_wj_pin '??' "(invalid git status timeout)"; return 1; }
   sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-status.XXXXXX")" || {
@@ -1844,6 +1918,7 @@ _cc_wj_pins() {
         case "$drc" in
           0) ;;
           2) _cc_wj_pin '!!' "$rest/ (declared, but holds a credential-shaped file)" ;;
+          3) _cc_wj_pin '!!' "$rest/ (declared, but an archive: pattern may name a path inside it)" ;;
           *) _cc_wj_pin '!!' "$rest/" ;;
         esac
         ;;
@@ -1855,6 +1930,19 @@ _cc_wj_pins() {
           case " $CC_WJ_REGENERABLE " in *" $base "*) continue ;; esac
         fi
         case " $CC_WJ_REGENERABLE_FILES " in *" $base "*) continue ;; esac
+        # archive: first: a plain line naming the same file would delete it uncopied.
+        arc=0
+        _cc_wj_archivable "$wt" "$rest" || arc=$?
+        case "$arc" in
+          0)
+            # Unlisted, it would be removed without a copy.
+            [ -z "$archive_to" ] || { printf '%s\n' "$rest" >> "$archive_to"; } 2>/dev/null ||
+              _cc_wj_pin '!!' "$rest (declared archive:, but it could not be listed for the copy)"
+            continue ;;
+          2)
+            _cc_wj_pin '!!' "$rest (declared archive:, but $_CC_WJ_ARCHIVE_WHY)"
+            continue ;;
+        esac
         if _cc_wj_declared "$rest" && ! _cc_wj_sensitive_name "$base"; then
           continue
         fi
@@ -1866,10 +1954,11 @@ _cc_wj_pins() {
   return 0
 }
 
-# Count the entries a removal would destroy that nothing is known to rebuild.
+# Count the entries a removal would destroy that nothing is known to rebuild. $2 as for
+# `_cc_wj_pins`.
 _cc_wj_undiscounted_count() {
   local out
-  out="$(_cc_wj_pins "$1")"
+  out="$(_cc_wj_pins "$1" "${2:-}")"
   if [ -z "$out" ]; then
     echo 0
   else
@@ -2016,8 +2105,8 @@ _CC_WJ_BASE_WHY=""
 # `main` is never made: in a repository whose trunk is not main nothing would be an
 # ancestor, and the run would report normally while reclaiming nothing.
 _cc_wj_prepare_base() {
-  local repo="$1" base="${CC_WJ_BASE_BRANCH:-}" all dropped fetch_timeout fetch_rc=0
-  _CC_WJ_BASE=""; _CC_WJ_BASE_OK=0; _CC_WJ_BASE_WHY=""; _CC_WJ_DECLARED=""
+  local repo="$1" base="${CC_WJ_BASE_BRANCH:-}" all plain archived dropped fetch_timeout fetch_rc=0
+  _CC_WJ_BASE=""; _CC_WJ_BASE_OK=0; _CC_WJ_BASE_WHY=""; _CC_WJ_DECLARED=""; _CC_WJ_ARCHIVED=""
   if ! git -C "$repo" config --get remote.origin.url >/dev/null 2>&1; then
     _CC_WJ_BASE_WHY="it has no origin remote"
     return 1
@@ -2055,10 +2144,11 @@ _cc_wj_prepare_base() {
   # A leading or trailing `/` is dropped, so `/logs/` means `logs`. `#` starts a comment at
   # the start of a line and after whitespace, so `logs  # runtime` does not declare a path
   # nobody has. These are shell globs, not .gitignore patterns: `*` matches across `/`.
+  # `archive: /x` means `archive:x`.
   all="$(git -C "$repo" show "refs/remotes/origin/${base}:.worktree-regenerable" 2>/dev/null |
          sed -e 's/^[[:space:]]*#.*//' -e 's/[[:space:]][[:space:]]*#.*$//' \
              -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-             -e 's#^/*##' -e 's#/*$##')"
+             -e 's#^/*##' -e 's#/*$##' -e 's#^archive:[[:space:]/]*#archive:#')"
   # A negation cannot be honoured - a case glob has no "except" - and dropping just that
   # line would widen what the rest of the file discounts: `logs` then `!logs/keep.md`
   # still deletes the file its author protected. So the whole file is set aside.
@@ -2066,8 +2156,13 @@ _cc_wj_prepare_base() {
     echo "worktree-janitor: $repo: .worktree-regenerable on origin/$base uses a negation (!), which is not supported; none of it was applied"
     return 0
   fi
-  _CC_WJ_DECLARED="$(printf '%s\n' "$all" | _cc_wj_names_a_path 1)"
-  dropped="$(printf '%s\n' "$all" | _cc_wj_names_a_path 0 | tr '\n' ' ')"
+  plain="$(printf '%s\n' "$all" | awk '!/^archive:/')"
+  archived="$(printf '%s\n' "$all" | awk 'sub(/^archive:/, "")')"
+  _CC_WJ_DECLARED="$(printf '%s\n' "$plain" | _cc_wj_names_a_path 1)"
+  _CC_WJ_ARCHIVED="$(printf '%s\n' "$archived" | _cc_wj_names_a_path 1)"
+  dropped="$( { printf '%s\n' "$plain" | _cc_wj_names_a_path 0
+               printf '%s\n' "$archived" | _cc_wj_names_a_path 0 | sed 's/^/archive:/'; } |
+             tr '\n' ' ')"
   [ -n "$dropped" ] &&
     echo "worktree-janitor: $repo: ignoring .worktree-regenerable pattern(s) on origin/$base that name no path: $dropped"
   return 0
@@ -2503,6 +2598,33 @@ _cc_wj_remove_worktree() {
 
   _cc_wj_log_write "FAILED to remove (git refused): $wt_path"
   return 1
+}
+
+# Copy the files listed in $3 - worktree-relative, one per line - out of worktree $2 of
+# repository $1 into a directory made for this removal, and compare every copy with its
+# source. Sets _CC_WJ_ARCHIVE_DEST. Any failure answers 1 and the worktree stays: the copy
+# is all that stands between those files and the removal. Nothing in the archive is ever
+# deleted here, a partial copy included.
+_cc_wj_archive_files() {
+  local repo wt="$2" list="$3" root dest f
+  # Resolved, so `--repo ..` or `--repo .` names the repository, not a path outside the root.
+  repo="$(cd "$1" 2>/dev/null && pwd -P)"; repo="${repo##*/}"
+  root="${CC_WJ_ARCHIVE_DIR:-$HOME/.cc-reaper/archive}"
+  _CC_WJ_ARCHIVE_DEST="$root/${repo:-repository}"
+  mkdir -p "$_CC_WJ_ARCHIVE_DEST" 2>/dev/null || return 1
+  # mktemp, because two worktrees of one repository can share a name and a second.
+  dest="$(mktemp -d "$_CC_WJ_ARCHIVE_DEST/${wt##*/}-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX" 2>/dev/null)" ||
+    return 1
+  _CC_WJ_ARCHIVE_DEST="$dest"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    mkdir -p "$(dirname "$dest/$f")" 2>/dev/null &&
+      cp -p "$wt/$f" "$dest/$f" 2>/dev/null &&
+      cmp -s "$wt/$f" "$dest/$f" || return 1
+  done < "$list"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$wt" \
+    "$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || echo '(detached)')" \
+    "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" "$dest" >> "$root/index.tsv" 2>/dev/null
 }
 
 # ─── Sweep lock ───────────────────────────────────────────────────────────────
@@ -3063,6 +3185,12 @@ KEEP
       [ "$active_detail" = "-" ] || printf "    active claim: %s\n" "$active_detail"
       [ "$lease_detail" = "-" ] || printf "    session lease: %s\n" "$lease_detail"
       [ "$task_done" != yes ] || printf "    done: claude-task-done at HEAD %s\n" "${head0:0:12}"
+      if [ "$classification" = REMOVABLE ] && [ -n "$_CC_WJ_ARCHIVED" ]; then
+        : > "$work/archive-list"
+        _cc_wj_undiscounted_count "$wt_path" "$work/archive-list" >/dev/null
+        [ ! -s "$work/archive-list" ] || printf "    archive on removal: %s\n" \
+          "$(awk '{ printf "%s%s", (NR > 1 ? "; " : ""), $0 }' "$work/archive-list")"
+      fi
       if [ "$dirty" != "0" ] && [ "${pins:--}" != "-" ]; then
         printf "    kept by: %s\n" "$pins"
         case "$pins" in
@@ -3138,8 +3266,10 @@ KEEP
               total_kept=$((total_kept + 1))
               continue
             fi
+            # The same read lists what the removal must copy out first.
+            : > "$work/archive-list"
             if _cc_wj_held "$work" "$wt_path" ||
-               [ "$(_cc_wj_undiscounted_count "$wt_path")" != "0" ] ||
+               [ "$(_cc_wj_undiscounted_count "$wt_path" "$work/archive-list")" != "0" ] ||
                [ "$(_cc_wj_idle "$wt_path" "$wt_idle_hours")" != "yes" ] ||
                [ -z "$head0" ] ||
                [ "$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)" != "$head0" ] ||
@@ -3148,9 +3278,19 @@ KEEP
               total_kept=$((total_kept + 1))
               continue
             fi
-            # Measure disk usage before removal
+            # Measure disk usage before removal, and before any copy: nothing slow may sit
+            # between a verified copy and the removal.
             bytes=0
             bytes=$(du -sk "$wt_path" 2>/dev/null | awk '{print $1 * 1024}') || bytes=0
+            if [ -s "$work/archive-list" ]; then
+              if ! _cc_wj_archive_files "$repo" "$wt_path" "$work/archive-list"; then
+                printf "    → kept: archiving its archive: files to %s failed\n" "$_CC_WJ_ARCHIVE_DEST"
+                total_kept=$((total_kept + 1))
+                continue
+              fi
+              printf "    → archived %s file(s) to %s\n" \
+                "$(wc -l < "$work/archive-list" | tr -d ' ')" "$_CC_WJ_ARCHIVE_DEST"
+            fi
             if _cc_wj_remove_worktree "$repo" "$wt_path"; then
               total_removed=$((total_removed + 1))
               total_reclaimed=$((total_reclaimed + bytes))
