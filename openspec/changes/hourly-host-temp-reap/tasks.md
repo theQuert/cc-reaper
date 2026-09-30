@@ -6,5 +6,7 @@
 
 ## 2. Verification and delivery
 
-- [ ] 2.1 Full shell suite, `bash -n`, `zsh -n`, `openspec validate --all --strict`, and my own review of the exact head.
+- [x] 2.1 Full shell suite, `bash -n`, `zsh -n`, `openspec validate --all --strict`, and my own review of the exact head.
+  Every `tests/*.sh` and `tests/*.py` passed; `tests/disk-janitor.sh` 136 ok; 8 reclaimer tests
+  with 14 mutants caught and 5 wiring mutants caught; strict validate 10/10.
 - [ ] 2.2 Deploy by rename with a rollback manifest; confirm the next hourly check logs the host temp step and the daily builder prune.
