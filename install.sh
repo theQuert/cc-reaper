@@ -456,6 +456,7 @@ for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cle
 done
 _cc_deploy "$SCRIPT_DIR/shell/chrome-clone-janitor.py" "$REAPER_DIR/chrome-clone-janitor.py"
 _cc_deploy "$SCRIPT_DIR/shell/growth-watch.py" "$REAPER_DIR/growth-watch.py"
+_cc_deploy "$SCRIPT_DIR/shell/host-temp-reaper.py" "$REAPER_DIR/host-temp-reaper.py"
 for SCRIPT in worktree-session-end stop-cleanup-orphans; do
   _cc_deploy "$SCRIPT_DIR/hooks/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
 done

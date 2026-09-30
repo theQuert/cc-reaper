@@ -263,8 +263,8 @@ expect_yes "check below threshold: osascript called" \
 expect_no "check below threshold: tmutil deletelocalsnapshots NOT called" \
   test -s "$TM_DELETE_CAPTURE"
 
-expect_no "check below threshold: docker NOT called" \
-  test -s "$DOCKER_CAPTURE"
+expect_no "check below threshold: docker gets only the reachability probe and the daily builder prune" \
+  grep -vqxE 'info|builder prune --force --filter until=24h' "$DOCKER_CAPTURE"
 
 expect_no "check below threshold: go NOT called" \
   test -s "$GO_CAPTURE"
@@ -340,6 +340,40 @@ expect_yes "growth: a missing script is a SKIP" \
   grep -q "SKIP growth watch (script or python3 not found)" "$SANDBOX/dj.log"
 unset CC_DJ_GROWTH_SCRIPT FAKE_GROWTH_LINES
 rm -f "$SANDBOX/state/cooldown-growth"
+
+printf "\n# Test group 3c: --check host temp reclaim, clone age, daily builder prune\n"
+# The reclaimer's own safety rules are tests/host-temp-reaper.py. Here only the contract with
+# --check: it runs in clean mode with the idle limit, a kill switch stops it, clones use the
+# one-day age, and the builder prune runs at most once a day and can be turned off.
+FAKE_HOST_TEMP="$SANDBOX/fake-host-temp.py"
+FAKE_CLONES="$SANDBOX/fake-clones.py"
+printf 'import sys\nprint("host temp args: " + " ".join(sys.argv[1:]))\n' > "$FAKE_HOST_TEMP"
+printf 'import sys\nprint("clone args: " + " ".join(sys.argv[1:]))\n' > "$FAKE_CLONES"
+export CC_DJ_HOST_TEMP_SCRIPT="$FAKE_HOST_TEMP" CC_DJ_CHROME_CLONE_SCRIPT="$FAKE_CLONES"
+_reset_captures
+rm -f "$SANDBOX/state/builder-prune-daily.stamp"
+_run_dj --check 80 0
+expect_yes "host temp: --check runs the reclaimer in clean mode with the 60-minute idle limit" \
+  grep -q "host temp args: clean --idle-minutes 60" "$SANDBOX/dj.log"
+expect_yes "clones: --check removes clones, at the one-day minimum age" \
+  grep -q "clone args: clean --min-age-days 1" "$SANDBOX/dj.log"
+expect_yes "builder: the first --check of a day prunes cache unused for 24h, once" \
+  test "$(grep -cx 'builder prune --force --filter until=24h' "$DOCKER_CAPTURE")" -eq 1
+expect_yes "builder: and leaves its stamp" test -f "$SANDBOX/state/builder-prune-daily.stamp"
+_reset_captures
+_run_dj --check 80 "$(date +%s)"   # the stat stub reports the stamp as just touched
+expect_no "builder: a second --check inside the day does not prune again" \
+  grep -q "builder prune" "$DOCKER_CAPTURE"
+_reset_captures
+CC_DJ_HOST_TEMP_REAP=0 CC_DJ_BUILDER_PRUNE_UNTIL=off _run_dj --check 80 0
+expect_no "host temp: CC_DJ_HOST_TEMP_REAP=0 stops the reclaimer" grep -q "host temp args" "$SANDBOX/dj.log"
+expect_no "builder: CC_DJ_BUILDER_PRUNE_UNTIL=off stops the daily prune" grep -q "builder prune" "$DOCKER_CAPTURE"
+_reset_captures
+CC_DJ_HOST_TEMP_SCRIPT="$SANDBOX/no-such.py" _run_dj --check 80 0
+expect_yes "host temp: a missing script is a SKIP" \
+  grep -q "SKIP host temp reclaim (script or python3 not found)" "$SANDBOX/dj.log"
+unset CC_DJ_HOST_TEMP_SCRIPT CC_DJ_CHROME_CLONE_SCRIPT
+rm -f "$SANDBOX/state/builder-prune-daily.stamp"
 
 printf "\n# Test group 4: --clean all targets present\n"
 _reset_captures
@@ -657,8 +691,9 @@ printf "\n# Test group 9: docker cleanup shape and skip accounting\n"
 expect_no "docker: no broad system/image/container/volume prune invocation" \
   bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -Eq "docker[[:space:]]+(system|image|container|volume)[[:space:]]+prune"' _ "$DJ"
 
-expect_yes "docker: the one prune invocation is the builder prune limited to until=168h" \
-  bash -c 'test "$(grep -vE "^[[:space:]]*#" "$1" | grep -c "docker[[:space:]].*prune")" -eq 1 &&
+expect_yes "docker: the only prune invocations are the builder prunes, weekly at 168h and the daily one" \
+  bash -c 'test "$(grep -vE "^[[:space:]]*#" "$1" | grep -c "docker[[:space:]].*prune")" -eq 2 &&
+    test "$(grep -vE "^[[:space:]]*#" "$1" | grep "docker[[:space:]].*prune" | grep -vc "docker builder prune --force --filter ")" -eq 0 &&
     grep -vE "^[[:space:]]*#" "$1" | grep -q "docker builder prune --force --filter until=168h$"' _ "$DJ"
 
 expect_no "docker: no volume removal survives outside comments" \
