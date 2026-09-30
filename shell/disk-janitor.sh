@@ -12,8 +12,11 @@ Usage: disk-janitor --check | --clean
 Disk space monitoring and rebuildable-cache cleanup for cc-reaper.
 
 Modes:
-  --check   Read-only: measure disk free %, detect TM snapshot pins,
-            notify when below threshold (cooldown-gated). No deletions.
+  --check   Measure disk free %, detect TM snapshot pins, notify when below
+            threshold (cooldown-gated). Also reclaims, each item only once it is
+            proved abandoned: orphaned headless Chrome, unreferenced cdp-* profiles,
+            idle wrangler logs, unheld Chrome code-sign clones, and (once a day)
+            Docker builder cache unused for 24 hours.
   --clean   Delete rebuildable caches, prune Docker builder cache unused for
             168 hours, and thin TM snapshots when below threshold. Never
             removes images, containers or volumes.
@@ -31,6 +34,10 @@ Environment:
   CC_DJ_CONFIG          Overrides sourced first (default: ~/.cc-reaper/disk-janitor.conf)
   CC_DJ_GO_CACHE_TRIM_DAYS  --clean deletes go build cache entries unused this many days (default: 3);
                         `off` when another reclaimer on the host owns that cache
+  CC_DJ_HOST_TEMP_REAP  Set to 0 to stop --check reclaiming host temp (default: 1)
+  CC_DJ_HOST_TEMP_IDLE_MINUTES  Idle minutes before a temp item is reclaimed (default: 60, min 30)
+  CC_DJ_CHROME_CLONE_MIN_AGE_DAYS  Minimum age of a removed code-sign clone (default: 1)
+  CC_DJ_BUILDER_PRUNE_UNTIL  Daily --check builder prune filter, or `off` (default: 24h)
   CC_DJ_GROWTH_TARGETS  Growth targets for --check (default: ~/.cc-reaper/growth-targets.tsv)
   CC_DJ_GROWTH_INTERVAL_HOURS / _BUDGET_SECONDS / _WINDOW_HOURS / _ALERT_GB / _KEY_TIMEOUT
                         Sampling interval per target (6), time budget per run (240),
@@ -50,6 +57,10 @@ CC_DJ_DISK_MIN_PCT="${CC_DJ_DISK_MIN_PCT:-15}"
 CC_DJ_TRIM_WORKTREES="${CC_DJ_TRIM_WORKTREES:-1}"
 CC_DJ_COOLDOWN_SECS="${CC_DJ_COOLDOWN_SECS:-3600}"
 CC_DJ_GO_CACHE_TRIM_DAYS="${CC_DJ_GO_CACHE_TRIM_DAYS:-3}"
+CC_DJ_HOST_TEMP_REAP="${CC_DJ_HOST_TEMP_REAP:-1}"
+CC_DJ_HOST_TEMP_IDLE_MINUTES="${CC_DJ_HOST_TEMP_IDLE_MINUTES:-60}"
+CC_DJ_CHROME_CLONE_MIN_AGE_DAYS="${CC_DJ_CHROME_CLONE_MIN_AGE_DAYS:-1}"
+CC_DJ_BUILDER_PRUNE_UNTIL="${CC_DJ_BUILDER_PRUNE_UNTIL:-24h}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
 CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
 # growth-watch.py reads its settings from the environment, and the config file sets them
@@ -277,7 +288,11 @@ _cc_dj_check() {
   # contents are somebody's abandoned work rather than a rebuildable cache, so the
   # operator gets to see it accumulating well before free space forces the question.
   _cc_dj_report_stale_tmp_dirs
-  _cc_dj_chrome_clones check
+  # Hourly, because a headless-Chrome script can leave 10 GB of profiles in two days and
+  # the weekly clean is too late for it (2026-09-30). Each item is proved abandoned first.
+  _cc_dj_host_temp_reap
+  _cc_dj_chrome_clones clean
+  _cc_dj_builder_prune_daily
   _cc_dj_orbstack_report
 
   if [ "$free_pct" -lt "$CC_DJ_DISK_MIN_PCT" ]; then
@@ -600,7 +615,42 @@ _cc_dj_chrome_clones() {
     _cc_dj_skip "Chrome code-sign clones (script or python3 not found)"
     return 0
   fi
-  _cc_dj_clean_target "Chrome code-sign clones (${mode})" python3 "$script" "$mode"
+  _cc_dj_clean_target "Chrome code-sign clones (${mode})" python3 "$script" "$mode" \
+    --min-age-days "$CC_DJ_CHROME_CLONE_MIN_AGE_DAYS"
+}
+
+_cc_dj_host_temp_reap() {
+  local script="${CC_DJ_HOST_TEMP_SCRIPT:-$HOME/.cc-reaper/host-temp-reaper.py}"
+  [ "$CC_DJ_HOST_TEMP_REAP" = 0 ] && return 0
+  if [ ! -r "$script" ] || ! command -v python3 >/dev/null 2>&1; then
+    _cc_dj_skip "host temp reclaim (script or python3 not found)"
+    return 0
+  fi
+  _cc_dj_clean_target "host temp: orphaned headless Chrome, cdp profiles, wrangler logs" \
+    python3 "$script" clean --idle-minutes "$CC_DJ_HOST_TEMP_IDLE_MINUTES"
+}
+
+# Once per day from the hourly check: builder cache grew 24.7 GB in two days here
+# (2026-09-30) while the weekly prune only reaches 168h. BuildKit never prunes a record
+# a running build holds, so this cannot break a build in flight; it only makes the next
+# cold one slower.
+_cc_dj_builder_prune_daily() {
+  local stamp="${CC_DJ_STATE_DIR%/}/builder-prune-daily.stamp"
+  [ "$CC_DJ_BUILDER_PRUNE_UNTIL" = off ] && return 0
+  if [ -f "$stamp" ] && [ $(( $(date +%s) - $(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp") )) -lt 86400 ]; then
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    _cc_dj_skip "daily builder prune (docker not found)"
+    return 0
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    _cc_dj_skip "daily builder prune (daemon unreachable)"
+    return 0
+  fi
+  _cc_dj_clean_target "docker builder cache unused ${CC_DJ_BUILDER_PRUNE_UNTIL}+" \
+    docker builder prune --force --filter "until=${CC_DJ_BUILDER_PRUNE_UNTIL}"
+  touch "$stamp"
 }
 
 # The go build cache, trimmed by age and never emptied. `go clean -cache` every week removed
