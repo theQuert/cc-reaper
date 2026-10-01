@@ -5,5 +5,5 @@
 
 ## 2. Verification and delivery
 
-- [ ] 2.1 Full suite, `bash -n`, `zsh -n`, `openspec validate --all --strict`; my own review of the exact head.
-- [ ] 2.2 Deploy by rename with a rollback manifest; the next session sweeps exit `status=0` while sessions write.
+- [x] 2.1 Full suite, `bash -n`, `zsh -n`, `openspec validate --all --strict`; my own review of the exact head. (Merged as #59.)
+- [x] 2.2 Deploy by rename with a rollback manifest; the next session sweeps exit `status=0` while sessions write. (Deployed 2026-10-01T08:57:52Z as `transcript-torn-record-reread-20261001T085752`. The four session sweeps that started after it, 17:00:54 to 17:15:03 +0800, all ended `status=0`, with no "could not be parsed" line. Before it, the same day had 46 such lines.)
