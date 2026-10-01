@@ -568,7 +568,9 @@ malformed_cache_result="$(CC_WJ_TRANSCRIPT_CACHE_DIR="$malformed_cache_dir" \
   _ "$WJ" "$malformed_cache_transcript" "$WT" "$cache_other")"
 check "a malformed canonical tool record stays fail closed for every candidate" test "$malformed_cache_result" = "2 2"
 malformed_query_processes="$(wc -l < "$malformed_query_trace" | tr -d ' ')"
-check "malformed relevant evidence bypasses the shared fast path" test "$malformed_query_processes" -eq 2
+# Two candidates, and each reads a record that stays malformed twice: once, then once more
+# after the torn-record wait. None of the four goes through the shared fast path.
+check "malformed relevant evidence bypasses the shared fast path" test "$malformed_query_processes" -eq 4
 
 escaped_target="$CASE/測試-worktree"
 escaped_transcript="$CASE/escaped-rollout.jsonl"
@@ -653,6 +655,40 @@ mixed_result="$(CC_WJ_CONFIG="$CASE/no-config" bash -c \
   'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; printf "%s\n" "$?"' \
   _ "$WJ" "$mixed_transcript" "$mixed_target")"
 check "mixed solidus and uppercase Unicode escapes retain a tool claim" test "$mixed_result" = 0
+
+# A live session appends its transcript a line at a time. A read that lands mid-line sees a
+# torn last record; the janitor reads once more after the writer finishes it (2026-10-01).
+torn_target="$CASE/torn-worktree"
+torn_transcript="$CASE/torn-rollout.jsonl"
+torn_rest="$CASE/torn-rest"
+python3 - "$torn_transcript" "$torn_rest" "$torn_target" <<'PY'
+import json, sys
+path, rest, target = sys.argv[1:]
+user = {"type": "response_item", "payload": {"type": "message", "role": "user", "content": "go"}}
+tool = json.dumps({"type": "response_item", "payload": {"type": "custom_tool_call", "input": f"workdir={target}"}})
+cut = len(tool) // 2
+open(path, "w").write(json.dumps(user) + "\n" + tool[:cut])
+open(rest, "w").write(tool[cut:] + "\n")
+PY
+cp "$torn_transcript" "$CASE/torn-forever.jsonl"
+( sleep 0.3; cat "$torn_rest" >> "$torn_transcript" ) &
+torn_result="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_RETRY_SECONDS=1 bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; printf "%s\n" "$?"' \
+  _ "$WJ" "$torn_transcript" "$torn_target")"
+wait
+check "a torn last record the writer then completes is read again and its claim found" test "$torn_result" = 0
+torn_forever="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_RETRY_SECONDS=0 bash -c \
+  'source "$1"; _cc_wj_transcript_claims_path Codex "$2" "$3"; printf "%s\n" "$?"' \
+  _ "$WJ" "$CASE/torn-forever.jsonl" "$torn_target")"
+check "a record still torn on the second read stays unparsable and fails closed" test "$torn_forever" = 2
+torn_twice="$(CC_WJ_CONFIG="$CASE/no-config" CC_WJ_TRANSCRIPT_RETRY_SECONDS=2 bash -c \
+  'source "$1"; start=$SECONDS
+   _cc_wj_transcript_claims_path Codex "$2" "$3"; a=$?
+   _cc_wj_transcript_claims_path Codex "$2" "$3"; b=$?
+   printf "%s %s %s\n" "$a" "$b" "$((SECONDS - start < 4))"' \
+  _ "$WJ" "$CASE/torn-forever.jsonl" "$torn_target")"
+check "a transcript that stays torn waits once per process, not once per candidate" test "$torn_twice" = "2 2 1"
+
 
 nested_target="$CASE/café-nested-worktree"
 nested_transcript="$CASE/nested-escaped-rollout.jsonl"

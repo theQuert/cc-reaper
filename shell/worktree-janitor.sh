@@ -409,6 +409,7 @@ _cc_wj_held() {
 _CC_WJ_ACTIVE_CLAIMS=""
 _CC_WJ_ACTIVE_TRANSCRIPTS=""
 _CC_WJ_ACTIVE_ERROR=""
+_CC_WJ_TORN_WAITED=""
 _CC_WJ_ACTIVE_REASON=""
 _CC_WJ_RECENT_CLAIMS=""
 _CC_WJ_RECENT_TRANSCRIPTS=""
@@ -1220,7 +1221,7 @@ _cc_wj_scan_active_sessions() { # <recent-session grace hours>
 # target, 1 when none does, and 2 when the transcript cannot be parsed. Live claims and
 # recent leases intentionally share this parser.
 _cc_wj_transcript_claims_path() { # <harness> <transcript> <resolved target>
-  local harness="$1" transcript="$2" wt="$3" alt mode
+  local harness="$1" transcript="$2" wt="$3" alt mode rc
   case "$wt" in /private/*) alt="${wt#/private}" ;; *) alt="/private$wt" ;; esac
   [ -r "$transcript" ] || return 2
   case "$harness" in
@@ -1228,7 +1229,22 @@ _cc_wj_transcript_claims_path() { # <harness> <transcript> <resolved target>
     Codex) mode=codex-claim ;;
     *) return 1 ;;
   esac
-  _cc_wj_transcript_tail_query "$mode" "$transcript" "$wt" "$alt"
+  _cc_wj_transcript_tail_query "$mode" "$transcript" "$wt" "$alt"; rc=$?
+  # A live session appends its transcript a line at a time, so a read can land mid-line
+  # and find a torn last record it cannot decide. Read once more after the writer has
+  # finished it; only a second failure reports the transcript unparsable. Twice that one
+  # torn read blinded a whole sweep (2026-09-27, 2026-10-01). The wait is paid once per
+  # transcript per process, so a record that stays malformed costs one second, not one per
+  # candidate worktree.
+  if [ "$rc" -eq 2 ] && [ -r "$transcript" ]; then
+    case "$_CC_WJ_TORN_WAITED" in
+      *"|$transcript|"*) ;;
+      *) sleep "${CC_WJ_TRANSCRIPT_RETRY_SECONDS:-1}"
+         _CC_WJ_TORN_WAITED="$_CC_WJ_TORN_WAITED|$transcript|" ;;
+    esac
+    _cc_wj_transcript_tail_query "$mode" "$transcript" "$wt" "$alt"; rc=$?
+  fi
+  return "$rc"
 }
 
 _cc_wj_recent_claim() { # <worktree> <grace hours> [all|cwd|tool]
