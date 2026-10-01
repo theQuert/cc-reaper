@@ -885,6 +885,22 @@ case "$out" in
   *) bad "and is still kept by a live claim read after that lease"; printf '# output: %s\n' "$out" ;;
 esac
 
+# An unreadable transcript names the open error, so a denied file and a vanished one differ.
+new_fixture unreadable-transcript-reason
+mkdir -p "$CLAUDE_PROJECTS/denied"
+denied="$CLAUDE_PROJECTS/denied/49494949-5555-4666-8777-888888888888.jsonl"
+printf '{"cwd":"/nowhere"}\n' > "$denied"; chmod 000 "$denied"
+out="$(run_wj 2>&1)"
+chmod 600 "$denied"
+case "$out" in
+  *'is unreadable (Permission denied)'*) ok "an unreadable recent transcript reports why it could not be opened" ;;
+  *) bad "an unreadable recent transcript reports why it could not be opened"; printf '# output: %s\n' "$out" ;;
+esac
+reason="$(bash -c 'source "$1"; _cc_wj_open_error "$2/missing"; _cc_wj_open_error "$3"' _ "$WJ" "$CASE" "$denied")"
+check "a missing file reports ENOENT and an openable one reports unknown" \
+  test "$reason" = "No such file or directory
+unknown"
+
 if [ "$failures" -gt 0 ]; then
   printf '%d test failure(s)\n' "$failures"
   exit 1

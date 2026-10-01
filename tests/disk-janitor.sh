@@ -176,6 +176,8 @@ chmod +x "$FAKE_BIN/brew"
 # bun stub
 cat > "$FAKE_BIN/bun" <<STUB
 #!/usr/bin/env bash
+# Like the real bun, refuse any directory without a package.json.
+[ -f package.json ] || { echo 'error: No package.json was found for directory "'"\$PWD"'"' >&2; exit 1; }
 echo "\$*" >> "$BUN_CAPTURE"
 STUB
 chmod +x "$FAKE_BIN/bun"
@@ -223,6 +225,8 @@ _run_dj() {
     # somebody's live scratch space.
     mkdir -p "$SANDBOX/tmp-empty"
     export CC_DJ_TMP_DIRS="$SANDBOX/tmp-empty"
+    mkdir -p "$SANDBOX/tmpdir"
+    export TMPDIR="$SANDBOX/tmpdir"
     # Create fixture cache dirs so rm -rf hits the sandbox
     mkdir -p "$FAKE_HOME/Library/Caches/com.spotify.client"
     mkdir -p "$FAKE_HOME/Library/Caches/com.todesktop.230313mzl4w4u92.ShipIt"
@@ -394,6 +398,12 @@ expect_yes "clean: brew called" \
 
 expect_yes "clean: bun called" \
   test -s "$BUN_CAPTURE"
+
+expect_yes "clean: bun ran inside a package, so it returned 0" \
+  grep -q "clean: target 'bun pm cache rm' done" "$SANDBOX/dj.log"
+
+expect_no "clean: bun's throwaway package directory is removed" \
+  sh -c 'ls -d "$1"/cc-dj-bun.* 2>/dev/null | grep -q .' sh "$SANDBOX/tmpdir"
 
 expect_yes "clean: docker called" \
   test -s "$DOCKER_CAPTURE"

@@ -862,6 +862,17 @@ expect_yes "an unreachable origin keeps its worktrees as KEEP(base-unfetched)" \
   file_after "$OUT_U" "unfetched-wt$" 2 "KEEP(base-unfetched)"
 expect_yes "and the report says the base could not be fetched" \
   file_has "$OUT_U" "could not be fetched"
+expect_yes "and it carries git's own reason" \
+  file_has "$OUT_U" "could not be fetched (rc=[0-9]*): .*no-such-origin"
+# Credentials an origin URL carries never reach the report.
+git -C "$U_ROOT" config remote.origin.url "http://user:s3cr3t-token@127.0.0.1:9/x.git"
+OUT_UC="$TMPDIR_ROOT/out-unfetched-cred.txt"
+_wj_idle --repo "$U_ROOT" > "$OUT_UC" 2>&1 || true
+expect_yes "a failed fetch over a credentialed URL still says why" \
+  file_has "$OUT_UC" "could not be fetched (rc=[0-9]*): .*127.0.0.1"
+expect_no "and blanks the credential" \
+  file_has "$OUT_UC" "s3cr3t-token"
+git -C "$U_ROOT" config remote.origin.url "$TMPDIR_ROOT/no-such-origin.git"
 expect_yes "and the incomplete repository makes the run fail observably" \
   test "$unfetched_rc" -ne 0
 

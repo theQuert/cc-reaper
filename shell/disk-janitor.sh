@@ -915,7 +915,16 @@ _cc_dj_clean() {
 
   # -- bun pm cache rm --------------------------------------------------------
   if command -v bun >/dev/null 2>&1; then
-    _cc_dj_clean_target "bun pm cache rm" bun pm cache rm
+    # bun refuses every `pm` command outside a package ("No package.json was found"),
+    # and launchd runs this from /, so it returned rc=1 every week. An empty package in
+    # a throwaway directory satisfies it; the cache it clears is still the global one.
+    local bun_dir
+    if bun_dir="$(mktemp -d "${TMPDIR:-/tmp}/cc-dj-bun.XXXXXX")" && printf '{}\n' > "$bun_dir/package.json"; then
+      _cc_dj_clean_target "bun pm cache rm" sh -c 'cd "$1" && exec bun pm cache rm' sh "$bun_dir"
+      rm -f "$bun_dir/package.json"; rmdir "$bun_dir" 2>/dev/null
+    else
+      _cc_dj_skip "bun pm cache rm (no temp directory)"
+    fi
   else
     _cc_dj_skip "bun pm cache rm (bun not found)"
   fi
