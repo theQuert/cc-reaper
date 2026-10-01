@@ -9,4 +9,4 @@
 - [x] 2.1 Full shell suite, `bash -n`, `zsh -n`, `openspec validate --all --strict`, and my own review of the exact head.
   Every `tests/*.sh` and `tests/*.py` passed; `tests/disk-janitor.sh` 136 ok; 8 reclaimer tests
   with 14 mutants caught and 5 wiring mutants caught; strict validate 10/10.
-- [ ] 2.2 Deploy by rename with a rollback manifest; confirm the next hourly check logs the host temp step and the daily builder prune.
+- [x] 2.2 Deploy by rename with a rollback manifest; confirm the next hourly check logs the host temp step and the daily builder prune. Deployed 2026-09-30T18:13Z (`hourly-host-temp-reap-20260930T181321`). By 2026-10-01 the host temp step had run 15 hourly checks without a SKIP and removed 53 profiles; the daily builder prune ran at 02:17 and wrote its stamp.
