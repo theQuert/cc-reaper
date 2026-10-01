@@ -901,6 +901,26 @@ check "a missing file reports ENOENT and an openable one reports unknown" \
   test "$reason" = "No such file or directory
 unknown"
 
+# A session entering a worktree moves its transcript after the listing; the scan lists again.
+new_fixture transcript-moved
+age_worktree 72
+sid=50505050-5555-4666-8777-888888888888
+mkdir -p "$CLAUDE_PROJECTS/primary" "$CLAUDE_PROJECTS/entered" "$CASE/move-bin"
+printf '{"cwd":"%s"}\n' "$WT" > "$CLAUDE_PROJECTS/primary/$sid.jsonl"
+cat > "$CASE/move-bin/find" <<STUB
+#!/usr/bin/env bash
+/usr/bin/find "\$@"
+case " \$* " in *" -mmin "*) [ -e "$CASE/moved" ] || { mv "$CLAUDE_PROJECTS/primary/$sid.jsonl" "$CLAUDE_PROJECTS/entered/"; : > "$CASE/moved"; } ;; esac
+STUB
+chmod +x "$CASE/move-bin/find"
+out="$(PATH="$CASE/move-bin:$PATH" run_wj 2>&1)"
+check "the transcript was moved after the first listing" test -e "$CASE/moved"
+case "$out" in
+  *'unreadable'*) bad "a transcript moved mid-scan is read at its new path"; printf '# output: %s\n' "$out" ;;
+  *"recent Claude session $sid"*) ok "a transcript moved mid-scan is read at its new path" ;;
+  *) bad "a transcript moved mid-scan is read at its new path"; printf '# output: %s\n' "$out" ;;
+esac
+
 if [ "$failures" -gt 0 ]; then
   printf '%d test failure(s)\n' "$failures"
   exit 1
