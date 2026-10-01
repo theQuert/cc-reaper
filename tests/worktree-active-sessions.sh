@@ -921,6 +921,26 @@ case "$out" in
   *) bad "a transcript moved mid-scan is read at its new path"; printf '# output: %s\n' "$out" ;;
 esac
 
+# A named session writes a title record before any message; that transcript claims nothing.
+new_fixture title-only-transcript
+age_worktree 72
+mkdir -p "$CLAUDE_PROJECTS/primary"
+printf '{"type":"custom-title","customTitle":"dashboard","sessionId":"51515151-5555-4666-8777-888888888888"}\n' \
+  > "$CLAUDE_PROJECTS/primary/51515151-5555-4666-8777-888888888888.jsonl"
+out="$(run_wj --apply 2>&1)"
+check "a title-only transcript does not stop a sweep" test ! -d "$WT"
+new_fixture message-without-cwd
+age_worktree 72
+mkdir -p "$CLAUDE_PROJECTS/primary"
+printf '{"type":"user","message":{"role":"user","content":"go"}}\n' \
+  > "$CLAUDE_PROJECTS/primary/52525252-5555-4666-8777-888888888888.jsonl"
+out="$(run_wj --apply 2>&1)"
+check "a transcript with a message but no cwd still fails closed" test -d "$WT"
+case "$out" in
+  *'has no mappable cwd'*) ok "and names the missing cwd" ;;
+  *) bad "and names the missing cwd"; printf '# output: %s\n' "$out" ;;
+esac
+
 if [ "$failures" -gt 0 ]; then
   printf '%d test failure(s)\n' "$failures"
   exit 1
