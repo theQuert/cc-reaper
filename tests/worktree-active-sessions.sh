@@ -929,6 +929,19 @@ printf '{"type":"custom-title","customTitle":"dashboard","sessionId":"51515151-5
   > "$CLAUDE_PROJECTS/primary/51515151-5555-4666-8777-888888888888.jsonl"
 out="$(run_wj --apply 2>&1)"
 check "a title-only transcript does not stop a sweep" test ! -d "$WT"
+new_fixture title-only-unread
+age_worktree 72
+mkdir -p "$CLAUDE_PROJECTS/primary" "$CASE/grep-bin"
+printf '{"type":"custom-title","customTitle":"dashboard","sessionId":"53535353-5555-4666-8777-888888888888"}\n' \
+  > "$CLAUDE_PROJECTS/primary/53535353-5555-4666-8777-888888888888.jsonl"
+cat > "$CASE/grep-bin/grep" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in *'"message"'*) exit 2 ;; esac
+exec /usr/bin/grep "$@"
+STUB
+chmod +x "$CASE/grep-bin/grep"
+PATH="$CASE/grep-bin:$PATH" run_wj --apply >/dev/null 2>&1
+check "a title-only transcript grep cannot read still fails closed" test -d "$WT"
 new_fixture message-without-cwd
 age_worktree 72
 mkdir -p "$CLAUDE_PROJECTS/primary"
