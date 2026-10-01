@@ -1094,6 +1094,14 @@ $(printf '%s\n' "$raw" | sed -n 's/^n//p')
 CODEX_LOCKS
 }
 
+# The reason open(2) gives for path, e.g. "Permission denied"; "unknown" when it opens.
+_cc_wj_open_error() {
+  local why
+  why="$( { : < "$1"; } 2>&1 )" && { echo unknown; return; }
+  why="${why##*: }"
+  printf '%s\n' "${why:-unknown}"
+}
+
 _cc_wj_scan_claude_recent() { # <grace hours>
   local grace="$1" projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
   local now cutoff_minutes files f base sid activity cwd resolved
@@ -1117,7 +1125,10 @@ _cc_wj_scan_claude_recent() { # <grace hours>
     base="${f##*/}"; sid="${base%.jsonl}"
     printf '%s\n' "$sid" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' || continue
     _cc_wj_active_has_id Claude "$sid" && continue
-    [ -r "$f" ] || { _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base is unreadable"; return 1; }
+    [ -r "$f" ] || {
+      # The open error is what tells a vanished file from a denied one.
+      _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base is unreadable ($(_cc_wj_open_error "$f"))"
+      return 1; }
     activity="$(_cc_wj_mtime_epoch "$f")"
     case "$activity" in ''|*[!0-9]*) _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base has no readable activity time"; return 1 ;; esac
     [ $((now - activity)) -lt $((grace * 3600)) ] || continue
@@ -2121,7 +2132,7 @@ _CC_WJ_BASE_WHY=""
 # `main` is never made: in a repository whose trunk is not main nothing would be an
 # ancestor, and the run would report normally while reclaiming nothing.
 _cc_wj_prepare_base() {
-  local repo="$1" base="${CC_WJ_BASE_BRANCH:-}" all plain archived dropped fetch_timeout fetch_rc=0
+  local repo="$1" base="${CC_WJ_BASE_BRANCH:-}" all plain archived dropped fetch_timeout fetch_err fetch_rc=0
   _CC_WJ_BASE=""; _CC_WJ_BASE_OK=0; _CC_WJ_BASE_WHY=""; _CC_WJ_DECLARED=""; _CC_WJ_ARCHIVED=""
   if ! git -C "$repo" config --get remote.origin.url >/dev/null 2>&1; then
     _CC_WJ_BASE_WHY="it has no origin remote"
@@ -2144,15 +2155,23 @@ _cc_wj_prepare_base() {
   # this runs in report mode too.
   fetch_timeout="$(_cc_wj_fetch_timeout_seconds)" || {
     _CC_WJ_BASE_WHY="the base fetch timeout is invalid"; return 1; }
-  _cc_wj_with_timeout "$fetch_timeout" git -C "$repo" fetch --quiet --no-tags \
+  fetch_err="$(_cc_wj_with_timeout "$fetch_timeout" git -C "$repo" fetch --quiet --no-tags \
     --no-auto-maintenance origin "+refs/heads/${base}:refs/remotes/origin/${base}" \
-    >/dev/null 2>&1 || fetch_rc=$?
+    2>&1 >/dev/null)" || fetch_rc=$?
   if [ "$fetch_rc" -ne 0 ]; then
     if [ "$fetch_rc" -eq 124 ]; then
       _CC_WJ_BASE_WHY="origin/$base could not be fetched within ${fetch_timeout}s"
     else
-      _CC_WJ_BASE_WHY="origin/$base could not be fetched"
+      _CC_WJ_BASE_WHY="origin/$base could not be fetched (rc=$fetch_rc)"
     fi
+    # git's first fatal/error line says why (no network, auth, a missing ref); its last
+    # lines are generic advice. Credentials an origin URL may carry are blanked before the
+    # line reaches a log.
+    fetch_err="$(printf '%s\n' "$fetch_err" |
+                 awk '/^(fatal|error):/ && !why { why = $0 } NF { last = $0 }
+                      END { print (why ? why : last) }' |
+                 sed -E 's#://[^/@[:space:]]*@#://***@#g' | cut -c1-200)"
+    [ -z "$fetch_err" ] || _CC_WJ_BASE_WHY="$_CC_WJ_BASE_WHY: $fetch_err"
     return 1
   fi
   _CC_WJ_BASE_OK=1
