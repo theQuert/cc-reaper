@@ -1102,9 +1102,9 @@ _cc_wj_open_error() {
   printf '%s\n' "${why:-unknown}"
 }
 
-_cc_wj_scan_claude_recent() { # <grace hours>
-  local grace="$1" projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
-  local now cutoff_minutes files f base sid activity cwd resolved
+_cc_wj_scan_claude_recent() { # <grace hours> [relisted]
+  local grace="$1" relisted="${2:-}" projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
+  local now cutoff_minutes files f base sid activity cwd resolved why
   [ "$grace" -gt 0 ] || return 0
   [ -e "$projects" ] || return 0
   if [ ! -d "$projects" ] || [ ! -r "$projects" ] || [ ! -x "$projects" ]; then
@@ -1127,7 +1127,15 @@ _cc_wj_scan_claude_recent() { # <grace hours>
     _cc_wj_active_has_id Claude "$sid" && continue
     [ -r "$f" ] || {
       # The open error is what tells a vanished file from a denied one.
-      _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base is unreadable ($(_cc_wj_open_error "$f"))"
+      why="$(_cc_wj_open_error "$f")"
+      # A session that enters a worktree has its transcript moved to that worktree's
+      # project directory, so the listed path is gone. List once more to read it there.
+      if [ "$why" = "No such file or directory" ] && [ -z "$relisted" ]; then
+        _CC_WJ_RECENT_CLAIMS=""; _CC_WJ_RECENT_TRANSCRIPTS=""
+        _cc_wj_scan_claude_recent "$grace" relisted
+        return
+      fi
+      _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base is unreadable ($why)"
       return 1; }
     activity="$(_cc_wj_mtime_epoch "$f")"
     case "$activity" in ''|*[!0-9]*) _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base has no readable activity time"; return 1 ;; esac
