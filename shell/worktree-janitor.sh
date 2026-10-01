@@ -1143,7 +1143,14 @@ _cc_wj_scan_claude_recent() { # <grace hours> [relisted]
     # Raw-line parsing tolerates a final partial JSONL record while a live harness writes.
     # Only the last explicit cwd is retained; message text never enters the diagnostic.
     cwd="$(_cc_wj_transcript_tail_query claude-cwd "$f")"
-    [ -n "$cwd" ] || { _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base has no mappable cwd"; return 1; }
+    if [ -z "$cwd" ]; then
+      # Naming a session writes a title record before any message. With no message and
+      # no cwd, the transcript cannot claim a path. Only grep's "no match" says so; a
+      # read error (rc 2) still fails closed.
+      grep -Eq '"message"[[:space:]]*:' "$f"
+      [ $? -ne 1 ] || continue
+      _CC_WJ_ACTIVE_ERROR="recent Claude transcript $base has no mappable cwd"; return 1
+    fi
     case "$cwd" in /*) ;; *) _CC_WJ_ACTIVE_ERROR="recent Claude session $sid has a non-absolute cwd"; return 1 ;; esac
     # Do not parse every recent transcript eagerly. Structured-path claims are only
     # relevant to a worktree that otherwise reaches the removable gate, where
