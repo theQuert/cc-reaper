@@ -129,13 +129,39 @@ class ReaperTest(unittest.TestCase):
         self.assertTrue(live.exists() and open_.exists() and other.exists())
         self.assertEqual(counts["wrangler"], [1, 1])
 
+    def test_only_old_unheld_build_copies_are_removed(self):
+        def copy(name, age):
+            path = self.root / name
+            (path / "site-nimbus").mkdir(parents=True)
+            (path / "site-nimbus" / "package.json").write_text("{}")
+            return self.aged(path, age)
+        old = copy("nimbus-articles-build-anqCbI", 7 * HOUR)
+        # Older than the general idle limit, younger than the build copy's own.
+        kept_on_purpose = copy("nimbus-articles-build-JGyZdU", 2 * HOUR)
+        running = copy("nimbus-articles-build-k0KChp", 7 * HOUR)
+        self.holders.add(running)
+        other = copy("nimbus-articles-build-toolong1", 7 * HOUR)
+        link = self.root / "nimbus-articles-build-5ilVsv"
+        target = self.aged(self.logs, 7 * HOUR)
+        link.symlink_to(target)
+        os.utime(link, (time.time() - 7 * HOUR,) * 2, follow_symlinks=False)
+        counts = self.run_clean()
+        self.assertFalse(old.exists())
+        for path in (kept_on_purpose, running, other, link):
+            self.assertTrue(path.exists() or path.is_symlink(), path)
+        self.assertEqual(counts["build"], [1, 1])
+
     def test_check_mode_changes_nothing(self):
         profile = self.profile("cdp-HHHHHH")
+        build = self.root / "nimbus-articles-build-KKKKKK"
+        build.mkdir()
+        self.aged(build, 7 * HOUR)
         self.chrome(50, self.root / "cdp-IIIIII")
         counts = reaper.reap(self.root, self.logs, clean=False, idle_seconds=HOUR,
                              send=lambda pid, sig: self.sent.append(pid))
-        self.assertTrue(profile.exists())
+        self.assertTrue(profile.exists() and build.exists())
         self.assertEqual(self.sent, [])
+        self.assertEqual(counts["build"], [1, 0])
         self.assertEqual(counts["profile"], [1, 0])
         self.assertEqual(counts["chrome"], [1, 0])
 
