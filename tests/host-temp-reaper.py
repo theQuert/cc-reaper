@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Isolated safety tests for the host temp reaper: every keep rule, and what it removes."""
 
+from datetime import datetime, timezone
 import importlib.util
+import json
 import os
 from pathlib import Path
 import signal
@@ -29,8 +31,10 @@ class ReaperTest(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve() / "T"
         self.logs = Path(temp.name).resolve() / "wrangler-logs"
+        self.jobs = Path(temp.name).resolve() / "jobs"
         self.root.mkdir()
         self.logs.mkdir()
+        self.jobs.mkdir()
         self.rows = []
         self.ports = {}
         self.clients = set()
@@ -181,6 +185,60 @@ class ReaperTest(unittest.TestCase):
         self.addCleanup(child.kill)
         self.assertTrue(REAL_HELD(inside))
         self.assertFalse(REAL_HELD(idle_dir))
+
+    def job(self, name, state="done", ended=2 * DAY, file_age=2 * DAY, raw=None):
+        job = self.jobs / name
+        (job / "tmp" / "venv" / "bin").mkdir(parents=True)
+        when = datetime.fromtimestamp(time.time() - ended, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        text = raw if raw is not None else json.dumps({"state": state, "lastTerminalAt": when, "updatedAt": when})
+        (job / "state.json").write_text(text)
+        self.aged(job / "state.json", file_age)
+        return job / "tmp"
+
+    def run_jobs(self, clean=True):
+        return reaper.reap(self.root, self.logs, clean=clean, idle_seconds=HOUR,
+                           send=lambda pid, sig: None, jobs_dir=self.jobs)
+
+    def test_only_a_long_finished_unused_jobs_tmp_is_removed(self):
+        gone = self.job("aaaaaaaa")
+        stopped = self.job("bbbbbbbb", state="stopped")
+        working = self.job("cccccccc", state="working")
+        blocked = self.job("dddddddd", state="blocked")
+        recent = self.job("eeeeeeee", ended=DAY - HOUR)
+        touched = self.job("ffffffff", file_age=DAY - HOUR)
+        in_use = self.job("11111111")
+        self.rows.append((70, 1, 10, f"{in_use}/venv/bin/python fake_soffice.py"))
+        held = self.job("22222222")
+        self.holders.add(held)
+        broken = self.job("33333333", raw="{not json")
+        no_time = self.job("44444444", raw=json.dumps({"state": "done"}))
+        other = self.job("release-owner")
+        counts = self.run_jobs()
+        self.assertFalse(gone.exists())
+        self.assertFalse(stopped.exists())
+        self.assertTrue((gone.parent / "state.json").exists())
+        for path in (working, blocked, recent, touched, in_use, held, broken, no_time, other):
+            self.assertTrue(path.exists(), path)
+        self.assertEqual(counts["jobtmp"], [2, 2])
+
+    def test_a_symlinked_job_tmp_is_never_followed(self):
+        target = self.root / "keep-me"
+        target.mkdir()
+        job = self.jobs / "abcdef01"
+        job.mkdir()
+        (job / "tmp").symlink_to(target)
+        when = datetime.fromtimestamp(time.time() - 2 * DAY, timezone.utc).isoformat()
+        (job / "state.json").write_text(json.dumps({"state": "done", "lastTerminalAt": when}))
+        self.aged(job / "state.json", 2 * DAY)
+        counts = self.run_jobs()
+        self.assertTrue(target.exists())
+        self.assertEqual(counts["jobtmp"], [0, 0])
+
+    def test_check_mode_keeps_a_job_tmp(self):
+        tmp = self.job("abababab")
+        counts = self.run_jobs(clean=False)
+        self.assertTrue(tmp.exists())
+        self.assertEqual(counts["jobtmp"], [1, 0])
 
     def test_check_mode_changes_nothing(self):
         profile = self.profile("cdp-HHHHHH")

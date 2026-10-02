@@ -457,6 +457,42 @@ Beyond process hygiene, cc-reaper ships three system-level janitors (added after
 | `disk-janitor.sh --clean` | Sunday 04:00 (launchd) | Cleans **rebuildable-only** targets: go build cache entries unused for `CC_DJ_GO_CACHE_TRIM_DAYS` (3) days - never the whole cache, nothing while a go build or test runs, and `off` where another reclaimer owns that cache - plus yarn / pip / brew / bun caches, Spotify / ShipIt / CoreSimulator caches, a **report** of docker dangling images and of unreferenced volumes with docker-generated-looking names, which are never deleted, TM snapshot thinning (dated `com.apple.TimeMachine.*` only, only when disk is below threshold). When the disk is below `CC_DJ_DISK_MIN_PCT`, it also delegates worktree-preserving cache trimming to `worktree-janitor.sh --trim-regenerable --apply`; holder, active-session, recent-claim and credential checks remain in that janitor. Tools are resolved from a known directory list, not the caller's `PATH`, because launchd supplies neither Homebrew nor Docker. Docker builder cache unused for at least 168 hours is pruned with `docker builder prune --force --filter until=168h`; images, containers and volumes are never removed. |
 | `worktree-janitor.sh` | every 6 hours by default, Claude/Codex SessionEnd, or manual | Inventories ordinary source roots plus `~/.claude/worktrees` and `~/.codex/worktrees`, deduplicated by git common directory. A worktree is REMOVABLE only when **all** checks succeed: only regenerable content remains; no process has a cwd or open file there; no verified-live Claude/Codex session claims it by cwd or structured tool call; no mapped harness activity falls within the **48-hour recent-session lease**; its work landed on the freshly fetched base by ancestry, content, or exact-head merged PR; it has been untouched for **48 hours**; and it is neither locked nor carrying a populated submodule. The same activity, content, HEAD, idle and git-state gates are repeated immediately before removal. Direct invocation is dry-run unless `--apply`; the installed policy separately opts SessionEnd and the scheduled run into apply. `--trim-regenerable` is a narrower pressure pass: it removes only ignored built-in cache directories from an unheld, unclaimed worktree and keeps the branch and worktree. It is report-only without `--apply`, and rechecks holders and claims before each directory. `--claims [id\|path]` exposes live and recent claims read-only; `--landed PATH` exposes the shared landed proof. The installer boots out and archives the legacy Claude worktree LaunchAgent so two destructive policies cannot race. Branches are never deleted and removal never uses `--force`. Policy lives in `~/.cc-reaper/worktree-janitor.conf`, not Claude or Codex settings. See [the reclamation method](docs/worktree-reclamation.md). |
 
+### Reclaim contract for producers
+
+Everything a CI flow, dev-workflow, a hook, a loop or a release driver writes to this host has
+to be reclaimable without guessing. On 2026-10-02 every leak found had the same shape: a
+producer with no end of its own, and a reclaimer that could not prove the thing was abandoned.
+Producers and cc-reaper both follow these five rules.
+
+1. **One owner per resource.** The producer bounds its own cache with a size or age cap.
+   cc-reaper monitors it through a `growth-targets.tsv` key and adds a second reclaimer only
+   when the producer has no end of its own. Two reclaimers on one cache fight: one removed a
+   file the other kept, and each emptied the pip cache before the other ran.
+2. **The producer ends what it starts.** Scratch, copies and checkouts are deleted in a
+   `trap` or `finally` on every exit path, not only on success. A record that must outlive
+   the run goes to a small, named path.
+3. **Session byproducts never land in a worktree.** Scratch belongs in the session
+   scratchpad or the job's `tmp/`. A rebuildable worktree byproduct is declared in the
+   repository's `.worktree-regenerable` (`archive:` for a record that must survive). The
+   janitor removes worktrees without `--force`, so one stray untracked file keeps the
+   whole tree.
+4. **A background process names its owner.** A dev server or stack is started through
+   something that records its pid (stima-api: `scripts/dev/local_stack.sh` and its lease)
+   and is stopped when its session or job ends. A server left behind with `&` outlives the
+   session and pins its worktree as a process holder.
+5. **A reclaimer proves abandonment; age alone is not proof.** It checks for a holder
+   (`lsof`, a command line naming the path), checks that the owner has ended, and applies
+   an age floor. Any probe that fails or cannot decide keeps the item.
+
+What cc-reaper reclaims under rule 5 on its own:
+
+| What | Rule |
+|---|---|
+| Orphaned headless Chrome, `cdp-*` profiles, `wrangler-*.log` | `host-temp-reaper.py`, idle limit, `lsof` |
+| `$TMPDIR/nimbus-articles-build-*` | 24h, `lsof +D` |
+| `~/.claude/jobs/<id>/tmp` of a `done` or `stopped` job | 24h after its last terminal time; no command line names it; `lsof +D` |
+| Worktrees | `worktree-janitor.sh` (landed, unheld, no session, idle) |
+
 ### Growth watch
 
 A fall in disk free says space went somewhere; it does not say where. Every hourly `--check`
