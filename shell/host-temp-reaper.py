@@ -16,8 +16,9 @@ Four kinds, each proved abandoned before it is touched:
   directory, created at least BUILD_COPY_IDLE_SECONDS ago and held open by no process
   (lsof +D also reports a process whose cwd is inside it). The docs repo's nimbus
   articles build test removes its 1.8 GB copy only when it passes, so every failed run
-  left one: five copies, 9.2 GB, on 2026-10-02. Six hours rather than the idle limit,
-  because NIMBUS_ARTICLES_BUILD_KEEP=1 keeps a copy on purpose for someone to read.
+  left one: five copies, 9.2 GB, on 2026-10-02. A day rather than the idle limit,
+  because NIMBUS_ARTICLES_BUILD_KEEP=1 keeps a copy on purpose and nothing on disk
+  tells it from a leak; a day still covers reading it the next morning.
 
 Every probe that fails or cannot decide keeps the item. Chrome is sent SIGTERM only, so
 it shuts down on its own terms. Tests drive the seams (`processes`, `listening_ports`,
@@ -39,7 +40,7 @@ import time
 PROFILE_NAME = re.compile(r"cdp-[A-Za-z0-9]{6}$")
 WRANGLER_LOG = re.compile(r"wrangler-[0-9_-]+\.log$")
 BUILD_COPY = re.compile(r"nimbus-articles-build-[A-Za-z0-9]{6}$")
-BUILD_COPY_IDLE_SECONDS = 6 * 3600
+BUILD_COPY_IDLE_SECONDS = 24 * 3600
 # The browser itself, never a Helper: helper paths run from "Google Chrome Helper.app".
 CHROME_BINARY = re.compile(r"/\S.*/Google Chrome\.app/Contents/MacOS/Google Chrome(?= --)")
 
@@ -183,15 +184,19 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill)
         print(f"{'REMOVED' if clean else 'CANDIDATE'} wrangler {path.name}")
 
     for path in sorted(root.iterdir()) if root.is_dir() else []:
-        if not BUILD_COPY.fullmatch(path.name) or path.is_symlink() or not path.is_dir():
-            continue
-        if not idle(path, max(idle_seconds, BUILD_COPY_IDLE_SECONDS), now) or held(path):
-            continue
-        counts["build"][0] += 1
-        if clean:
-            shutil.rmtree(path)
-            counts["build"][1] += 1
-        print(f"{'REMOVED' if clean else 'CANDIDATE'} build {path.name}")
+        # One copy that vanishes or will not delete is kept; it never stops the run.
+        try:
+            if not BUILD_COPY.fullmatch(path.name) or path.is_symlink() or not path.is_dir():
+                continue
+            if not idle(path, max(idle_seconds, BUILD_COPY_IDLE_SECONDS), now) or held(path):
+                continue
+            counts["build"][0] += 1
+            if clean:
+                shutil.rmtree(path)
+                counts["build"][1] += 1
+            print(f"{'REMOVED' if clean else 'CANDIDATE'} build {path.name}")
+        except OSError as error:
+            print(f"KEEP build {path.name} ({error.strerror or error})")
     return counts
 
 
