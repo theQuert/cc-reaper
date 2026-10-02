@@ -5,6 +5,7 @@ import importlib.util
 import os
 from pathlib import Path
 import signal
+import subprocess
 import tempfile
 import time
 import unittest
@@ -15,9 +16,11 @@ SOURCE = Path(__file__).resolve().parents[1] / "shell" / "host-temp-reaper.py"
 spec = importlib.util.spec_from_file_location("host_temp_reaper", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
+REAL_HELD = reaper.held
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 HOUR = 3600
+DAY = 24 * HOUR
 
 
 class ReaperTest(unittest.TestCase):
@@ -129,13 +132,67 @@ class ReaperTest(unittest.TestCase):
         self.assertTrue(live.exists() and open_.exists() and other.exists())
         self.assertEqual(counts["wrangler"], [1, 1])
 
+    def test_only_old_unheld_build_copies_are_removed(self):
+        def copy(name, age):
+            path = self.root / name
+            (path / "site-nimbus").mkdir(parents=True)
+            (path / "site-nimbus" / "package.json").write_text("{}")
+            return self.aged(path, age)
+        old = copy("nimbus-articles-build-anqCbI", DAY + HOUR)
+        # Older than the general idle limit, younger than the build copy's own.
+        kept_on_purpose = copy("nimbus-articles-build-JGyZdU", DAY - HOUR)
+        running = copy("nimbus-articles-build-k0KChp", DAY + HOUR)
+        self.holders.add(running)
+        other = copy("nimbus-articles-build-toolong1", DAY + HOUR)
+        link = self.root / "nimbus-articles-build-5ilVsv"
+        target = self.aged(self.logs, DAY + HOUR)
+        link.symlink_to(target)
+        os.utime(link, (time.time() - DAY + HOUR,) * 2, follow_symlinks=False)
+        counts = self.run_clean()
+        self.assertFalse(old.exists())
+        for path in (kept_on_purpose, running, other, link):
+            self.assertTrue(path.exists() or path.is_symlink(), path)
+        self.assertEqual(counts["build"], [1, 1])
+
+    def test_a_build_copy_that_will_not_delete_is_kept_and_the_run_goes_on(self):
+        stuck = self.root / "nimbus-articles-build-AAAAAA"
+        gone = self.root / "nimbus-articles-build-BBBBBB"
+        for path in (stuck, gone):
+            path.mkdir()
+            self.aged(path, DAY + HOUR)
+        real = reaper.shutil.rmtree
+        def rmtree(path, *a, **k):
+            if Path(path) == stuck:
+                raise PermissionError(1, "Operation not permitted", str(path))
+            return real(path, *a, **k)
+        with mock.patch.object(reaper.shutil, "rmtree", side_effect=rmtree):
+            counts = self.run_clean()
+        self.assertTrue(stuck.exists())
+        self.assertFalse(gone.exists())
+        self.assertEqual(counts["build"], [2, 1])
+
+    def test_lsof_sees_a_process_whose_cwd_is_inside(self):
+        inside = self.root / "nimbus-articles-build-CCCCCC"
+        (inside / "site-nimbus").mkdir(parents=True)
+        idle_dir = self.root / "nimbus-articles-build-DDDDDD"
+        idle_dir.mkdir()
+        child = subprocess.Popen(["sleep", "30"], cwd=inside / "site-nimbus")
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.assertTrue(REAL_HELD(inside))
+        self.assertFalse(REAL_HELD(idle_dir))
+
     def test_check_mode_changes_nothing(self):
         profile = self.profile("cdp-HHHHHH")
+        build = self.root / "nimbus-articles-build-KKKKKK"
+        build.mkdir()
+        self.aged(build, DAY + HOUR)
         self.chrome(50, self.root / "cdp-IIIIII")
         counts = reaper.reap(self.root, self.logs, clean=False, idle_seconds=HOUR,
                              send=lambda pid, sig: self.sent.append(pid))
-        self.assertTrue(profile.exists())
+        self.assertTrue(profile.exists() and build.exists())
         self.assertEqual(self.sent, [])
+        self.assertEqual(counts["build"], [1, 0])
         self.assertEqual(counts["profile"], [1, 0])
         self.assertEqual(counts["chrome"], [1, 0])
 
