@@ -472,7 +472,8 @@ Producers and cc-reaper both follow these five rules.
    `trap` or `finally` on every exit path, not only on success. A record that must outlive
    the run goes to a small, named path.
 3. **Session byproducts never land in a worktree.** Scratch belongs in the session
-   scratchpad or the job's `tmp/`. A rebuildable worktree byproduct is declared in the
+   scratchpad or the job's `tmp/`. A resumed job reuses its `tmp/`, so cc-reaper removes
+   only a virtualenv from it, never the job's other files. A rebuildable worktree byproduct is declared in the
    repository's `.worktree-regenerable` (`archive:` for a record that must survive). The
    janitor removes worktrees without `--force`, so one stray untracked file keeps the
    whole tree.
@@ -490,7 +491,7 @@ What cc-reaper reclaims under rule 5 on its own:
 |---|---|
 | Orphaned headless Chrome, `cdp-*` profiles, `wrangler-*.log` | `host-temp-reaper.py`, idle limit, `lsof` |
 | `$TMPDIR/nimbus-articles-build-*` | 24h, `lsof +D` |
-| `~/.claude/jobs/<id>/tmp` of a `done` or `stopped` job | 24h after its last terminal time; no command line names it; `lsof +D` |
+| A virtualenv (`pyvenv.cfg`) in `~/.claude/jobs/<8 hex>/tmp` of a `done` or `stopped` job | 72h after both its last terminal time and `state.json` mtime; no command line names it; `lsof +D`; job rechecked just before removal. `blocked`, `working` or an unreadable state is kept |
 | Worktrees | `worktree-janitor.sh` (landed, unheld, no session, idle) |
 
 ### Growth watch
