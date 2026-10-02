@@ -626,7 +626,7 @@ _cc_dj_host_temp_reap() {
     _cc_dj_skip "host temp reclaim (script or python3 not found)"
     return 0
   fi
-  _cc_dj_clean_target "host temp: orphaned headless Chrome, cdp profiles, wrangler logs, test build copies" \
+  _cc_dj_clean_target "host temp: orphaned headless Chrome, cdp profiles, wrangler logs, test build copies, finished job venvs" \
     python3 "$script" clean --idle-minutes "$CC_DJ_HOST_TEMP_IDLE_MINUTES"
 }
 

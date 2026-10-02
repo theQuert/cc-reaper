@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Reclaim what headless-Chrome scripts, wrangler and failed test builds leave in this
-user's temp space.
+"""Reclaim what headless-Chrome scripts, wrangler, failed test builds and finished
+background Claude jobs leave in this user's temp space.
 
-Four kinds, each proved abandoned before it is touched:
+Five kinds, each proved abandoned before it is touched:
 
 - an orphaned headless Chrome: launched with --headless, --remote-debugging-port and a
   --user-data-dir directly under this user's temp directory, reparented to launchd (its
@@ -18,7 +18,16 @@ Four kinds, each proved abandoned before it is touched:
   articles build test removes its 1.8 GB copy only when it passes, so every failed run
   left one: five copies, 9.2 GB, on 2026-10-02. A day rather than the idle limit,
   because NIMBUS_ARTICLES_BUILD_KEEP=1 keeps a copy on purpose and nothing on disk
-  tells it from a leak; a day still covers reading it the next morning.
+  tells it from a leak; a day still covers reading it the next morning;
+- a Python virtualenv (a directory holding `pyvenv.cfg`) directly in the `tmp/` of a
+  finished background Claude job (~/.claude/jobs/<8 hex>/): its state.json says `done`
+  or `stopped`, its last terminal time and the file itself are JOB_TMP_IDLE_SECONDS old,
+  no running process names the venv on its command line (a test's child still running
+  the venv's python does), and lsof +D finds no holder. Loop jobs built one there and
+  nothing removed it: 75 jobs, 9.7 GB on 2026-10-02. Only the venv goes, because a
+  resumed job reuses its directory: every other file in `tmp/` is the job's own and
+  stays, and a venv is what `pip install` rebuilds. Three days, because resumes were
+  seen 23 h and 42 h after a job ended. The job is checked again just before removal.
 
 Every probe that fails or cannot decide keeps the item. Chrome is sent SIGTERM only, so
 it shuts down on its own terms. Tests drive the seams (`processes`, `listening_ports`,
@@ -26,6 +35,8 @@ it shuts down on its own terms. Tests drive the seams (`processes`, `listening_p
 """
 
 import argparse
+from datetime import datetime
+import json
 import os
 from pathlib import Path
 import re
@@ -41,6 +52,9 @@ PROFILE_NAME = re.compile(r"cdp-[A-Za-z0-9]{6}$")
 WRANGLER_LOG = re.compile(r"wrangler-[0-9_-]+\.log$")
 BUILD_COPY = re.compile(r"nimbus-articles-build-[A-Za-z0-9]{6}$")
 BUILD_COPY_IDLE_SECONDS = 24 * 3600
+JOB_ID = re.compile(r"[0-9a-f]{8}$")
+JOB_TERMINAL_STATES = ("done", "stopped")
+JOB_TMP_IDLE_SECONDS = 72 * 3600
 # The browser itself, never a Helper: helper paths run from "Google Chrome Helper.app".
 CHROME_BINARY = re.compile(r"/\S.*/Google Chrome\.app/Contents/MacOS/Google Chrome(?= --)")
 
@@ -134,13 +148,28 @@ def idle(path, idle_seconds, now):
     return now - path.lstat().st_mtime >= idle_seconds
 
 
-def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill):
+def finished_job(job, now):
+    """True only when state.json proves the job ended JOB_TMP_IDLE_SECONDS ago."""
+    state_file = job / "state.json"
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or state.get("state") not in JOB_TERMINAL_STATES:
+            return False
+        ended = state.get("lastTerminalAt") or state.get("updatedAt")
+        ended = datetime.fromisoformat(ended.replace("Z", "+00:00")).timestamp()
+        return min(now - ended, now - state_file.stat().st_mtime) >= JOB_TMP_IDLE_SECONDS
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+
+
+def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill, jobs_dir=None):
     """Return counts {kind: (candidates, acted)}; prints one line per item."""
     now = time.time() if now is None else now
     rows = processes()
     if rows is None:
         raise RuntimeError("ps failed; kept everything")
-    counts = {"chrome": [0, 0], "profile": [0, 0], "wrangler": [0, 0], "build": [0, 0]}
+    counts = {"chrome": [0, 0], "profile": [0, 0], "wrangler": [0, 0], "build": [0, 0],
+              "jobvenv": [0, 0]}
 
     for row in rows:
         if not orphan_chrome(row, root, idle_seconds):
@@ -197,7 +226,38 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill)
             print(f"{'REMOVED' if clean else 'CANDIDATE'} build {path.name}")
         except OSError as error:
             print(f"KEEP build {path.name} ({error.strerror or error})")
+
+    jobs = jobs_dir.resolve() if jobs_dir is not None and jobs_dir.is_dir() else None
+    for job in sorted(jobs.iterdir()) if jobs is not None else []:
+        tmp = job / "tmp"
+        try:
+            if not JOB_ID.fullmatch(job.name) or job.is_symlink() or tmp.is_symlink() or not tmp.is_dir():
+                continue
+            if not finished_job(job, now):
+                continue
+            for venv in sorted(tmp.iterdir()):
+                if venv.is_symlink() or not (venv / "pyvenv.cfg").is_file():
+                    continue
+                if in_use(venv):
+                    continue
+                counts["jobvenv"][0] += 1
+                if clean:
+                    # A resume between the scan and here would be seen now.
+                    if not finished_job(job, time.time()) or in_use(venv):
+                        print(f"KEEP jobvenv {job.name}/{venv.name} (changed)")
+                        continue
+                    shutil.rmtree(venv)
+                    counts["jobvenv"][1] += 1
+                print(f"{'REMOVED' if clean else 'CANDIDATE'} jobvenv {job.name}/{venv.name}")
+        except OSError as error:
+            print(f"KEEP jobvenv {job.name} ({error.strerror or error})")
     return counts
+
+
+def in_use(path):
+    """A process names the path on its command line, or lsof finds a holder; True when unsure."""
+    rows = processes()
+    return rows is None or any(str(path) in r[3] for r in rows) or held(path)
 
 
 def main():
@@ -208,7 +268,8 @@ def main():
     if args.idle_minutes < 30:
         raise ValueError("idle limit must be at least 30 minutes")
     counts = reap(temp_root(), Path.home() / "Library/Preferences/.wrangler/logs",
-                  clean=args.mode == "clean", idle_seconds=args.idle_minutes * 60)
+                  clean=args.mode == "clean", idle_seconds=args.idle_minutes * 60,
+                  jobs_dir=Path.home() / ".claude/jobs")
     print("host temp: " + " ".join(f"{k}={v[1]}/{v[0]}" for k, v in counts.items()))
 
 
