@@ -787,7 +787,8 @@ while read -r asked head merge base; do
   [ "$asked" = "$sha" ] || continue
   case "$jq" in *'.head.sha == '*) case "$jq" in *".head.sha == \"$head\""*) ;; *) continue ;; esac ;; esac
   case "$jq" in *'.base.ref == '*) case "$jq" in *".base.ref == \"$base\""*) ;; *) continue ;; esac ;; esac
-  echo "$merge"
+  # A filter that prints the base beside the merge leaves the base test to the caller.
+  case "$jq" in *'(.base.ref)'*) echo "$base $merge" ;; *) echo "$merge" ;; esac
 done < "$GH_PULLS_FILE"
 STUB
 chmod +x "$STUBS_IDLE/gh"
@@ -2123,6 +2124,98 @@ CC_WJ_ARCHIVE_DIR="$RCH_ROOT/store" PATH="$RCH_STUBS:$STUBS_IDLE:$PATH" \
   bash "$WJ" --repo "$RCH_PRIMARY" > "$OUT_RCH_FAIL" 2>&1
 expect_yes "a reach check that fails keeps the directory" \
   d_says "$OUT_RCH_FAIL" wt-each "notes/ (declared, but an archive: pattern may name a path inside it)"
+
+# ─── Pull requests found by SHA search and by branch ─────────────────────────
+# The stub serves one JSON file per endpoint and applies the caller's --jq with real jq,
+# so a filter that stops comparing the head, base or close time stops matching here too.
+# An endpoint with no file fails, as a network error would.
+GHX_ROOT="$(mktemp -d)"; GHX_FIX="$GHX_ROOT/fix"; GHX_STUBS="$GHX_ROOT/bin"
+mkdir -p "$GHX_FIX" "$GHX_STUBS"
+cat > "$GHX_STUBS/gh" <<'STUB'
+#!/usr/bin/env bash
+endpoint="" jq="."
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --hostname) shift 2 ;;
+    --jq) jq="$2"; shift 2 ;;
+    --paginate) shift ;;
+    repos/*|search/*) endpoint="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+f="$GHX_FIX/$(printf '%s' "$endpoint" | tr '/?&:=+' '______')"
+[ -f "$f" ] || exit 1
+jq -r "$jq" "$f"
+STUB
+chmod +x "$GHX_STUBS/gh"
+export GHX_FIX
+ghx() { printf '%s' "$2" > "$GHX_FIX/$(printf '%s' "$1" | tr '/?&:=+' '______')"; }
+
+GHX_WT="$GHX_ROOT/wt"
+git -C "$GHX_ROOT" init -q -b feat/x wt
+git -C "$GHX_WT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m head
+git -C "$GHX_WT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m merged-on-main
+GHX_MERGE="$(git -C "$GHX_WT" rev-parse HEAD)"
+git -C "$GHX_WT" update-ref refs/remotes/origin/main "$GHX_MERGE"
+git -C "$GHX_WT" reset -q --hard HEAD~1
+GHX_HEAD="$(git -C "$GHX_WT" rev-parse HEAD)"
+git -C "$GHX_WT" remote add origin https://github.com/acme/demo.git
+
+ghx_landed() { PATH="$GHX_STUBS:$PATH" _CC_WJ_BASE=main _cc_wj_landed_by_pr "$GHX_WT" refs/remotes/origin/main; }
+ghx_closed_is() { [ "$(PATH="$GHX_STUBS:$PATH" _cc_wj_closed_at_head "$GHX_WT")" = "$1" ]; }
+
+# The commit's PR list names only the stacked PR into another branch.
+ghx "repos/acme/demo/commits/$GHX_HEAD/pulls" \
+  "[{\"number\":2506,\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"stack\"},\"head\":{\"sha\":\"$GHX_HEAD\"},\"merge_commit_sha\":\"$GHX_HEAD\"}]"
+ghx "search/issues?q=repo:acme/demo+is:pr+is:merged+$GHX_HEAD&per_page=20" '{"items":[{"number":2506},{"number":2490}]}'
+ghx "repos/acme/demo/pulls/2506" "{\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"stack\"},\"head\":{\"sha\":\"$GHX_HEAD\"},\"merge_commit_sha\":\"$GHX_HEAD\"}"
+ghx "repos/acme/demo/pulls/2490" "{\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"head\":{\"sha\":\"$GHX_HEAD\"},\"merge_commit_sha\":\"$GHX_MERGE\"}"
+expect_yes "a head merged into a stacked branch, then into the base by another PR, has landed" ghx_landed
+ghx "repos/acme/demo/pulls/2490" "{\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"head\":{\"sha\":\"1111111111111111111111111111111111111111\"},\"merge_commit_sha\":\"$GHX_MERGE\"}"
+expect_no "a search hit whose head moved past this commit has not landed it" ghx_landed
+ghx "repos/acme/demo/pulls/2490" "{\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"head\":{\"sha\":\"$GHX_HEAD\"},\"merge_commit_sha\":\"2222222222222222222222222222222222222222\"}"
+expect_no "a merge commit that is not on the fetched base proves nothing" ghx_landed
+# Every other answer would prove it, so only the failed search stands between.
+ghx "repos/acme/demo/pulls/2490" "{\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"head\":{\"sha\":\"$GHX_HEAD\"},\"merge_commit_sha\":\"$GHX_MERGE\"}"
+rm -f "$GHX_FIX"/search_*
+expect_no "a search that fails keeps the worktree unlanded" ghx_landed
+# A head merged nowhere is ordinary unfinished work: no search is spent on it, so even a
+# search that would answer yes is never asked.
+ghx "search/issues?q=repo:acme/demo+is:pr+is:merged+$GHX_HEAD&per_page=20" '{"items":[{"number":2490}]}'
+ghx "repos/acme/demo/commits/$GHX_HEAD/pulls" '[]'
+expect_no "a head with no merged PR at all does not spend a search" ghx_landed
+
+# Closed unmerged at this HEAD, long enough ago, with nothing open.
+ghx_iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+GHX_OLD="$(ghx_iso $(( $(date +%s) - 20 * 86400 )))"
+GHX_NEW="$(ghx_iso $(( $(date +%s) - 2 * 86400 )))"
+ghx_closed_fix() { ghx "repos/acme/demo/pulls?head=acme:feat/x&state=closed&per_page=100" "$1"; }
+ghx "repos/acme/demo/pulls?head=acme:feat/x&state=open&per_page=100" '[]'
+ghx_closed_fix "[{\"number\":5,\"merged_at\":null,\"head\":{\"sha\":\"$GHX_HEAD\"},\"closed_at\":\"$GHX_OLD\"}]"
+expect_yes "a PR closed unmerged at this HEAD 20 days ago is abandoned" ghx_closed_is yes
+ghx_closed_fix "[{\"number\":5,\"merged_at\":null,\"head\":{\"sha\":\"$GHX_HEAD\"},\"closed_at\":\"$GHX_NEW\"}]"
+expect_yes "one closed two days ago is not, yet" ghx_closed_is no
+ghx_closed_fix "[{\"number\":5,\"merged_at\":null,\"head\":{\"sha\":\"1111111111111111111111111111111111111111\"},\"closed_at\":\"$GHX_OLD\"}]"
+expect_yes "a closed PR at another head says nothing about this commit" ghx_closed_is no
+ghx_closed_fix "[{\"number\":5,\"merged_at\":\"2026-09-01T00:00:00Z\",\"head\":{\"sha\":\"$GHX_HEAD\"},\"closed_at\":\"$GHX_OLD\"}]"
+expect_yes "a merged PR is not a closed one" ghx_closed_is no
+ghx_closed_fix "[{\"number\":5,\"merged_at\":null,\"head\":{\"sha\":\"$GHX_HEAD\"},\"closed_at\":\"$GHX_OLD\"}]"
+ghx "repos/acme/demo/pulls?head=acme:feat/x&state=open&per_page=100" '[{"number":6}]'
+expect_yes "an open PR for the branch keeps it" ghx_closed_is no
+rm -f "$GHX_FIX"/*state_open*
+expect_yes "an open-PR query that fails keeps it" ghx_closed_is no
+ghx "repos/acme/demo/pulls?head=acme:feat/x&state=open&per_page=100" '[]'
+git -C "$GHX_WT" checkout -q --detach
+expect_yes "a detached HEAD is never abandoned this way" ghx_closed_is no
+git -C "$GHX_WT" checkout -q feat/x
+ghx_closed_fix "[{\"number\":5,\"merged_at\":null,\"head\":{\"sha\":\"$GHX_HEAD\"},\"closed_at\":\"$GHX_OLD\"}]"
+for d in 0 abc 99999; do
+  expect_yes "CC_WJ_CLOSED_PR_DAYS=$d is refused, so nothing is abandoned" \
+    env CC_WJ_CLOSED_PR_DAYS=$d bash -c 'source "$1"; PATH="$2:$PATH" _cc_wj_closed_at_head "$3" | grep -qx no' _ "$WJ" "$GHX_STUBS" "$GHX_WT"
+done
+expect_yes "CC_WJ_CLOSED_PR_DAYS=08 reads as eight days, not an error" \
+  env CC_WJ_CLOSED_PR_DAYS=08 bash -c 'source "$1"; PATH="$2:$PATH" _cc_wj_closed_at_head "$3" | grep -qx yes' _ "$WJ" "$GHX_STUBS" "$GHX_WT"
+rm -rf "$GHX_ROOT"
 
 # ─── Final result ─────────────────────────────────────────────────────────────
 

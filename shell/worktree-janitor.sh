@@ -2299,10 +2299,33 @@ _cc_wj_landed_by_pr() {
   esac
   case "$slug" in */*) ;; *) return 1 ;; esac
   [ -n "$host" ] || return 1
-  merges="$(_cc_wj_with_timeout 30 gh api --hostname "$host" "repos/$slug/commits/$head/pulls" \
+  local listed n numbers
+  listed="$(_cc_wj_with_timeout 30 gh api --hostname "$host" "repos/$slug/commits/$head/pulls" \
      --paginate \
-     --jq ".[] | select(.merged_at != null and .base.ref == \"$_CC_WJ_BASE\" and .head.sha == \"$head\") | .merge_commit_sha" \
+     --jq ".[] | select(.merged_at != null and .head.sha == \"$head\") | \"\\(.base.ref) \\(.merge_commit_sha)\"" \
      2>/dev/null)" || return 1
+  merges="$(printf '%s\n' "$listed" | awk -v b="$_CC_WJ_BASE" '$1 == b { print $2 }')"
+  # The commit's PR list names one pull request, not all of them: a head first merged into
+  # a stacked branch lists only that PR, and the later one that took the same head to the
+  # base, from another branch, is missing (stima-api #2506 into codex/2471-header-state,
+  # then #2490 into main, kept 6.9 GB as unlanded on 2026-10-03). Search merged pull
+  # requests by the SHA and read each one: the head, base and merge commit checks are the
+  # same as above, so a search hit is only a candidate. Searched only when this head was
+  # merged into some other branch, the stacked case's mark: search allows 30 calls a
+  # minute per account, and most unlanded trees are simply unfinished.
+  if [ -z "$merges" ] && [ -n "$listed" ]; then
+    numbers="$(_cc_wj_with_timeout 30 gh api --hostname "$host" \
+      "search/issues?q=repo:$slug+is:pr+is:merged+$head&per_page=20" --jq '.items[].number' 2>/dev/null)" || return 1
+    while IFS= read -r n; do
+      case "$n" in ''|*[!0-9]*) continue ;; esac
+      mc="$(_cc_wj_with_timeout 30 gh api --hostname "$host" "repos/$slug/pulls/$n" \
+        --jq "select(.merged_at != null and .base.ref == \"$_CC_WJ_BASE\" and .head.sha == \"$head\") | .merge_commit_sha" \
+        2>/dev/null)" || return 1
+      [ -z "$mc" ] || merges="$merges$mc"$'\n'
+    done <<NUMBERS
+$numbers
+NUMBERS
+  fi
   [ -n "$merges" ] || return 1
   while IFS= read -r mc; do
     [ -n "$mc" ] || continue
@@ -2311,6 +2334,63 @@ _cc_wj_landed_by_pr() {
 $merges
 MERGES
   return 1
+}
+
+# Run jq filter $5 over the pull requests in state $4 whose head is worktree $1's branch or
+# its upstream's branch, in repository $3 on host $2, printing the results. Fails when any
+# query fails, so a partial answer never reads as a complete one; prints nothing for a
+# detached HEAD.
+_cc_wj_branch_prs() {
+  local wt="$1" host="$2" slug="$3" state="$4" filter="$5" name up seen="" out
+  name="$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null)" || return 0
+  up="$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" || up=""
+  up="${up#*/}"
+  for name in "$name" "$up"; do
+    [ -n "$name" ] || continue
+    case " $seen " in *" $name "*) continue ;; esac
+    seen="$seen $name"
+    out="$(_cc_wj_with_timeout 30 gh api --hostname "$host" --paginate \
+          "repos/$slug/pulls?head=${slug%%/*}:$name&state=$state&per_page=100" \
+          --jq "$filter" 2>/dev/null)" || return 1
+    [ -z "$out" ] || printf '%s\n' "$out"
+  done
+}
+
+# Answer `yes` only when GitHub confirms a pull request was CLOSED unmerged at exactly this
+# worktree's HEAD, at least CC_WJ_CLOSED_PR_DAYS (14) days ago, and that no pull request for
+# the branch is open. Somebody decided against that work, the commits stay on the branch
+# and in the pull request's ref, and only the checkout goes. 11 such worktrees held 9.8 GB
+# on 2026-10-03. Every failure, a detached HEAD and a newer commit answer `no`.
+_cc_wj_closed_at_head() {
+  local wt="$1" head url rest host slug days="${CC_WJ_CLOSED_PR_DAYS:-14}" cutoff closed open
+  # Whole days, 1 to 9999, read as decimal: `08` is not octal, and 0 would take a PR closed
+  # this minute.
+  case "$days" in ''|*[!0-9]*|?????*) echo no; return ;; esac
+  days=$((10#$days))
+  [ "$days" -ge 1 ] || { echo no; return; }
+  command -v gh >/dev/null 2>&1 || { echo no; return; }
+  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)" || { echo no; return; }
+  url="$(git -C "$wt" config --get remote.origin.url 2>/dev/null)" || { echo no; return; }
+  url="${url%.git}"
+  case "$url" in
+    *://*)
+      rest="${url#*://}"; rest="${rest#*@}"
+      host="${rest%%/*}"; host="${host%%:*}"
+      slug="${rest#*/}" ;;
+    *:*)
+      host="${url%%:*}"; host="${host##*@}"
+      slug="${url#*:}" ;;
+    *) echo no; return ;;
+  esac
+  case "$slug" in */*) ;; *) echo no; return ;; esac
+  [ -n "$host" ] || { echo no; return; }
+  cutoff="$(( $(date +%s) - days * 86400 ))"
+  open="$(_cc_wj_branch_prs "$wt" "$host" "$slug" open '.[] | .number')" || { echo no; return; }
+  [ -z "$open" ] || { echo no; return; }
+  closed="$(_cc_wj_branch_prs "$wt" "$host" "$slug" closed \
+    ".[] | select(.merged_at == null and .head.sha == \"$head\" and (.closed_at | fromdateiso8601) <= $cutoff) | .number")" ||
+    { echo no; return; }
+  [ -n "$closed" ] && echo yes || echo no
 }
 
 # Answer `yes` only when GitHub CONFIRMS that this branch has never had a pull request,
@@ -2447,7 +2527,8 @@ _cc_wj_classify() {
   local landed="${6:-}"  # ancestor | content | pr | no | unfetched
   local idle="${7:-}"    # yes | no | unknown
   local recent="${8:-no}" # "yes" when a bounded harness-session lease applies
-  local abandoned="${9:-no}" # "yes" only when GitHub confirmed no pull request ever existed
+  local abandoned="${9:-no}" # "yes" only when GitHub confirmed no pull request ever existed,
+                             # or one closed unmerged at this HEAD (`_cc_wj_closed_at_head`)
 
   if [ "$dirty" = "MISSING" ]; then
     echo "KEEP(missing-dir)"
@@ -3178,6 +3259,7 @@ KEEP
             if [ "$idle_long" = "yes" ]; then
               idle="yes"
               abandoned="$(_cc_wj_never_had_pr "$wt_path")"
+              [ "$abandoned" = "yes" ] || abandoned="$(_cc_wj_closed_at_head "$wt_path")"
             fi
             ;;
         esac
