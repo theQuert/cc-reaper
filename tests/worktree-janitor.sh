@@ -787,7 +787,8 @@ while read -r asked head merge base; do
   [ "$asked" = "$sha" ] || continue
   case "$jq" in *'.head.sha == '*) case "$jq" in *".head.sha == \"$head\""*) ;; *) continue ;; esac ;; esac
   case "$jq" in *'.base.ref == '*) case "$jq" in *".base.ref == \"$base\""*) ;; *) continue ;; esac ;; esac
-  echo "$merge"
+  # A filter that prints the base beside the merge leaves the base test to the caller.
+  case "$jq" in *'(.base.ref)'*) echo "$base $merge" ;; *) echo "$merge" ;; esac
 done < "$GH_PULLS_FILE"
 STUB
 chmod +x "$STUBS_IDLE/gh"
@@ -2178,10 +2179,16 @@ expect_no "a merge commit that is not on the fetched base proves nothing" ghx_la
 ghx "repos/acme/demo/pulls/2490" "{\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"head\":{\"sha\":\"$GHX_HEAD\"},\"merge_commit_sha\":\"$GHX_MERGE\"}"
 rm -f "$GHX_FIX"/search_*
 expect_no "a search that fails keeps the worktree unlanded" ghx_landed
+# A head merged nowhere is ordinary unfinished work: no search is spent on it, so even a
+# search that would answer yes is never asked.
+ghx "search/issues?q=repo:acme/demo+is:pr+is:merged+$GHX_HEAD&per_page=20" '{"items":[{"number":2490}]}'
+ghx "repos/acme/demo/commits/$GHX_HEAD/pulls" '[]'
+expect_no "a head with no merged PR at all does not spend a search" ghx_landed
 
 # Closed unmerged at this HEAD, long enough ago, with nothing open.
-GHX_OLD="$(date -u -r $(( $(date +%s) - 20 * 86400 )) +%Y-%m-%dT%H:%M:%SZ)"
-GHX_NEW="$(date -u -r $(( $(date +%s) - 2 * 86400 )) +%Y-%m-%dT%H:%M:%SZ)"
+ghx_iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+GHX_OLD="$(ghx_iso $(( $(date +%s) - 20 * 86400 )))"
+GHX_NEW="$(ghx_iso $(( $(date +%s) - 2 * 86400 )))"
 ghx_closed_fix() { ghx "repos/acme/demo/pulls?head=acme:feat/x&state=closed&per_page=100" "$1"; }
 ghx "repos/acme/demo/pulls?head=acme:feat/x&state=open&per_page=100" '[]'
 ghx_closed_fix "[{\"number\":5,\"merged_at\":null,\"head\":{\"sha\":\"$GHX_HEAD\"},\"closed_at\":\"$GHX_OLD\"}]"
@@ -2200,6 +2207,14 @@ expect_yes "an open-PR query that fails keeps it" ghx_closed_is no
 ghx "repos/acme/demo/pulls?head=acme:feat/x&state=open&per_page=100" '[]'
 git -C "$GHX_WT" checkout -q --detach
 expect_yes "a detached HEAD is never abandoned this way" ghx_closed_is no
+git -C "$GHX_WT" checkout -q feat/x
+ghx_closed_fix "[{\"number\":5,\"merged_at\":null,\"head\":{\"sha\":\"$GHX_HEAD\"},\"closed_at\":\"$GHX_OLD\"}]"
+for d in 0 abc 99999; do
+  expect_yes "CC_WJ_CLOSED_PR_DAYS=$d is refused, so nothing is abandoned" \
+    env CC_WJ_CLOSED_PR_DAYS=$d bash -c 'source "$1"; PATH="$2:$PATH" _cc_wj_closed_at_head "$3" | grep -qx no' _ "$WJ" "$GHX_STUBS" "$GHX_WT"
+done
+expect_yes "CC_WJ_CLOSED_PR_DAYS=08 reads as eight days, not an error" \
+  env CC_WJ_CLOSED_PR_DAYS=08 bash -c 'source "$1"; PATH="$2:$PATH" _cc_wj_closed_at_head "$3" | grep -qx yes' _ "$WJ" "$GHX_STUBS" "$GHX_WT"
 rm -rf "$GHX_ROOT"
 
 # ─── Final result ─────────────────────────────────────────────────────────────
