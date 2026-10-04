@@ -21,9 +21,13 @@ A launcher tree is stopped only when every one of these holds:
   vite and astro move to; listeners are read again right before signalling. For
   `react-scripts start`, whose port is not on its command line, serving means a TCP
   connection to any port its tree listens on: an open tab keeps the hot-reload socket
-  connected, so a tree with listeners and no connection, both at the scan and at the
-  recheck, has nobody using it. Two CRA servers sat 2 days like that on 2026-10-05,
-  holding 4.5 GB while the compressor churned 850 MB/s;
+  connected, but a closed laptop drops it within seconds, so one empty moment proves
+  nothing: the tree must have had no connection at every run for CRA_IDLE_HOURS, as
+  recorded in the state directory, and none again at the recheck. Two CRA servers sat 2
+  days like that on 2026-10-05, holding 4.5 GB while the compressor churned 850 MB/s;
+- nothing publishes it: no other listening process names its worktree on its command line
+  (a review front such as ~/stima-review/tailnet_review.mjs <worktree> <port>), and no
+  `tailscale serve` handler proxies to a port the tree listens on;
 - the root is at least the minimum age, so a server still starting is not judged;
 - the worktree janitor's `--claims <worktree>` names no live session cwd and no live
   session tool call for that worktree (this session's own mentions excepted, as the
@@ -38,7 +42,9 @@ matches the scan, so a reused pid is never hit.
 """
 
 import argparse
+import json
 import os
+import shutil
 from pathlib import Path
 import re
 import signal
@@ -52,6 +58,9 @@ AGENT = re.compile(r"(?:^|/)(?:claude|codex)(?:\s|$)")
 PORT_SHIFT = 20
 # `react-scripts start` reads PORT from the environment; its port is whatever it listens on.
 ANY_PORT = -1
+# How long such a tree must have had no connection at every run before it is stopped.
+CRA_IDLE_HOURS = 12
+STATE_DIR = Path.home() / ".cc-reaper" / "state" / "dev-server-idle"
 
 
 def launcher(command):
@@ -151,6 +160,79 @@ def connected():
     return found or None
 
 
+def served_ports():
+    """Local ports a `tailscale serve` handler forwards to; empty without tailscale, None
+    when tailscale is there and cannot answer."""
+    binary = shutil.which("tailscale")
+    if binary is None:
+        return set()
+    try:
+        probe = subprocess.run([binary, "serve", "status", "--json"], capture_output=True,
+                               text=True, timeout=30, check=False)
+        config = json.loads(probe.stdout) if probe.returncode == 0 and probe.stdout.strip() else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    found = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, str):
+            match = re.search(r":(\d{2,5})(?:/|$)", node)
+            if match:
+                found.add(int(match.group(1)))
+    walk({k: v for k, v in config.items() if k != "TCP"})
+    return found
+
+
+def published(rows, ports, members, worktree):
+    """Why the tree is published to someone, or None. Anything unreadable is a reason."""
+    # An argument naming the worktree, not argv[0]: the local stack's own API runs from a
+    # binary inside the worktree and publishes nothing.
+    for pid, held in ports.items():
+        if not held or pid in members or pid not in rows:
+            continue
+        if any(arg == str(worktree) or arg.startswith(f"{worktree}/") for arg in rows[pid][4].split()[1:]):
+            return f"published by listening pid {pid}, which names its worktree"
+    forwarded = served_ports()
+    if forwarded is None:
+        return "tailscale serve unreadable"
+    hit = sorted(forwarded & {p for pid in members for p in ports.get(pid, ())})
+    return f"published by tailscale serve on {hit[0]}" if hit else None
+
+
+def idle_for(state_dir, root, begun, now):
+    """Seconds this tree has been recorded unused; records it first when new."""
+    marker = state_dir / f"{root}-{int(begun)}"
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        if not marker.exists():
+            marker.touch()
+            return 0
+        return now - marker.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def forget_idle(state_dir, root, begun):
+    try:
+        (state_dir / f"{root}-{int(begun)}").unlink()
+    except OSError:
+        pass
+
+
+def prune_idle(state_dir, rows):
+    """Drop markers of trees that no longer run, so a reused pid starts from zero."""
+    live = {f"{pid}-{int(started(row[3]) or 0)}" for pid, row in rows.items()}
+    try:
+        for marker in state_dir.iterdir():
+            if marker.name not in live:
+                marker.unlink()
+    except OSError:
+        pass
+
+
 def cwd(pid):
     """The process's working directory; None when lsof cannot say."""
     try:
@@ -221,7 +303,7 @@ def serving(ports, members, port):
             return None
         clients = connected()
         if clients is None:
-            return "connections unreadable"
+            return "kept: connections unreadable"
         used = sorted(listens & clients)
         return f"has connections on {used[0]}" if used else None
     if any(port in ports.get(pid, ()) for pid in members):
@@ -230,7 +312,8 @@ def serving(ports, members, port):
     return f"moved from {port} to {moved[0]}" if moved else None
 
 
-def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=900):
+def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=900,
+          state_dir=STATE_DIR, idle_hours=CRA_IDLE_HOURS):
     """(verdict, reason, worktree, members, port); verdict is reap, serving or keep."""
     ppid, _, _, lstart, command = rows[root]
     port = launcher(command)
@@ -242,6 +325,8 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
     members = tree(rows, root)
     why = serving(ports, members, port)
     if why:
+        if port == ANY_PORT:
+            forget_idle(state_dir, root, begun)
         return "serving", why, None, members, port
     groups = {rows[pid][1] for pid in members}
     if any(AGENT.search(row[4]) and (pid in members or row[1] in groups)
@@ -258,8 +343,17 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
         claims[worktree] = claimed(worktree, janitor, claim_timeout)
     if claims[worktree]:
         return "keep", "a live session claims the worktree, or the claim check failed", worktree, [], port
+    why = published(rows, ports, members, worktree)
+    if why:
+        # Unused starts counting again when the publisher goes, not from before it came.
+        if port == ANY_PORT:
+            forget_idle(state_dir, root, begun)
+        return "serving", why, worktree, members, port
     if port == ANY_PORT:
-        return "reap", "has no connection on any port it listens on", worktree, members, port
+        idle = idle_for(state_dir, root, begun, now)
+        if idle < idle_hours * 3600:
+            return "keep", f"unused for {idle / 3600:.1f}h of the {idle_hours}h it must be", worktree, [], port
+        return "reap", f"no connection on any port it listens on for {idle / 3600:.1f}h", worktree, members, port
     return "reap", f"does not listen on its port {port}", worktree, members, port
 
 
@@ -292,7 +386,7 @@ def stop(members, snapshot, grace, send=os.kill, sleep=time.sleep):
 
 
 def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=os.kill,
-         sleep=time.sleep, claim_timeout=900):
+         sleep=time.sleep, claim_timeout=900, state_dir=STATE_DIR, idle_hours=CRA_IDLE_HOURS):
     """Print one line per launcher root and a summary; return (reaped, candidates)."""
     now = time.time() if now is None else now
     janitor = janitor or Path.home() / ".cc-reaper" / "worktree-janitor.sh"
@@ -305,12 +399,13 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
     reaped = candidates = 0
     rss_kb = 0
     claims = {}
+    prune_idle(state_dir, rows)
     for root in sorted(rows):
         ppid, _, _, _, command = rows[root]
         if ppid != 1 or launcher(command) is None:
             continue
         verdict, reason, worktree, members, port = judge(rows, ports, root, min_age, now, janitor, claims,
-                                                         claim_timeout)
+                                                         claim_timeout, state_dir, idle_hours)
         label = f"pid={root} worktree={worktree or '-'} cmd={command[:80]!r}"
         if verdict != "reap":
             print(f"{verdict.upper()} {label} ({reason})")
@@ -329,7 +424,8 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
             print(f"KEEP {label} (changed, or unreadable, at the recheck)")
             continue
         members = tree(fresh_rows, root)
-        if serving(fresh, members, port) or any(AGENT.search(fresh_rows[p][4]) for p in members):
+        if (serving(fresh, members, port) or published(fresh_rows, fresh, members, worktree)
+                or any(AGENT.search(fresh_rows[p][4]) for p in members)):
             print(f"KEEP {label} (serving, or an agent joined, at the recheck)")
             continue
         snapshot = {p: fresh_rows[p][3] for p in members}
@@ -353,11 +449,12 @@ def main():
     parser.add_argument("--min-hours", type=int, default=6)
     parser.add_argument("--grace-seconds", type=int, default=10)
     parser.add_argument("--claim-timeout-seconds", type=int, default=900)
+    parser.add_argument("--cra-idle-hours", type=int, default=CRA_IDLE_HOURS)
     args = parser.parse_args()
-    if args.min_hours < 1:
-        raise ValueError("minimum age must be at least 1 hour")
+    if args.min_hours < 1 or args.cra_idle_hours < 1:
+        raise ValueError("minimum age and CRA idle time must be at least 1 hour")
     reap(apply=args.mode == "apply", min_age=args.min_hours * 3600, grace=args.grace_seconds,
-         claim_timeout=args.claim_timeout_seconds)
+         claim_timeout=args.claim_timeout_seconds, idle_hours=args.cra_idle_hours)
 
 
 if __name__ == "__main__":

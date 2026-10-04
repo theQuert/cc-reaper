@@ -2,6 +2,8 @@
 """Isolated safety tests for the dev-server reaper: every keep rule, and what it stops."""
 
 import importlib.util
+import json
+import os
 from pathlib import Path
 import signal
 import subprocess
@@ -31,6 +33,10 @@ class ReaperTest(unittest.TestCase):
         self.worktrees = {WT / "site": WT}
         self.claims = set()
         self.connections = {443}
+        self.forwarded = set()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.state = Path(temp.name)
         self.sent = []
         self.claim_calls = []
         for name, fake in (("processes", lambda: dict(self.rows)),
@@ -38,6 +44,7 @@ class ReaperTest(unittest.TestCase):
                            ("cwd", lambda pid: self.cwds.get(pid)),
                            ("linked_worktree", lambda path: self.worktrees.get(path)),
                            ("connected", lambda: set(self.connections) or None),
+                           ("served_ports", lambda: set(self.forwarded)),
                            ("claimed", self.fake_claimed)):
             patcher = mock.patch.object(reaper, name, side_effect=fake)
             patcher.start()
@@ -57,13 +64,14 @@ class ReaperTest(unittest.TestCase):
         self.ports[root + 2] = {9229}
         self.cwds[root] = where
 
-    def run_reap(self, apply=True):
+    def run_reap(self, apply=True, now=NOW):
         def send(pid, sig):
             self.sent.append((pid, sig))
             if sig == signal.SIGTERM:
                 self.rows.pop(pid, None)
-        return reaper.reap(apply=apply, min_age=6 * HOUR, grace=0, now=NOW,
-                           janitor=Path("/janitor"), send=send, sleep=lambda s: None)
+        return reaper.reap(apply=apply, min_age=6 * HOUR, grace=0, now=now,
+                           janitor=Path("/janitor"), send=send, sleep=lambda s: None,
+                           state_dir=self.state, idle_hours=12)
 
     def terms(self):
         return sorted(p for p, s in self.sent if s == signal.SIGTERM)
@@ -232,7 +240,7 @@ class ReaperTest(unittest.TestCase):
             if sig == signal.SIGTERM:
                 self.rows.pop(pid, None)
         reaped = reaper.reap(apply=True, min_age=6 * HOUR, grace=0, now=NOW, janitor=Path("/j"),
-                             send=send, sleep=lambda s: None)
+                             send=send, sleep=lambda s: None, state_dir=self.state)
         self.assertEqual(reaped, (2, 2))
         self.assertEqual(self.terms(), [100, 102, 200, 201, 202])
 
@@ -240,10 +248,84 @@ class ReaperTest(unittest.TestCase):
         self.server(root, cmd="node ./node_modules/.bin/react-scripts start")
         self.ports[root + 2] = {port}
 
-    def test_an_unused_cra_server_is_stopped(self):
+    def aged_marker(self, root, hours):
+        begun = int(reaper.started(OLD))
+        marker = self.state / f"{root}-{begun}"
+        marker.touch()
+        old = NOW - hours * HOUR
+        os.utime(marker, (old, old))
+
+    def test_an_unused_cra_server_is_first_recorded_then_stopped_after_12h(self):
         self.cra(100)
-        self.assertEqual(self.run_reap(), (1, 1))
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.run_reap(now=NOW + 11 * HOUR), (0, 0))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.run_reap(now=time.time() + 13 * HOUR), (1, 1))
         self.assertEqual(self.terms(), [100, 101, 102])
+
+    def test_a_connection_resets_the_idle_record(self):
+        self.cra(100)
+        self.aged_marker(100, 13)
+        self.connections.add(3633)
+        self.run_reap()
+        self.connections.discard(3633)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_cra_server_published_by_a_review_front_is_kept(self):
+        self.cra(100)
+        self.aged_marker(100, 13)
+        self.rows[500] = (1, 500, 10, OLD, f"node /x/tailnet_review.mjs {WT} 3157")
+        self.ports[500] = {3157}
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+        del self.rows[500], self.ports[500]          # the review ends: the 12h start over
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_review_front_started_by_the_recheck_keeps_it(self):
+        self.cra(100)
+        self.aged_marker(100, 13)
+        scans = []
+        original = reaper.processes.side_effect
+
+        def front_appears():
+            scans.append(1)
+            rows = original()
+            if len(scans) > 1:
+                rows[500] = (1, 500, 10, NEW, f"node /x/tailnet_review.mjs {WT} 3157")
+            return rows
+        reaper.processes.side_effect = front_appears
+        reaper.listening.side_effect = lambda: {**self.ports, 500: {3157}} if len(scans) > 1 else dict(self.ports)
+        self.assertEqual(self.run_reap(), (0, 1))
+        self.assertEqual(self.sent, [])
+
+    def test_the_stacks_own_api_running_from_the_worktree_is_not_a_publisher(self):
+        self.cra(100)
+        self.aged_marker(100, 13)
+        self.rows[600] = (1, 600, 10, OLD, f"{WT}/.local-stack/api")
+        self.ports[600] = {3632}
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_a_cra_server_behind_tailscale_serve_is_kept(self):
+        self.cra(100)
+        self.aged_marker(100, 13)
+        self.forwarded = {3633}
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_unreadable_tailscale_keeps_it(self):
+        self.cra(100)
+        self.aged_marker(100, 13)
+        reaper.served_ports.side_effect = lambda: None
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_markers_of_gone_trees_are_pruned(self):
+        (self.state / "999-123").touch()
+        self.run_reap()
+        self.assertFalse((self.state / "999-123").exists())
 
     def test_a_cra_server_with_a_connection_is_serving(self):
         self.cra(100)
@@ -253,6 +335,7 @@ class ReaperTest(unittest.TestCase):
 
     def test_a_cra_server_connected_by_the_recheck_is_kept(self):
         self.cra(100)
+        self.aged_marker(100, 13)
         calls = []
 
         def later():
@@ -264,6 +347,7 @@ class ReaperTest(unittest.TestCase):
 
     def test_unreadable_connections_keep_a_cra_server(self):
         self.cra(100)
+        self.aged_marker(100, 13)
         self.connections.clear()
         self.assertEqual(self.run_reap(), (0, 0))
         self.assertEqual(self.sent, [])
@@ -271,7 +355,8 @@ class ReaperTest(unittest.TestCase):
     def test_survivors_of_term_get_kill(self):
         self.server(100)
         reaper.reap(apply=True, min_age=6 * HOUR, grace=0, now=NOW, janitor=Path("/j"),
-                    send=lambda pid, sig: self.sent.append((pid, sig)), sleep=lambda s: None)
+                    send=lambda pid, sig: self.sent.append((pid, sig)), sleep=lambda s: None,
+                    state_dir=self.state)
         self.assertEqual(sorted(p for p, s in self.sent if s == signal.SIGKILL), [100, 101, 102])
 
     def test_scan_failures_keep_everything(self):
@@ -361,6 +446,22 @@ class WorktreeTest(unittest.TestCase):
             self.assertEqual(reaper.linked_worktree(linked), linked)
             self.assertEqual(reaper.linked_worktree(linked / "web" / "next"), linked)
             self.assertIsNone(reaper.linked_worktree(base))
+
+
+class ServedPortsTest(unittest.TestCase):
+    def run_status(self, stdout, rc=0, which="/bin/tailscale"):
+        with mock.patch.object(reaper.shutil, "which", return_value=which), \
+             mock.patch.object(reaper.subprocess, "run", return_value=mock.Mock(returncode=rc, stdout=stdout)):
+            return reaper.served_ports()
+
+    def test_proxies_are_read_and_tcp_listen_ports_are_not(self):
+        status = {"TCP": {"8157": {"HTTP": True}}, "Web": {"h:8157": {"Handlers": {
+            "/": {"Proxy": "http://127.0.0.1:3157"}, "/v": {"Proxy": "http://127.0.0.1:4979/"}}}}}
+        self.assertEqual(self.run_status(json.dumps(status)), {3157, 4979})
+
+    def test_no_tailscale_is_nothing_served_and_a_failure_is_unknown(self):
+        self.assertEqual(self.run_status("", which=None), set())
+        self.assertIsNone(self.run_status("not json"))
 
 
 class ConnectedTest(unittest.TestCase):
