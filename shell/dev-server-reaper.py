@@ -163,7 +163,10 @@ def connected():
 def served_ports():
     """Local ports a `tailscale serve` handler forwards to; empty without tailscale, None
     when tailscale is there and cannot answer."""
-    binary = shutil.which("tailscale")
+    # launchd's PATH has no Homebrew; look where it is installed before calling it absent.
+    binary = shutil.which("tailscale") or next(
+        (p for p in ("/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale",
+                     "/Applications/Tailscale.app/Contents/MacOS/Tailscale") if os.access(p, os.X_OK)), None)
     if binary is None:
         return set()
     try:
@@ -182,18 +185,19 @@ def served_ports():
             match = re.search(r":(\d{2,5})(?:/|$)", node)
             if match:
                 found.add(int(match.group(1)))
-    walk({k: v for k, v in config.items() if k != "TCP"})
+    walk(config)   # values only: TCPForward targets count, listen-port keys do not
     return found
 
 
 def published(rows, ports, members, worktree):
     """Why the tree is published to someone, or None. Anything unreadable is a reason."""
-    # An argument naming the worktree, not argv[0]: the local stack's own API runs from a
-    # binary inside the worktree and publishes nothing.
+    # An argument that IS the worktree, not argv[0] and not a path inside it: the local
+    # stack's own API runs from a binary in the worktree, and a sibling dev server's child
+    # runs a script under it (node <wt>/node_modules/...), and neither publishes anything.
     for pid, held in ports.items():
         if not held or pid in members or pid not in rows:
             continue
-        if any(arg == str(worktree) or arg.startswith(f"{worktree}/") for arg in rows[pid][4].split()[1:]):
+        if any(arg.rstrip("/") == str(worktree) for arg in rows[pid][4].split()[1:]):
             return f"published by listening pid {pid}, which names its worktree"
     forwarded = served_ports()
     if forwarded is None:

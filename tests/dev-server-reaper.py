@@ -308,6 +308,12 @@ class ReaperTest(unittest.TestCase):
         self.ports[600] = {3632}
         self.assertEqual(self.run_reap(), (1, 1))
 
+    def test_a_sibling_dev_server_in_the_same_worktree_is_not_a_publisher(self):
+        self.server(100)
+        self.rows[700] = (1, 700, 10, OLD, f"node {WT}/node_modules/react-scripts/scripts/start.js")
+        self.ports[700] = {3579}
+        self.assertEqual(self.run_reap(), (1, 1))
+
     def test_a_cra_server_behind_tailscale_serve_is_kept(self):
         self.cra(100)
         self.aged_marker(100, 13)
@@ -455,12 +461,14 @@ class ServedPortsTest(unittest.TestCase):
             return reaper.served_ports()
 
     def test_proxies_are_read_and_tcp_listen_ports_are_not(self):
-        status = {"TCP": {"8157": {"HTTP": True}}, "Web": {"h:8157": {"Handlers": {
-            "/": {"Proxy": "http://127.0.0.1:3157"}, "/v": {"Proxy": "http://127.0.0.1:4979/"}}}}}
-        self.assertEqual(self.run_status(json.dumps(status)), {3157, 4979})
+        status = {"TCP": {"8157": {"HTTP": True}, "9000": {"TCPForward": "127.0.0.1:3000"}},
+                  "Web": {"h:8157": {"Handlers": {
+                      "/": {"Proxy": "http://127.0.0.1:3157"}, "/v": {"Proxy": "http://127.0.0.1:4979/"}}}}}
+        self.assertEqual(self.run_status(json.dumps(status)), {3157, 4979, 3000})
 
     def test_no_tailscale_is_nothing_served_and_a_failure_is_unknown(self):
-        self.assertEqual(self.run_status("", which=None), set())
+        with mock.patch.object(reaper.os, "access", return_value=False):
+            self.assertEqual(self.run_status("", which=None), set())
         self.assertIsNone(self.run_status("not json"))
 
 
