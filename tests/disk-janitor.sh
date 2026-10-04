@@ -85,7 +85,7 @@ if [ "$intercept" = "1" ]; then
   USED=$((100 - FREE))
   # Columns: Filesystem 1024-blocks Used Available Use% Mounted
   printf "Filesystem     1024-blocks      Used Available Capacity Mounted on\n"
-  printf "/dev/disk1s1   976490576 %d %d   %d%%  /\n" "$((USED * 1000))" "$((FREE * 1000))" "$USED"
+  printf "/dev/disk1s1   976490576 %d %d   %d%%  /\n" "$((USED * 1000))" "${FAKE_DF_AVAIL_KB:-$((FREE * 1000))}" "$USED"
 else
   # Absolute path, never `command df`: this file is the first df on PATH.
   /bin/df "$@"
@@ -219,6 +219,9 @@ _run_dj() {
     export CC_DJ_STATE_DIR="$SANDBOX/state"
     export CC_DJ_DISK_MIN_PCT=15
     export CC_DJ_COOLDOWN_SECS=3600
+    # The df stub reports kilobytes of free space, far under the act floor; only group 3d
+    # turns the low-disk action on.
+    export CC_DJ_ACT_FREE_GB="${CC_DJ_ACT_FREE_GB:-off}"
     # Never the machine's real /private/tmp. These runs exercise the cache targets,
     # and letting them enumerate the host's temp directory made the result depend on
     # whatever else was running - besides being slow and pointing a deletion path at
@@ -344,6 +347,77 @@ expect_yes "growth: a missing script is a SKIP" \
   grep -q "SKIP growth watch (script or python3 not found)" "$SANDBOX/dj.log"
 unset CC_DJ_GROWTH_SCRIPT FAKE_GROWTH_LINES
 rm -f "$SANDBOX/state/cooldown-growth"
+
+printf "\n# Test group 3d: --check acts below the free-GB floor\n"
+# The owner tools are stubs that record their arguments; gh records the comment it would
+# post. The act runs once per cooldown and never twice at a time.
+ACT_CAPTURE="$SANDBOX/act_calls"; : > "$ACT_CAPTURE"
+for t in go-hook janitor; do
+  printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\n' "$t" "$ACT_CAPTURE" > "$SANDBOX/act-$t"
+  chmod +x "$SANDBOX/act-$t"
+done
+printf '#!/usr/bin/env bash\necho "gh $*" >> "%s"\ncat >> "%s"\n' "$ACT_CAPTURE" "$ACT_CAPTURE" > "$FAKE_BIN/gh"
+chmod +x "$FAKE_BIN/gh"
+_run_act() {
+  CC_DJ_ACT_FREE_GB="${CC_DJ_ACT_FREE_GB:-30}" \
+  CC_DJ_ACT_GO_CACHE_HOOK="$SANDBOX/act-go-hook" CC_DJ_ACT_WORKTREE_JANITOR="$SANDBOX/act-janitor" \
+    CC_DJ_ALERT_ISSUE="${ACT_ISSUE-acme/demo#3337}" CC_DJ_GROWTH_TARGETS="$SANDBOX/no-targets.tsv" \
+    FAKE_DF_AVAIL_KB="$1" _run_dj --check 80 "${2:-0}"
+}
+rm -f "$SANDBOX/state/cooldown-act"; rmdir "$SANDBOX/state/low-disk-act.lock" 2>/dev/null || true
+: > "$ACT_CAPTURE"; _run_act $((25 * 1048576))
+expect_yes "act: below 30 GB free, the go cache pressure trim runs once" \
+  test "$(grep -cx 'go-hook --go-cache' "$ACT_CAPTURE")" -eq 1
+expect_yes "act: then the worktree regenerable trim, once" \
+  test "$(grep -cx 'janitor --trim-regenerable --apply' "$ACT_CAPTURE")" -eq 1
+expect_yes "act: the go cache trim runs before the worktree trim" \
+  test "$(grep -n 'go-hook' "$ACT_CAPTURE" | cut -d: -f1)" -lt "$(grep -n '^janitor' "$ACT_CAPTURE" | cut -d: -f1)"
+expect_yes "act: one comment goes to the alert issue" \
+  test "$(grep -cx 'gh issue comment 3337 --repo acme/demo --body-file -' "$ACT_CAPTURE")" -eq 1
+expect_yes "act: the comment states the free space before and after" \
+  grep -q 'Free after:' "$ACT_CAPTURE"
+expect_yes "act: and the lock is released" test ! -d "$SANDBOX/state/low-disk-act.lock"
+: > "$ACT_CAPTURE"; _run_act $((25 * 1048576)) "$(date +%s)"   # the stat stub: acted just now
+expect_no "act: a second check inside the cooldown does not act again" grep -q 'go-hook' "$ACT_CAPTURE"
+expect_yes "act: and says why" grep -q 'acted within' "$SANDBOX/dj.log"
+rm -f "$SANDBOX/state/cooldown-act"
+: > "$ACT_CAPTURE"; _run_act $((40 * 1048576))
+expect_no "act: at 40 GB free nothing acts" grep -q . "$ACT_CAPTURE"
+: > "$ACT_CAPTURE"; mkdir -p "$SANDBOX/state/low-disk-act.lock"; _run_act $((25 * 1048576))
+expect_no "act: a run holding the lock keeps a second one out" grep -q 'go-hook' "$ACT_CAPTURE"
+rmdir "$SANDBOX/state/low-disk-act.lock"; rm -f "$SANDBOX/state/cooldown-act"
+: > "$ACT_CAPTURE"; CC_DJ_ACT_FREE_GB=off _run_act $((25 * 1048576))
+expect_no "act: CC_DJ_ACT_FREE_GB=off turns it off" grep -q . "$ACT_CAPTURE"
+: > "$ACT_CAPTURE"; ACT_ISSUE="" _run_act $((25 * 1048576))
+expect_yes "act: with no alert issue it still acts" grep -q 'go-hook' "$ACT_CAPTURE"
+expect_no "act: and posts nothing" grep -q '^gh ' "$ACT_CAPTURE"
+rm -f "$SANDBOX/state/cooldown-act"
+# A trim that overruns its bound is stopped, and the run still reports and unlocks.
+printf '#!/usr/bin/env bash\necho "janitor $*" >> "%s"\nsleep 30\n' "$ACT_CAPTURE" > "$SANDBOX/act-janitor"
+: > "$ACT_CAPTURE"; ACT_T0=$(date +%s); CC_DJ_ACT_TRIM_SECONDS=2 _run_act $((25 * 1048576)); ACT_T1=$(date +%s)
+expect_yes "act: the hourly check is not held by a trim that would run 30s" test $((ACT_T1 - ACT_T0)) -lt 15
+expect_yes "act: a trim past CC_DJ_ACT_TRIM_SECONDS is stopped and says so" \
+  grep -q 'worktree regenerable trim (stopped after 2s)' "$SANDBOX/dj.log"
+expect_yes "act: and the lock is still released" test ! -d "$SANDBOX/state/low-disk-act.lock"
+rm -f "$SANDBOX/state/cooldown-act"
+# A trim that fails is reported with its status, not as done.
+printf '#!/usr/bin/env bash\necho "janitor $*" >> "%s"\nexit 3\n' "$ACT_CAPTURE" > "$SANDBOX/act-janitor"
+: > "$ACT_CAPTURE"; _run_act $((25 * 1048576))
+expect_yes "act: a failed trim is reported with its status" grep -q 'worktree regenerable trim (rc=3)' "$SANDBOX/dj.log"
+rm -f "$SANDBOX/state/cooldown-act"
+# A malformed setting skips the action and never aborts the hourly check.
+: > "$ACT_CAPTURE"; CC_DJ_ACT_FREE_GB=08 _run_act $((5 * 1048576))
+expect_yes "act: a floor written 08 is eight GB, not an octal error" grep -q 'go-hook' "$ACT_CAPTURE"
+rm -f "$SANDBOX/state/cooldown-act"
+: > "$ACT_CAPTURE"; CC_DJ_ACT_TRIM_SECONDS=900s _run_act $((25 * 1048576)); ACT_RC=$?
+expect_no "act: a non-numeric bound does not act" grep -q 'go-hook' "$ACT_CAPTURE"
+expect_yes "act: and logs why" grep -q 'act: CC_DJ_ACT_TRIM_SECONDS=900s is not a number' "$SANDBOX/dj.log"
+expect_yes "act: and the check still exits 0" test "$ACT_RC" -eq 0
+# A lock left by a killed run does not block every later check.
+mkdir -p "$SANDBOX/state/low-disk-act.lock"; touch -t 202601010000 "$SANDBOX/state/low-disk-act.lock"
+: > "$ACT_CAPTURE"; CC_DJ_ACT_TRIM_SECONDS=1 _run_act $((25 * 1048576))
+expect_yes "act: a stale lock is removed and the act runs" grep -q 'go-hook' "$ACT_CAPTURE"
+rm -f "$SANDBOX/state/cooldown-act" "$FAKE_BIN/gh"
 
 printf "\n# Test group 3c: --check host temp reclaim, clone age, daily builder prune\n"
 # The reclaimer's own safety rules are tests/host-temp-reaper.py. Here only the contract with

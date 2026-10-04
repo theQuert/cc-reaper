@@ -38,6 +38,10 @@ Environment:
   CC_DJ_HOST_TEMP_IDLE_MINUTES  Idle minutes before a temp item is reclaimed (default: 60, min 30)
   CC_DJ_CHROME_CLONE_MIN_AGE_DAYS  Minimum age of a removed code-sign clone (default: 1)
   CC_DJ_BUILDER_PRUNE_UNTIL  Daily --check builder prune filter, or `off` (default: 24h)
+  CC_DJ_ACT_FREE_GB     --check acts below this many free GB, or `off` (default: 30)
+  CC_DJ_ACT_COOLDOWN_SECS  Seconds between two low-disk actions (default: 10800)
+  CC_DJ_ACT_TRIM_SECONDS   Bound on the worktree regenerable trim it runs (default: 900)
+  CC_DJ_ALERT_ISSUE     owner/repo#N to comment on after acting; unset = log only
   CC_DJ_GROWTH_TARGETS  Growth targets for --check (default: ~/.cc-reaper/growth-targets.tsv)
   CC_DJ_GROWTH_INTERVAL_HOURS / _BUDGET_SECONDS / _WINDOW_HOURS / _ALERT_GB / _KEY_TIMEOUT
                         Sampling interval per target (6), time budget per run (240),
@@ -61,6 +65,10 @@ CC_DJ_HOST_TEMP_REAP="${CC_DJ_HOST_TEMP_REAP:-1}"
 CC_DJ_HOST_TEMP_IDLE_MINUTES="${CC_DJ_HOST_TEMP_IDLE_MINUTES:-60}"
 CC_DJ_CHROME_CLONE_MIN_AGE_DAYS="${CC_DJ_CHROME_CLONE_MIN_AGE_DAYS:-1}"
 CC_DJ_BUILDER_PRUNE_UNTIL="${CC_DJ_BUILDER_PRUNE_UNTIL:-24h}"
+CC_DJ_ACT_FREE_GB="${CC_DJ_ACT_FREE_GB:-30}"
+CC_DJ_ACT_COOLDOWN_SECS="${CC_DJ_ACT_COOLDOWN_SECS:-10800}"
+CC_DJ_ACT_TRIM_SECONDS="${CC_DJ_ACT_TRIM_SECONDS:-900}"
+CC_DJ_ALERT_ISSUE="${CC_DJ_ALERT_ISSUE:-}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
 CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
 # growth-watch.py reads its settings from the environment, and the config file sets them
@@ -266,6 +274,104 @@ _cc_dj_notify() {
   osascript -e "display notification \"$msg\" with title \"cc-reaper: disk-janitor\""
 }
 
+# Run "$@" for about $1 seconds. Past that it gets SIGTERM, which the worktree janitor traps
+# once its current step (one removal, one du) ends, so the bound is soft by that step and
+# no tree is left half removed. Returns the command's status, or 124 when it was stopped.
+_cc_dj_run_bounded() {
+  local secs="$1" pid waited=0; shift
+  "$@" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      kill -TERM "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null
+}
+
+# Below CC_DJ_ACT_FREE_GB free, act instead of only notifying. On 2026-10-04 --check logged
+# BELOW threshold every hour from 10% free, sent one desktop notification nobody saw and
+# reclaimed nothing; at 20 GB the CI slots declined jobs and merge-gate queued for 90
+# minutes (stima-api#3337). GB, not %, because the floor that matters is the CI's 20 GB.
+#
+# Each step is the owner's own reclaimer, bounded and safe beside running work: the skills
+# hook's pressure trim of the go cache (idle entries first, never a clear for pressure), then the
+# worktree janitor's regenerable trim (unheld, unclaimed trees only; trees and branches
+# stay). Chrome clones and host temp already ran above. One run at a time (a lock), and
+# at most one per CC_DJ_ACT_COOLDOWN_SECS, so hourly checks do not stack. The record goes
+# to CC_DJ_ALERT_ISSUE, where a person reads it; the desktop notification stays as well.
+_cc_dj_low_disk_act() {
+  local free_kb="$1" lock="$CC_DJ_STATE_DIR/low-disk-act.lock" before after step_before rc body hook janitor
+  local v floor_gb trim_s cool_s
+  [ "$CC_DJ_ACT_FREE_GB" = off ] && return 0
+  # A bad value logs and skips the action; it never aborts the rest of the hourly check.
+  for v in CC_DJ_ACT_FREE_GB CC_DJ_ACT_TRIM_SECONDS CC_DJ_ACT_COOLDOWN_SECS; do
+    case "${!v}" in ''|*[!0-9]*) _cc_dj_log "act: $v=${!v} is not a number; not acting"; return 0 ;; esac
+  done
+  case "$free_kb" in ''|*[!0-9]*) _cc_dj_log "act: free space unreadable; not acting"; return 0 ;; esac
+  # 10# so 08 is eight, not an octal error.
+  floor_gb=$((10#$CC_DJ_ACT_FREE_GB)); trim_s=$((10#$CC_DJ_ACT_TRIM_SECONDS)); cool_s=$((10#$CC_DJ_ACT_COOLDOWN_SECS))
+  [ "$free_kb" -lt $(( floor_gb * 1048576 )) ] || return 0
+  if ! CC_DJ_COOLDOWN_SECS="$cool_s" _cc_dj_cooldown_ok act; then
+    _cc_dj_log "act: free $(_cc_dj_fmt_kb_delta "$free_kb") < ${floor_gb}GB, but acted within ${cool_s}s; not again"
+    return 0
+  fi
+  # A lock older than twice the trim bound belongs to a run that was killed.
+  if [ -d "$lock" ] && [ $(( $(date +%s) - $(/usr/bin/stat -f %m "$lock" 2>/dev/null || /usr/bin/stat -c %Y "$lock" 2>/dev/null || date +%s) )) -gt $(( 2 * trim_s + 600 )) ]; then
+    rmdir "$lock" 2>/dev/null && _cc_dj_log "act: removed a stale lock $lock"
+  fi
+  if ! mkdir "$lock" 2>/dev/null; then
+    _cc_dj_log "act: another low-disk action holds $lock; not acting"
+    return 0
+  fi
+  _cc_dj_cooldown_touch act
+  before="$free_kb"
+  body="cc-reaper disk-janitor acted: free $(_cc_dj_fmt_kb_delta "$before") < ${floor_gb} GB on $(hostname -s) at $(date '+%Y-%m-%dT%H:%M:%S%z')."
+
+  hook="${CC_DJ_ACT_GO_CACHE_HOOK:-$HOME/.claude/hooks/reclaim-byproducts.sh}"
+  step_before="$(_cc_dj_free_kb)"
+  if [ -x "$hook" ]; then
+    rc=0; "$hook" --go-cache >/dev/null 2>&1 || rc=$?
+    body="$body"$'\n'"- go cache pressure trim (rc=$rc): $(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before )))"
+  else
+    body="$body"$'\n'"- go cache pressure trim: skipped ($hook not found)"
+  fi
+
+  janitor="${CC_DJ_ACT_WORKTREE_JANITOR:-$HOME/.cc-reaper/worktree-janitor.sh}"
+  step_before="$(_cc_dj_free_kb)"
+  if [ "$CC_DJ_TRIM_WORKTREES" = 1 ] && [ -x "$janitor" ]; then
+    rc=0; _cc_dj_run_bounded "$trim_s" "$janitor" --trim-regenerable --apply >/dev/null 2>&1 || rc=$?
+    case "$rc" in 0) rc=done ;; 124) rc="stopped after ${trim_s}s" ;; *) rc="rc=$rc" ;; esac
+    body="$body"$'\n'"- worktree regenerable trim ($rc): $(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before )))"
+  else
+    body="$body"$'\n'"- worktree regenerable trim: skipped (enabled=$CC_DJ_TRIM_WORKTREES)"
+  fi
+
+  after="$(_cc_dj_free_kb)"
+  body="$body"$'\n'"Free after: $(_cc_dj_fmt_kb_delta "$after")."
+  rc="$(grep 'growth: top ' "$CC_DJ_LOG" 2>/dev/null | tail -1 | sed 's/^.*growth: top //')"
+  [ -z "$rc" ] || body="$body"$'\n'"Top growers (last growth watch): $rc"
+  rmdir "$lock" 2>/dev/null
+  while IFS= read -r rc; do _cc_dj_log "act: $rc"; done <<< "$body"
+
+  if [ -n "$CC_DJ_ALERT_ISSUE" ]; then
+    case "$CC_DJ_ALERT_ISSUE" in
+      */*'#'[0-9]*)
+        if command -v gh >/dev/null 2>&1 &&
+           printf '%s\n' "$body" | gh issue comment "${CC_DJ_ALERT_ISSUE##*#}" --repo "${CC_DJ_ALERT_ISSUE%%#*}" --body-file - >/dev/null 2>&1; then
+          _cc_dj_log "act: commented on $CC_DJ_ALERT_ISSUE"
+        else
+          _cc_dj_log "act: could not comment on $CC_DJ_ALERT_ISSUE"
+        fi ;;
+      *) _cc_dj_log "act: CC_DJ_ALERT_ISSUE=$CC_DJ_ALERT_ISSUE is not owner/repo#N; not commented" ;;
+    esac
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # --check mode
 # ---------------------------------------------------------------------------
@@ -310,6 +416,8 @@ _cc_dj_check() {
   else
     _cc_dj_log "check: OK — free=${free_pct}% >= ${CC_DJ_DISK_MIN_PCT}%"
   fi
+  # By GB, apart from the % notice above: 30 GB is 6% of this host's volume.
+  _cc_dj_low_disk_act "$(_cc_dj_free_kb)"
   # Last, because it can spend its budget plus one per-target timeout, and a disk that is
   # filling must not wait that long for its alert.
   _cc_dj_growth_watch
