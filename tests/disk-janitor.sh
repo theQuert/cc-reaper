@@ -453,6 +453,46 @@ expect_yes "host temp: a missing script is a SKIP" \
 unset CC_DJ_HOST_TEMP_SCRIPT CC_DJ_CHROME_CLONE_SCRIPT
 rm -f "$SANDBOX/state/builder-prune-daily.stamp"
 
+printf "\n# Test group 3e: --check and the dev-server reaper\n"
+# The reaper's own keep rules are tests/dev-server-reaper.py. Here only the contract with
+# --check: report by default, apply on request, one comment only when something stopped.
+FAKE_DEV="$SANDBOX/fake-dev.py"
+DEV_CAPTURE="$SANDBOX/dev_calls"
+cat > "$FAKE_DEV" <<'FAKE'
+import sys
+print("dev args: " + " ".join(sys.argv[1:]))
+print("SERVING pid=7 worktree=- cmd='next dev --port 4462' (listens on 4462)")
+if sys.argv[1] == "apply":
+    print("STOPPED pid=9 worktree=/wt/m9 cmd='npm run preview --port 8811' (does not listen on its port 8811)")
+print("dev servers: stopped=%d/1 rss=2700MB" % (sys.argv[1] == "apply"))
+FAKE
+printf '#!/usr/bin/env bash\necho "gh $*" >> "%s"\ncat >> "%s"\n' "$DEV_CAPTURE" "$DEV_CAPTURE" > "$FAKE_BIN/gh"
+chmod +x "$FAKE_BIN/gh"
+export CC_DJ_DEV_SERVER_SCRIPT="$FAKE_DEV"
+: > "$SANDBOX/dj.log"; : > "$DEV_CAPTURE"
+CC_DJ_ALERT_ISSUE=acme/demo#3337 _run_dj --check 80 0
+expect_yes "dev servers: --check reports by default, at the 6-hour minimum age" \
+  grep -q "dev servers: dev args: report --min-hours 6" "$SANDBOX/dj.log"
+expect_no "dev servers: a report posts nothing" grep -q . "$DEV_CAPTURE"
+: > "$SANDBOX/dj.log"; : > "$DEV_CAPTURE"
+CC_DJ_DEV_SERVER_REAP=apply CC_DJ_ALERT_ISSUE=acme/demo#3337 _run_dj --check 80 0
+expect_yes "dev servers: apply runs the reaper in apply mode" grep -q "dev args: apply --min-hours 6" "$SANDBOX/dj.log"
+expect_yes "dev servers: what it stopped goes to the alert issue, once" \
+  test "$(grep -cx 'gh issue comment 3337 --repo acme/demo --body-file -' "$DEV_CAPTURE")" -eq 1
+expect_yes "dev servers: the comment names the stopped tree and the ones still serving" \
+  sh -c "grep -q '^STOPPED pid=9' '$DEV_CAPTURE' && grep -q '^SERVING pid=7' '$DEV_CAPTURE'"
+: > "$SANDBOX/dj.log"; : > "$DEV_CAPTURE"
+CC_DJ_DEV_SERVER_REAP=off _run_dj --check 80 0
+expect_no "dev servers: off does not run it" grep -q "dev args" "$SANDBOX/dj.log"
+: > "$SANDBOX/dj.log"
+CC_DJ_DEV_SERVER_REAP=yes _run_dj --check 80 0
+expect_yes "dev servers: an unknown mode is logged and not run" \
+  sh -c "grep -q 'is not off, report or apply' '$SANDBOX/dj.log' && ! grep -q 'dev args' '$SANDBOX/dj.log'"
+: > "$SANDBOX/dj.log"
+CC_DJ_DEV_SERVER_MIN_HOURS=08 _run_dj --check 80 0
+expect_yes "dev servers: a minimum written 08 is eight hours" grep -q "dev args: report --min-hours 8" "$SANDBOX/dj.log"
+unset CC_DJ_DEV_SERVER_SCRIPT; rm -f "$FAKE_BIN/gh"
+
 printf "\n# Test group 4: --clean all targets present\n"
 _reset_captures
 
