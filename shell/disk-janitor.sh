@@ -274,8 +274,9 @@ _cc_dj_notify() {
   osascript -e "display notification \"$msg\" with title \"cc-reaper: disk-janitor\""
 }
 
-# Run "$@" for at most $1 seconds. Past that it gets SIGTERM, which the worktree janitor
-# traps to remove its private temp before it exits; 1 means it was stopped.
+# Run "$@" for about $1 seconds. Past that it gets SIGTERM, which the worktree janitor traps
+# once its current step (one removal, one du) ends, so the bound is soft by that step and
+# no tree is left half removed. Returns the command's status, or 124 when it was stopped.
 _cc_dj_run_bounded() {
   local secs="$1" pid waited=0; shift
   "$@" &
@@ -284,13 +285,12 @@ _cc_dj_run_bounded() {
     if [ "$waited" -ge "$secs" ]; then
       kill -TERM "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
-      return 1
+      return 124
     fi
     sleep 1
     waited=$((waited + 1))
   done
   wait "$pid" 2>/dev/null
-  return 0
 }
 
 # Below CC_DJ_ACT_FREE_GB free, act instead of only notifying. On 2026-10-04 --check logged
@@ -299,22 +299,29 @@ _cc_dj_run_bounded() {
 # minutes (stima-api#3337). GB, not %, because the floor that matters is the CI's 20 GB.
 #
 # Each step is the owner's own reclaimer, bounded and safe beside running work: the skills
-# hook's pressure trim of the go cache (idle entries first, never a clear), then the
+# hook's pressure trim of the go cache (idle entries first, never a clear for pressure), then the
 # worktree janitor's regenerable trim (unheld, unclaimed trees only; trees and branches
 # stay). Chrome clones and host temp already ran above. One run at a time (a lock), and
 # at most one per CC_DJ_ACT_COOLDOWN_SECS, so hourly checks do not stack. The record goes
 # to CC_DJ_ALERT_ISSUE, where a person reads it; the desktop notification stays as well.
 _cc_dj_low_disk_act() {
   local free_kb="$1" lock="$CC_DJ_STATE_DIR/low-disk-act.lock" before after step_before rc body hook janitor
-  case "$CC_DJ_ACT_FREE_GB" in off) return 0 ;; ''|*[!0-9]*) _cc_dj_log "act: CC_DJ_ACT_FREE_GB=$CC_DJ_ACT_FREE_GB is not a number; not acting"; return 0 ;; esac
+  local v floor_gb trim_s cool_s
+  [ "$CC_DJ_ACT_FREE_GB" = off ] && return 0
+  # A bad value logs and skips the action; it never aborts the rest of the hourly check.
+  for v in CC_DJ_ACT_FREE_GB CC_DJ_ACT_TRIM_SECONDS CC_DJ_ACT_COOLDOWN_SECS; do
+    case "${!v}" in ''|*[!0-9]*) _cc_dj_log "act: $v=${!v} is not a number; not acting"; return 0 ;; esac
+  done
   case "$free_kb" in ''|*[!0-9]*) _cc_dj_log "act: free space unreadable; not acting"; return 0 ;; esac
-  [ "$free_kb" -lt $(( CC_DJ_ACT_FREE_GB * 1048576 )) ] || return 0
-  if ! CC_DJ_COOLDOWN_SECS="$CC_DJ_ACT_COOLDOWN_SECS" _cc_dj_cooldown_ok act; then
-    _cc_dj_log "act: free $(_cc_dj_fmt_kb_delta "$free_kb") < ${CC_DJ_ACT_FREE_GB}GB, but acted within ${CC_DJ_ACT_COOLDOWN_SECS}s; not again"
+  # 10# so 08 is eight, not an octal error.
+  floor_gb=$((10#$CC_DJ_ACT_FREE_GB)); trim_s=$((10#$CC_DJ_ACT_TRIM_SECONDS)); cool_s=$((10#$CC_DJ_ACT_COOLDOWN_SECS))
+  [ "$free_kb" -lt $(( floor_gb * 1048576 )) ] || return 0
+  if ! CC_DJ_COOLDOWN_SECS="$cool_s" _cc_dj_cooldown_ok act; then
+    _cc_dj_log "act: free $(_cc_dj_fmt_kb_delta "$free_kb") < ${floor_gb}GB, but acted within ${cool_s}s; not again"
     return 0
   fi
   # A lock older than twice the trim bound belongs to a run that was killed.
-  if [ -d "$lock" ] && [ $(( $(date +%s) - $(/usr/bin/stat -f %m "$lock" 2>/dev/null || /usr/bin/stat -c %Y "$lock" 2>/dev/null || date +%s) )) -gt $(( 2 * CC_DJ_ACT_TRIM_SECONDS + 600 )) ]; then
+  if [ -d "$lock" ] && [ $(( $(date +%s) - $(/usr/bin/stat -f %m "$lock" 2>/dev/null || /usr/bin/stat -c %Y "$lock" 2>/dev/null || date +%s) )) -gt $(( 2 * trim_s + 600 )) ]; then
     rmdir "$lock" 2>/dev/null && _cc_dj_log "act: removed a stale lock $lock"
   fi
   if ! mkdir "$lock" 2>/dev/null; then
@@ -323,7 +330,7 @@ _cc_dj_low_disk_act() {
   fi
   _cc_dj_cooldown_touch act
   before="$free_kb"
-  body="cc-reaper disk-janitor acted: free $(_cc_dj_fmt_kb_delta "$before") < ${CC_DJ_ACT_FREE_GB} GB on $(hostname -s) at $(date '+%Y-%m-%dT%H:%M:%S%z')."
+  body="cc-reaper disk-janitor acted: free $(_cc_dj_fmt_kb_delta "$before") < ${floor_gb} GB on $(hostname -s) at $(date '+%Y-%m-%dT%H:%M:%S%z')."
 
   hook="${CC_DJ_ACT_GO_CACHE_HOOK:-$HOME/.claude/hooks/reclaim-byproducts.sh}"
   step_before="$(_cc_dj_free_kb)"
@@ -337,11 +344,8 @@ _cc_dj_low_disk_act() {
   janitor="${CC_DJ_ACT_WORKTREE_JANITOR:-$HOME/.cc-reaper/worktree-janitor.sh}"
   step_before="$(_cc_dj_free_kb)"
   if [ "$CC_DJ_TRIM_WORKTREES" = 1 ] && [ -x "$janitor" ]; then
-    if _cc_dj_run_bounded "$CC_DJ_ACT_TRIM_SECONDS" "$janitor" --trim-regenerable --apply >/dev/null 2>&1; then
-      rc=done
-    else
-      rc="stopped after ${CC_DJ_ACT_TRIM_SECONDS}s"
-    fi
+    rc=0; _cc_dj_run_bounded "$trim_s" "$janitor" --trim-regenerable --apply >/dev/null 2>&1 || rc=$?
+    case "$rc" in 0) rc=done ;; 124) rc="stopped after ${trim_s}s" ;; *) rc="rc=$rc" ;; esac
     body="$body"$'\n'"- worktree regenerable trim ($rc): $(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before )))"
   else
     body="$body"$'\n'"- worktree regenerable trim: skipped (enabled=$CC_DJ_TRIM_WORKTREES)"

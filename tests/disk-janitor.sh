@@ -400,6 +400,19 @@ expect_yes "act: a trim past CC_DJ_ACT_TRIM_SECONDS is stopped and says so" \
   grep -q 'worktree regenerable trim (stopped after 2s)' "$SANDBOX/dj.log"
 expect_yes "act: and the lock is still released" test ! -d "$SANDBOX/state/low-disk-act.lock"
 rm -f "$SANDBOX/state/cooldown-act"
+# A trim that fails is reported with its status, not as done.
+printf '#!/usr/bin/env bash\necho "janitor $*" >> "%s"\nexit 3\n' "$ACT_CAPTURE" > "$SANDBOX/act-janitor"
+: > "$ACT_CAPTURE"; _run_act $((25 * 1048576))
+expect_yes "act: a failed trim is reported with its status" grep -q 'worktree regenerable trim (rc=3)' "$SANDBOX/dj.log"
+rm -f "$SANDBOX/state/cooldown-act"
+# A malformed setting skips the action and never aborts the hourly check.
+: > "$ACT_CAPTURE"; CC_DJ_ACT_FREE_GB=08 _run_act $((5 * 1048576))
+expect_yes "act: a floor written 08 is eight GB, not an octal error" grep -q 'go-hook' "$ACT_CAPTURE"
+rm -f "$SANDBOX/state/cooldown-act"
+: > "$ACT_CAPTURE"; CC_DJ_ACT_TRIM_SECONDS=900s _run_act $((25 * 1048576)); ACT_RC=$?
+expect_no "act: a non-numeric bound does not act" grep -q 'go-hook' "$ACT_CAPTURE"
+expect_yes "act: and logs why" grep -q 'act: CC_DJ_ACT_TRIM_SECONDS=900s is not a number' "$SANDBOX/dj.log"
+expect_yes "act: and the check still exits 0" test "$ACT_RC" -eq 0
 # A lock left by a killed run does not block every later check.
 mkdir -p "$SANDBOX/state/low-disk-act.lock"; touch -t 202601010000 "$SANDBOX/state/low-disk-act.lock"
 : > "$ACT_CAPTURE"; CC_DJ_ACT_TRIM_SECONDS=1 _run_act $((25 * 1048576))
