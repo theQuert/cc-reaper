@@ -182,16 +182,12 @@ def tree(rows, root):
 
 
 def serving(ports, members, port):
-    """Why the tree serves, or None: it listens on its port, or on a nearby one because
-    something outside the tree holds its port."""
+    """Why the tree serves, or None: it listens on its port, or on one just above it, where
+    vite and astro move when theirs is taken - whether or not it is still taken now."""
     if any(port in ports.get(pid, ()) for pid in members):
         return f"listens on {port}"
-    if any(port in held for pid, held in ports.items() if pid not in members):
-        moved = sorted(p for pid in members for p in ports.get(pid, ())
-                       if port < p <= port + PORT_SHIFT)
-        if moved:
-            return f"{port} is taken; listens on {moved[0]}"
-    return None
+    moved = sorted(p for pid in members for p in ports.get(pid, ()) if port < p <= port + PORT_SHIFT)
+    return f"moved from {port} to {moved[0]}" if moved else None
 
 
 def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=900):
@@ -282,13 +278,19 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
         if not apply:
             print(f"CANDIDATE {label} ({reason}; {len(members)} processes, {size // 1024} MB)")
             continue
-        # Listeners again, right before signalling: the scan, and the claim checks since,
-        # can be minutes old, and a server restarting may have bound its port meanwhile.
-        fresh = listening()
-        if fresh is None or serving(fresh, members, port):
-            print(f"KEEP {label} (serving, or listeners unreadable, at the recheck)")
+        # Processes and listeners again, right before signalling: the scan, and the claim
+        # checks since, can be minutes old, and a restarting server may have new children
+        # bound to its port by now. The tree is rebuilt from the fresh listing.
+        fresh_rows, fresh = processes(), listening()
+        if (fresh_rows is None or fresh is None or root not in fresh_rows
+                or fresh_rows[root][3] != rows[root][3]):
+            print(f"KEEP {label} (changed, or unreadable, at the recheck)")
             continue
-        snapshot = {p: rows[p][3] for p in members}
+        members = tree(fresh_rows, root)
+        if serving(fresh, members, port) or any(AGENT.search(fresh_rows[p][4]) for p in members):
+            print(f"KEEP {label} (serving, or an agent joined, at the recheck)")
+            continue
+        snapshot = {p: fresh_rows[p][3] for p in members}
         signalled, denied = stop(members, snapshot, grace, send=send, sleep=sleep)
         note = f"; not permitted to signal {denied}" if denied else ""
         if signalled:

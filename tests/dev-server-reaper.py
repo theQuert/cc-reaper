@@ -148,10 +148,11 @@ class ReaperTest(unittest.TestCase):
         calls = []
 
         def swapped():
-            # The scan sees the server; by the time it signals, pid 102 is a new process.
+            # The scan and the recheck see the server; by the time it signals, pid 102 is a
+            # new process.
             calls.append(1)
             rows = original()
-            if len(calls) > 1:
+            if len(calls) > 2:
                 rows[102] = (101, 100, 1, NEW, "something else")
             return rows
         reaper.processes.side_effect = swapped
@@ -167,6 +168,7 @@ class ReaperTest(unittest.TestCase):
     def test_an_agent_inside_the_tree_keeps_it(self):
         self.server(100)
         self.rows[103] = (100, 103, 10, OLD, "/Users/x/.local/bin/claude --resume abc")
+        self.assertEqual(self.run_reap(apply=False), (0, 0))
         self.run_reap()
         self.assertEqual(self.sent, [])
 
@@ -177,10 +179,34 @@ class ReaperTest(unittest.TestCase):
         self.assertEqual(self.run_reap(), (0, 0))
         self.assertEqual(self.sent, [])
 
-    def test_a_nearby_port_alone_does_not_count_when_its_port_is_free(self):
+    def test_a_server_that_moved_stays_serving_after_its_port_frees(self):
         self.server(100, port=5173)
         self.ports[102] = {9229, 5174}
-        self.assertEqual(self.run_reap(), (1, 1))
+        self.assertEqual(self.run_reap(), (0, 0))
+
+    def test_a_sibling_holding_the_port_does_not_make_a_duplicate_serving(self):
+        self.server(100)
+        self.server(200)
+        self.ports[202] = {8812, 9230}   # a sibling that moved: its port, not this tree's
+        self.ports[102] = {9229, 52011}
+        self.run_reap()
+        self.assertEqual(self.terms(), [100, 101, 102])
+
+    def test_a_new_child_bound_to_the_port_at_the_recheck_keeps_the_tree(self):
+        self.server(100)
+        scans = []
+        original = reaper.processes.side_effect
+
+        def restarted():
+            scans.append(1)
+            rows = original()
+            if len(scans) > 1:
+                rows[150] = (101, 100, 10, NEW, "workerd serve")
+            return rows
+        reaper.processes.side_effect = restarted
+        reaper.listening.side_effect = lambda: {**self.ports, 150: {8811}} if len(scans) > 1 else dict(self.ports)
+        self.assertEqual(self.run_reap(), (0, 1))
+        self.assertEqual(self.sent, [])
 
     def test_a_server_that_binds_before_the_signal_is_kept(self):
         self.server(100)
