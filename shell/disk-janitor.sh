@@ -38,6 +38,8 @@ Environment:
   CC_DJ_HOST_TEMP_IDLE_MINUTES  Idle minutes before a temp item is reclaimed (default: 60, min 30)
   CC_DJ_CHROME_CLONE_MIN_AGE_DAYS  Minimum age of a removed code-sign clone (default: 1)
   CC_DJ_BUILDER_PRUNE_UNTIL  Daily --check builder prune filter, or `off` (default: 24h)
+  CC_DJ_DEV_SERVER_REAP off, report or apply: dev servers serving nothing (default: report)
+  CC_DJ_DEV_SERVER_MIN_HOURS  Never judge a dev server younger than this (default: 6)
   CC_DJ_ACT_FREE_GB     --check acts below this many free GB, or `off` (default: 30)
   CC_DJ_ACT_COOLDOWN_SECS  Seconds between two low-disk actions (default: 10800)
   CC_DJ_ACT_TRIM_SECONDS   Bound on the worktree regenerable trim it runs (default: 900)
@@ -63,6 +65,8 @@ CC_DJ_COOLDOWN_SECS="${CC_DJ_COOLDOWN_SECS:-3600}"
 CC_DJ_GO_CACHE_TRIM_DAYS="${CC_DJ_GO_CACHE_TRIM_DAYS:-3}"
 CC_DJ_HOST_TEMP_REAP="${CC_DJ_HOST_TEMP_REAP:-1}"
 CC_DJ_HOST_TEMP_IDLE_MINUTES="${CC_DJ_HOST_TEMP_IDLE_MINUTES:-60}"
+CC_DJ_DEV_SERVER_REAP="${CC_DJ_DEV_SERVER_REAP:-report}"
+CC_DJ_DEV_SERVER_MIN_HOURS="${CC_DJ_DEV_SERVER_MIN_HOURS:-6}"
 CC_DJ_CHROME_CLONE_MIN_AGE_DAYS="${CC_DJ_CHROME_CLONE_MIN_AGE_DAYS:-1}"
 CC_DJ_BUILDER_PRUNE_UNTIL="${CC_DJ_BUILDER_PRUNE_UNTIL:-24h}"
 CC_DJ_ACT_FREE_GB="${CC_DJ_ACT_FREE_GB:-30}"
@@ -358,18 +362,23 @@ _cc_dj_low_disk_act() {
   rmdir "$lock" 2>/dev/null
   while IFS= read -r rc; do _cc_dj_log "act: $rc"; done <<< "$body"
 
-  if [ -n "$CC_DJ_ALERT_ISSUE" ]; then
-    case "$CC_DJ_ALERT_ISSUE" in
-      */*'#'[0-9]*)
-        if command -v gh >/dev/null 2>&1 &&
-           printf '%s\n' "$body" | gh issue comment "${CC_DJ_ALERT_ISSUE##*#}" --repo "${CC_DJ_ALERT_ISSUE%%#*}" --body-file - >/dev/null 2>&1; then
-          _cc_dj_log "act: commented on $CC_DJ_ALERT_ISSUE"
-        else
-          _cc_dj_log "act: could not comment on $CC_DJ_ALERT_ISSUE"
-        fi ;;
-      *) _cc_dj_log "act: CC_DJ_ALERT_ISSUE=$CC_DJ_ALERT_ISSUE is not owner/repo#N; not commented" ;;
-    esac
-  fi
+  _cc_dj_alert act "$body"
+}
+
+# Comment $2 on CC_DJ_ALERT_ISSUE (owner/repo#N) when it is set; $1 prefixes the log lines.
+_cc_dj_alert() {
+  local tag="$1" body="$2"
+  [ -n "$CC_DJ_ALERT_ISSUE" ] || return 0
+  case "$CC_DJ_ALERT_ISSUE" in
+    */*'#'[0-9]*)
+      if command -v gh >/dev/null 2>&1 &&
+         printf '%s\n' "$body" | gh issue comment "${CC_DJ_ALERT_ISSUE##*#}" --repo "${CC_DJ_ALERT_ISSUE%%#*}" --body-file - >/dev/null 2>&1; then
+        _cc_dj_log "$tag: commented on $CC_DJ_ALERT_ISSUE"
+      else
+        _cc_dj_log "$tag: could not comment on $CC_DJ_ALERT_ISSUE"
+      fi ;;
+    *) _cc_dj_log "$tag: CC_DJ_ALERT_ISSUE=$CC_DJ_ALERT_ISSUE is not owner/repo#N; not commented" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -397,6 +406,7 @@ _cc_dj_check() {
   # Hourly, because a headless-Chrome script can leave 10 GB of profiles in two days and
   # the weekly clean is too late for it (2026-09-30). Each item is proved abandoned first.
   _cc_dj_host_temp_reap
+  _cc_dj_dev_server_reap
   _cc_dj_chrome_clones clean
   _cc_dj_builder_prune_daily
   _cc_dj_orbstack_report
@@ -736,6 +746,34 @@ _cc_dj_host_temp_reap() {
   fi
   _cc_dj_clean_target "host temp: orphaned headless Chrome, cdp profiles, wrangler logs, test build copies, finished job venvs" \
     python3 "$script" clean --idle-minutes "$CC_DJ_HOST_TEMP_IDLE_MINUTES"
+}
+
+# Hourly: dev servers left serving nothing hold memory, not disk - five unbound preview
+# trees for one worktree held 2.7 GB while swap was full (2026-10-04, stima-api#3337).
+# dev-server-reaper.py proves each one abandoned; report lists them, apply stops them and
+# comments what it stopped on CC_DJ_ALERT_ISSUE. Trees that do serve are only listed.
+_cc_dj_dev_server_reap() {
+  local script="${CC_DJ_DEV_SERVER_SCRIPT:-$HOME/.cc-reaper/dev-server-reaper.py}" out rc=0 stopped
+  case "$CC_DJ_DEV_SERVER_REAP" in
+    off) return 0 ;;
+    report|apply) ;;
+    *) _cc_dj_log "dev servers: CC_DJ_DEV_SERVER_REAP=$CC_DJ_DEV_SERVER_REAP is not off, report or apply; not run"; return 0 ;;
+  esac
+  case "$CC_DJ_DEV_SERVER_MIN_HOURS" in ''|*[!0-9]*) _cc_dj_log "dev servers: CC_DJ_DEV_SERVER_MIN_HOURS=$CC_DJ_DEV_SERVER_MIN_HOURS is not a number; not run"; return 0 ;; esac
+  if [ ! -r "$script" ] || ! command -v python3 >/dev/null 2>&1; then
+    _cc_dj_skip "dev servers (script or python3 not found)"
+    return 0
+  fi
+  out="$(python3 "$script" "$CC_DJ_DEV_SERVER_REAP" --min-hours "$((10#$CC_DJ_DEV_SERVER_MIN_HOURS))" 2>&1)" || rc=$?
+  while IFS= read -r stopped; do [ -n "$stopped" ] && _cc_dj_log "dev servers: $stopped"; done <<< "$out"
+  [ "$rc" -eq 0 ] || return 0
+  stopped="$(printf '%s\n' "$out" | grep '^STOPPED ' || true)"
+  [ -n "$stopped" ] || return 0
+  _cc_dj_alert "dev servers" "cc-reaper disk-janitor stopped dev servers that served nothing on $(hostname -s) at $(date '+%Y-%m-%dT%H:%M:%S%z'):
+$stopped
+$(printf '%s\n' "$out" | tail -1)
+Still serving (listed only, not stopped):
+$(printf '%s\n' "$out" | grep '^SERVING ' || echo '- none')"
 }
 
 # Once per day from the hourly check: builder cache grew 24.7 GB in two days here
