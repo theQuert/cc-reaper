@@ -406,7 +406,6 @@ _cc_dj_check() {
   # Hourly, because a headless-Chrome script can leave 10 GB of profiles in two days and
   # the weekly clean is too late for it (2026-09-30). Each item is proved abandoned first.
   _cc_dj_host_temp_reap
-  _cc_dj_dev_server_reap
   _cc_dj_chrome_clones clean
   _cc_dj_builder_prune_daily
   _cc_dj_orbstack_report
@@ -431,6 +430,8 @@ _cc_dj_check() {
   # Last, because it can spend its budget plus one per-target timeout, and a disk that is
   # filling must not wait that long for its alert.
   _cc_dj_growth_watch
+  # After the disk work and its alerts: its claim checks take minutes per worktree.
+  _cc_dj_dev_server_reap
 }
 
 # ---------------------------------------------------------------------------

@@ -14,10 +14,11 @@ A launcher tree is stopped only when every one of these holds:
   `next dev|start`, `vite`) and names its port on the command line - no port named, no
   verdict;
 - the root was reparented to launchd (ppid 1), so no session's shell is waiting on it, and
-  no `claude` or `codex` process shares a process group with any process in the tree;
+  no `claude` or `codex` process is in the tree or shares a process group with one in it;
 - the root's working directory is inside a linked git worktree, never a primary checkout;
 - no process in the tree listens on that port (the inspector ports a server also opens
-  do not count);
+  do not count), nor - when something else holds that port - on one of the next 20, where
+  vite and astro move to; listeners are read again right before signalling;
 - the root is at least the minimum age, so a server still starting is not judged;
 - the worktree janitor's `--claims <worktree>` names no live session cwd and no live
   session tool call for that worktree (this session's own mentions excepted, as the
@@ -41,13 +42,39 @@ import sys
 import time
 
 
-LAUNCHER = re.compile(
-    r"(?:^|[\s/])(?:npm run (?:dev|preview|start)"
-    r"|wrangler(?:\.js)? (?:pages )?dev"
-    r"|next (?:dev|start)"
-    r"|vite)(?:\s|$)")
-PORT = re.compile(r"(?:--port[= ]|\s-p\s+)(\d{2,5})(?:\s|$)")
 AGENT = re.compile(r"(?:^|/)(?:claude|codex)(?:\s|$)")
+# How far a dev server moves when its port is taken: vite and astro try the next ports.
+PORT_SHIFT = 20
+
+
+def launcher(command):
+    """The port a dev-server launcher names (0 for none); None when command is not one.
+
+    Judged from argv[0], or the script after `node`, never from anywhere in the line: a
+    tmux or screen server keeps the argv of the command that started it, and an agent
+    keeps its prompt, so `npm run dev --port 5173` can appear in either.
+    """
+    args = command.split()
+    if args and os.path.basename(args[0]) == "node":
+        args = args[1:]
+    if not args:
+        return None
+    tool = re.sub(r"\.(?:c|m)?js$", "", os.path.basename(args[0]))
+    sub = args[1:]
+    if not ((tool == "npm" and sub[:1] == ["run"] and sub[1:2] in (["dev"], ["preview"], ["start"]))
+            or (tool == "wrangler" and (sub[:1] == ["dev"] or sub[:2] == ["pages", "dev"]))
+            or (tool == "next" and sub[:1] in (["dev"], ["start"]))
+            or tool == "vite"):
+        return None
+    for i, arg in enumerate(args):
+        value = None
+        if arg in ("--port", "-p") and i + 1 < len(args):
+            value = args[i + 1]
+        elif arg.startswith("--port="):
+            value = arg.split("=", 1)[1]
+        if value is not None:
+            return int(value) if value.isdigit() and 0 < int(value) < 65536 else 0
+    return 0
 
 
 def processes():
@@ -90,7 +117,8 @@ def listening():
             tail = field.rsplit(":", 1)[1]
             if tail.isdigit():
                 ports.setdefault(pid, set()).add(int(tail))
-    return ports
+    # A host always has listeners; an empty answer is a failed probe, not a quiet machine.
+    return ports or None
 
 
 def cwd(pid):
@@ -110,19 +138,22 @@ def linked_worktree(path):
         return subprocess.run(["git", "-C", str(path), *args], capture_output=True,
                               text=True, timeout=30, check=True).stdout.strip()
     try:
+        # Absolute, because a relative --git-common-dir is relative to the -C directory, not
+        # the top: from a primary checkout's subdirectory it read as a linked worktree.
         top, gd, common = git("rev-parse", "--show-toplevel", "--absolute-git-dir",
-                              "--git-common-dir").splitlines()
+                              "--path-format=absolute", "--git-common-dir").splitlines()
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    common = Path(common) if os.path.isabs(common) else Path(top) / common
-    return Path(top) if Path(gd).resolve() != common.resolve() else None
+    return Path(top) if Path(gd).resolve() != Path(common).resolve() else None
 
 
-def claimed(worktree, janitor):
+def claimed(worktree, janitor, timeout=900):
     """True when a live session claims the worktree, or the janitor cannot say."""
     try:
+        # Minutes, not seconds: it reads every live and recent transcript, and took 5m11s
+        # under load on 2026-10-05. A timeout is a claim, so too short keeps everything.
         probe = subprocess.run([str(janitor), "--claims", str(worktree)], capture_output=True,
-                               text=True, timeout=300, check=False)
+                               text=True, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError):
         return True
     if probe.returncode != 0 or not probe.stdout.startswith("CLAIMS"):
@@ -150,59 +181,80 @@ def tree(rows, root):
     return found
 
 
-def judge(rows, ports, root, min_age, now, janitor, claims=None):
-    """('reap'|'serving'|'keep', reason, worktree, members) for one launcher root."""
+def serving(ports, members, port):
+    """Why the tree serves, or None: it listens on its port, or on a nearby one because
+    something outside the tree holds its port."""
+    if any(port in ports.get(pid, ()) for pid in members):
+        return f"listens on {port}"
+    if any(port in held for pid, held in ports.items() if pid not in members):
+        moved = sorted(p for pid in members for p in ports.get(pid, ())
+                       if port < p <= port + PORT_SHIFT)
+        if moved:
+            return f"{port} is taken; listens on {moved[0]}"
+    return None
+
+
+def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=900):
+    """(verdict, reason, worktree, members, port); verdict is reap, serving or keep."""
     ppid, _, _, lstart, command = rows[root]
-    port = PORT.search(command)
-    if port is None:
-        return "keep", "no port on the command line", None, []
-    port = int(port.group(1))
+    port = launcher(command)
+    if not port:
+        return "keep", "no port on the command line", None, [], port
     begun = started(lstart)
     if begun is None or now - begun < min_age:
-        return "keep", "younger than the minimum age", None, []
+        return "keep", "younger than the minimum age", None, [], port
     members = tree(rows, root)
-    if any(port in ports.get(pid, ()) for pid in members):
-        return "serving", f"listens on {port}", None, members
+    why = serving(ports, members, port)
+    if why:
+        return "serving", why, None, members, port
     groups = {rows[pid][1] for pid in members}
-    if any(row[1] in groups and pid not in members and AGENT.search(row[4])
+    if any(AGENT.search(row[4]) and (pid in members or row[1] in groups)
            for pid, row in rows.items()):
-        return "keep", "an agent process shares its process group", None, []
+        return "keep", "an agent process is in the tree or its process group", None, [], port
     where = cwd(root)
     worktree = linked_worktree(where) if where else None
     if worktree is None:
-        return "keep", "not in a linked worktree", None, []
+        return "keep", "not in a linked worktree", None, [], port
     # One janitor --claims call per worktree per run: it reads every live transcript, and
     # duplicates share their worktree.
     claims = {} if claims is None else claims
     if worktree not in claims:
-        claims[worktree] = claimed(worktree, janitor)
+        claims[worktree] = claimed(worktree, janitor, claim_timeout)
     if claims[worktree]:
-        return "keep", "a live session claims the worktree, or the claim check failed", worktree, []
-    return "reap", f"does not listen on its port {port}", worktree, members
+        return "keep", "a live session claims the worktree, or the claim check failed", worktree, [], port
+    return "reap", f"does not listen on its port {port}", worktree, members, port
 
 
 def stop(members, snapshot, grace, send=os.kill, sleep=time.sleep):
-    """TERM then KILL members whose start time still matches; return the pids signalled."""
+    """TERM then KILL members whose start time still matches.
+
+    Returns (signalled, denied): a member this user may not signal is left alone and named.
+    """
+    denied = set()
+
     def alive_same():
         now = processes() or {}
-        return [p for p in members if p in now and now[p][3] == snapshot[p]]
-    targets = alive_same()
-    for pid in targets:
-        try:
-            send(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        return [p for p in members if p in now and now[p][3] == snapshot[p] and p not in denied]
+
+    def signal_all(pids, sig):
+        done = []
+        for pid in pids:
+            try:
+                send(pid, sig)
+                done.append(pid)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                denied.add(pid)
+        return done
+    targets = signal_all(alive_same(), signal.SIGTERM)
     sleep(grace)
-    for pid in alive_same():
-        try:
-            send(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    return targets
+    signal_all(alive_same(), signal.SIGKILL)
+    return targets, sorted(denied)
 
 
 def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=os.kill,
-         sleep=time.sleep):
+         sleep=time.sleep, claim_timeout=900):
     """Print one line per launcher root and a summary; return (reaped, candidates)."""
     now = time.time() if now is None else now
     janitor = janitor or Path.home() / ".cc-reaper" / "worktree-janitor.sh"
@@ -217,9 +269,10 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
     claims = {}
     for root in sorted(rows):
         ppid, _, _, _, command = rows[root]
-        if ppid != 1 or not LAUNCHER.search(command):
+        if ppid != 1 or launcher(command) is None:
             continue
-        verdict, reason, worktree, members = judge(rows, ports, root, min_age, now, janitor, claims)
+        verdict, reason, worktree, members, port = judge(rows, ports, root, min_age, now, janitor, claims,
+                                                         claim_timeout)
         label = f"pid={root} worktree={worktree or '-'} cmd={command[:80]!r}"
         if verdict != "reap":
             print(f"{verdict.upper()} {label} ({reason})")
@@ -229,14 +282,21 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
         if not apply:
             print(f"CANDIDATE {label} ({reason}; {len(members)} processes, {size // 1024} MB)")
             continue
+        # Listeners again, right before signalling: the scan, and the claim checks since,
+        # can be minutes old, and a server restarting may have bound its port meanwhile.
+        fresh = listening()
+        if fresh is None or serving(fresh, members, port):
+            print(f"KEEP {label} (serving, or listeners unreadable, at the recheck)")
+            continue
         snapshot = {p: rows[p][3] for p in members}
-        signalled = stop(members, snapshot, grace, send=send, sleep=sleep)
+        signalled, denied = stop(members, snapshot, grace, send=send, sleep=sleep)
+        note = f"; not permitted to signal {denied}" if denied else ""
         if signalled:
             reaped += 1
             rss_kb += size
-            print(f"STOPPED {label} ({reason}; {len(signalled)} processes, {size // 1024} MB)")
+            print(f"STOPPED {label} ({reason}; {len(signalled)} processes, {size // 1024} MB{note})")
         else:
-            print(f"KEEP {label} (changed before it could be stopped)")
+            print(f"KEEP {label} (changed before it could be stopped{note})")
     print(f"dev servers: stopped={reaped}/{candidates} rss={rss_kb // 1024}MB"
           + ("" if apply else " (report only)"))
     return reaped, candidates
@@ -248,10 +308,12 @@ def main():
     parser.add_argument("mode", choices=("report", "apply"))
     parser.add_argument("--min-hours", type=int, default=6)
     parser.add_argument("--grace-seconds", type=int, default=10)
+    parser.add_argument("--claim-timeout-seconds", type=int, default=900)
     args = parser.parse_args()
     if args.min_hours < 1:
         raise ValueError("minimum age must be at least 1 hour")
-    reap(apply=args.mode == "apply", min_age=args.min_hours * 3600, grace=args.grace_seconds)
+    reap(apply=args.mode == "apply", min_age=args.min_hours * 3600, grace=args.grace_seconds,
+         claim_timeout=args.claim_timeout_seconds)
 
 
 if __name__ == "__main__":

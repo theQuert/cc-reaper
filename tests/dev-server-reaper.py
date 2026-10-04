@@ -4,6 +4,8 @@
 import importlib.util
 from pathlib import Path
 import signal
+import subprocess
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -39,7 +41,7 @@ class ReaperTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def fake_claimed(self, worktree, janitor):
+    def fake_claimed(self, worktree, janitor, timeout=900):
         self.claim_calls.append(worktree)
         return worktree in self.claims
 
@@ -156,6 +158,56 @@ class ReaperTest(unittest.TestCase):
         self.run_reap()
         self.assertNotIn(102, self.terms())
 
+    def test_a_tmux_server_carrying_a_dev_command_is_not_a_launcher(self):
+        self.server(100, cmd="tmux new-session -d npm run dev --port 5173")
+        self.rows[105] = (100, 105, 10, OLD, "/Users/x/.local/bin/claude")
+        self.run_reap()
+        self.assertEqual(self.sent, [])
+
+    def test_an_agent_inside_the_tree_keeps_it(self):
+        self.server(100)
+        self.rows[103] = (100, 103, 10, OLD, "/Users/x/.local/bin/claude --resume abc")
+        self.run_reap()
+        self.assertEqual(self.sent, [])
+
+    def test_a_server_that_moved_off_a_taken_port_is_serving(self):
+        self.server(100, port=5173)
+        self.ports[777] = {5173}
+        self.ports[102] = {9229, 5174}
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_nearby_port_alone_does_not_count_when_its_port_is_free(self):
+        self.server(100, port=5173)
+        self.ports[102] = {9229, 5174}
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_a_server_that_binds_before_the_signal_is_kept(self):
+        self.server(100)
+        scans = []
+
+        def later():
+            scans.append(1)
+            return dict(self.ports) if len(scans) == 1 else {**self.ports, 102: {8811}}
+        reaper.listening.side_effect = later
+        self.assertEqual(self.run_reap(), (0, 1))
+        self.assertEqual(self.sent, [])
+
+    def test_a_member_it_may_not_signal_is_named_and_the_rest_continue(self):
+        self.server(100)
+        self.server(200)
+
+        def send(pid, sig):
+            if pid == 101:
+                raise PermissionError
+            self.sent.append((pid, sig))
+            if sig == signal.SIGTERM:
+                self.rows.pop(pid, None)
+        reaped = reaper.reap(apply=True, min_age=6 * HOUR, grace=0, now=NOW, janitor=Path("/j"),
+                             send=send, sleep=lambda s: None)
+        self.assertEqual(reaped, (2, 2))
+        self.assertEqual(self.terms(), [100, 102, 200, 201, 202])
+
     def test_survivors_of_term_get_kill(self):
         self.server(100)
         reaper.reap(apply=True, min_age=6 * HOUR, grace=0, now=NOW, janitor=Path("/j"),
@@ -195,22 +247,71 @@ class ClaimsTest(unittest.TestCase):
         self.assertFalse(self.probe("CLAIMS x\nLIVE_TOOL\tharness=Claude\tid=me\tpath=/wt\tscope=x\n", own="me"))
         self.assertTrue(self.probe("CLAIMS x\nLIVE_TOOL\tharness=Claude\tid=mex\tpath=/wt\tscope=x\n", own="me"))
 
+    def test_a_timeout_is_a_claim(self):
+        with mock.patch.object(reaper.subprocess, "run",
+                               side_effect=reaper.subprocess.TimeoutExpired("janitor", 900)):
+            self.assertTrue(reaper.claimed(WT, Path("/janitor")))
+
     def test_failure_or_garbage_is_a_claim(self):
         self.assertTrue(self.probe("", rc=2))
         self.assertTrue(self.probe("ERROR\tharness=Claude\n"))
 
 
 class PatternTest(unittest.TestCase):
-    def test_launchers(self):
-        for cmd in ("npm run preview --port 8811 --ip 0.0.0.0", "npm run dev -- --port 3000",
-                    "node node_modules/.bin/next dev --webpack --port 4462",
-                    "node /x/node_modules/.bin/wrangler dev --port 8787",
-                    "node /x/node_modules/.bin/vite --port 5173"):
-            self.assertTrue(reaper.LAUNCHER.search(cmd), cmd)
-            self.assertTrue(reaper.PORT.search(cmd), cmd)
-        for cmd in ("npm run build", "npm run test --port 1", "/bin/bash sup.sh",
-                    "node ./node_modules/.bin/react-scripts start"):
-            self.assertFalse(reaper.LAUNCHER.search(cmd), cmd)
+    def test_launchers_and_their_ports(self):
+        for cmd, port in (("npm run preview --port 8811 --ip 0.0.0.0", 8811),
+                          ("npm run dev -- --port 3000", 3000),
+                          ("node node_modules/.bin/next dev --webpack --port 4462", 4462),
+                          ("/opt/homebrew/bin/node /x/node_modules/.bin/wrangler dev --port=8787", 8787),
+                          ("node /x/node_modules/wrangler/bin/wrangler.js pages dev -p 8788", 8788),
+                          ("node /x/node_modules/.bin/vite --port 5173", 5173),
+                          ("npm run dev", 0), ("node ./node_modules/.bin/next start --port x", 0)):
+            self.assertEqual(reaper.launcher(cmd), port, cmd)
+
+    def test_not_launchers(self):
+        for cmd in ("npm run build", "npm run test --port 1", "/bin/bash sup.sh --port 8811",
+                    "node ./node_modules/.bin/react-scripts start",
+                    "tmux new-session -d npm run dev --port 5173",
+                    "SCREEN -dmS x npm run dev --port 5173",
+                    "/Users/x/.local/bin/claude --bg run npm run dev --port 3000",
+                    "sh -c npm run dev --port 3000", "node", ""):
+            self.assertIsNone(reaper.launcher(cmd), cmd)
+
+
+class WorktreeTest(unittest.TestCase):
+    """Real git: a primary checkout, a linked worktree, and a subdirectory of each."""
+
+    def test_only_a_linked_worktree_is_one(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            primary, linked = base / "repo", base / "wt"
+
+            def git(*args):
+                subprocess.run(["git", "-C", str(primary), *args], check=True, capture_output=True)
+            primary.mkdir()
+            git("init", "-q")
+            (primary / "web" / "next").mkdir(parents=True)
+            (primary / "web" / "next" / "f").write_text("x")
+            git("add", ".")
+            git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
+            git("worktree", "add", "-q", str(linked))
+            self.assertIsNone(reaper.linked_worktree(primary))
+            self.assertIsNone(reaper.linked_worktree(primary / "web" / "next"))
+            self.assertEqual(reaper.linked_worktree(linked), linked)
+            self.assertEqual(reaper.linked_worktree(linked / "web" / "next"), linked)
+            self.assertIsNone(reaper.linked_worktree(base))
+
+
+class ListeningTest(unittest.TestCase):
+    def test_an_empty_listing_is_a_failed_probe(self):
+        result = mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(reaper.subprocess, "run", return_value=result):
+            self.assertIsNone(reaper.listening())
+
+    def test_listeners_parse_every_address_form(self):
+        result = mock.Mock(returncode=0, stdout="p10\nn*:8811\nn[::1]:9229\np11\nn127.0.0.1:4462\n")
+        with mock.patch.object(reaper.subprocess, "run", return_value=result):
+            self.assertEqual(reaper.listening(), {10: {8811, 9229}, 11: {4462}})
 
 
 if __name__ == "__main__":
