@@ -12,13 +12,18 @@ A launcher tree is stopped only when every one of these holds:
 
 - its root runs a known dev-server launcher (`npm run dev|preview|start`, `wrangler dev`,
   `next dev|start`, `vite`) and names its port on the command line - no port named, no
-  verdict;
+  verdict - or runs `react-scripts start`, which takes its port from the environment;
 - the root was reparented to launchd (ppid 1), so no session's shell is waiting on it, and
   no `claude` or `codex` process is in the tree or shares a process group with one in it;
 - the root's working directory is inside a linked git worktree, never a primary checkout;
 - no process in the tree listens on that port (the inspector ports a server also opens
   do not count), nor - when something else holds that port - on one of the next 20, where
-  vite and astro move to; listeners are read again right before signalling;
+  vite and astro move to; listeners are read again right before signalling. For
+  `react-scripts start`, whose port is not on its command line, serving means a TCP
+  connection to any port its tree listens on: an open tab keeps the hot-reload socket
+  connected, so a tree with listeners and no connection, both at the scan and at the
+  recheck, has nobody using it. Two CRA servers sat 2 days like that on 2026-10-05,
+  holding 4.5 GB while the compressor churned 850 MB/s;
 - the root is at least the minimum age, so a server still starting is not judged;
 - the worktree janitor's `--claims <worktree>` names no live session cwd and no live
   session tool call for that worktree (this session's own mentions excepted, as the
@@ -45,6 +50,8 @@ import time
 AGENT = re.compile(r"(?:^|/)(?:claude|codex)(?:\s|$)")
 # How far a dev server moves when its port is taken: vite and astro try the next ports.
 PORT_SHIFT = 20
+# `react-scripts start` reads PORT from the environment; its port is whatever it listens on.
+ANY_PORT = -1
 
 
 def launcher(command):
@@ -61,6 +68,8 @@ def launcher(command):
         return None
     tool = re.sub(r"\.(?:c|m)?js$", "", os.path.basename(args[0]))
     sub = args[1:]
+    if tool == "react-scripts":
+        return ANY_PORT if sub[:1] == ["start"] else None
     if not ((tool == "npm" and sub[:1] == ["run"] and sub[1:2] in (["dev"], ["preview"], ["start"]))
             or (tool == "wrangler" and (sub[:1] == ["dev"] or sub[:2] == ["pages", "dev"]))
             or (tool == "next" and sub[:1] in (["dev"], ["start"]))
@@ -119,6 +128,27 @@ def listening():
                 ports.setdefault(pid, set()).add(int(tail))
     # A host always has listeners; an empty answer is a failed probe, not a quiet machine.
     return ports or None
+
+
+def connected():
+    """Every local or remote port of an established TCP connection; None when lsof cannot
+    answer. Both ends count, so a browser on this host connected to a server counts too."""
+    try:
+        probe = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fn"],
+                               capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if probe.returncode not in (0, 1):
+        return None
+    found = set()
+    for field in probe.stdout.split():
+        if field.startswith("n") and "->" in field:
+            for end in field[1:].split("->"):
+                tail = end.rsplit(":", 1)[-1]
+                if tail.isdigit():
+                    found.add(int(tail))
+    # This host always has connections (every session talks to its API); none is a failed probe.
+    return found or None
 
 
 def cwd(pid):
@@ -183,7 +213,17 @@ def tree(rows, root):
 
 def serving(ports, members, port):
     """Why the tree serves, or None: it listens on its port, or on one just above it, where
-    vite and astro move when theirs is taken - whether or not it is still taken now."""
+    vite and astro move when theirs is taken - whether or not it is still taken now. With
+    ANY_PORT: something is connected to a port the tree listens on."""
+    if port == ANY_PORT:
+        listens = {p for pid in members for p in ports.get(pid, ())}
+        if not listens:
+            return None
+        clients = connected()
+        if clients is None:
+            return "connections unreadable"
+        used = sorted(listens & clients)
+        return f"has connections on {used[0]}" if used else None
     if any(port in ports.get(pid, ()) for pid in members):
         return f"listens on {port}"
     moved = sorted(p for pid in members for p in ports.get(pid, ()) if port < p <= port + PORT_SHIFT)
@@ -218,6 +258,8 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
         claims[worktree] = claimed(worktree, janitor, claim_timeout)
     if claims[worktree]:
         return "keep", "a live session claims the worktree, or the claim check failed", worktree, [], port
+    if port == ANY_PORT:
+        return "reap", "has no connection on any port it listens on", worktree, members, port
     return "reap", f"does not listen on its port {port}", worktree, members, port
 
 

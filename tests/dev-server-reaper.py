@@ -30,12 +30,14 @@ class ReaperTest(unittest.TestCase):
         self.cwds = {}
         self.worktrees = {WT / "site": WT}
         self.claims = set()
+        self.connections = {443}
         self.sent = []
         self.claim_calls = []
         for name, fake in (("processes", lambda: dict(self.rows)),
                            ("listening", lambda: dict(self.ports)),
                            ("cwd", lambda pid: self.cwds.get(pid)),
                            ("linked_worktree", lambda path: self.worktrees.get(path)),
+                           ("connected", lambda: set(self.connections) or None),
                            ("claimed", self.fake_claimed)):
             patcher = mock.patch.object(reaper, name, side_effect=fake)
             patcher.start()
@@ -97,7 +99,7 @@ class ReaperTest(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
     def test_no_port_on_the_command_line_is_kept(self):
-        self.server(100, cmd="node ./node_modules/.bin/react-scripts start")
+        self.server(100, cmd="node ./node_modules/.bin/vite")
         self.server(200, cmd="npm run dev")
         self.run_reap()
         self.assertEqual(self.sent, [])
@@ -234,6 +236,38 @@ class ReaperTest(unittest.TestCase):
         self.assertEqual(reaped, (2, 2))
         self.assertEqual(self.terms(), [100, 102, 200, 201, 202])
 
+    def cra(self, root, port=3633):
+        self.server(root, cmd="node ./node_modules/.bin/react-scripts start")
+        self.ports[root + 2] = {port}
+
+    def test_an_unused_cra_server_is_stopped(self):
+        self.cra(100)
+        self.assertEqual(self.run_reap(), (1, 1))
+        self.assertEqual(self.terms(), [100, 101, 102])
+
+    def test_a_cra_server_with_a_connection_is_serving(self):
+        self.cra(100)
+        self.connections.add(3633)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_cra_server_connected_by_the_recheck_is_kept(self):
+        self.cra(100)
+        calls = []
+
+        def later():
+            calls.append(1)
+            return {443} if len(calls) == 1 else {443, 3633}
+        reaper.connected.side_effect = later
+        self.assertEqual(self.run_reap(), (0, 1))
+        self.assertEqual(self.sent, [])
+
+    def test_unreadable_connections_keep_a_cra_server(self):
+        self.cra(100)
+        self.connections.clear()
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
     def test_survivors_of_term_get_kill(self):
         self.server(100)
         reaper.reap(apply=True, min_age=6 * HOUR, grace=0, now=NOW, janitor=Path("/j"),
@@ -291,12 +325,13 @@ class PatternTest(unittest.TestCase):
                           ("/opt/homebrew/bin/node /x/node_modules/.bin/wrangler dev --port=8787", 8787),
                           ("node /x/node_modules/wrangler/bin/wrangler.js pages dev -p 8788", 8788),
                           ("node /x/node_modules/.bin/vite --port 5173", 5173),
-                          ("npm run dev", 0), ("node ./node_modules/.bin/next start --port x", 0)):
+                          ("npm run dev", 0), ("node ./node_modules/.bin/next start --port x", 0),
+                          ("node ./node_modules/.bin/react-scripts start", reaper.ANY_PORT)):
             self.assertEqual(reaper.launcher(cmd), port, cmd)
 
     def test_not_launchers(self):
         for cmd in ("npm run build", "npm run test --port 1", "/bin/bash sup.sh --port 8811",
-                    "node ./node_modules/.bin/react-scripts start",
+                    "node ./node_modules/.bin/react-scripts build",
                     "tmux new-session -d npm run dev --port 5173",
                     "SCREEN -dmS x npm run dev --port 5173",
                     "/Users/x/.local/bin/claude --bg run npm run dev --port 3000",
@@ -326,6 +361,15 @@ class WorktreeTest(unittest.TestCase):
             self.assertEqual(reaper.linked_worktree(linked), linked)
             self.assertEqual(reaper.linked_worktree(linked / "web" / "next"), linked)
             self.assertIsNone(reaper.linked_worktree(base))
+
+
+class ConnectedTest(unittest.TestCase):
+    def test_both_ends_count_and_empty_is_a_failed_probe(self):
+        result = mock.Mock(returncode=0, stdout="p1\nn127.0.0.1:55001->127.0.0.1:3633\nn[::1]:3579->[::1]:61000\n")
+        with mock.patch.object(reaper.subprocess, "run", return_value=result):
+            self.assertEqual(reaper.connected(), {55001, 3633, 3579, 61000})
+        with mock.patch.object(reaper.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="")):
+            self.assertIsNone(reaper.connected())
 
 
 class ListeningTest(unittest.TestCase):
