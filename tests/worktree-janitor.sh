@@ -698,6 +698,34 @@ expect_yes "a detached HEAD landed only by content is kept" \
   classify7_is "KEEP(detached-head)" 0 no yes "(detached)" content yes
 expect_yes "a detached HEAD landed by ancestry is removable" \
   classify7_is REMOVABLE 0 no yes "(detached)" ancestor yes
+# The tenth argument: a ref that contains the detached HEAD keeps its commits after removal.
+expect_yes "an idle detached HEAD a ref contains is removable" \
+  classify7_is REMOVABLE 0 no yes "(detached)" no yes no yes yes
+expect_yes "a detached HEAD landed by content that a ref contains is removable" \
+  classify7_is REMOVABLE 0 no yes "(detached)" content yes no no yes
+expect_yes "a contained detached HEAD that is not abandoned stays unlanded" \
+  classify7_is "KEEP(unlanded)" 0 no yes "(detached)" no yes no no yes
+expect_yes "a contained detached HEAD that is not idle is kept" \
+  classify7_is "KEEP(recent-activity)" 0 no yes "(detached)" no no no yes yes
+expect_yes "containment does not override a dirty detached HEAD" \
+  classify7_is "KEEP(unrebuildable=1)" 1 no yes "(detached)" no yes no yes yes
+
+# _cc_wj_referenced, against real refs.
+REF_TMP="$(mktemp -d)"
+git -C "$REF_TMP" init -q -b main 2>/dev/null
+git -C "$REF_TMP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m a 2>/dev/null
+git -C "$REF_TMP" checkout -q --detach 2>/dev/null
+expect_yes "a detached HEAD on a branch is referenced" \
+  test "$(_cc_wj_referenced "$REF_TMP")" = yes
+git -C "$REF_TMP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m loose 2>/dev/null
+expect_yes "a commit made on the detached HEAD is not" \
+  test "$(_cc_wj_referenced "$REF_TMP")" = no
+git -C "$REF_TMP" update-ref refs/remotes/origin/keep HEAD
+expect_yes "until a remote-tracking ref contains it" \
+  test "$(_cc_wj_referenced "$REF_TMP")" = yes
+expect_yes "a directory that is not a repository is not referenced" \
+  test "$(_cc_wj_referenced "$REF_TMP/nope")" = no
+rm -rf "$REF_TMP"
 expect_yes "an empty landed answer is not a yes" \
   classify7_is "KEEP(unlanded)" 0 no yes task/x "" yes
 expect_yes "an empty idle answer is not a yes" \
@@ -735,7 +763,11 @@ SQUASH_HEAD="$(git -C "$L_ROOT/wt-squash" rev-parse HEAD)"
 echo s > "$L_PRIMARY/s.txt"; lgit add s.txt; lgit commit -qm "squash: add s"
 echo later > "$L_PRIMARY/later.txt"; lgit add later.txt; lgit commit -qm later
 # Detached at that same head: its change is on main, its commit is on nothing.
-lgit worktree add -q --detach "$L_ROOT/wt-squash-detached" "$SQUASH_HEAD" 2>/dev/null
+# A twin of the squashed commit that no ref contains, so the checkout is all that keeps it.
+SQUASH_LOOSE="$(lgit commit-tree -p "$SQUASH_HEAD^" -m "add s, loose" "$SQUASH_HEAD^{tree}")"
+lgit worktree add -q --detach "$L_ROOT/wt-squash-detached" "$SQUASH_LOOSE" 2>/dev/null
+# The squashed commit itself: branch `squash` still contains it.
+lgit worktree add -q --detach "$L_ROOT/wt-squash-detached-ref" "$SQUASH_HEAD" 2>/dev/null
 # Detached at a commit that is itself on main.
 lgit worktree add -q --detach "$L_ROOT/wt-ancestor-detached" "$(lgit rev-parse HEAD)" 2>/dev/null
 
@@ -808,6 +840,8 @@ expect_yes "and is removable" \
   file_after "$OUT_L" "wt-squash$" 2 "REMOVABLE"
 expect_yes "a detached HEAD whose change landed by content is KEEP(detached-head)" \
   file_after "$OUT_L" "wt-squash-detached$" 2 "KEEP(detached-head)"
+expect_yes "the same, with a branch containing its commit, is removable" \
+  file_after "$OUT_L" "wt-squash-detached-ref$" 2 "REMOVABLE"
 expect_yes "a detached HEAD on the base is removable" \
   file_after "$OUT_L" "wt-ancestor-detached$" 2 "REMOVABLE"
 expect_yes "a PR merged at this exact head lands work that was later reverted" \
@@ -2215,7 +2249,70 @@ for d in 0 abc 99999; do
 done
 expect_yes "CC_WJ_CLOSED_PR_DAYS=08 reads as eight days, not an error" \
   env CC_WJ_CLOSED_PR_DAYS=08 bash -c 'source "$1"; PATH="$2:$PATH" _cc_wj_closed_at_head "$3" | grep -qx yes' _ "$WJ" "$GHX_STUBS" "$GHX_WT"
+# A checkout one push behind its own branch, whose pushed head merged: behind_merged.
+GHX_UP="$(git -C "$GHX_WT" commit-tree -p "$GHX_HEAD" -m pushed-after "$(git -C "$GHX_WT" rev-parse "$GHX_HEAD^{tree}")")"
+git -C "$GHX_WT" update-ref refs/remotes/origin/feat/x "$GHX_UP"
+ghx_behind() { PATH="$GHX_STUBS:$PATH" _CC_WJ_BASE=main _cc_wj_behind_merged "$GHX_WT" refs/remotes/origin/main; }
+ghx "repos/acme/demo/commits/$GHX_UP/pulls" \
+  "[{\"number\":3000,\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"head\":{\"sha\":\"$GHX_UP\"},\"merge_commit_sha\":\"$GHX_MERGE\"}]"
+expect_yes "a checkout behind its own pushed head, which merged, has landed" ghx_behind
+ghx "repos/acme/demo/commits/$GHX_UP/pulls" '[]'
+expect_no "its pushed head merged nowhere: not landed" ghx_behind
+ghx "repos/acme/demo/commits/$GHX_UP/pulls" \
+  "[{\"number\":3000,\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"head\":{\"sha\":\"$GHX_UP\"},\"merge_commit_sha\":\"$GHX_MERGE\"}]"
+git -C "$GHX_WT" update-ref refs/remotes/origin/feat/x "$GHX_HEAD"
+expect_no "a checkout level with its pushed head is not asked again" ghx_behind
+GHX_SIDE="$(git -C "$GHX_WT" commit-tree -m unrelated "$(git -C "$GHX_WT" rev-parse "$GHX_HEAD^{tree}")")"
+git -C "$GHX_WT" update-ref refs/remotes/origin/feat/x "$GHX_SIDE"
+ghx "repos/acme/demo/commits/$GHX_SIDE/pulls" \
+  "[{\"number\":3001,\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"head\":{\"sha\":\"$GHX_SIDE\"},\"merge_commit_sha\":\"$GHX_MERGE\"}]"
+expect_no "a pushed head that does not contain the checkout proves nothing" ghx_behind
+git -C "$GHX_WT" update-ref -d refs/remotes/origin/feat/x
+expect_no "no pushed head: not asked" ghx_behind
+# Wired into _cc_wj_landed: a checkout neither on the base nor landed by content, whose
+# pushed head merged, answers pr. Its own HEAD has no PR fixture, so only this path says so.
+git -C "$GHX_WT" checkout -q -b feat/y "$GHX_HEAD" 2>/dev/null
+echo y > "$GHX_WT/y.txt"; git -C "$GHX_WT" add y.txt
+git -C "$GHX_WT" -c user.email=t@t -c user.name=t commit -qm "add y"
+GHX_Y_UP="$(git -C "$GHX_WT" commit-tree -p HEAD -m pushed "$(git -C "$GHX_WT" rev-parse "HEAD^{tree}")")"
+git -C "$GHX_WT" update-ref refs/remotes/origin/feat/y "$GHX_Y_UP"
+ghx "repos/acme/demo/commits/$GHX_Y_UP/pulls" \
+  "[{\"number\":3002,\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"head\":{\"sha\":\"$GHX_Y_UP\"},\"merge_commit_sha\":\"$GHX_MERGE\"}]"
+expect_yes "_cc_wj_landed answers pr for a checkout behind its merged pushed head" \
+  test "$(PATH="$GHX_STUBS:$PATH" _CC_WJ_BASE=main _CC_WJ_BASE_OK=1 _cc_wj_landed "$GHX_WT")" = pr
+git -C "$GHX_WT" update-ref -d refs/remotes/origin/feat/y
+expect_yes "and no without it" \
+  test "$(PATH="$GHX_STUBS:$PATH" _CC_WJ_BASE=main _CC_WJ_BASE_OK=1 _cc_wj_landed "$GHX_WT")" = no
 rm -rf "$GHX_ROOT"
+
+# ─── An operation in progress, and the pin a detached removal leaves ──────────
+INP_TMP="$(mktemp -d)"
+git -C "$INP_TMP" init -q -b main 2>/dev/null
+git -C "$INP_TMP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m a 2>/dev/null
+expect_yes "a worktree with nothing in progress has no git keep" test -z "$(_cc_wj_git_keep "$INP_TMP")"
+for marker in rebase-merge BISECT_LOG MERGE_HEAD; do
+  mkdir -p "$INP_TMP/.git/x" && { [ "$marker" = rebase-merge ] && mkdir "$INP_TMP/.git/$marker" || : > "$INP_TMP/.git/$marker"; }
+  expect_yes "a worktree with $marker in its git dir is kept as in-progress" \
+    test "$(_cc_wj_git_keep "$INP_TMP")" = in-progress
+  rm -rf "${INP_TMP:?}/.git/$marker"
+done
+expect_no "a pin refuses something that is not a SHA" _cc_wj_pin_detached "$INP_TMP" "HEAD"
+INP_HEAD="$(git -C "$INP_TMP" rev-parse HEAD)"
+CC_WJ_LOG="$INP_TMP/log" _cc_wj_pin_detached "$INP_TMP" "$INP_HEAD"
+expect_yes "a pin writes refs/cc-reaper/detached/<sha>" \
+  test "$(git -C "$INP_TMP" rev-parse --verify --quiet "refs/cc-reaper/detached/$INP_HEAD")" = "$INP_HEAD"
+rm -rf "$INP_TMP"
+
+# End to end, last because it removes the landed fixture's worktrees: the contained
+# detached HEAD goes and is pinned; the loose one, which nothing contains, stays.
+OUT_LA="$TMPDIR_ROOT/out-landed-apply.txt"
+_wj_idle --repo "$L_PRIMARY" --apply > "$OUT_LA"
+expect_no "--apply removes a detached HEAD a branch contains" test -d "$L_ROOT/wt-squash-detached-ref"
+expect_yes "after pinning it under refs/cc-reaper/detached/" \
+  test "$(lgit rev-parse --verify --quiet "refs/cc-reaper/detached/$SQUASH_HEAD")" = "$SQUASH_HEAD"
+expect_yes "and keeps a detached HEAD nothing contains" test -d "$L_ROOT/wt-squash-detached"
+expect_no "a detached HEAD on the base needs no pin" \
+  sh -c "git -C '$L_PRIMARY' for-each-ref refs/cc-reaper/detached | grep -qv '$SQUASH_HEAD'"
 
 # ─── Final result ─────────────────────────────────────────────────────────────
 
