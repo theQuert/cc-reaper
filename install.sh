@@ -18,7 +18,7 @@ fi
 
 # Validate the generated worktree LaunchAgent cadence before this installer writes
 # anything. A typo must not leave an otherwise healthy installation half-updated.
-WORKTREE_INTERVAL_SECONDS="${CC_REAPER_WORKTREE_INTERVAL_SECONDS:-21600}"
+WORKTREE_INTERVAL_SECONDS="${CC_REAPER_WORKTREE_INTERVAL_SECONDS:-3600}"
 case "$WORKTREE_INTERVAL_SECONDS" in
   ''|*[!0-9]*)
     echo "FATAL: CC_REAPER_WORKTREE_INTERVAL_SECONDS must be a whole number from 300 to 604800." >&2
@@ -506,7 +506,7 @@ for AGENT in resource-watch disk-check weekly-clean guard worktree-janitor; do
   AGENT_PLIST="$PLIST_DIR/$AGENT_LABEL.plist"
   if [ "$AGENT" = "worktree-janitor" ]; then
     sed -e "s|__HOME__|$HOME_DIR|g" \
-      -e "s|<integer>21600</integer>|<integer>$WORKTREE_INTERVAL_SECONDS</integer>|" \
+      -e "s|<integer>3600</integer>|<integer>$WORKTREE_INTERVAL_SECONDS</integer>|" \
       "$SCRIPT_DIR/launchd/$AGENT_LABEL.plist" > "$AGENT_PLIST"
   else
     sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/$AGENT_LABEL.plist" > "$AGENT_PLIST"

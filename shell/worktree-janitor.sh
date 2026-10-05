@@ -60,6 +60,12 @@ Environment:
   CC_WJ_BASE_BRANCH       Integration branch (default: origin's default branch)
   CC_WJ_SESSION_APPLY     Set to 1 to let --session remove (default: report only)
   CC_WJ_SCHEDULE_APPLY    Set to 1 to let --scheduled remove (default: report only)
+  CC_WJ_PRESSURE_FREE_GB  Below this many GB free, the disk pressure tier applies
+                          (default: 100; off or 0 disables it)
+  CC_WJ_PRESSURE_IDLE_HOURS, CC_WJ_PRESSURE_SESSION_GRACE_HOURS
+                          The idle window and session lease under pressure (default: 2)
+  CC_WJ_PRESSURE_TRIM     1 (default): a scheduled apply under pressure also trims the
+                          regenerable caches of the worktrees it kept
   CC_WJ_SESSION_LOG       --session log (default: ~/.cc-reaper/logs/worktree-janitor-session.log)
   CC_WJ_CLAUDE_SESSIONS  Claude live-session registry (default: ~/.claude/sessions)
   CC_WJ_CLAUDE_PROJECTS  Claude transcript registry (default: ~/.claude/projects)
@@ -2053,7 +2059,7 @@ _cc_wj_regenerable_dirs() {
 }
 
 _cc_wj_trim_regenerable() {
-  local wt="$1" work="$2" apply="$3" session_grace="$4" dir bytes before after list_file list_rc
+  local wt="$1" work="$2" apply="$3" session_grace="$4" idle_window="${5:-}" dir bytes before after list_file list_rc
   local count=0 trimmed=0 reclaimed=0 active_rc recent_rc
   [ "$LSOF_OK" = yes ] || { printf 'KEEP(process-scan-unknown)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'; return 0; }
   [ "$ACTIVE_OK" = yes ] || { printf 'KEEP(session-scan-unknown)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'; return 0; }
@@ -2071,6 +2077,12 @@ _cc_wj_trim_regenerable() {
     0) printf 'KEEP(%s)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n' "$_CC_WJ_RECENT_REASON"; return 0 ;;
     2) printf 'KEEP(session-scan-unknown)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'; return 0 ;;
   esac
+  # Under disk pressure the session lease is short, so a tree someone works in outside a
+  # harness session must also have sat untouched for the pressure idle window.
+  if [ -n "$idle_window" ] && [ "$(_cc_wj_idle "$wt" "$idle_window")" != yes ]; then
+    printf 'KEEP(recent-activity)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'
+    return 0
+  fi
 
   list_file="$(mktemp "${TMPDIR:-/tmp}/cc-wj-trim-list.XXXXXX")" || {
     printf 'KEEP(trim-list-unavailable)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'
@@ -2122,6 +2134,8 @@ _cc_wj_trim_regenerable() {
     reclaimed=$((reclaimed + before))
     trimmed=$((trimmed + 1))
     printf '    → trimmed (%s bytes reclaimed)\n' "$before"
+    # Every gate was asked again just now; say so to a sweep deciding whether this one died.
+    [ -n "${lock:-}" ] && touch "$lock" 2>/dev/null
   done < "$list_file"
   rm -f "$list_file"
   printf 'TRIM_RESULT count=%s trimmed=%s reclaimed=%s\n' "$count" "$trimmed" "$reclaimed"
@@ -3006,6 +3020,26 @@ _cc_wj_run_inner() {
     return $?
   fi
 
+  # Under disk pressure a finished tree waits CC_WJ_PRESSURE_IDLE_HOURS and
+  # CC_WJ_PRESSURE_SESSION_GRACE_HOURS (default 2 each) instead, never longer than configured.
+  local pressure p_idle p_grace trim_idle_window=""
+  if pressure="$(_cc_wj_disk_pressure)"; then
+    p_idle="${CC_WJ_PRESSURE_IDLE_HOURS:-2}"; p_grace="${CC_WJ_PRESSURE_SESSION_GRACE_HOURS:-2}"
+    case "$p_idle" in ''|*[!0-9]*|??????*)
+      echo "worktree-janitor: CC_WJ_PRESSURE_IDLE_HOURS=$p_idle is not a whole number of hours below 100000; scanned and removed nothing" >&2
+      return 2 ;;
+    esac
+    case "$p_grace" in ''|*[!0-9]*|??????*)
+      echo "worktree-janitor: CC_WJ_PRESSURE_SESSION_GRACE_HOURS=$p_grace is not a whole number of hours below 100000; scanned and removed nothing" >&2
+      return 2 ;;
+    esac
+    [ $((10#$p_idle)) -lt "$idle_hours" ] && idle_hours=$((10#$p_idle))
+    [ $((10#$p_grace)) -lt "$session_grace_hours" ] && session_grace_hours=$((10#$p_grace))
+    trim_idle_window="$idle_hours"
+    echo "worktree-janitor: disk pressure ($pressure): idle window ${idle_hours}h, session lease ${session_grace_hours}h"
+    _cc_wj_log_write "disk pressure ($pressure): idle window ${idle_hours}h, session lease ${session_grace_hours}h"
+  fi
+
   # Asked once, before discovery, so the reason a scan came back empty is on the
   # record next to the emptiness rather than inferred from it.
   #
@@ -3269,7 +3303,7 @@ KEEP
             continue
             ;;
         esac
-        trim_result="$(_cc_wj_trim_regenerable "$wt_path" "$work" "$apply" "$session_grace_hours")"
+        trim_result="$(_cc_wj_trim_regenerable "$wt_path" "$work" "$apply" "$session_grace_hours" "$trim_idle_window")"
         printf "%s\n" "$trim_result"
         trim_count="$(printf '%s\n' "$trim_result" | awk -F'[ =]' '/^TRIM_RESULT / {print $3}')"
         trim_count_done="$(printf '%s\n' "$trim_result" | awk -F'[ =]' '/^TRIM_RESULT / {print $5}')"
@@ -3596,6 +3630,22 @@ _cc_wj_run() {
       "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$$"
   fi
   _cc_wj_run_inner "$@"; rc=$?
+  # Under disk pressure the scheduled sweep also trims the regenerable caches
+  # (node_modules, .next, .venv...) of the worktrees it kept: 45 GB of them on 2026-10-05.
+  # The trim keeps the worktree and asks every gate again before each directory.
+  if [ "$scheduled" -eq 1 ] && [ "${CC_WJ_SCHEDULE_APPLY-}" = 1 ] &&
+     [ "${CC_WJ_PRESSURE_TRIM:-1}" = 1 ] && _cc_wj_disk_pressure >/dev/null; then
+    echo "== worktree-janitor under disk pressure: trimming regenerable caches of kept worktrees"
+    # The same repositories the sweep was given: --repo pairs pass through, nothing else.
+    local trim_args=() prev=""
+    for arg in "$@"; do
+      [ "$prev" = --repo ] && trim_args+=(--repo "$arg")
+      prev="$arg"
+    done
+    # Its own status is printed; the sweep's is the one the run reports.
+    _cc_wj_run_inner --trim-regenerable --apply ${trim_args[@]+"${trim_args[@]}"} ||
+      echo "== worktree-janitor pressure trim ended with status $?"
+  fi
   if [ "$scheduled" -eq 1 ]; then
     printf '== worktree-janitor scheduled sweep ended %s elapsed=%ss status=%s\n' \
       "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$(( $(date +%s) - started ))" "$rc"
@@ -3606,6 +3656,24 @@ _cc_wj_run() {
 # ─── Session mode ─────────────────────────────────────────────────────────────
 
 _cc_wj_free_kb() { df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 + 0 }'; }
+
+# Disk pressure: under CC_WJ_PRESSURE_FREE_GB (default 100) free on the volume holding
+# $HOME, print why and return 0. On 2026-10-05 the Mac mini fell to 25 GB free while 31
+# landed, clean, unheld worktrees (21.5 GB) waited out a 24h idle window and the session
+# lease: worktrees open at about 60 a day there, and a day of them is 45 GB. Nothing the
+# pressure tier shortens is a safety gate - landed, clean, unheld and unclaimed still
+# hold - only how long a finished tree waits. `off` or 0 disables it; an unreadable free
+# figure or a bad floor is not pressure.
+_cc_wj_disk_pressure() {
+  local floor="${CC_WJ_PRESSURE_FREE_GB:-100}" free
+  case "$floor" in ''|off|*[!0-9]*|??????*) return 1 ;; esac
+  floor=$((10#$floor))
+  [ "$floor" -gt 0 ] || return 1
+  free="$(_cc_wj_free_kb)"
+  case "$free" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$free" -lt $((floor * 1048576)) ] || return 1
+  printf 'free %s < %sGB' "$(_cc_wj_gib "$free")" "$floor"
+}
 _cc_wj_gib() {
   case "$1" in
     ''|*[!0-9]*) printf '?' ;;

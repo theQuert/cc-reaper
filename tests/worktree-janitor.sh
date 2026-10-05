@@ -172,6 +172,9 @@ export CC_WJ_ARCHIVE_DIR="$TMPDIR_ROOT/no-archive"
 # Fixtures are created seconds before they are judged. The idle gate has its own cases
 # below; everywhere else it is set to a window nothing can fall inside.
 export CC_WJ_IDLE_HOURS=0
+# The disk pressure tier reads this host's real free space, so it is off here and turned
+# on only by its own cases.
+export CC_WJ_PRESSURE_FREE_GB=off
 
 # ─── Runner helpers ───────────────────────────────────────────────────────────
 
@@ -2313,6 +2316,83 @@ expect_yes "after pinning it under refs/cc-reaper/detached/" \
 expect_yes "and keeps a detached HEAD nothing contains" test -d "$L_ROOT/wt-squash-detached"
 expect_no "a detached HEAD on the base needs no pin" \
   sh -c "git -C '$L_PRIMARY' for-each-ref refs/cc-reaper/detached | grep -qv '$SQUASH_HEAD'"
+
+# ─── Disk pressure tier ──────────────────────────────────────────────────────
+# Under CC_WJ_PRESSURE_FREE_GB free, the idle window and the session lease shorten; every
+# other gate stays. 99999 GB is always pressure, 1 GB never is on a test host.
+expect_yes "pressure: below the floor names the free space" \
+  bash -c 'source "$1"; _cc_wj_free_kb() { echo 1048576; }; CC_WJ_PRESSURE_FREE_GB=100 _cc_wj_disk_pressure | grep -q "free 1.0GiB < 100GB"' _ "$WJ"
+expect_no "pressure: at or above the floor is none" \
+  bash -c 'source "$1"; _cc_wj_free_kb() { echo $((100 * 1048576)); }; CC_WJ_PRESSURE_FREE_GB=100 _cc_wj_disk_pressure' _ "$WJ"
+for bad in off 0 x 123456; do
+  expect_no "pressure: a floor of '$bad' is none" \
+    bash -c 'source "$1"; _cc_wj_free_kb() { echo 1; }; CC_WJ_PRESSURE_FREE_GB="$2" _cc_wj_disk_pressure' _ "$WJ" "$bad"
+done
+expect_no "pressure: an unreadable free figure is none" \
+  bash -c 'source "$1"; _cc_wj_free_kb() { echo; }; CC_WJ_PRESSURE_FREE_GB=100 _cc_wj_disk_pressure' _ "$WJ"
+
+P_ROOT="$TMPDIR_ROOT/pressure"; mkdir -p "$P_ROOT"
+git init -q --bare "$P_ROOT/origin.git" -b main
+git clone -q "$P_ROOT/origin.git" "$P_ROOT/primary" 2>/dev/null
+pgit() { git -C "$P_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$P_ROOT/primary/README"; pgit add README; pgit commit -qm base; pgit push -q origin main
+pgit worktree add -q "$P_ROOT/wt-landed" -b landed origin/main 2>/dev/null
+pgit worktree add -q "$P_ROOT/wt-unlanded" -b unlanded origin/main 2>/dev/null
+printf 'node_modules/\n' > "$P_ROOT/wt-unlanded/.gitignore"
+pgit -C "$P_ROOT/wt-unlanded" add .gitignore; pgit -C "$P_ROOT/wt-unlanded" commit -qm caches
+mkdir -p "$P_ROOT/wt-unlanded/node_modules/pkg"; echo p > "$P_ROOT/wt-unlanded/node_modules/pkg/index.js"
+
+OUT_P_NONE="$TMPDIR_ROOT/out-pressure-none.txt"
+CC_WJ_IDLE_HOURS=6 CC_WJ_PRESSURE_FREE_GB=1 _wj_idle --repo "$P_ROOT/primary" > "$OUT_P_NONE"
+expect_yes "pressure: without it, a landed tree touched just now waits out the idle window" \
+  file_after "$OUT_P_NONE" "wt-landed" 2 "KEEP(recent-activity)"
+OUT_P="$TMPDIR_ROOT/out-pressure.txt"
+CC_WJ_IDLE_HOURS=6 CC_WJ_PRESSURE_FREE_GB=99999 CC_WJ_PRESSURE_IDLE_HOURS=0 \
+  _wj_idle --repo "$P_ROOT/primary" > "$OUT_P"
+expect_yes "pressure: the run says so, with the windows it used" \
+  file_has "$OUT_P" "disk pressure (free "
+expect_yes "pressure: under it, the pressure idle window applies" \
+  file_after "$OUT_P" "wt-landed" 2 "REMOVABLE"
+expect_yes "pressure: an unlanded tree is still kept" \
+  file_after "$OUT_P" "wt-unlanded" 2 "KEEP(unlanded)"
+OUT_P_MIN="$TMPDIR_ROOT/out-pressure-min.txt"
+CC_WJ_IDLE_HOURS=0 CC_WJ_PRESSURE_FREE_GB=99999 CC_WJ_PRESSURE_IDLE_HOURS=6 \
+  _wj_idle --repo "$P_ROOT/primary" > "$OUT_P_MIN"
+expect_yes "pressure: never lengthens a window" \
+  file_after "$OUT_P_MIN" "wt-landed" 2 "REMOVABLE"
+expect_no "pressure: a malformed pressure window fails the run" \
+  env CC_WJ_PRESSURE_FREE_GB=99999 CC_WJ_PRESSURE_IDLE_HOURS=x PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$P_ROOT/primary" --apply
+expect_yes "and removed nothing" test -d "$P_ROOT/wt-landed"
+
+# A scheduled apply under pressure also trims the caches of what it kept, and only in the
+# repositories it was given.
+P2_ROOT="$TMPDIR_ROOT/pressure-other"; mkdir -p "$P2_ROOT"
+git init -q --bare "$P2_ROOT/origin.git" -b main
+git clone -q "$P2_ROOT/origin.git" "$P2_ROOT/primary" 2>/dev/null
+p2git() { git -C "$P2_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$P2_ROOT/primary/README"; p2git add README; p2git commit -qm base; p2git push -q origin main
+p2git worktree add -q "$P2_ROOT/wt-other" -b other origin/main 2>/dev/null
+printf 'node_modules/\n' > "$P2_ROOT/wt-other/.gitignore"
+p2git -C "$P2_ROOT/wt-other" add .gitignore; p2git -C "$P2_ROOT/wt-other" commit -qm caches
+mkdir -p "$P2_ROOT/wt-other/node_modules/pkg"; echo p > "$P2_ROOT/wt-other/node_modules/pkg/index.js"
+P_HOME="$TMPDIR_ROOT/pressure-home"; mkdir -p "$P_HOME/.cc-reaper/logs"
+HOME="$P_HOME" CC_WJ_SCHEDULE_APPLY=1 CC_WJ_PRESSURE_FREE_GB=1 CC_WJ_IDLE_HOURS=6 PATH="$STUBS_IDLE:$PATH" \
+  bash "$WJ" --scheduled --repo "$P_ROOT/primary" > "$TMPDIR_ROOT/out-pressure-sched-none.txt" 2>&1
+expect_yes "pressure: no scheduled trim without it" test -d "$P_ROOT/wt-unlanded/node_modules"
+expect_yes "pressure: nor the 6h idle window shortened" test -d "$P_ROOT/wt-landed"
+HOME="$P_HOME" CC_WJ_SCHEDULE_APPLY=1 CC_WJ_PRESSURE_FREE_GB=99999 CC_WJ_IDLE_HOURS=6 PATH="$STUBS_IDLE:$PATH" \
+  bash "$WJ" --scheduled --repo "$P_ROOT/primary" > "$TMPDIR_ROOT/out-pressure-sched-recent.txt" 2>&1
+expect_yes "pressure: a tree touched within the pressure idle window keeps its caches" \
+  test -d "$P_ROOT/wt-unlanded/node_modules"
+OUT_P_SCHED="$TMPDIR_ROOT/out-pressure-sched.txt"
+HOME="$P_HOME" CC_WJ_SCHEDULE_APPLY=1 CC_WJ_PRESSURE_FREE_GB=99999 CC_WJ_PRESSURE_IDLE_HOURS=0 CC_WJ_IDLE_HOURS=6 \
+  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --scheduled --repo "$P_ROOT/primary" > "$OUT_P_SCHED" 2>&1
+expect_yes "pressure: the scheduled sweep removes the landed tree" test ! -d "$P_ROOT/wt-landed"
+expect_no "pressure: and trims the kept tree's node_modules" test -e "$P_ROOT/wt-unlanded/node_modules"
+expect_yes "pressure: keeping the tree" test -f "$P_ROOT/wt-unlanded/.gitignore"
+expect_yes "pressure: and its branch" git -C "$P_ROOT/primary" show-ref --verify --quiet refs/heads/unlanded
+expect_yes "pressure: the trim stayed in the repository it was given" \
+  test -d "$P2_ROOT/wt-other/node_modules"
 
 # ─── Final result ─────────────────────────────────────────────────────────────
 

@@ -11,7 +11,7 @@
     <string>--scheduled</string>
   </array>
   <key>StartInterval</key>
-  <integer>21600</integer>
+  <integer>3600</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>ProcessType</key>
