@@ -31,8 +31,11 @@ A launcher tree is stopped only when every one of these holds:
     drops even the hot-reload socket within seconds, so one empty moment proves nothing,
     and runs more than MAX_SAMPLE_GAP apart start the count over. Two CRA servers sat 2
     days like that on 2026-10-05, holding 4.5 GB while the compressor churned 850 MB/s.
-    While the kernel's memory pressure level is 2 or more the window is
-    PRESSURE_IDLE_HOURS instead;
+    While the kernel's memory pressure level is 2 or more - now, or in any sample of the
+    host's pressure log within the last PRESSURE_LOOKBACK - the window is
+    PRESSURE_IDLE_HOURS instead. The level flips between 1 and 2 by the minute under load,
+    so one reading at run time took the 12h window at 13:47 on 2026-10-05 while the log
+    showed level 2 that hour;
 - nothing publishes it: no other listening process names its worktree on its command line
   (a review front such as ~/stima-review/tailnet_review.mjs <worktree> <port>), and no
   `tailscale serve` handler proxies to a port the tree listens on;
@@ -50,6 +53,7 @@ matches the scan, so a reused pid is never hit.
 """
 
 import argparse
+import calendar
 import json
 import os
 import shutil
@@ -72,6 +76,10 @@ IDLE_HOURS = 12
 PRESSURE_IDLE_HOURS = 3
 # Runs further apart than this cannot vouch for the time between them.
 MAX_SAMPLE_GAP = 2 * 3600
+# The host's 5-minute pressure samples ("<UTC>Z ... mp=<level> ..."), read when present.
+PRESSURE_LOG = Path(os.environ.get("CC_DEV_SERVER_PRESSURE_LOG",
+                                   Path.home() / "stima-watch" / "host" / "pressure.log"))
+PRESSURE_LOOKBACK = 3600
 STATE_DIR = Path.home() / ".cc-reaper" / "state" / "dev-server-idle"
 
 
@@ -259,17 +267,36 @@ def prune_idle(state_dir, rows):
         pass
 
 
-def pressure():
-    """(True, why) while the kernel's memory pressure level is 2 (warn) or more. Not swap
-    free: macOS grows swap a file at a time, so free swap sits near one file's size
-    whenever swap is in use at all. A probe that fails says not short, the longer window."""
+def pressure(log=None, now=None):
+    """(True, why) while the kernel's memory pressure level is 2 (warn) or more, now or in
+    the pressure log's samples of the last PRESSURE_LOOKBACK. Not swap free: macOS grows
+    swap a file at a time, so free swap sits near one file's size whenever swap is in use
+    at all. A probe or log that fails says not short, the longer window."""
     try:
         level = subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
                                capture_output=True, text=True, timeout=10, check=True).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        return False, ""
+        level = ""
     if level.isdigit() and int(level) >= 2:
         return True, f"memory pressure level {level}"
+    log = PRESSURE_LOG if log is None else log
+    now = time.time() if now is None else now
+    try:
+        with open(log, "rb") as f:
+            f.seek(max(0, os.fstat(f.fileno()).st_size - 65536))
+            lines = f.read().decode(errors="replace").splitlines()
+    except OSError:
+        return False, ""
+    for line in reversed(lines):
+        sample = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) .*\bmp=(\d+)", line)
+        if not sample:
+            continue
+        try:
+            at = calendar.timegm(time.strptime(sample.group(1), "%Y-%m-%dT%H:%M:%SZ"))
+        except ValueError:
+            continue
+        if int(sample.group(2)) >= 2 and 0 <= now - at <= PRESSURE_LOOKBACK:
+            return True, f"memory pressure level {sample.group(2)} at {sample.group(1)}"
     return False, ""
 
 

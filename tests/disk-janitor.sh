@@ -491,6 +491,24 @@ expect_yes "dev servers: an unknown mode is logged and not run" \
 : > "$SANDBOX/dj.log"
 CC_DJ_DEV_SERVER_MIN_HOURS=08 _run_dj --check 80 0
 expect_yes "dev servers: a minimum written 08 is eight hours" grep -q "dev args: report --min-hours 8" "$SANDBOX/dj.log"
+# Beside the disk work, not behind it: a slow low-disk trim must not hold the dev-server pass
+# back (2026-10-05). The fake trim waits up to 5s for the pass to have started; the pass
+# then outlasts everything else, so its line is logged only if --check waits for it.
+printf 'import pathlib, time\npathlib.Path("%s").touch()\ntime.sleep(3)\nprint("dev servers: stopped=0/0")\n' "$SANDBOX/dev-started" > "$SANDBOX/fake-dev-early.py"
+printf '#!/usr/bin/env bash\nfor _ in $(seq 50); do [ -e "%s" ] && { echo started > "%s"; exit 0; }; sleep 0.1; done\necho late > "%s"\n' \
+  "$SANDBOX/dev-started" "$SANDBOX/dev-order" "$SANDBOX/dev-order" > "$SANDBOX/act-wait-hook"
+chmod +x "$SANDBOX/act-wait-hook"
+rm -f "$SANDBOX/dev-started" "$SANDBOX/dev-order" "$SANDBOX/state/cooldown-act"
+rmdir "$SANDBOX/state/low-disk-act.lock" 2>/dev/null || true
+CC_DJ_DEV_SERVER_SCRIPT="$SANDBOX/fake-dev-early.py" CC_DJ_ACT_FREE_GB=30 \
+  CC_DJ_ACT_GO_CACHE_HOOK="$SANDBOX/act-wait-hook" CC_DJ_ACT_WORKTREE_JANITOR="$SANDBOX/no-such-janitor" \
+  CC_DJ_ALERT_ISSUE= CC_DJ_GROWTH_TARGETS="$SANDBOX/no-targets.tsv" \
+  FAKE_DF_AVAIL_KB=$((25 * 1048576)) _run_dj --check 80 0
+expect_yes "dev servers: the pass runs while the low-disk trim is still going" \
+  grep -qx started "$SANDBOX/dev-order"
+expect_yes "dev servers: and --check waits for it before it ends" \
+  grep -q "dev servers: dev servers: stopped=0/0" "$SANDBOX/dj.log"
+rm -f "$SANDBOX/state/cooldown-act"
 unset CC_DJ_DEV_SERVER_SCRIPT; rm -f "$FAKE_BIN/gh"
 
 printf "\n# Test group 4: --clean all targets present\n"

@@ -389,6 +389,12 @@ _cc_dj_check() {
   local free_pct
   free_pct="$(_cc_dj_free_pct)"
   _cc_dj_log "check: disk free=${free_pct}% threshold=${CC_DJ_DISK_MIN_PCT}%"
+  # Alongside the disk work, not after it: memory is short exactly when the disk is too, and
+  # behind the low-disk trim and the growth watch the pass ran 30+ minutes late or not at all
+  # in an hour (2026-10-05, 14:47). Its claim checks take minutes per worktree.
+  local dev_server_pid
+  _cc_dj_dev_server_reap &
+  dev_server_pid=$!
 
   local snapshots
   snapshots="$(_cc_dj_tm_snapshots)"
@@ -430,8 +436,7 @@ _cc_dj_check() {
   # Last, because it can spend its budget plus one per-target timeout, and a disk that is
   # filling must not wait that long for its alert.
   _cc_dj_growth_watch
-  # After the disk work and its alerts: its claim checks take minutes per worktree.
-  _cc_dj_dev_server_reap
+  wait "$dev_server_pid" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
