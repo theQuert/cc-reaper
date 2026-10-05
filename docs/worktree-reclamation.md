@@ -89,9 +89,19 @@ prunes worktree records, which is a removal even in a run that promised to remov
    repository from `remote.origin.url` yourself, or `$GH_REPO` can make another repository's
    PR authorise this removal.
 
-A **detached HEAD** needs the ancestor proof specifically. Content and PR proofs put its
-change on the base, not its commits, and nothing references those commits once the worktree
-is gone.
+A **detached HEAD** needs the ancestor proof, or a ref that contains it. Content and PR
+proofs put its change on the base, not its commits. When a branch, tag or remote-tracking
+ref contains the HEAD it may be removed, after the abandon window when it has not landed,
+and the HEAD is first pinned as `refs/cc-reaper/detached/<sha>`: a remote-tracking ref can
+be pruned or force-pushed away, and the pin is what keeps the commits afterwards.
+
+A **branch one push behind its own pushed head** has landed when that pushed head passes the
+merged-PR proof: every local commit is in what merged. Asked only when HEAD is a strict
+ancestor of `refs/remotes/origin/<branch>`.
+
+A worktree with an **operation in progress** (`rebase-merge`, `rebase-apply`, `BISECT_LOG`,
+`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD` in its git dir) is kept: that state exists
+nowhere else.
 
 ## Byproducts only the repository knows about
 

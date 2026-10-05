@@ -2285,6 +2285,35 @@ expect_yes "and no without it" \
   test "$(PATH="$GHX_STUBS:$PATH" _CC_WJ_BASE=main _CC_WJ_BASE_OK=1 _cc_wj_landed "$GHX_WT")" = no
 rm -rf "$GHX_ROOT"
 
+# ─── An operation in progress, and the pin a detached removal leaves ──────────
+INP_TMP="$(mktemp -d)"
+git -C "$INP_TMP" init -q -b main 2>/dev/null
+git -C "$INP_TMP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m a 2>/dev/null
+expect_yes "a worktree with nothing in progress has no git keep" test -z "$(_cc_wj_git_keep "$INP_TMP")"
+for marker in rebase-merge BISECT_LOG MERGE_HEAD; do
+  mkdir -p "$INP_TMP/.git/x" && { [ "$marker" = rebase-merge ] && mkdir "$INP_TMP/.git/$marker" || : > "$INP_TMP/.git/$marker"; }
+  expect_yes "a worktree with $marker in its git dir is kept as in-progress" \
+    test "$(_cc_wj_git_keep "$INP_TMP")" = in-progress
+  rm -rf "${INP_TMP:?}/.git/$marker"
+done
+expect_no "a pin refuses something that is not a SHA" _cc_wj_pin_detached "$INP_TMP" "HEAD"
+INP_HEAD="$(git -C "$INP_TMP" rev-parse HEAD)"
+CC_WJ_LOG="$INP_TMP/log" _cc_wj_pin_detached "$INP_TMP" "$INP_HEAD"
+expect_yes "a pin writes refs/cc-reaper/detached/<sha>" \
+  test "$(git -C "$INP_TMP" rev-parse --verify --quiet "refs/cc-reaper/detached/$INP_HEAD")" = "$INP_HEAD"
+rm -rf "$INP_TMP"
+
+# End to end, last because it removes the landed fixture's worktrees: the contained
+# detached HEAD goes and is pinned; the loose one, which nothing contains, stays.
+OUT_LA="$TMPDIR_ROOT/out-landed-apply.txt"
+_wj_idle --repo "$L_PRIMARY" --apply > "$OUT_LA"
+expect_no "--apply removes a detached HEAD a branch contains" test -d "$L_ROOT/wt-squash-detached-ref"
+expect_yes "after pinning it under refs/cc-reaper/detached/" \
+  test "$(lgit rev-parse --verify --quiet "refs/cc-reaper/detached/$SQUASH_HEAD")" = "$SQUASH_HEAD"
+expect_yes "and keeps a detached HEAD nothing contains" test -d "$L_ROOT/wt-squash-detached"
+expect_no "a detached HEAD on the base needs no pin" \
+  sh -c "git -C '$L_PRIMARY' for-each-ref refs/cc-reaper/detached | grep -qv '$SQUASH_HEAD'"
+
 # ─── Final result ─────────────────────────────────────────────────────────────
 
 if [ "$failures" -gt 0 ]; then

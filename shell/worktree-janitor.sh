@@ -2484,6 +2484,15 @@ _cc_wj_git_keep() {
     echo submodule
     return 0
   fi
+  # An operation in progress lives only in the worktree's git dir: a rebase's todo list, a
+  # bisect's log, a merge or pick waiting on a commit. Removal would drop it, and a detached
+  # HEAD mid-rebase can otherwise pass every other gate.
+  for rec in rebase-merge rebase-apply BISECT_LOG MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+    if [ -e "$gitdir/$rec" ]; then
+      echo in-progress
+      return 0
+    fi
+  done
   # Into a file, so an index that cannot be listed is told apart from one with no gitlinks.
   sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-stage.XXXXXX")" || { echo unknown; return 0; }
   if ! git -C "$wt" ls-files --stage -z > "$sf" 2>/dev/null; then
@@ -2747,6 +2756,17 @@ _cc_wj_cleanup_and_reraise() {
 # removal; what does - an untracked file, a lock, a submodule appearing in the moment
 # before - is exactly what force would destroy, and a status check that failed used to read
 # as "nothing there" and authorise it.
+# Pin a detached HEAD that is not on the base under refs/cc-reaper/detached/<sha> before its
+# checkout goes, so a branch, tag or remote ref that contained it - a remote one can be
+# pruned or force-pushed away at any time - is not what keeps its commits. Fails, and the
+# caller keeps the worktree, when the ref cannot be written.
+_cc_wj_pin_detached() {
+  local wt="$1" head="$2"
+  case "$head" in *[!0-9a-f]*|'') return 1 ;; esac
+  git -C "$wt" update-ref "refs/cc-reaper/detached/$head" "$head" 2>/dev/null || return 1
+  _cc_wj_log_write "pinned detached HEAD $head as refs/cc-reaper/detached/$head: $wt"
+}
+
 _cc_wj_remove_worktree() {
   local repo="$1"
   local wt_path="$2"
@@ -3461,6 +3481,12 @@ KEEP
               fi
               printf "    → archived %s file(s) to %s\n" \
                 "$(wc -l < "$work/archive-list" | tr -d ' ')" "$_CC_WJ_ARCHIVE_DEST"
+            fi
+            if [ "$branch" = "(detached)" ] && [ "$landed" != "ancestor" ] &&
+               ! _cc_wj_pin_detached "$wt_path" "$head0"; then
+              printf "    → kept: its detached HEAD could not be pinned before removal\n"
+              total_kept=$((total_kept + 1))
+              continue
             fi
             if _cc_wj_remove_worktree "$repo" "$wt_path"; then
               total_removed=$((total_removed + 1))

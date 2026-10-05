@@ -1,0 +1,5 @@
+- [x] `_cc_wj_behind_merged`, wired into `_cc_wj_landed`
+- [x] `_cc_wj_referenced`, the detached-head gate and the detached abandoned path
+- [x] Pin a removed detached HEAD under `refs/cc-reaper/detached/`
+- [x] Keep a worktree with an operation in progress
+- [x] Tests in `tests/worktree-janitor.sh`; docs in `docs/worktree-reclamation.md`
