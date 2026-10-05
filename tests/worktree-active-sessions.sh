@@ -3,7 +3,7 @@
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-WJ="$ROOT_DIR/shell/worktree-janitor.sh"
+WJ="${WJ_SCRIPT:-$ROOT_DIR/shell/worktree-janitor.sh}"
 TMP_ROOT="$(mktemp -d)"
 trap 'jobs -p | xargs kill 2>/dev/null || true; rm -rf "$TMP_ROOT"' EXIT
 failures=0
@@ -105,7 +105,7 @@ run_wj() {
     CC_WJ_STATE_DIR="$CASE/state" CC_WJ_CLAUDE_SESSIONS="$CLAUDE_SESSIONS" \
     CC_WJ_CLAUDE_PROJECTS="$CLAUDE_PROJECTS" CC_WJ_CODEX_LOCKS="$CODEX_LOCKS" \
     CC_WJ_CODEX_SESSIONS="$CODEX_SESSIONS" CC_WJ_CODEX_STATE_DB="$CODEX_STATE" \
-    CC_WJ_NOTIFY_MIN_GB=999999 \
+    CC_WJ_NOTIFY_MIN_GB=999999 CC_WJ_PRESSURE_FREE_GB="${CC_WJ_PRESSURE_FREE_GB:-off}" \
     CODEX_THREAD_ID="${CODEX_THREAD_ID:-}" CLAUDE_CODE_SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}" \
     bash "$WJ" --repo "$PRIMARY" "$@"
 }
@@ -417,6 +417,20 @@ printf '{"type":"system","sessionId":"%s","cwd":"%s"}\n' "$sid" "$WT" > "$transc
 out="$(run_wj --apply 2>&1)"
 check "recent inactive Claude transcript activity keeps an old worktree" test -d "$WT"
 case "$out" in *'KEEP(recent-session)'*"$sid"*) ok "the inventory exposes the Claude session lease" ;; *) bad "the inventory exposes the Claude session lease" ;; esac
+
+# Under disk pressure the lease is CC_WJ_PRESSURE_SESSION_GRACE_HOURS (default 2): the
+# same lease, five hours old, no longer pins the worktree.
+new_fixture claude-recent-inactive-pressure
+age_worktree 72
+sid=36363636-4444-4555-8666-888888888888
+mkdir -p "$CLAUDE_PROJECTS/project"
+transcript="$CLAUDE_PROJECTS/project/$sid.jsonl"
+printf '{"type":"system","sessionId":"%s","cwd":"%s"}\n' "$sid" "$WT" > "$transcript"
+touch -t "$(date -v-5H '+%Y%m%d%H%M.%S' 2>/dev/null || date -d '5 hours ago' '+%Y%m%d%H%M.%S')" "$transcript"
+run_wj --apply >/dev/null 2>&1
+check "a five-hour-old lease keeps the worktree without disk pressure" test -d "$WT"
+CC_WJ_PRESSURE_FREE_GB=99999 run_wj --apply >/dev/null 2>&1
+check "and under disk pressure it does not" test ! -d "$WT"
 
 new_fixture claude-recent-tool-workdir
 age_worktree 72
