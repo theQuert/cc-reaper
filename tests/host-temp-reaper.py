@@ -20,6 +20,8 @@ spec = importlib.util.spec_from_file_location("host_temp_reaper", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
 REAL_HELD = reaper.held
+REAL_HOLDERS = reaper.holders
+REAL_PROCESSES = reaper.processes
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 HOUR = 3600
@@ -41,10 +43,11 @@ class ReaperTest(unittest.TestCase):
         self.clients = set()
         self.holders = set()
         self.sent = []
-        for name, fake in (("processes", lambda: list(self.rows)),
+        for name, fake in (("processes", lambda env=False: list(self.rows)),
                            ("listening_ports", lambda pid: self.ports.get(pid, set())),
                            ("has_client", lambda port: port in self.clients),
-                           ("held", lambda path: path in self.holders)):
+                           ("held", lambda path: path in self.holders),
+                           ("holders", lambda root, rows: {p.name for p in self.holders})):
             patcher = mock.patch.object(reaper, name, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -186,6 +189,116 @@ class ReaperTest(unittest.TestCase):
         self.addCleanup(child.kill)
         self.assertTrue(REAL_HELD(inside))
         self.assertFalse(REAL_HELD(idle_dir))
+
+    def leftover(self, name, age, inner_age=None, file=False):
+        path = self.root / name
+        if file:
+            path.write_text("x")
+        else:
+            (path / "deep").mkdir(parents=True)
+            (path / "deep" / "f").write_text("x")
+            self.aged(path / "deep" / "f", age if inner_age is None else inner_age)
+            self.aged(path / "deep", age)
+        return self.aged(path, age)
+
+    def test_only_untouched_unheld_tool_leftovers_are_removed(self):
+        gone = [self.leftover("tmpab_cd123", 3 * DAY + HOUR),
+                self.leftover("tmp.AbCdEf123x", 3 * DAY + HOUR),
+                self.leftover("pip-unpack-6pi0dsfu", DAY + HOUR),
+                self.leftover("go-build535115792", DAY + HOUR),
+                self.leftover("nimbus-m2-build-Ab12Cd", DAY + HOUR)]
+        kept = [self.leftover("tmpab_cd124", 2 * DAY),             # generic name: three days
+                self.leftover("pip-unpack-6pi0dsfx", DAY - HOUR),   # a day not yet up
+                self.leftover("go-build1", DAY + HOUR, inner_age=HOUR),  # changed deep inside
+                self.leftover("tmpheld0001", 4 * DAY),
+                self.leftover("node-compile-cache", 9 * DAY),       # not a tool temp name
+                self.leftover("tmpTOOLONG123", 4 * DAY),
+                self.leftover("tmp_scratch", 4 * DAY),               # a person's name: no digit
+                self.leftover("tmp.AbCdEf1234", 4 * DAY, file=True),  # a generic name: dirs only
+                self.leftover("nimbus-prod-config", 4 * DAY)]       # not a known nimbus test
+        self.holders.add(self.root / "tmpheld0001")
+        counts = self.run_clean()
+        for path in gone:
+            self.assertFalse(path.exists(), path)
+        for path in kept:
+            self.assertTrue(path.exists(), path)
+        self.assertEqual(counts["leftover"], [5, 5])
+
+    def test_a_leftover_reaching_another_filesystem_is_kept(self):
+        path = self.leftover("go-build79", DAY + HOUR)
+        real = reaper.os.lstat
+        def lstat(p, *a, **k):
+            st = real(p, *a, **k)
+            if str(p).endswith("/deep/f"):
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1) + tuple(st)[3:])
+            return st
+        with mock.patch.object(reaper.os, "lstat", side_effect=lstat):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["leftover"], [0, 0])
+
+    def test_a_failed_ps_while_removing_keeps_the_rest(self):
+        path = self.leftover("go-build80", DAY + HOUR)
+        calls = []
+        def processes(env=False):
+            calls.append(env)
+            return list(self.rows) if len(calls) == 1 else None
+        with mock.patch.object(reaper, "processes", side_effect=processes):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(calls[1:], [True], "the holder scan reads environments")
+        self.assertEqual(counts["leftover"], [0, 0])
+
+    def test_only_the_per_user_temp_directory_is_swept(self):
+        path = self.leftover("go-build81", DAY + HOUR)
+        # The fixtures live under this user's temp directory; any other root is refused.
+        with mock.patch.object(reaper, "USER_TEMP_PREFIX", "/no/such/prefix/"):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["leftover"], [0, 0])
+
+    def test_the_holder_scan_reads_environments(self):
+        rows = REAL_PROCESSES(env=True)
+        self.assertIsNotNone(rows)
+        me = next(r for r in rows if r[0] == os.getpid())
+        self.assertIn("PATH=", me[3])
+
+    def test_leftovers_are_only_listed_without_clean(self):
+        path = self.leftover("go-build77", DAY + HOUR)
+        counts = reaper.reap(self.root, self.logs, clean=False, jobs_dir=self.jobs)
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["leftover"], [1, 0])
+
+    def test_no_lsof_answer_keeps_every_leftover(self):
+        path = self.leftover("go-build78", DAY + HOUR)
+        with mock.patch.object(reaper, "holders", return_value=None):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["leftover"], [0, 0])
+
+    def test_holders_reads_open_files_cwds_and_command_lines(self):
+        inside = self.root / "tmpcwdcwd01"
+        (inside / "sub").mkdir(parents=True)
+        opened = self.root / "tmpopen0001"
+        opened.mkdir()
+        named = self.root / "tmpnamed001"
+        named.mkdir()
+        idle_dir = self.root / "tmpidle0001"
+        idle_dir.mkdir()
+        child = subprocess.Popen(["sleep", "30"], cwd=inside / "sub")
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        handle = open(opened / "f", "w")
+        self.addCleanup(handle.close)
+        rows = [(1, 1, 0, f"python3 {named}/x.py"),
+                (2, 1, 0, f"docker run -v {self.root}//tmpslash001:/cfg img"),
+                (3, 1, 0, "python3 tmprel00001/x.py"),
+                (4, 1, 0, f"node server.js PYTHONPATH={self.root}//tmpenvenv01 HOME=/x")]
+        names = REAL_HOLDERS(self.root, rows)
+        for held in ("tmpcwdcwd01", "tmpopen0001", "tmpnamed001", "tmpslash001", "tmprel00001",
+                     "tmpenvenv01"):
+            self.assertIn(held, names)
+        self.assertNotIn("tmpidle0001", names)
 
     def job(self, name, state="done", ended=4 * DAY, file_age=4 * DAY, raw=None):
         job = self.jobs / name
