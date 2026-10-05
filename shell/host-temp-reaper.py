@@ -2,7 +2,7 @@
 """Reclaim what headless-Chrome scripts, wrangler, failed test builds and finished
 background Claude jobs leave in this user's temp space.
 
-Five kinds, each proved abandoned before it is touched:
+Six kinds, each proved abandoned before it is touched:
 
 - an orphaned headless Chrome: launched with --headless, --remote-debugging-port and a
   --user-data-dir directly under this user's temp directory, reparented to launchd (its
@@ -29,6 +29,16 @@ Five kinds, each proved abandoned before it is touched:
   stays, and a venv is what `pip install` rebuilds. Three days, because resumes were
   seen 23 h and 42 h after a job ended. The job is checked again just before removal.
 
+- a tool's own temp leftover directly under the temp directory, by the name that tool's
+  mkdtemp/mktemp gives it (`LEFTOVERS`): Python's `tmpXXXXXXXX`, mktemp's `tmp.XXXXXXXXXX`,
+  pip's `pip-unpack-…`, go's `go-build<N>`, the docs repo's `nimbus-…-XXXXXX` test copies.
+  Nothing anywhere under it changed for that name's idle limit, no open file or cwd of
+  this user's processes is inside it, and no command line names it. Each tool removes its
+  own on a clean exit, so what is left is a killed or failed run: 442,337 entries, 16.4 GB
+  on 2026-10-05, 10.3 GB of it untouched for a day. A day for the build tools; three for
+  the generic `tmp` names, the age macOS itself clears them at boot, because any program
+  may use one.
+
 Every probe that fails or cannot decide keeps the item. Chrome is sent SIGTERM only, so
 it shuts down on its own terms. Tests drive the seams (`processes`, `listening_ports`,
 `has_client`, `held`) with fixtures; no CLI option names an arbitrary root.
@@ -52,6 +62,16 @@ PROFILE_NAME = re.compile(r"cdp-[A-Za-z0-9]{6}$")
 WRANGLER_LOG = re.compile(r"wrangler-[0-9_-]+\.log$")
 BUILD_COPY = re.compile(r"nimbus-articles-build-[A-Za-z0-9]{6}$")
 BUILD_COPY_IDLE_SECONDS = 24 * 3600
+# (name, idle seconds): a tool's own temp name, and how long it must be untouched.
+LEFTOVERS = (
+    (re.compile(r"tmp[a-z0-9_]{8}"), 72 * 3600),
+    (re.compile(r"tmp\.[A-Za-z0-9]{10}"), 72 * 3600),
+    (re.compile(r"pip-[a-z]+(-[a-z]+)*-[a-z0-9_]{8}"), 24 * 3600),
+    (re.compile(r"go-(build|link-)\d+"), 24 * 3600),
+    (re.compile(r"nimbus-[a-z0-9]+(-[a-z0-9]+)*-[A-Za-z0-9]{6}"), 24 * 3600),
+)
+# A fresh picture of what is open, at least this often while removing.
+HOLDERS_MAX_AGE = 60
 JOB_ID = re.compile(r"[0-9a-f]{8}$")
 JOB_TERMINAL_STATES = ("done", "stopped")
 JOB_TMP_IDLE_SECONDS = 72 * 3600
@@ -131,6 +151,57 @@ def held(path):
                for f in probe.stdout.split(b"\0"))
 
 
+def leftover_idle(name):
+    """The idle limit for a tool temp name, or None for any other name."""
+    return next((idle for pattern, idle in LEFTOVERS if pattern.fullmatch(name)), None)
+
+
+def newest_change(path):
+    """The newest mtime of path and everything under it, links not followed; None when
+    any part cannot be read."""
+    try:
+        newest = path.lstat().st_mtime
+        if path.is_dir() and not path.is_symlink():
+            for top, dirs, files in os.walk(path, onerror=_raise):
+                for name in dirs + files:
+                    newest = max(newest, os.lstat(os.path.join(top, name)).st_mtime)
+    except OSError:
+        return None
+    return newest
+
+
+def _raise(error):
+    raise error
+
+
+def holders(root, rows):
+    """Names directly under root that an open file, a cwd or a command line reaches;
+    None when lsof cannot answer. One lsof for all of this user's processes, not one per
+    item: there were 442,337 items."""
+    try:
+        probe = subprocess.run(["lsof", "-n", "-F0n", "-u", str(os.getuid())],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if probe.returncode not in (0, 1) or not probe.stdout:
+        return None
+    names = set()
+    prefixes = {os.fsencode(str(root)) + b"/"}
+    if str(root).startswith("/private/"):
+        prefixes.add(os.fsencode(str(root)[len("/private"):]) + b"/")
+    for field in probe.stdout.split(b"\0"):
+        field = field.lstrip(b"\n")
+        for prefix in prefixes:
+            if field.startswith(b"n" + prefix):
+                names.add(os.fsdecode(field[len(prefix) + 1:].split(b"/", 1)[0]))
+    for prefix in prefixes:
+        text = re.escape(os.fsdecode(prefix))
+        for row in rows:
+            names.update(re.findall(text + r"([^/\s'\"]+)", row[3]))
+    return names
+
+
 def orphan_chrome(row, root, idle_seconds):
     pid, ppid, elapsed, command = row
     if ppid != 1 or elapsed < idle_seconds or not CHROME_BINARY.match(command):
@@ -169,7 +240,7 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
     if rows is None:
         raise RuntimeError("ps failed; kept everything")
     counts = {"chrome": [0, 0], "profile": [0, 0], "wrangler": [0, 0], "build": [0, 0],
-              "jobvenv": [0, 0]}
+              "jobvenv": [0, 0], "leftover": [0, 0]}
 
     for row in rows:
         if not orphan_chrome(row, root, idle_seconds):
@@ -226,6 +297,37 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
             print(f"{'REMOVED' if clean else 'CANDIDATE'} build {path.name}")
         except OSError as error:
             print(f"KEEP build {path.name} ({error.strerror or error})")
+
+    held_names, held_at = None, 0
+    for path in sorted(root.iterdir()) if root.is_dir() else []:
+        try:
+            limit = leftover_idle(path.name)
+            # A build copy has its own rule above.
+            if limit is None or BUILD_COPY.fullmatch(path.name) or path.is_symlink():
+                continue
+            # The entry's own time first: most are recent, and a deep walk costs.
+            if now - path.lstat().st_mtime < limit:
+                continue
+            newest = newest_change(path)
+            if newest is None or now - newest < limit:
+                continue
+            if held_names is None or time.time() - held_at > HOLDERS_MAX_AGE:
+                held_names, held_at = holders(root, processes() or []), time.time()
+                if held_names is None:
+                    print("KEEP leftover (lsof could not answer; kept them all)")
+                    break
+            if path.name in held_names:
+                continue
+            counts["leftover"][0] += 1
+            if clean:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                counts["leftover"][1] += 1
+            print(f"{'REMOVED' if clean else 'CANDIDATE'} leftover {path.name}")
+        except OSError as error:
+            print(f"KEEP leftover {path.name} ({error.strerror or error})")
 
     jobs = jobs_dir.resolve() if jobs_dir is not None and jobs_dir.is_dir() else None
     for job in sorted(jobs.iterdir()) if jobs is not None else []:

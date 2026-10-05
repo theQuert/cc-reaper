@@ -20,6 +20,7 @@ spec = importlib.util.spec_from_file_location("host_temp_reaper", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
 REAL_HELD = reaper.held
+REAL_HOLDERS = reaper.holders
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 HOUR = 3600
@@ -44,7 +45,8 @@ class ReaperTest(unittest.TestCase):
         for name, fake in (("processes", lambda: list(self.rows)),
                            ("listening_ports", lambda pid: self.ports.get(pid, set())),
                            ("has_client", lambda port: port in self.clients),
-                           ("held", lambda path: path in self.holders)):
+                           ("held", lambda path: path in self.holders),
+                           ("holders", lambda root, rows: {p.name for p in self.holders})):
             patcher = mock.patch.object(reaper, name, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -186,6 +188,71 @@ class ReaperTest(unittest.TestCase):
         self.addCleanup(child.kill)
         self.assertTrue(REAL_HELD(inside))
         self.assertFalse(REAL_HELD(idle_dir))
+
+    def leftover(self, name, age, inner_age=None, file=False):
+        path = self.root / name
+        if file:
+            path.write_text("x")
+        else:
+            (path / "deep").mkdir(parents=True)
+            (path / "deep" / "f").write_text("x")
+            self.aged(path / "deep" / "f", age if inner_age is None else inner_age)
+            self.aged(path / "deep", age)
+        return self.aged(path, age)
+
+    def test_only_untouched_unheld_tool_leftovers_are_removed(self):
+        gone = [self.leftover("tmpab_cd123", 3 * DAY + HOUR),
+                self.leftover("tmp.AbCdEf1234", 3 * DAY + HOUR, file=True),
+                self.leftover("pip-unpack-6pi0dsfu", DAY + HOUR),
+                self.leftover("go-build535115792", DAY + HOUR),
+                self.leftover("nimbus-m2-build-Ab12Cd", DAY + HOUR)]
+        kept = [self.leftover("tmpab_cd124", 2 * DAY),             # generic name: three days
+                self.leftover("pip-unpack-6pi0dsfx", DAY - HOUR),   # a day not yet up
+                self.leftover("go-build1", DAY + HOUR, inner_age=HOUR),  # changed deep inside
+                self.leftover("tmpheld0001", 4 * DAY),
+                self.leftover("node-compile-cache", 9 * DAY),       # not a tool temp name
+                self.leftover("tmpTOOLONG123", 4 * DAY)]
+        self.holders.add(self.root / "tmpheld0001")
+        counts = self.run_clean()
+        for path in gone:
+            self.assertFalse(path.exists(), path)
+        for path in kept:
+            self.assertTrue(path.exists(), path)
+        self.assertEqual(counts["leftover"], [5, 5])
+
+    def test_leftovers_are_only_listed_without_clean(self):
+        path = self.leftover("go-build77", DAY + HOUR)
+        counts = reaper.reap(self.root, self.logs, clean=False, jobs_dir=self.jobs)
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["leftover"], [1, 0])
+
+    def test_no_lsof_answer_keeps_every_leftover(self):
+        path = self.leftover("go-build78", DAY + HOUR)
+        with mock.patch.object(reaper, "holders", return_value=None):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["leftover"], [0, 0])
+
+    def test_holders_reads_open_files_cwds_and_command_lines(self):
+        inside = self.root / "tmpcwdcwd01"
+        (inside / "sub").mkdir(parents=True)
+        opened = self.root / "tmpopen0001"
+        opened.mkdir()
+        named = self.root / "tmpnamed001"
+        named.mkdir()
+        idle_dir = self.root / "tmpidle0001"
+        idle_dir.mkdir()
+        child = subprocess.Popen(["sleep", "30"], cwd=inside / "sub")
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        handle = open(opened / "f", "w")
+        self.addCleanup(handle.close)
+        rows = [(1, 1, 0, f"python3 {named}/x.py")]
+        names = REAL_HOLDERS(self.root, rows)
+        self.assertIn("tmpcwdcwd01", names)
+        self.assertIn("tmpopen0001", names)
+        self.assertIn("tmpnamed001", names)
+        self.assertNotIn("tmpidle0001", names)
 
     def job(self, name, state="done", ended=4 * DAY, file_age=4 * DAY, raw=None):
         job = self.jobs / name
