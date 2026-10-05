@@ -347,7 +347,8 @@ class ReaperTest(unittest.TestCase):
 
     def test_a_listening_server_nobody_uses_goes_after_the_window(self):
         self.server(100, cmd="node ./node_modules/.bin/next dev --port 8811")
-        self.ports[102] = {9229, 8811}
+        self.rows[101] = (100, 100, 2000, OLD, "next-server (v15.5.0)")
+        self.ports[101] = {8811}
         self.assertEqual(self.run_reap(), (0, 0))       # first seen: recorded, kept
         self.aged_marker(100, 11)
         self.assertEqual(self.run_reap(), (0, 0))
@@ -357,7 +358,8 @@ class ReaperTest(unittest.TestCase):
 
     def test_a_listening_server_with_a_connection_is_serving_and_starts_over(self):
         self.server(100, cmd="node ./node_modules/.bin/next dev --port 8811")
-        self.ports[102] = {9229, 8811}
+        self.rows[101] = (100, 100, 2000, OLD, "next-server (v15.5.0)")
+        self.ports[101] = {8811}
         self.aged_marker(100, 13)
         self.connections.add(8811)
         self.assertEqual(self.run_reap(), (0, 0))
@@ -367,14 +369,16 @@ class ReaperTest(unittest.TestCase):
 
     def test_a_connection_on_the_inspector_port_alone_does_not_count_for_a_named_port(self):
         self.server(100, cmd="node ./node_modules/.bin/next dev --port 8811")
-        self.ports[102] = {9229, 8811}
+        self.rows[101] = (100, 100, 2000, OLD, "next-server (v15.5.0)")
+        self.ports[101] = {8811}
         self.aged_marker(100, 13)
         self.connections.add(9229)
         self.assertEqual(self.run_reap(), (1, 1))
 
     def test_under_memory_pressure_the_window_is_three_hours(self):
         self.server(100, cmd="node ./node_modules/.bin/next dev --port 8811")
-        self.ports[102] = {9229, 8811}
+        self.rows[101] = (100, 100, 2000, OLD, "next-server (v15.5.0)")
+        self.ports[101] = {8811}
         self.aged_marker(100, 4)
         self.assertEqual(self.run_reap(), (0, 0))
         self.short = (True, "swap free 900M")
@@ -406,7 +410,7 @@ class ReaperTest(unittest.TestCase):
                           (200, "node ./node_modules/.bin/vite preview --port 8812"),
                           (300, "npm run preview --port 8813")):
             self.server(root, cmd=cmd)
-            self.ports[root + 2] = {9229, int(cmd.rsplit(" ", 1)[1])}
+            self.ports[root] = {int(cmd.rsplit(" ", 1)[1])}   # the launcher itself serves
             self.aged_marker(root, 13)
         self.assertEqual(self.run_reap(), (0, 0))
         self.assertEqual(self.sent, [])
@@ -420,14 +424,39 @@ class ReaperTest(unittest.TestCase):
 
     def test_a_hot_reload_server_that_came_up_by_the_recheck_is_kept_though_unused(self):
         self.server(100, cmd="node ./node_modules/.bin/next dev --port 8811")
+        self.rows[101] = (100, 100, 2000, OLD, "next-server (v15.5.0)")
         scans = []
 
         def later():
             scans.append(1)
-            return dict(self.ports) if len(scans) == 1 else {**self.ports, 102: {9229, 8811}}
+            return dict(self.ports) if len(scans) == 1 else {**self.ports, 101: {8811}}
         reaper.listening.side_effect = later
         self.assertEqual(self.run_reap(), (0, 1))
         self.assertEqual(self.sent, [])
+
+    def test_a_mixed_tree_is_judged_by_what_serves_the_measured_port(self):
+        self.server(100, cmd="npm run dev --port=8787")
+        self.rows[101] = (100, 100, 2000, OLD, "node /wt/node_modules/.bin/concurrently vite 'wrangler dev --port 8787'")
+        self.rows[103] = (101, 100, 2000, OLD, "node /wt/node_modules/.bin/vite --port 5173")
+        self.rows[104] = (101, 100, 2000, OLD, "node /wt/node_modules/.bin/wrangler dev --port 8787")
+        self.rows[105] = (104, 100, 2000, OLD, "workerd serve")
+        self.ports[103] = {5173}
+        self.ports[105] = {8787}
+        self.connections.add(5173)
+        self.aged_marker(100, 13)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_vite_with_flags_before_preview_is_not_hot(self):
+        self.assertFalse(reaper.hot_reload({1: (0, 1, 1, OLD, "node /x/vite --mode staging preview --port 4173")}, [1]))
+        self.assertTrue(reaper.hot_reload({1: (0, 1, 1, OLD, "node /x/vite --mode staging --port 5173")}, [1]))
+
+    def test_a_marker_that_is_not_a_number_starts_over(self):
+        self.cra(100)
+        marker = self.state / f"100-{int(reaper.started(OLD))}"
+        marker.write_text("²\n")
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(float(marker.read_text()), NOW)
 
     def test_markers_of_gone_trees_are_pruned(self):
         (self.state / "999-123").touch()

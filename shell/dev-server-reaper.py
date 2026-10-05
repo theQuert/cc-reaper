@@ -225,8 +225,11 @@ def idle_for(state_dir, root, begun, now):
     marker = state_dir / f"{root}-{int(begun)}"
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
-        last = marker.read_text().strip() if marker.exists() else ""
-        if not last.replace(".", "", 1).isdigit() or now - float(last) > MAX_SAMPLE_GAP:
+        try:
+            last = float(marker.read_text().strip()) if marker.exists() else None
+        except ValueError:   # unreadable or not a number: start over
+            last = None
+        if last is None or now - last > MAX_SAMPLE_GAP:
             marker.write_text(f"{now}\n")
             os.utime(marker, (now, now))
             return 0
@@ -270,8 +273,15 @@ def pressure():
     return False, ""
 
 
-def hot_reload(rows, members):
-    """Whether the tree runs a dev server whose open tab holds a socket to it."""
+def hot_reload(rows, members, ports=None, used_on=None):
+    """Whether the process serving `used_on` runs a dev server whose open tab holds a socket
+    to it. Judged from that listener and its parent only, not the whole tree: a tree can
+    mix a vite and a wrangler (one `concurrently` even names both on its own command line),
+    and the port being measured must belong to the hot-reload one. Without ports, any
+    member counts, for callers that only ask whether the tree runs one at all."""
+    if ports is not None and used_on:
+        owners = {pid for pid in members if ports.get(pid, set()) & set(used_on)}
+        members = owners | {rows[pid][0] for pid in owners if rows[pid][0] in rows}
     for pid in members:
         args = rows[pid][4].split()
         names = [re.sub(r"\.(?:c|m)?js$", "", os.path.basename(a)) for a in args]
@@ -281,7 +291,9 @@ def hot_reload(rows, members):
                 return True
             if name == "next" and following == "dev":
                 return True
-            if name == "vite" and following not in ("preview", "build", "optimize"):
+            # Any later word, not the next one: options can come first (`--mode x preview`),
+            # and a stray match only means the server is taken as serving.
+            if name == "vite" and not {"preview", "build", "optimize"} & set(args[i + 1:]):
                 return True
             if (name == "webpack" and following == "serve") or name == "webpack-dev-server":
                 return True
@@ -348,7 +360,7 @@ def tree(rows, root):
     return found
 
 
-def serving(ports, members, port, hot=True):
+def serving(ports, members, port, hot=True, rows=None):
     """(state, why). unserved: it does not listen on its port or the 20 above it, where vite
     and astro move. serving: something is connected to the port it serves on (with ANY_PORT,
     to any port it listens on), connections are unreadable, or it listens without a
@@ -365,6 +377,8 @@ def serving(ports, members, port, hot=True):
         if not moved:
             return "unserved", f"does not listen on its port {port}"
         used_on = {moved[0]}
+    if rows is not None:
+        hot = hot_reload(rows, members, ports, used_on)
     if not hot and port != ANY_PORT:
         return "serving", f"listens on {min(used_on)}; no hot-reload socket to judge use by"
     clients = connected()
@@ -388,7 +402,7 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
     if begun is None or now - begun < min_age:
         return "keep", "younger than the minimum age", None, [], port, None
     members = tree(rows, root)
-    state, why = serving(ports, members, port, hot_reload(rows, members))
+    state, why = serving(ports, members, port, rows=rows)
     if state == "serving":
         forget_idle(state_dir, root, begun)
         return "serving", why, None, members, port, state
@@ -492,7 +506,7 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
         members = tree(fresh_rows, root)
         # Kept if it is now used, or no longer what it was judged as: a tree judged unserved
         # that listens now is a server that came up, whatever its connections say.
-        now_state, _ = serving(fresh, members, port, hot_reload(fresh_rows, members))
+        now_state, _ = serving(fresh, members, port, rows=fresh_rows)
         if (now_state != state or published(fresh_rows, fresh, members, worktree)
                 or any(AGENT.search(fresh_rows[p][4]) for p in members)):
             print(f"KEEP {label} (serving, or an agent joined, at the recheck)")
