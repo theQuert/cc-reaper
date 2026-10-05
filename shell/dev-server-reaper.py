@@ -16,15 +16,18 @@ A launcher tree is stopped only when every one of these holds:
 - the root was reparented to launchd (ppid 1), so no session's shell is waiting on it, and
   no `claude` or `codex` process is in the tree or shares a process group with one in it;
 - the root's working directory is inside a linked git worktree, never a primary checkout;
-- no process in the tree listens on that port (the inspector ports a server also opens
-  do not count), nor - when something else holds that port - on one of the next 20, where
-  vite and astro move to; listeners are read again right before signalling. For
-  `react-scripts start`, whose port is not on its command line, serving means a TCP
-  connection to any port its tree listens on: an open tab keeps the hot-reload socket
-  connected, but a closed laptop drops it within seconds, so one empty moment proves
-  nothing: the tree must have had no connection at every run for CRA_IDLE_HOURS, as
-  recorded in the state directory, and none again at the recheck. Two CRA servers sat 2
-  days like that on 2026-10-05, holding 4.5 GB while the compressor churned 850 MB/s;
+- it serves nobody, in one of two ways:
+  - no process in the tree listens on its port, nor on one of the 20 above it where vite
+    and astro move when theirs is taken (the inspector ports a server also opens do not
+    count) - it can serve nobody, so it goes at once;
+  - it listens, but nothing has been connected to that port (for `react-scripts start`,
+    which names no port, to any port its tree listens on) at any run for IDLE_HOURS, as
+    recorded in the state directory, nor at the recheck. An open tab keeps the hot-reload
+    socket connected; a closed laptop drops it within seconds, so one empty moment proves
+    nothing. Two CRA servers sat 2 days like that on 2026-10-05, holding 4.5 GB while the
+    compressor churned 850 MB/s. While memory is short - swap free under 2 GB, or the
+    kernel's pressure level 2 or more - the window is PRESSURE_IDLE_HOURS instead: a
+    server nobody has opened for three hourly runs is not worth the swap;
 - nothing publishes it: no other listening process names its worktree on its command line
   (a review front such as ~/stima-review/tailnet_review.mjs <worktree> <port>), and no
   `tailscale serve` handler proxies to a port the tree listens on;
@@ -34,8 +37,8 @@ A launcher tree is stopped only when every one of these holds:
   janitor does).
 
 Nothing is judged by file times: a page being viewed writes no file, and a stack with
-its own ticker writes one every minute. A tree that does serve its port is listed as
-SERVING for a person to decide on, never stopped. Every probe that fails or cannot decide
+its own ticker writes one every minute. A tree something is connected to, or that is
+published, is listed as SERVING for a person to decide on, never stopped. Every probe that fails or cannot decide
 keeps the tree. Stopping is SIGTERM to every process in the tree, then SIGKILL to those
 still alive after the grace period; each pid is signalled only while its start time still
 matches the scan, so a reused pid is never hit.
@@ -58,8 +61,11 @@ AGENT = re.compile(r"(?:^|/)(?:claude|codex)(?:\s|$)")
 PORT_SHIFT = 20
 # `react-scripts start` reads PORT from the environment; its port is whatever it listens on.
 ANY_PORT = -1
-# How long such a tree must have had no connection at every run before it is stopped.
-CRA_IDLE_HOURS = 12
+# How long a listening tree must have had no connection at every run before it is stopped,
+# and the shorter window while memory is short.
+IDLE_HOURS = 12
+PRESSURE_IDLE_HOURS = 3
+SWAP_FLOOR_MB = 2048
 STATE_DIR = Path.home() / ".cc-reaper" / "state" / "dev-server-idle"
 
 
@@ -237,6 +243,24 @@ def prune_idle(state_dir, rows):
         pass
 
 
+def pressure():
+    """(True, why) while memory is short: the kernel's pressure level is 2 or more, or swap
+    has under SWAP_FLOOR_MB free. A probe that fails says not short, the longer window."""
+    def sysctl(name):
+        try:
+            return subprocess.run(["sysctl", "-n", name], capture_output=True, text=True,
+                                  timeout=10, check=True).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    level = sysctl("kern.memorystatus_vm_pressure_level")
+    if level.isdigit() and int(level) >= 2:
+        return True, f"memory pressure level {level}"
+    swap = re.search(r"total = ([\d.]+)M .*free = ([\d.]+)M", sysctl("vm.swapusage"))
+    if swap and float(swap.group(1)) > 0 and float(swap.group(2)) < SWAP_FLOOR_MB:
+        return True, f"swap free {float(swap.group(2)):.0f}M"
+    return False, ""
+
+
 def cwd(pid):
     """The process's working directory; None when lsof cannot say."""
     try:
@@ -298,67 +322,72 @@ def tree(rows, root):
 
 
 def serving(ports, members, port):
-    """Why the tree serves, or None: it listens on its port, or on one just above it, where
-    vite and astro move when theirs is taken - whether or not it is still taken now. With
-    ANY_PORT: something is connected to a port the tree listens on."""
+    """(state, why). unserved: it does not listen on its port or the 20 above it, where vite
+    and astro move. serving: something is connected to the port it serves on (with ANY_PORT,
+    to any port it listens on), or connections are unreadable. idle: it listens, unused."""
+    listens = {p for pid in members for p in ports.get(pid, ())}
     if port == ANY_PORT:
-        listens = {p for pid in members for p in ports.get(pid, ())}
-        if not listens:
-            return None
-        clients = connected()
-        if clients is None:
-            return "kept: connections unreadable"
-        used = sorted(listens & clients)
-        return f"has connections on {used[0]}" if used else None
-    if any(port in ports.get(pid, ()) for pid in members):
-        return f"listens on {port}"
-    moved = sorted(p for pid in members for p in ports.get(pid, ()) if port < p <= port + PORT_SHIFT)
-    return f"moved from {port} to {moved[0]}" if moved else None
+        used_on = listens
+        if not used_on:
+            return "idle", "listens on nothing"
+    elif port in listens:
+        used_on = {port}
+    else:
+        moved = sorted(p for p in listens if port < p <= port + PORT_SHIFT)
+        if not moved:
+            return "unserved", f"does not listen on its port {port}"
+        used_on = {moved[0]}
+    clients = connected()
+    if clients is None:
+        return "serving", "kept: connections unreadable"
+    used = sorted(used_on & clients)
+    if used:
+        return "serving", f"has connections on {used[0]}"
+    return "idle", f"listens on {min(used_on)} with no connection"
 
 
 def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=900,
-          state_dir=STATE_DIR, idle_hours=CRA_IDLE_HOURS):
-    """(verdict, reason, worktree, members, port); verdict is reap, serving or keep."""
+          state_dir=STATE_DIR, idle_hours=IDLE_HOURS):
+    """(verdict, reason, worktree, members, port, state); verdict is reap, serving or keep,
+    state is serving()'s, so the recheck can tell what changed."""
     ppid, _, _, lstart, command = rows[root]
     port = launcher(command)
     if not port:
-        return "keep", "no port on the command line", None, [], port
+        return "keep", "no port on the command line", None, [], port, None
     begun = started(lstart)
     if begun is None or now - begun < min_age:
-        return "keep", "younger than the minimum age", None, [], port
+        return "keep", "younger than the minimum age", None, [], port, None
     members = tree(rows, root)
-    why = serving(ports, members, port)
-    if why:
-        if port == ANY_PORT:
-            forget_idle(state_dir, root, begun)
-        return "serving", why, None, members, port
+    state, why = serving(ports, members, port)
+    if state == "serving":
+        forget_idle(state_dir, root, begun)
+        return "serving", why, None, members, port, state
     groups = {rows[pid][1] for pid in members}
     if any(AGENT.search(row[4]) and (pid in members or row[1] in groups)
            for pid, row in rows.items()):
-        return "keep", "an agent process is in the tree or its process group", None, [], port
+        return "keep", "an agent process is in the tree or its process group", None, [], port, state
     where = cwd(root)
     worktree = linked_worktree(where) if where else None
     if worktree is None:
-        return "keep", "not in a linked worktree", None, [], port
+        return "keep", "not in a linked worktree", None, [], port, state
     # One janitor --claims call per worktree per run: it reads every live transcript, and
     # duplicates share their worktree.
     claims = {} if claims is None else claims
     if worktree not in claims:
         claims[worktree] = claimed(worktree, janitor, claim_timeout)
     if claims[worktree]:
-        return "keep", "a live session claims the worktree, or the claim check failed", worktree, [], port
-    why = published(rows, ports, members, worktree)
-    if why:
+        return "keep", "a live session claims the worktree, or the claim check failed", worktree, [], port, state
+    published_by = published(rows, ports, members, worktree)
+    if published_by:
         # Unused starts counting again when the publisher goes, not from before it came.
-        if port == ANY_PORT:
-            forget_idle(state_dir, root, begun)
-        return "serving", why, worktree, members, port
-    if port == ANY_PORT:
+        forget_idle(state_dir, root, begun)
+        return "serving", published_by, worktree, members, port, "serving"
+    if state == "idle":
         idle = idle_for(state_dir, root, begun, now)
         if idle < idle_hours * 3600:
-            return "keep", f"unused for {idle / 3600:.1f}h of the {idle_hours}h it must be", worktree, [], port
-        return "reap", f"no connection on any port it listens on for {idle / 3600:.1f}h", worktree, members, port
-    return "reap", f"does not listen on its port {port}", worktree, members, port
+            return "keep", f"{why}; unused for {idle / 3600:.1f}h of the {idle_hours}h it must be", worktree, [], port, state
+        return "reap", f"{why} for {idle / 3600:.1f}h", worktree, members, port, state
+    return "reap", why, worktree, members, port, state
 
 
 def stop(members, snapshot, grace, send=os.kill, sleep=time.sleep):
@@ -390,9 +419,12 @@ def stop(members, snapshot, grace, send=os.kill, sleep=time.sleep):
 
 
 def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=os.kill,
-         sleep=time.sleep, claim_timeout=900, state_dir=STATE_DIR, idle_hours=CRA_IDLE_HOURS):
+         sleep=time.sleep, claim_timeout=900, state_dir=STATE_DIR, idle_hours=IDLE_HOURS,
+         pressure_hours=PRESSURE_IDLE_HOURS):
     """Print one line per launcher root and a summary; return (reaped, candidates)."""
     now = time.time() if now is None else now
+    short, short_why = pressure()
+    window = min(pressure_hours, idle_hours) if short else idle_hours
     janitor = janitor or Path.home() / ".cc-reaper" / "worktree-janitor.sh"
     rows = processes()
     if rows is None:
@@ -408,8 +440,8 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
         ppid, _, _, _, command = rows[root]
         if ppid != 1 or launcher(command) is None:
             continue
-        verdict, reason, worktree, members, port = judge(rows, ports, root, min_age, now, janitor, claims,
-                                                         claim_timeout, state_dir, idle_hours)
+        verdict, reason, worktree, members, port, state = judge(
+            rows, ports, root, min_age, now, janitor, claims, claim_timeout, state_dir, window)
         label = f"pid={root} worktree={worktree or '-'} cmd={command[:80]!r}"
         if verdict != "reap":
             print(f"{verdict.upper()} {label} ({reason})")
@@ -428,7 +460,10 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
             print(f"KEEP {label} (changed, or unreadable, at the recheck)")
             continue
         members = tree(fresh_rows, root)
-        if (serving(fresh, members, port) or published(fresh_rows, fresh, members, worktree)
+        # Kept if it is now used, or no longer what it was judged as: a tree judged unserved
+        # that listens now is a server that came up, whatever its connections say.
+        now_state, _ = serving(fresh, members, port)
+        if (now_state != state or published(fresh_rows, fresh, members, worktree)
                 or any(AGENT.search(fresh_rows[p][4]) for p in members)):
             print(f"KEEP {label} (serving, or an agent joined, at the recheck)")
             continue
@@ -441,8 +476,8 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
             print(f"STOPPED {label} ({reason}; {len(signalled)} processes, {size // 1024} MB{note})")
         else:
             print(f"KEEP {label} (changed before it could be stopped{note})")
-    print(f"dev servers: stopped={reaped}/{candidates} rss={rss_kb // 1024}MB"
-          + ("" if apply else " (report only)"))
+    print(f"dev servers: stopped={reaped}/{candidates} rss={rss_kb // 1024}MB idle-window={window}h"
+          + (f" ({short_why})" if short else "") + ("" if apply else " (report only)"))
     return reaped, candidates
 
 
@@ -453,12 +488,14 @@ def main():
     parser.add_argument("--min-hours", type=int, default=6)
     parser.add_argument("--grace-seconds", type=int, default=10)
     parser.add_argument("--claim-timeout-seconds", type=int, default=900)
-    parser.add_argument("--cra-idle-hours", type=int, default=CRA_IDLE_HOURS)
+    parser.add_argument("--idle-hours", type=int, default=IDLE_HOURS)
+    parser.add_argument("--pressure-idle-hours", type=int, default=PRESSURE_IDLE_HOURS)
     args = parser.parse_args()
-    if args.min_hours < 1 or args.cra_idle_hours < 1:
-        raise ValueError("minimum age and CRA idle time must be at least 1 hour")
+    if min(args.min_hours, args.idle_hours, args.pressure_idle_hours) < 1:
+        raise ValueError("minimum age and idle windows must be at least 1 hour")
     reap(apply=args.mode == "apply", min_age=args.min_hours * 3600, grace=args.grace_seconds,
-         claim_timeout=args.claim_timeout_seconds, idle_hours=args.cra_idle_hours)
+         claim_timeout=args.claim_timeout_seconds, idle_hours=args.idle_hours,
+         pressure_hours=args.pressure_idle_hours)
 
 
 if __name__ == "__main__":

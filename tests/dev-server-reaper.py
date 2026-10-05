@@ -34,6 +34,7 @@ class ReaperTest(unittest.TestCase):
         self.claims = set()
         self.connections = {443}
         self.forwarded = set()
+        self.short = (False, "")
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.state = Path(temp.name)
@@ -45,6 +46,7 @@ class ReaperTest(unittest.TestCase):
                            ("linked_worktree", lambda path: self.worktrees.get(path)),
                            ("connected", lambda: set(self.connections) or None),
                            ("served_ports", lambda: set(self.forwarded)),
+                           ("pressure", lambda: self.short),
                            ("claimed", self.fake_claimed)):
             patcher = mock.patch.object(reaper, name, side_effect=fake)
             patcher.start()
@@ -328,6 +330,62 @@ class ReaperTest(unittest.TestCase):
         self.assertEqual(self.run_reap(), (0, 0))
         self.assertEqual(self.sent, [])
 
+    def test_a_listening_server_nobody_uses_goes_after_the_window(self):
+        self.server(100)
+        self.ports[102] = {9229, 8811}
+        self.assertEqual(self.run_reap(), (0, 0))       # first seen: recorded, kept
+        self.aged_marker(100, 11)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.aged_marker(100, 13)
+        self.assertEqual(self.run_reap(), (1, 1))
+        self.assertEqual(self.terms(), [100, 101, 102])
+
+    def test_a_listening_server_with_a_connection_is_serving_and_starts_over(self):
+        self.server(100)
+        self.ports[102] = {9229, 8811}
+        self.aged_marker(100, 13)
+        self.connections.add(8811)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.connections.discard(8811)
+        self.assertEqual(self.run_reap(), (0, 0))       # the record started over
+        self.assertEqual(self.sent, [])
+
+    def test_a_connection_on_the_inspector_port_alone_does_not_count_for_a_named_port(self):
+        self.server(100)
+        self.ports[102] = {9229, 8811}
+        self.aged_marker(100, 13)
+        self.connections.add(9229)
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_under_memory_pressure_the_window_is_three_hours(self):
+        self.server(100)
+        self.ports[102] = {9229, 8811}
+        self.aged_marker(100, 4)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.short = (True, "swap free 900M")
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_pressure_keeps_its_three_hour_window_and_never_touches_a_published_tree(self):
+        self.cra(100)
+        self.aged_marker(100, 2)
+        self.short = (True, "memory pressure level 4")
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.aged_marker(100, 4)
+        self.forwarded = {3633}
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_server_that_started_listening_by_the_recheck_is_kept(self):
+        self.server(100)
+        scans = []
+
+        def later():
+            scans.append(1)
+            return dict(self.ports) if len(scans) == 1 else {**self.ports, 102: {9229, 8811}}
+        reaper.listening.side_effect = later
+        self.assertEqual(self.run_reap(), (0, 1))
+        self.assertEqual(self.sent, [])
+
     def test_markers_of_gone_trees_are_pruned(self):
         (self.state / "999-123").touch()
         self.run_reap()
@@ -470,6 +528,30 @@ class ServedPortsTest(unittest.TestCase):
         with mock.patch.object(reaper.os, "access", return_value=False):
             self.assertEqual(self.run_status("", which=None), set())
         self.assertIsNone(self.run_status("not json"))
+
+
+class PressureTest(unittest.TestCase):
+    def run_sysctl(self, level, swap):
+        answers = {"kern.memorystatus_vm_pressure_level": level, "vm.swapusage": swap}
+
+        def fake(args, **kw):
+            value = answers[args[-1]]
+            if value is None:
+                raise reaper.subprocess.CalledProcessError(1, args)
+            return mock.Mock(stdout=value + "\n")
+        with mock.patch.object(reaper.subprocess, "run", side_effect=fake):
+            return reaper.pressure()
+
+    def test_level_and_swap(self):
+        roomy = "total = 14336.00M  used = 4000.00M  free = 10336.00M  (encrypted)"
+        tight = "total = 14336.00M  used = 13432.75M  free = 903.25M  (encrypted)"
+        self.assertEqual(self.run_sysctl("1", roomy), (False, ""))
+        self.assertEqual(self.run_sysctl("2", roomy), (True, "memory pressure level 2"))
+        self.assertEqual(self.run_sysctl("1", tight), (True, "swap free 903M"))
+        self.assertEqual(self.run_sysctl("1", "total = 0.00M  used = 0.00M  free = 0.00M"), (False, ""))
+
+    def test_a_failed_probe_is_not_pressure(self):
+        self.assertEqual(self.run_sysctl(None, None), (False, ""))
 
 
 class ConnectedTest(unittest.TestCase):
