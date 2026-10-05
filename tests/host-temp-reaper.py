@@ -21,6 +21,7 @@ reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
 REAL_HELD = reaper.held
 REAL_HOLDERS = reaper.holders
+REAL_PROCESSES = reaper.processes
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 HOUR = 3600
@@ -42,7 +43,7 @@ class ReaperTest(unittest.TestCase):
         self.clients = set()
         self.holders = set()
         self.sent = []
-        for name, fake in (("processes", lambda: list(self.rows)),
+        for name, fake in (("processes", lambda env=False: list(self.rows)),
                            ("listening_ports", lambda pid: self.ports.get(pid, set())),
                            ("has_client", lambda port: port in self.clients),
                            ("held", lambda path: path in self.holders),
@@ -239,12 +240,13 @@ class ReaperTest(unittest.TestCase):
     def test_a_failed_ps_while_removing_keeps_the_rest(self):
         path = self.leftover("go-build80", DAY + HOUR)
         calls = []
-        def processes():
-            calls.append(1)
+        def processes(env=False):
+            calls.append(env)
             return list(self.rows) if len(calls) == 1 else None
         with mock.patch.object(reaper, "processes", side_effect=processes):
             counts = self.run_clean()
         self.assertTrue(path.exists())
+        self.assertEqual(calls[1:], [True], "the holder scan reads environments")
         self.assertEqual(counts["leftover"], [0, 0])
 
     def test_only_the_per_user_temp_directory_is_swept(self):
@@ -254,6 +256,12 @@ class ReaperTest(unittest.TestCase):
             counts = self.run_clean()
         self.assertTrue(path.exists())
         self.assertEqual(counts["leftover"], [0, 0])
+
+    def test_the_holder_scan_reads_environments(self):
+        rows = REAL_PROCESSES(env=True)
+        self.assertIsNotNone(rows)
+        me = next(r for r in rows if r[0] == os.getpid())
+        self.assertIn("PATH=", me[3])
 
     def test_leftovers_are_only_listed_without_clean(self):
         path = self.leftover("go-build77", DAY + HOUR)
@@ -284,9 +292,11 @@ class ReaperTest(unittest.TestCase):
         self.addCleanup(handle.close)
         rows = [(1, 1, 0, f"python3 {named}/x.py"),
                 (2, 1, 0, f"docker run -v {self.root}//tmpslash001:/cfg img"),
-                (3, 1, 0, "python3 tmprel00001/x.py")]
+                (3, 1, 0, "python3 tmprel00001/x.py"),
+                (4, 1, 0, f"node server.js PYTHONPATH={self.root}//tmpenvenv01 HOME=/x")]
         names = REAL_HOLDERS(self.root, rows)
-        for held in ("tmpcwdcwd01", "tmpopen0001", "tmpnamed001", "tmpslash001", "tmprel00001"):
+        for held in ("tmpcwdcwd01", "tmpopen0001", "tmpnamed001", "tmpslash001", "tmprel00001",
+                     "tmpenvenv01"):
             self.assertIn(held, names)
         self.assertNotIn("tmpidle0001", names)
 

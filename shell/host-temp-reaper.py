@@ -102,10 +102,13 @@ def temp_root():
     return Path(tempfile.gettempdir()).resolve()
 
 
-def processes():
-    """Yield (pid, ppid, elapsed_seconds, command) for every process; None when ps fails."""
+def processes(env=False):
+    """Yield (pid, ppid, elapsed_seconds, command) for every process; None when ps fails.
+    With env, this user's processes' environments follow their command lines (ps -E), so a
+    `PYTHONPATH=$TMPDIR/tmp…` names its directory too."""
     try:
-        out = subprocess.run(["ps", "-axo", "pid=,ppid=,etime=,command="], capture_output=True,
+        out = subprocess.run(["ps", "-axww" + ("E" if env else ""), "-o", "pid=,ppid=,etime=,command="],
+                             capture_output=True,
                              text=True, timeout=30, check=True).stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -341,7 +344,7 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
             if newest is None or now - newest < limit:
                 continue
             if held_names is None or time.time() - held_at > HOLDERS_MAX_AGE:
-                rows_now = processes()
+                rows_now = processes(env=True)
                 held_names = None if rows_now is None else holders(root, rows_now)
                 held_at = time.time()
                 if held_names is None:
