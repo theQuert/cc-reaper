@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolated safety tests for the dev-server reaper: every keep rule, and what it stops."""
 
+import calendar
 import importlib.util
 import json
 import os
@@ -612,7 +613,7 @@ class PressureTest(unittest.TestCase):
                 raise reaper.subprocess.CalledProcessError(1, args)
             return mock.Mock(stdout=value + "\n")
         with mock.patch.object(reaper.subprocess, "run", side_effect=fake):
-            return reaper.pressure()
+            return reaper.pressure(log="/nonexistent/pressure.log")
 
     def test_only_the_pressure_level_counts(self):
         tight = "total = 14336.00M  used = 13432.75M  free = 903.25M  (encrypted)"
@@ -622,6 +623,28 @@ class PressureTest(unittest.TestCase):
 
     def test_a_failed_probe_is_not_pressure(self):
         self.assertEqual(self.run_sysctl(None, None), (False, ""))
+
+    def run_log(self, level, text, now):
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write(text)
+        self.addCleanup(os.unlink, f.name)
+        with mock.patch.object(reaper.subprocess, "run",
+                               return_value=mock.Mock(stdout=level + "\n")):
+            return reaper.pressure(log=f.name, now=now)
+
+    def test_a_level_two_sample_in_the_last_hour_counts(self):
+        now = calendar.timegm((2026, 10, 5, 7, 0, 0))
+        log = ("2026-10-04T17:32:44Z load=1 swap=1M cmpGB=9.2\n"
+               "2026-10-05T06:10:00Z load=1 swap=1M mp=2 cmpGB=9\n"
+               "2026-10-05T06:30:00Z load=1 swap=1M mp=2 cmpGB=9\n"
+               "2026-10-05T06:55:00Z load=1 swap=1M mp=1 cmpGB=9\n")
+        self.assertEqual(self.run_log("1", log, now),
+                         (True, "memory pressure level 2 at 2026-10-05T06:30:00Z"))
+        self.assertEqual(self.run_log("1", log, now + 1801), (False, ""))
+        self.assertEqual(self.run_log("1", log.replace("mp=2", "mp=1"), now), (False, ""))
+        self.assertEqual(self.run_log("1", "", now), (False, ""))
+        with mock.patch.object(reaper.subprocess, "run", return_value=mock.Mock(stdout="1\n")):
+            self.assertEqual(reaper.pressure(log="/nonexistent/pressure.log", now=now), (False, ""))
 
 
 class ConnectedTest(unittest.TestCase):
