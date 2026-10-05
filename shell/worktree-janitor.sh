@@ -2228,7 +2228,7 @@ _cc_wj_landed() {
     echo ancestor
   elif _cc_wj_landed_by_content "$wt" "$ref"; then
     echo content
-  elif _cc_wj_landed_by_pr "$wt" "$ref"; then
+  elif _cc_wj_landed_by_pr "$wt" "$ref" || _cc_wj_behind_merged "$wt" "$ref"; then
     echo pr
   else
     echo no
@@ -2281,9 +2281,9 @@ _cc_wj_landed_by_content() {
 # rather than left to gh, which would honour $GH_REPO and let another repository's merged
 # PR authorise this removal.
 _cc_wj_landed_by_pr() {
-  local wt="$1" ref="$2" head url host slug rest merges mc
+  local wt="$1" ref="$2" head="${3:-}" url host slug rest merges mc
   command -v gh >/dev/null 2>&1 || return 1
-  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)" || return 1
+  [ -n "$head" ] || head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)" || return 1
   url="$(git -C "$wt" config --get remote.origin.url 2>/dev/null)" || return 1
   url="${url%.git}"
   # URL form before SCP form: an https URL contains both a colon and slashes.
@@ -2403,6 +2403,34 @@ _cc_wj_closed_at_head() {
 # whether one was ever opened at all, merged, closed or still open. A branch with a closed
 # pull request is a decision somebody made and is not abandoned; a branch with none is work
 # that never reached anyone.
+# A branch whose own pushed head moved past it, and that pushed head merged: every local
+# commit is in what landed. A squash merge keys on the PR's final head, so a checkout that
+# stopped one push short never matched it; on 2026-10-05 two such stima-api trees, 1.1 GB,
+# sat as unlanded with their PRs merged. Asked only when the local HEAD is a strict
+# ancestor of refs/remotes/origin/<branch>, so a tree ahead or diverged is never judged.
+_cc_wj_behind_merged() {
+  local wt="$1" ref="$2" br head up
+  br="$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null)" || return 1
+  head="$(git -C "$wt" rev-parse --verify --quiet HEAD 2>/dev/null)" || return 1
+  up="$(git -C "$wt" rev-parse --verify --quiet "refs/remotes/origin/$br^{commit}" 2>/dev/null)" || return 1
+  [ "$up" != "$head" ] || return 1
+  git -C "$wt" merge-base --is-ancestor "$head" "$up" 2>/dev/null || return 1
+  _cc_wj_landed_by_pr "$wt" "$ref" "$up"
+}
+
+# yes when a branch, tag or remote-tracking ref contains this worktree's HEAD, so removing
+# the checkout leaves every commit referenced; no otherwise, and no on any failure. On
+# 2026-10-05 four detached stima-api trees idle 7+ days, 4.6 GB, were all contained in
+# origin branches and three also in local ones, yet a detached HEAD could never be removed
+# unless it sat on the base.
+_cc_wj_referenced() {
+  local wt="$1" head out
+  head="$(git -C "$wt" rev-parse --verify --quiet HEAD 2>/dev/null)" || { echo no; return; }
+  out="$(git -C "$wt" for-each-ref --count=1 --contains "$head" --format='%(refname)' \
+        refs/heads refs/tags refs/remotes 2>/dev/null)" || { echo no; return; }
+  [ -n "$out" ] && echo yes || echo no
+}
+
 _cc_wj_never_had_pr() {
   local wt="$1" branch url rest host slug out
   command -v gh >/dev/null 2>&1 || { echo no; return; }
@@ -2528,7 +2556,9 @@ _cc_wj_classify() {
   local idle="${7:-}"    # yes | no | unknown
   local recent="${8:-no}" # "yes" when a bounded harness-session lease applies
   local abandoned="${9:-no}" # "yes" only when GitHub confirmed no pull request ever existed,
-                             # or one closed unmerged at this HEAD (`_cc_wj_closed_at_head`)
+                             # or one closed unmerged at this HEAD (`_cc_wj_closed_at_head`),
+                             # or, for a detached HEAD, a ref contains it (`_cc_wj_referenced`)
+  local referenced="${10:-no}" # "yes" when a branch, tag or remote ref contains the HEAD
 
   if [ "$dirty" = "MISSING" ]; then
     echo "KEEP(missing-dir)"
@@ -2577,9 +2607,10 @@ _cc_wj_classify() {
   esac
 
   # Removal takes the checkout and leaves the branch, so a branch's commits survive it.
-  # A detached HEAD's do not: nothing references them once the worktree is gone. Landed by
-  # ancestry puts them on the base; landed by content or PR puts only their change there.
-  if [ "$branch" = "(detached)" ] && [ "$landed" != "ancestor" ]; then
+  # A detached HEAD's survive only when something else references them: the base (landed by
+  # ancestry), or a branch, tag or remote ref that contains the HEAD. Landed by content or
+  # PR puts only their change on the base.
+  if [ "$branch" = "(detached)" ] && [ "$landed" != "ancestor" ] && [ "$referenced" != "yes" ]; then
     echo "KEEP(detached-head)"
     return
   fi
@@ -3069,7 +3100,7 @@ KEEP
   local repo lock lock_rc skipped=0
   # Declared once, outside the loop: zsh prints the value of an already-set local that is
   # declared again.
-  local active lease landed idle classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes task_done wt_idle_hours
+  local active lease landed idle referenced classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes task_done wt_idle_hours
   # Said once, because the absence is otherwise silent: every squash-merged worktree just
   # reads KEEP(unlanded). That is how the scheduled sweep went without landed=pr for weeks.
   if [ "$trim" -eq 0 ] && ! command -v gh >/dev/null 2>&1; then
@@ -3240,8 +3271,10 @@ KEEP
       landed="-"
       idle="-"
       abandoned="no"
+      referenced="no"
       head0="$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)"
       if [ "$dirty" = "0" ] && [ "$active" = "no" ] && [ "$lease" = "no" ]; then
+        [ "$branch" = "(detached)" ] && referenced="$(_cc_wj_referenced "$wt_path")"
         landed="$(_cc_wj_landed "$wt_path")"
         case "$landed" in
           ancestor|content|pr) idle="$(_cc_wj_idle "$wt_path" "$wt_idle_hours")" ;;
@@ -3258,8 +3291,14 @@ KEEP
             idle_long="$(_cc_wj_idle "$wt_path" "$abandon_hours")"
             if [ "$idle_long" = "yes" ]; then
               idle="yes"
-              abandoned="$(_cc_wj_never_had_pr "$wt_path")"
-              [ "$abandoned" = "yes" ] || abandoned="$(_cc_wj_closed_at_head "$wt_path")"
+              # A detached HEAD has no branch to ask GitHub about; what makes it safe to
+              # remove is that a ref keeps its commits.
+              if [ "$branch" = "(detached)" ]; then
+                abandoned="$referenced"
+              else
+                abandoned="$(_cc_wj_never_had_pr "$wt_path")"
+                [ "$abandoned" = "yes" ] || abandoned="$(_cc_wj_closed_at_head "$wt_path")"
+              fi
             fi
             ;;
         esac
@@ -3308,7 +3347,7 @@ KEEP
         fi
       fi
       [ -n "$classification" ] ||
-        classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle" "$lease" "$abandoned")
+        classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle" "$lease" "$abandoned" "$referenced")
 
       printf "  WORKTREE  %s\n" "$wt_path"
       printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s  recent=%s  landed=%s  idle=%s\n" \
