@@ -62,14 +62,25 @@ PROFILE_NAME = re.compile(r"cdp-[A-Za-z0-9]{6}$")
 WRANGLER_LOG = re.compile(r"wrangler-[0-9_-]+\.log$")
 BUILD_COPY = re.compile(r"nimbus-articles-build-[A-Za-z0-9]{6}$")
 BUILD_COPY_IDLE_SECONDS = 24 * 3600
-# (name, idle seconds): a tool's own temp name, and how long it must be untouched.
+# (name, idle seconds, directories only): a tool's own temp name, and how long it must be
+# untouched. The generic names are directories only and must hold a digit, so a person's
+# `tmp_scratch` or a file another program was handed by name is not one.
 LEFTOVERS = (
-    (re.compile(r"tmp[a-z0-9_]{8}"), 72 * 3600),
-    (re.compile(r"tmp\.[A-Za-z0-9]{10}"), 72 * 3600),
-    (re.compile(r"pip-[a-z]+(-[a-z]+)*-[a-z0-9_]{8}"), 24 * 3600),
-    (re.compile(r"go-(build|link-)\d+"), 24 * 3600),
-    (re.compile(r"nimbus-[a-z0-9]+(-[a-z0-9]+)*-[A-Za-z0-9]{6}"), 24 * 3600),
+    (re.compile(r"tmp(?=[a-z0-9_]*[0-9])[a-z0-9_]{8}"), 72 * 3600, True),
+    (re.compile(r"tmp\.(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{10}"), 72 * 3600, True),
+    (re.compile(r"pip-[a-z]+(-[a-z]+)*-[a-z0-9_]{8}"), 24 * 3600, False),
+    (re.compile(r"go-(build|link-)\d+"), 24 * 3600, False),
+    (re.compile(r"nimbus-(acceptance|articles|env|m2|m2-build|m3r|m8|manifest|static)-[A-Za-z0-9_]{6}"),
+     24 * 3600, False),
 )
+# Any of those names, wherever it appears in a command line: `$TMPDIR/x` expands to `T//x`,
+# and a relative path names no directory at all.
+LEFTOVER_MENTION = re.compile(r"(?<![A-Za-z0-9_.-])(tmp[a-z0-9_]{8}|tmp\.[A-Za-z0-9]{10}"
+                              r"|pip-[a-z]+(?:-[a-z]+)*-[a-z0-9_]{8}|go-(?:build|link-)\d+"
+                              r"|nimbus-[a-z0-9-]+-[A-Za-z0-9_]{6})(?![A-Za-z0-9_])")
+# The per-user temp directory is the only root this rule may sweep: /tmp is shared with
+# other users and root, whose processes neither lsof -u nor this user's ps can vouch for.
+USER_TEMP_PREFIX = "/private/var/folders/"
 # A fresh picture of what is open, at least this often while removing.
 HOLDERS_MAX_AGE = 60
 JOB_ID = re.compile(r"[0-9a-f]{8}$")
@@ -80,6 +91,14 @@ CHROME_BINARY = re.compile(r"/\S.*/Google Chrome\.app/Contents/MacOS/Google Chro
 
 
 def temp_root():
+    """This user's own temp directory, whatever TMPDIR says: launchd jobs may have none."""
+    try:
+        path = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True,
+                              text=True, timeout=10, check=True).stdout.strip()
+        if path:
+            return Path(path).resolve()
+    except (OSError, subprocess.SubprocessError):
+        pass
     return Path(tempfile.gettempdir()).resolve()
 
 
@@ -151,20 +170,27 @@ def held(path):
                for f in probe.stdout.split(b"\0"))
 
 
-def leftover_idle(name):
-    """The idle limit for a tool temp name, or None for any other name."""
-    return next((idle for pattern, idle in LEFTOVERS if pattern.fullmatch(name)), None)
+def leftover_rule(name):
+    """(idle seconds, directories only) for a tool temp name, or None for any other name."""
+    return next(((idle, dirs) for pattern, idle, dirs in LEFTOVERS if pattern.fullmatch(name)), None)
 
 
 def newest_change(path):
     """The newest mtime of path and everything under it, links not followed; None when
-    any part cannot be read."""
+    any part cannot be read or lies on another filesystem - a share mounted on a temp
+    directory is not the temp directory's to delete."""
     try:
-        newest = path.lstat().st_mtime
+        top_stat = path.lstat()
+        newest, device = top_stat.st_mtime, top_stat.st_dev
         if path.is_dir() and not path.is_symlink():
+            if os.path.ismount(path):
+                return None
             for top, dirs, files in os.walk(path, onerror=_raise):
                 for name in dirs + files:
-                    newest = max(newest, os.lstat(os.path.join(top, name)).st_mtime)
+                    st = os.lstat(os.path.join(top, name))
+                    if st.st_dev != device:
+                        return None
+                    newest = max(newest, st.st_mtime)
     except OSError:
         return None
     return newest
@@ -180,11 +206,12 @@ def holders(root, rows):
     item: there were 442,337 items."""
     try:
         probe = subprocess.run(["lsof", "-n", "-F0n", "-u", str(os.getuid())],
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                timeout=120, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
-    if probe.returncode not in (0, 1) or not probe.stdout:
+    # A partial answer is no answer: a process lsof could not read is one it cannot vouch for.
+    if probe.returncode not in (0, 1) or probe.stderr or not probe.stdout:
         return None
     names = set()
     prefixes = {os.fsencode(str(root)) + b"/"}
@@ -195,10 +222,8 @@ def holders(root, rows):
         for prefix in prefixes:
             if field.startswith(b"n" + prefix):
                 names.add(os.fsdecode(field[len(prefix) + 1:].split(b"/", 1)[0]))
-    for prefix in prefixes:
-        text = re.escape(os.fsdecode(prefix))
-        for row in rows:
-            names.update(re.findall(text + r"([^/\s'\"]+)", row[3]))
+    for row in rows:
+        names.update(LEFTOVER_MENTION.findall(row[3]))
     return names
 
 
@@ -299,11 +324,15 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
             print(f"KEEP build {path.name} ({error.strerror or error})")
 
     held_names, held_at = None, 0
-    for path in sorted(root.iterdir()) if root.is_dir() else []:
+    sweep = root.is_dir() and str(root).startswith(USER_TEMP_PREFIX)
+    for path in sorted(root.iterdir()) if sweep else []:
         try:
-            limit = leftover_idle(path.name)
+            rule = leftover_rule(path.name)
             # A build copy has its own rule above.
-            if limit is None or BUILD_COPY.fullmatch(path.name) or path.is_symlink():
+            if rule is None or BUILD_COPY.fullmatch(path.name) or path.is_symlink():
+                continue
+            limit, dirs_only = rule
+            if dirs_only and not path.is_dir():
                 continue
             # The entry's own time first: most are recent, and a deep walk costs.
             if now - path.lstat().st_mtime < limit:
@@ -312,7 +341,9 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
             if newest is None or now - newest < limit:
                 continue
             if held_names is None or time.time() - held_at > HOLDERS_MAX_AGE:
-                held_names, held_at = holders(root, processes() or []), time.time()
+                rows_now = processes()
+                held_names = None if rows_now is None else holders(root, rows_now)
+                held_at = time.time()
                 if held_names is None:
                     print("KEEP leftover (lsof could not answer; kept them all)")
                     break

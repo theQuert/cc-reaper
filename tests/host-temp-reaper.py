@@ -202,7 +202,7 @@ class ReaperTest(unittest.TestCase):
 
     def test_only_untouched_unheld_tool_leftovers_are_removed(self):
         gone = [self.leftover("tmpab_cd123", 3 * DAY + HOUR),
-                self.leftover("tmp.AbCdEf1234", 3 * DAY + HOUR, file=True),
+                self.leftover("tmp.AbCdEf123x", 3 * DAY + HOUR),
                 self.leftover("pip-unpack-6pi0dsfu", DAY + HOUR),
                 self.leftover("go-build535115792", DAY + HOUR),
                 self.leftover("nimbus-m2-build-Ab12Cd", DAY + HOUR)]
@@ -211,7 +211,10 @@ class ReaperTest(unittest.TestCase):
                 self.leftover("go-build1", DAY + HOUR, inner_age=HOUR),  # changed deep inside
                 self.leftover("tmpheld0001", 4 * DAY),
                 self.leftover("node-compile-cache", 9 * DAY),       # not a tool temp name
-                self.leftover("tmpTOOLONG123", 4 * DAY)]
+                self.leftover("tmpTOOLONG123", 4 * DAY),
+                self.leftover("tmp_scratch", 4 * DAY),               # a person's name: no digit
+                self.leftover("tmp.AbCdEf1234", 4 * DAY, file=True),  # a generic name: dirs only
+                self.leftover("nimbus-prod-config", 4 * DAY)]       # not a known nimbus test
         self.holders.add(self.root / "tmpheld0001")
         counts = self.run_clean()
         for path in gone:
@@ -219,6 +222,38 @@ class ReaperTest(unittest.TestCase):
         for path in kept:
             self.assertTrue(path.exists(), path)
         self.assertEqual(counts["leftover"], [5, 5])
+
+    def test_a_leftover_reaching_another_filesystem_is_kept(self):
+        path = self.leftover("go-build79", DAY + HOUR)
+        real = reaper.os.lstat
+        def lstat(p, *a, **k):
+            st = real(p, *a, **k)
+            if str(p).endswith("/deep/f"):
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1) + tuple(st)[3:])
+            return st
+        with mock.patch.object(reaper.os, "lstat", side_effect=lstat):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["leftover"], [0, 0])
+
+    def test_a_failed_ps_while_removing_keeps_the_rest(self):
+        path = self.leftover("go-build80", DAY + HOUR)
+        calls = []
+        def processes():
+            calls.append(1)
+            return list(self.rows) if len(calls) == 1 else None
+        with mock.patch.object(reaper, "processes", side_effect=processes):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["leftover"], [0, 0])
+
+    def test_only_the_per_user_temp_directory_is_swept(self):
+        path = self.leftover("go-build81", DAY + HOUR)
+        # The fixtures live under this user's temp directory; any other root is refused.
+        with mock.patch.object(reaper, "USER_TEMP_PREFIX", "/no/such/prefix/"):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["leftover"], [0, 0])
 
     def test_leftovers_are_only_listed_without_clean(self):
         path = self.leftover("go-build77", DAY + HOUR)
@@ -247,11 +282,12 @@ class ReaperTest(unittest.TestCase):
         self.addCleanup(child.kill)
         handle = open(opened / "f", "w")
         self.addCleanup(handle.close)
-        rows = [(1, 1, 0, f"python3 {named}/x.py")]
+        rows = [(1, 1, 0, f"python3 {named}/x.py"),
+                (2, 1, 0, f"docker run -v {self.root}//tmpslash001:/cfg img"),
+                (3, 1, 0, "python3 tmprel00001/x.py")]
         names = REAL_HOLDERS(self.root, rows)
-        self.assertIn("tmpcwdcwd01", names)
-        self.assertIn("tmpopen0001", names)
-        self.assertIn("tmpnamed001", names)
+        for held in ("tmpcwdcwd01", "tmpopen0001", "tmpnamed001", "tmpslash001", "tmprel00001"):
+            self.assertIn(held, names)
         self.assertNotIn("tmpidle0001", names)
 
     def job(self, name, state="done", ended=4 * DAY, file_age=4 * DAY, raw=None):
