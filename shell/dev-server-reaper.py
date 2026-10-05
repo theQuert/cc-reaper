@@ -20,14 +20,19 @@ A launcher tree is stopped only when every one of these holds:
   - no process in the tree listens on its port, nor on one of the 20 above it where vite
     and astro move when theirs is taken (the inspector ports a server also opens do not
     count) - it can serve nobody, so it goes at once;
-  - it listens, but nothing has been connected to that port (for `react-scripts start`,
-    which names no port, to any port its tree listens on) at any run for IDLE_HOURS, as
-    recorded in the state directory, nor at the recheck. An open tab keeps the hot-reload
-    socket connected; a closed laptop drops it within seconds, so one empty moment proves
-    nothing. Two CRA servers sat 2 days like that on 2026-10-05, holding 4.5 GB while the
-    compressor churned 850 MB/s. While memory is short - swap free under 2 GB, or the
-    kernel's pressure level 2 or more - the window is PRESSURE_IDLE_HOURS instead: a
-    server nobody has opened for three hourly runs is not worth the swap;
+  - it runs a hot-reload dev server (`react-scripts start`, `next dev`, `vite` other than
+    `vite preview|build`, `webpack serve`, judged from the commands its tree actually runs,
+    not the npm script's name) and listens, but nothing has been connected to that port
+    (for `react-scripts start`, which names no port, to any port its tree listens on) at
+    any run for IDLE_HOURS, as recorded in the state directory, nor at the recheck. Only a
+    hot-reload server can be judged this way: an open tab keeps its socket connected,
+    while `next start`, `vite preview` or `wrangler dev` hold no connection between
+    requests, so a listening one of those is always taken as serving. A closed laptop
+    drops even the hot-reload socket within seconds, so one empty moment proves nothing,
+    and runs more than MAX_SAMPLE_GAP apart start the count over. Two CRA servers sat 2
+    days like that on 2026-10-05, holding 4.5 GB while the compressor churned 850 MB/s.
+    While the kernel's memory pressure level is 2 or more the window is
+    PRESSURE_IDLE_HOURS instead;
 - nothing publishes it: no other listening process names its worktree on its command line
   (a review front such as ~/stima-review/tailnet_review.mjs <worktree> <port>), and no
   `tailscale serve` handler proxies to a port the tree listens on;
@@ -65,7 +70,8 @@ ANY_PORT = -1
 # and the shorter window while memory is short.
 IDLE_HOURS = 12
 PRESSURE_IDLE_HOURS = 3
-SWAP_FLOOR_MB = 2048
+# Runs further apart than this cannot vouch for the time between them.
+MAX_SAMPLE_GAP = 2 * 3600
 STATE_DIR = Path.home() / ".cc-reaper" / "state" / "dev-server-idle"
 
 
@@ -213,14 +219,21 @@ def published(rows, ports, members, worktree):
 
 
 def idle_for(state_dir, root, begun, now):
-    """Seconds this tree has been recorded unused; records it first when new."""
+    """Seconds this tree has been seen unused at every run without a gap; records it first
+    when new. The marker's mtime is when the unbroken run of samples began, its content the
+    last sample; a gap over MAX_SAMPLE_GAP (a skipped or overlong run) starts it over."""
     marker = state_dir / f"{root}-{int(begun)}"
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
-        if not marker.exists():
-            marker.touch()
+        last = marker.read_text().strip() if marker.exists() else ""
+        if not last.replace(".", "", 1).isdigit() or now - float(last) > MAX_SAMPLE_GAP:
+            marker.write_text(f"{now}\n")
+            os.utime(marker, (now, now))
             return 0
-        return now - marker.stat().st_mtime
+        since = marker.stat().st_mtime
+        marker.write_text(f"{now}\n")
+        os.utime(marker, (since, since))   # the write moved mtime; the start must not move
+        return now - since
     except OSError:
         return 0
 
@@ -244,21 +257,35 @@ def prune_idle(state_dir, rows):
 
 
 def pressure():
-    """(True, why) while memory is short: the kernel's pressure level is 2 or more, or swap
-    has under SWAP_FLOOR_MB free. A probe that fails says not short, the longer window."""
-    def sysctl(name):
-        try:
-            return subprocess.run(["sysctl", "-n", name], capture_output=True, text=True,
-                                  timeout=10, check=True).stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            return ""
-    level = sysctl("kern.memorystatus_vm_pressure_level")
+    """(True, why) while the kernel's memory pressure level is 2 (warn) or more. Not swap
+    free: macOS grows swap a file at a time, so free swap sits near one file's size
+    whenever swap is in use at all. A probe that fails says not short, the longer window."""
+    try:
+        level = subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                               capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
     if level.isdigit() and int(level) >= 2:
         return True, f"memory pressure level {level}"
-    swap = re.search(r"total = ([\d.]+)M .*free = ([\d.]+)M", sysctl("vm.swapusage"))
-    if swap and float(swap.group(1)) > 0 and float(swap.group(2)) < SWAP_FLOOR_MB:
-        return True, f"swap free {float(swap.group(2)):.0f}M"
     return False, ""
+
+
+def hot_reload(rows, members):
+    """Whether the tree runs a dev server whose open tab holds a socket to it."""
+    for pid in members:
+        args = rows[pid][4].split()
+        names = [re.sub(r"\.(?:c|m)?js$", "", os.path.basename(a)) for a in args]
+        for i, name in enumerate(names):
+            following = args[i + 1] if i + 1 < len(args) else ""
+            if (name == "react-scripts" and following == "start") or args[i].endswith("react-scripts/scripts/start.js"):
+                return True
+            if name == "next" and following == "dev":
+                return True
+            if name == "vite" and following not in ("preview", "build", "optimize"):
+                return True
+            if (name == "webpack" and following == "serve") or name == "webpack-dev-server":
+                return True
+    return False
 
 
 def cwd(pid):
@@ -321,10 +348,11 @@ def tree(rows, root):
     return found
 
 
-def serving(ports, members, port):
+def serving(ports, members, port, hot=True):
     """(state, why). unserved: it does not listen on its port or the 20 above it, where vite
     and astro move. serving: something is connected to the port it serves on (with ANY_PORT,
-    to any port it listens on), or connections are unreadable. idle: it listens, unused."""
+    to any port it listens on), connections are unreadable, or it listens without a
+    hot-reload socket to judge use by. idle: a hot-reload server listens, unused."""
     listens = {p for pid in members for p in ports.get(pid, ())}
     if port == ANY_PORT:
         used_on = listens
@@ -337,6 +365,8 @@ def serving(ports, members, port):
         if not moved:
             return "unserved", f"does not listen on its port {port}"
         used_on = {moved[0]}
+    if not hot and port != ANY_PORT:
+        return "serving", f"listens on {min(used_on)}; no hot-reload socket to judge use by"
     clients = connected()
     if clients is None:
         return "serving", "kept: connections unreadable"
@@ -358,7 +388,7 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
     if begun is None or now - begun < min_age:
         return "keep", "younger than the minimum age", None, [], port, None
     members = tree(rows, root)
-    state, why = serving(ports, members, port)
+    state, why = serving(ports, members, port, hot_reload(rows, members))
     if state == "serving":
         forget_idle(state_dir, root, begun)
         return "serving", why, None, members, port, state
@@ -462,7 +492,7 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
         members = tree(fresh_rows, root)
         # Kept if it is now used, or no longer what it was judged as: a tree judged unserved
         # that listens now is a server that came up, whatever its connections say.
-        now_state, _ = serving(fresh, members, port)
+        now_state, _ = serving(fresh, members, port, hot_reload(fresh_rows, members))
         if (now_state != state or published(fresh_rows, fresh, members, worktree)
                 or any(AGENT.search(fresh_rows[p][4]) for p in members)):
             print(f"KEEP {label} (serving, or an agent joined, at the recheck)")
