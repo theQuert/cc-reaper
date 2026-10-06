@@ -2427,10 +2427,20 @@ expect_yes "pressure: keeping the tree" test -f "$P_ROOT/wt-unlanded/.gitignore"
 expect_yes "pressure: and its branch" git -C "$P_ROOT/primary" show-ref --verify --quiet refs/heads/unlanded
 expect_yes "pressure: the trim stayed in the repository it was given" \
   test -d "$P2_ROOT/wt-other/node_modules"
-# The trim frees disk first, so a slow removal sweep cannot delay it.
-expect_yes "pressure: the trim phase ends before the removal phase begins" \
-  awk '/trimming regenerable caches/ && !h { h = NR } /^Summary: trimmed=/ && !t { t = NR }
-       /^Summary: removed=/ && !r { r = NR } END { exit !(h && t && r && h < t && t < r) }' "$OUT_P_SCHED"
+# Removal runs before the trim. Trimming first bumps the worktree's own mtime, so the
+# removal that followed in the same run kept a landed tree as recently active.
+PL_ROOT="$TMPDIR_ROOT/pressure-landed-cache"; mkdir -p "$PL_ROOT"
+git init -q --bare "$PL_ROOT/origin.git" -b main
+git clone -q "$PL_ROOT/origin.git" "$PL_ROOT/primary" 2>/dev/null
+plgit() { git -C "$PL_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+printf 'node_modules/\n' > "$PL_ROOT/primary/.gitignore"; plgit add .gitignore; plgit commit -qm base; plgit push -q origin main
+plgit worktree add -q "$PL_ROOT/wt-cached" -b cached origin/main 2>/dev/null
+mkdir -p "$PL_ROOT/wt-cached/node_modules/pkg"; echo p > "$PL_ROOT/wt-cached/node_modules/pkg/index.js"
+age_tree "$PL_ROOT/wt-cached"
+HOME="$P_HOME" CC_WJ_SCHEDULE_APPLY=1 CC_WJ_PRESSURE_FREE_GB=99999 CC_WJ_PRESSURE_IDLE_HOURS=1 CC_WJ_IDLE_HOURS=6 \
+  PATH="$STUBS_IDLE:$PATH" bash "$WJ" --scheduled --repo "$PL_ROOT/primary" > "$TMPDIR_ROOT/out-pressure-landed-cache.txt" 2>&1
+expect_no "pressure: a landed idle tree with a cache is removed in the same scheduled run" \
+  test -d "$PL_ROOT/wt-cached"
 
 # ─── A bounded sweep ─────────────────────────────────────────────────────────
 #
@@ -2581,6 +2591,43 @@ chmod 644 "$RR_STATE"/repo-cursor-* 2>/dev/null
 expect_yes "repos: an unreadable repository cursor starts with the first repository" \
   bash -c 'case "$1" in r1-*) exit 0 ;; esac; exit 1' _ "$(examined_rw "$OUT_RR")"
 expect_yes "repos: and fails nothing" test "$RR_RC" -eq 0
+
+# The budget runs out while q2 is still being fetched, before any of its worktrees was
+# examined: the cursor names q1, the last repository with progress, so q2 goes first next.
+RQ_ROOT="$TMPDIR_ROOT/budget-prep"; mkdir -p "$RQ_ROOT"
+RQ_STATE="$TMPDIR_ROOT/budget-prep-state"
+for r in q1 q2 q3; do
+  git init -q --bare "$RQ_ROOT/$r.git" -b main
+  git clone -q "$RQ_ROOT/$r.git" "$RQ_ROOT/$r" 2>/dev/null
+  echo x > "$RQ_ROOT/$r/README"
+  git -C "$RQ_ROOT/$r" -c user.email=t@t -c user.name=t add README
+  git -C "$RQ_ROOT/$r" -c user.email=t@t -c user.name=t commit -qm base
+  git -C "$RQ_ROOT/$r" push -q origin main
+  git -C "$RQ_ROOT/$r" worktree add -q "$RQ_ROOT/$r-w1" -b keep origin/main 2>/dev/null
+  echo w > "$RQ_ROOT/$r-w1/w"
+  git -C "$RQ_ROOT/$r-w1" -c user.email=t@t -c user.name=t add w
+  git -C "$RQ_ROOT/$r-w1" -c user.email=t@t -c user.name=t commit -qm w
+done
+RQ_STUBS="$TMPDIR_ROOT/stubs-budget-prep"; mkdir -p "$RQ_STUBS"
+cat > "$RQ_STUBS/git" <<STUB
+#!/usr/bin/env bash
+case " \$* " in *" fetch "*) case "\$*" in *"$RQ_ROOT/q2"*) sleep 12 ;; esac ;; esac
+exec "$(command -v git)" "\$@"
+STUB
+chmod +x "$RQ_STUBS/git"
+run_prep() {
+  CC_WJ_STATE_DIR="$RQ_STATE" CC_WJ_SWEEP_BUDGET_SECONDS=10 PATH="$RQ_STUBS:$STUBS_IDLE:$PATH" \
+    bash "$WJ" --repo "$RQ_ROOT/q1" --repo "$RQ_ROOT/q2" --repo "$RQ_ROOT/q3" --apply 2>&1
+}
+examined_q() { sed -n 's|^  WORKTREE  .*/\(q[0-9]-w1\)$|\1|p' "$1" | paste -sd' ' -; }
+OUT_RQ="$TMPDIR_ROOT/out-budget-prep.txt"
+run_prep > "$OUT_RQ"
+expect_yes "repos: the budget ran out during the second repository's fetch" \
+  bash -c '[ "$(sed -n "s|^  WORKTREE  .*/\(q[0-9]-w1\)$|\1|p" "$1" | paste -sd" " -)" = q1-w1 ] &&
+           grep -q "budget exhausted" "$1"' _ "$OUT_RQ"
+run_prep > "$OUT_RQ"
+expect_yes "repos: the next run starts with the repository still being prepared" \
+  bash -c 'case "$1" in q2-w1*) exit 0 ;; esac; exit 1' _ "$(examined_q "$OUT_RQ")"
 
 # ─── Scan timeouts and one retry ─────────────────────────────────────────────
 

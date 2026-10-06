@@ -212,12 +212,14 @@ pattern that names no path, so the file goes on keeping its worktree.
   whose setup alone outlasts the budget still makes progress. A per-repository, per-phase
   cursor under `~/.cc-reaper/state/` (`CC_WJ_STATE_DIR`) makes the next apply run start
   after the last worktree examined, in path order, wrapping round, and a per-phase repository
-  cursor makes it start with the repository after the one the budget ran out in, so a large
+  cursor makes it start with the repository after the last one in which it examined a
+  worktree before the budget ran out, so a large
   first repository cannot starve the rest; report runs neither read nor write either. The
   lock is refreshed at every worktree boundary.
-- **Freeing disk first under pressure.** A scheduled apply under disk pressure runs the trim
-  phase before the removal phase, each with its own budget. Before a later cache directory
-  of the same worktree the trim reuses a holder and session snapshot younger than
+- **Rechecking a trim without rescanning for every cache.** The scheduled trim under disk
+  pressure runs after the removal phase, with its own budget: trimming first would bump the
+  worktree's mtime and make the same run keep a landed tree as recently active. Before a
+  later cache directory of the same worktree the trim reuses a holder and session snapshot younger than
   `CC_WJ_RECHECK_FRESH_SECONDS` (120) instead of rescanning the machine; every claim, holder
   and content check is still asked against it. Removal always rescans.
 

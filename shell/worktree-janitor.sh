@@ -2947,7 +2947,6 @@ _cc_wj_lock() {
   _cc_wj_lock_write "$lock"
 }
 
-# Released only while it is still ours: after a takeover it belongs to somebody else.
 # Best effort: a cursor that cannot be written costs only where the next sweep starts.
 _cc_wj_cursor_write() { # <cursor file> <worktree>
   [ -n "$1" ] || return 0
@@ -2958,6 +2957,7 @@ _cc_wj_cursor_write() { # <cursor file> <worktree>
   return 0
 }
 
+# Released only while it is still ours: after a takeover it belongs to somebody else.
 _cc_wj_unlock() {
   [ "$(cat "$1/pid" 2>/dev/null)" = "${_CC_WJ_RUN_PID:-$$}" ] && rm -f "$1/pid" "$1/cmd" && rmdir "$1" 2>/dev/null
   return 0
@@ -3239,11 +3239,13 @@ KEEP
   # first is examined whatever the clock says, so a phase whose setup alone outlasts the
   # budget still moves the cursor on. A yield is never a failure.
   local common cursor cursor_file phase=removal budget_hit=0 examined=0 wt_total=0 wt_index=0 elapsed=0 unexamined=0 repo_wts
-  local repo_cursor_file="" swept_common="" rr rr_found=0 rr_after=() rr_through=()
+  local repo_cursor_file="" progress_common="" rr rr_found=0 rr_after=() rr_through=()
   [ "$trim" -eq 1 ] && phase=trim
   # Repositories rotate too: the next apply run of a phase starts with the repository after
-  # the one its budget ran out in, so a large first repository cannot keep the others from
-  # ever being examined. Same rules as the worktree cursor; an unknown one keeps the order.
+  # the last one in which it examined a worktree before its budget ran out - not merely the
+  # one it was fetching or listing, which would then be skipped again - so a large first
+  # repository cannot keep the others from ever being examined. Same rules as the worktree
+  # cursor; an unknown one keeps the order, and a phase that examined nothing writes none.
   if [ "$apply" -eq 1 ]; then
     repo_cursor_file="$(_cc_wj_state_dir)/repo-cursor-$phase"
     cursor="$(head -n 1 "$repo_cursor_file" 2>/dev/null)"
@@ -3292,8 +3294,8 @@ KEEP
     if [ "$apply" -eq 1 ]; then
       common="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
       lock="$common/cc-reaper-worktree-janitor.lock"
-      # One cursor per repository and phase, so the trim that runs first under pressure
-      # does not move where the removal sweep starts.
+      # One cursor per repository and phase, so the scheduled trim does not move where
+      # the removal sweep starts.
       cursor_file="$(_cc_wj_state_dir)/worktree-cursor-$phase-$(printf '%s' "$common" | cksum | awk '{ print $1 }')"
       lock_rc=0
       _cc_wj_lock "$lock" || lock_rc=$?
@@ -3301,7 +3303,6 @@ KEEP
         [ "$lock_rc" -eq 2 ] || skipped=1
         continue
       fi
-      swept_common="$common"
     fi
 
     # Discovery also sees ordinary clones with no linked worktree. They have nothing this
@@ -3359,6 +3360,7 @@ KEEP
         [ -n "$lock" ] && touch "$lock" 2>/dev/null
         _cc_wj_cursor_write "$cursor_file" "$wt_path"
         examined=$((examined + 1))
+        progress_common="$common"
       fi
       wt_index=$((wt_index + 1))
 
@@ -3709,7 +3711,7 @@ KEEP
   if [ "$budget_hit" -eq 1 ]; then
     echo "worktree-janitor: $phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined; kept them for the next sweep, which resumes after the last examined"
     _cc_wj_log_write "$phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined"
-    [ -n "$swept_common" ] && _cc_wj_cursor_write "$repo_cursor_file" "$swept_common"
+    [ -n "$progress_common" ] && _cc_wj_cursor_write "$repo_cursor_file" "$progress_common"
   fi
   _cc_wj_remove_private_temp "$work"
   if [ -n "${BASH_VERSION:-}" ]; then
@@ -3796,13 +3798,13 @@ _cc_wj_run() {
     printf '== worktree-janitor scheduled sweep started %s pid=%s\n' \
       "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$$"
   fi
+  _cc_wj_run_inner "$@"; rc=$?
   # Under disk pressure the scheduled sweep also trims the regenerable caches
-  # (node_modules, .next, .venv...) of the worktrees it keeps: 45 GB of them on 2026-10-05.
-  # The trim keeps the worktree and asks every gate again before each directory. It runs
-  # first, with its own budget, so the disk is freed however long the removal sweep takes.
+  # (node_modules, .next, .venv...) of the worktrees it kept: 45 GB of them on 2026-10-05.
+  # The trim keeps the worktree and asks every gate again before each directory.
   if [ "$scheduled" -eq 1 ] && [ "${CC_WJ_SCHEDULE_APPLY-}" = 1 ] &&
      [ "${CC_WJ_PRESSURE_TRIM:-1}" = 1 ] && _cc_wj_disk_pressure >/dev/null; then
-    echo "== worktree-janitor under disk pressure: trimming regenerable caches before the removal sweep"
+    echo "== worktree-janitor under disk pressure: trimming regenerable caches of kept worktrees"
     # The same repositories the sweep was given: --repo pairs pass through, nothing else.
     local trim_args=() prev=""
     for arg in "$@"; do
@@ -3813,7 +3815,6 @@ _cc_wj_run() {
     _cc_wj_run_inner --trim-regenerable --apply ${trim_args[@]+"${trim_args[@]}"} ||
       echo "== worktree-janitor pressure trim ended with status $?"
   fi
-  _cc_wj_run_inner "$@"; rc=$?
   if [ "$scheduled" -eq 1 ]; then
     printf '== worktree-janitor scheduled sweep ended %s elapsed=%ss status=%s\n' \
       "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$(( $(date +%s) - started ))" "$rc"
