@@ -2541,6 +2541,47 @@ expect_yes "budget: it resumes after the removed worktree" \
   test "$(examined "$BR_SLOG")" = "2 3"
 expect_yes "budget: and removes what the yield left" test ! -d "$BR_ROOT/wt-2" -a ! -d "$BR_ROOT/wt-3"
 
+# Repositories rotate too: a first repository that exhausts the budget every run must not
+# keep the others from ever being examined. r1 has two worktrees, r2 and r3 one each.
+RR_ROOT="$TMPDIR_ROOT/budget-repos"; mkdir -p "$RR_ROOT"
+RR_STATE="$TMPDIR_ROOT/budget-repos-state"
+for r in r1 r2 r3; do
+  git init -q --bare "$RR_ROOT/$r.git" -b main
+  git clone -q "$RR_ROOT/$r.git" "$RR_ROOT/$r" 2>/dev/null
+  echo x > "$RR_ROOT/$r/README"
+  git -C "$RR_ROOT/$r" -c user.email=t@t -c user.name=t add README
+  git -C "$RR_ROOT/$r" -c user.email=t@t -c user.name=t commit -qm base
+  git -C "$RR_ROOT/$r" push -q origin main
+  for w in w1 w2; do
+    [ "$r" = r1 ] || [ "$w" = w1 ] || continue
+    git -C "$RR_ROOT/$r" worktree add -q "$RR_ROOT/$r-$w" -b "keep-$w" origin/main 2>/dev/null
+    echo "$w" > "$RR_ROOT/$r-$w/$w"
+    git -C "$RR_ROOT/$r-$w" -c user.email=t@t -c user.name=t add "$w"
+    git -C "$RR_ROOT/$r-$w" -c user.email=t@t -c user.name=t commit -qm "$w"
+  done
+done
+run_repos() {
+  CC_WJ_STATE_DIR="$RR_STATE" CC_WJ_SWEEP_BUDGET_SECONDS=1 PATH="$BUDGET_STUBS:$STUBS_IDLE:$PATH" \
+    bash "$WJ" --repo "$RR_ROOT/r1" --repo "$RR_ROOT/r2" --repo "$RR_ROOT/r3" "$@" 2>&1
+}
+examined_rw() { sed -n 's|^  WORKTREE  .*/\(r[0-9]-w[0-9]\)$|\1|p' "$1" | paste -sd' ' -; }
+OUT_RR="$TMPDIR_ROOT/out-budget-repos.txt"
+run_repos > "$OUT_RR"
+expect_yes "repos: a report-only run sweeps every repository" test "$(examined_rw "$OUT_RR")" = "r1-w1 r1-w2 r2-w1 r3-w1"
+expect_no "repos: and writes no repository cursor" \
+  bash -c 'ls "$1" 2>/dev/null | grep -q repo-cursor' _ "$RR_STATE"
+for want in r1-w1 r2-w1 r3-w1 r1-w2; do
+  run_repos --apply > "$OUT_RR"
+  expect_yes "repos: the next run starts with the repository after the one the budget ran out in ($want)" \
+    test "$(examined_rw "$OUT_RR")" = "$want"
+done
+chmod 000 "$RR_STATE"/repo-cursor-*
+RR_RC=0; run_repos --apply > "$OUT_RR" || RR_RC=$?
+chmod 644 "$RR_STATE"/repo-cursor-* 2>/dev/null
+expect_yes "repos: an unreadable repository cursor starts with the first repository" \
+  bash -c 'case "$1" in r1-*) exit 0 ;; esac; exit 1' _ "$(examined_rw "$OUT_RR")"
+expect_yes "repos: and fails nothing" test "$RR_RC" -eq 0
+
 # ─── Scan timeouts and one retry ─────────────────────────────────────────────
 
 RETRY_STUBS="$TMPDIR_ROOT/stubs-retry"; mkdir -p "$RETRY_STUBS"

@@ -3239,7 +3239,26 @@ KEEP
   # first is examined whatever the clock says, so a phase whose setup alone outlasts the
   # budget still moves the cursor on. A yield is never a failure.
   local common cursor cursor_file phase=removal budget_hit=0 examined=0 wt_total=0 wt_index=0 elapsed=0 unexamined=0 repo_wts
+  local repo_cursor_file="" swept_common="" rr rr_found=0 rr_after=() rr_through=()
   [ "$trim" -eq 1 ] && phase=trim
+  # Repositories rotate too: the next apply run of a phase starts with the repository after
+  # the one its budget ran out in, so a large first repository cannot keep the others from
+  # ever being examined. Same rules as the worktree cursor; an unknown one keeps the order.
+  if [ "$apply" -eq 1 ]; then
+    repo_cursor_file="$(_cc_wj_state_dir)/repo-cursor-$phase"
+    cursor="$(head -n 1 "$repo_cursor_file" 2>/dev/null)"
+    if [ -n "$cursor" ]; then
+      for rr in "${repos[@]}"; do
+        if [ "$rr_found" -eq 1 ]; then
+          rr_after+=("$rr")
+        else
+          rr_through+=("$rr")
+          [ "$(git -C "$rr" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" = "$cursor" ] && rr_found=1
+        fi
+      done
+      [ "$rr_found" -eq 1 ] && repos=(${rr_after[@]+"${rr_after[@]}"} "${rr_through[@]}")
+    fi
+  fi
   # Declared once, outside the loop: zsh prints the value of an already-set local that is
   # declared again.
   local active lease landed idle referenced classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes task_done wt_idle_hours
@@ -3282,6 +3301,7 @@ KEEP
         [ "$lock_rc" -eq 2 ] || skipped=1
         continue
       fi
+      swept_common="$common"
     fi
 
     # Discovery also sees ordinary clones with no linked worktree. They have nothing this
@@ -3689,6 +3709,7 @@ KEEP
   if [ "$budget_hit" -eq 1 ]; then
     echo "worktree-janitor: $phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined; kept them for the next sweep, which resumes after the last examined"
     _cc_wj_log_write "$phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined"
+    [ -n "$swept_common" ] && _cc_wj_cursor_write "$repo_cursor_file" "$swept_common"
   fi
   _cc_wj_remove_private_temp "$work"
   if [ -n "${BASH_VERSION:-}" ]; then

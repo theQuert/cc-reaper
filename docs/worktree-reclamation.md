@@ -211,8 +211,10 @@ pattern that names no path, so the file goes on keeping its worktree.
   and exits 0. The first worktree of a phase is examined whatever the clock says, so a phase
   whose setup alone outlasts the budget still makes progress. A per-repository, per-phase
   cursor under `~/.cc-reaper/state/` (`CC_WJ_STATE_DIR`) makes the next apply run start
-  after the last worktree examined, in path order, wrapping round; report runs neither read
-  nor write it. The lock is refreshed at every worktree boundary.
+  after the last worktree examined, in path order, wrapping round, and a per-phase repository
+  cursor makes it start with the repository after the one the budget ran out in, so a large
+  first repository cannot starve the rest; report runs neither read nor write either. The
+  lock is refreshed at every worktree boundary.
 - **Freeing disk first under pressure.** A scheduled apply under disk pressure runs the trim
   phase before the removal phase, each with its own budget. Before a later cache directory
   of the same worktree the trim reuses a holder and session snapshot younger than
