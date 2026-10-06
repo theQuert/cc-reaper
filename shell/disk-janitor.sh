@@ -861,10 +861,35 @@ _cc_dj_proc_cmdlines() {
   printf '%s\n' "$out"
 }
 
+# Every path this user's processes hold: open files, working directories and running
+# binaries, one `lsof -u` for all of them. Non-zero when lsof cannot be trusted (see
+# `_cc_dj_lsof_usable`) or reports nothing, which it never does for a live user.
+_cc_dj_open_files() {
+  _cc_dj_lsof_usable || return 1
+  local out
+  out="$(lsof -u "$(id -u)" -Fn 2>/dev/null | sed -n 's/^n//p')"
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+# Is a path named by a command line (substring) or held by a process (the path or anything
+# under it)? Both spellings: lsof reports the resolved path, a command line the one it was
+# given. Usage: _cc_dj_path_in_use <path> <command lines> <open paths>
+_cc_dj_path_in_use() {
+  local real p
+  real="$(cd "$1" 2>/dev/null && pwd -P)" || real="$1"
+  for p in "$1" "$real"; do
+    case "$2" in *"$p"*) return 0 ;; esac
+    case $'\n'"$3"$'\n' in *$'\n'"$p"$'\n'*|*$'\n'"$p"/*) return 0 ;; esac
+  done
+  return 1
+}
+
 # The npm content cache (~/.npm/_cacache: `npm cache clean` removes only that). Sessions and
 # MCP servers are its only users here - CI slots keep their own inside their containers. An
-# install reading it mid-run is the one thing to wait for; `npm exec` and npx servers, which
-# run for days, are not installs and do not hold the weekly clean off.
+# install reading it mid-run is one thing to wait for; an npx cold start, an `npm exec` that
+# the install pattern rightly ignores, writes it too, so an open file under it is the other.
+# Long-running npx servers hold no cache file and do not keep the weekly clean off.
 _cc_dj_npm_cache_clean() {
   if [ "$CC_DJ_NPM_CACHE" = off ]; then
     _cc_dj_log "npm cache: off (CC_DJ_NPM_CACHE=off)"
@@ -874,34 +899,68 @@ _cc_dj_npm_cache_clean() {
     _cc_dj_skip "npm cache clean (npm not found)"
     return 0
   fi
-  local procs
+  local procs files cache="$HOME/.npm/_cacache"
   if ! procs="$(_cc_dj_proc_cmdlines)"; then
     _cc_dj_skip "npm cache clean (process listing failed)"
     return 0
   fi
   # npm's own title (`npm ci`), or node running the npm shim or npm-cli.js; flags may come
   # before the command. `.npm/` in an npx path is preceded by a dot, so it does not match.
-  if printf '%s\n' "$procs" | grep -Eq '(^|[ /])npm(-cli\.js)?( +-[^ ]+)* +(install|i|ci|update|add)( |$)'; then
+  if printf '%s\n' "$procs" | grep -Eq '(^|[ /])npm(-cli\.js)?( +-[^ ]+)* +(install|i|it|install-test|ci|cit|ic|clean-install|install-ci-test|update|up|upgrade|add)( |$)'; then
     _cc_dj_skip "npm cache clean (an npm install is running)"
+    return 0
+  fi
+  if ! files="$(_cc_dj_open_files)"; then
+    _cc_dj_skip "npm cache clean (open-file listing failed)"
+    return 0
+  fi
+  if _cc_dj_path_in_use "$cache" "" "$files"; then
+    _cc_dj_skip "npm cache clean (a process has a file open under $cache)"
     return 0
   fi
   _cc_dj_clean_target "npm cache clean" npm cache clean --force
 }
 
-# Removes the npx installs it is given, each only if it is a child of ~/.npm/_npx.
+# An npx install nothing modified within CC_DJ_NPX_TRIM_DAYS and no process names or holds.
+# Usage: _cc_dj_npx_idle <dir> <command lines> <open paths>
+_cc_dj_npx_idle() {
+  local recent
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  # A find that fails proves nothing about age.
+  recent="$(find "$1" -mmin -"$(( CC_DJ_NPX_TRIM_DAYS * 1440 ))" -print -quit 2>/dev/null)" || return 1
+  [ -z "$recent" ] || return 1
+  ! _cc_dj_path_in_use "$1" "$2" "$3"
+}
+
+# Removes the npx installs it is given, each only if it is a child of ~/.npm/_npx and still
+# idle by a fresh listing taken just before it goes - the scan may be seconds old. Renamed
+# first, in one step, to a dot-named tombstone the scan never selects, so an npx starting
+# meanwhile finds the install absent and reinstalls it rather than finding half of it.
 _cc_dj_npx_remove() {
-  local d
+  local d procs files tomb
   for d in "$@"; do
-    case "$d" in
-      "$HOME/.npm/_npx/"?*) rm -rf -- "$d" && echo "removed $d" ;;
-    esac
+    case "$d" in "$HOME/.npm/_npx/"?*) ;; *) continue ;; esac
+    if ! procs="$(_cc_dj_proc_cmdlines)" || ! files="$(_cc_dj_open_files)"; then
+      echo "kept $d (listing failed on recheck)"
+      continue
+    fi
+    if ! _cc_dj_npx_idle "$d" "$procs" "$files"; then
+      echo "kept $d (in use or modified since the scan)"
+      continue
+    fi
+    tomb="$HOME/.npm/_npx/.trash-${d##*/}-$$"
+    if [ -e "$tomb" ] || ! mv -- "$d" "$tomb"; then
+      echo "kept $d (could not rename it to $tomb)"
+      continue
+    fi
+    rm -rf -- "$tomb" && echo "removed $d"
   done
 }
 
 # npx installs, one directory per package set under ~/.npm/_npx, that nothing has modified
-# within CC_DJ_NPX_TRIM_DAYS and no running process names. Long-running MCP servers run from
-# these for days without writing to them, so age alone would delete a live server's code:
-# a command line or working directory inside the install keeps it.
+# within CC_DJ_NPX_TRIM_DAYS and no running process names or holds. Long-running MCP servers
+# run from these for days without writing to them, so age alone would delete a live server's
+# code: a command line, working directory or open file inside the install keeps it.
 _cc_dj_npx_trim() {
   case "$CC_DJ_NPX_TRIM_DAYS" in
     off)
@@ -916,30 +975,21 @@ _cc_dj_npx_trim() {
     _cc_dj_skip "npx installs (path not found: $root)"
     return 0
   fi
-  local procs cwds
+  local procs files
   if ! procs="$(_cc_dj_proc_cmdlines)"; then
     _cc_dj_skip "npx installs (process listing failed)"
     return 0
   fi
-  if ! _cc_dj_lsof_usable; then
-    _cc_dj_skip "npx installs (cannot list working directories)"
+  if ! files="$(_cc_dj_open_files)"; then
+    _cc_dj_skip "npx installs (open-file listing failed)"
     return 0
   fi
-  cwds="$(lsof -a -u "$(id -u)" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
-  local d real p named victims=()
+  # `*` skips dot-names, so a tombstone is never taken for an install.
+  local d victims=()
   for d in "$root"/*; do
-    [ -d "$d" ] && [ ! -L "$d" ] || continue
-    [ -z "$(find "$d" -mmin -"$(( CC_DJ_NPX_TRIM_DAYS * 1440 ))" -print -quit 2>/dev/null)" ] || continue
-    # Both spellings: lsof reports the resolved path, a command line the one it was given.
-    real="$(cd "$d" 2>/dev/null && pwd -P)" || continue
-    named=0
-    for p in "$d" "$real"; do
-      case "$procs" in *"$p"*) named=1 ;; esac
-      case "$(printf '\n%s\n' "$cwds")" in *$'\n'"$p"$'\n'*|*$'\n'"$p"/*) named=1 ;; esac
-    done
-    [ "$named" = 0 ] && victims+=("$d")
+    _cc_dj_npx_idle "$d" "$procs" "$files" && victims+=("$d")
   done
-  _cc_dj_clean_target "npx installs (unused ${CC_DJ_NPX_TRIM_DAYS}d+)" _cc_dj_npx_remove "${victims[@]}"
+  _cc_dj_clean_target "npx installs (unmodified ${CC_DJ_NPX_TRIM_DAYS}d+)" _cc_dj_npx_remove "${victims[@]}"
 }
 
 # The Go module cache, emptied only when the disk is short. Unlike the build cache it is not
@@ -961,10 +1011,11 @@ _cc_dj_go_modcache() {
     _cc_dj_skip "go module cache (go not found)"
     return 0
   fi
-  # As the build-cache trim, plus `go mod`, which reads and fills this cache. pgrep exits 1
-  # for no match; anything above that is a listing that failed and proves nothing.
+  # As the build-cache trim, plus the module readers: `go mod`, `get`, `list`, `work`, any of
+  # them after `-C <dir>`, and gopls, which loads modules for as long as an editor is open.
+  # pgrep exits 1 for no match; anything above that is a listing that failed and proves nothing.
   local rc=0
-  pgrep -f '(^|/)go (build|test|run|vet|install|generate|mod)( |$)|/pkg/tool/[^ ]*/(compile|link|asm|cgo)( |$)' >/dev/null 2>&1 || rc=$?
+  pgrep -f '(^|/)go( -C [^ ]+)? (build|test|run|vet|install|generate|mod|get|list|work)( |$)|(^|/)gopls( |$)|/pkg/tool/[^ ]*/(compile|link|asm|cgo)( |$)' >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
     _cc_dj_skip "go module cache (a go build or toolchain process is running)"
     return 0

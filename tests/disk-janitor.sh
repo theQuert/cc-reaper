@@ -173,6 +173,13 @@ if [ "$*" = "-axww -o command=" ]; then
   [ "${FAKE_PS_FAIL:-0}" = 1 ] && exit 1
   printf '%s\n' /sbin/launchd "ps -axww -o command="
   [ -z "${FAKE_PS_EXTRA-}" ] || printf '%s\n' "$FAKE_PS_EXTRA"
+  # FAKE_PS_LATE appears from listing number FAKE_PS_LATE_FROM on (counted in
+  # FAKE_PS_COUNTER), so a test can start a user between the scan and the removal.
+  if [ -n "${FAKE_PS_LATE-}" ]; then
+    n=$(( $(cat "$FAKE_PS_COUNTER" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$FAKE_PS_COUNTER"
+    [ "$n" -lt "${FAKE_PS_LATE_FROM:-1}" ] || printf '%s\n' "$FAKE_PS_LATE"
+  fi
   exit 0
 fi
 exec /bin/ps "$@"
@@ -186,6 +193,16 @@ cat > "$FAKE_BIN/lsof" <<'STUB'
 exec /usr/sbin/lsof "$@"
 STUB
 chmod +x "$FAKE_BIN/lsof"
+
+# mv stub: records each rename, then does it.
+MV_CAPTURE="$SANDBOX/mv_calls"
+cat > "$FAKE_BIN/mv" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$MV_CAPTURE"
+exec /bin/mv "\$@"
+STUB
+chmod +x "$FAKE_BIN/mv"
+touch "$MV_CAPTURE"
 
 # yarn stub
 cat > "$FAKE_BIN/yarn" <<STUB
@@ -280,6 +297,7 @@ _reset_captures() {
   truncate -s 0 "$TM_DELETE_CAPTURE" "$OSASCRIPT_CAPTURE" "$DOCKER_CAPTURE" \
                 "$GO_CAPTURE" "$YARN_CAPTURE" "$PIP3_CAPTURE" "$BREW_CAPTURE" \
                 "$BUN_CAPTURE" "$RM_CAPTURE" "$WORKTREE_TRIM_CAPTURE" "$NPM_CAPTURE"
+  : > "$MV_CAPTURE"
   rm -f "$SANDBOX/state/cooldown-disk" "$SANDBOX/dj.log"
 }
 
@@ -741,7 +759,8 @@ expect_yes "npm cache: and freed bytes are logged" \
 # shim, node running npm-cli.js, and an install with a flag ahead of the command.
 for line in 'npm ci' 'node /opt/homebrew/bin/npm ci' 'npm install' 'npm i left-pad' \
     'node /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js update' 'npm add x' \
-    'npm --silent install'; do
+    'npm --silent install' 'npm it' 'npm cit' 'npm install-test' 'npm install-ci-test' \
+    'npm clean-install' 'npm ic' 'npm up' 'npm upgrade x'; do
   _reset_captures
   FAKE_PS_EXTRA="$line" _run_dj --clean 80 0
   expect_no "npm cache: untouched while '$line' runs" grep -q 'cache clean' "$NPM_CAPTURE"
@@ -765,6 +784,36 @@ FAKE_PS_FAIL=1 _run_dj --clean 80 0
 expect_no "npm cache: a failed process listing touches nothing" grep -q 'cache clean' "$NPM_CAPTURE"
 expect_yes "npm cache: and is a SKIP" \
   grep -q "SKIP npm cache clean (process listing failed)" "$SANDBOX/dj.log"
+
+# An npx cold start writes the content cache from an `npm exec` process, which the install
+# pattern rightly ignores: an open file under _cacache holds the clean off. A real process
+# holding a real file, seen by the real lsof.
+mkdir -p "$FAKE_HOME/.npm/_cacache/content-v2"
+printf x > "$FAKE_HOME/.npm/_cacache/content-v2/blob"
+_reset_captures
+( exec 7<"$FAKE_HOME/.npm/_cacache/content-v2/blob"; exec sleep 300 ) &
+NPM_HOLD_PID=$!
+sleep 1
+FAKE_PS_EXTRA='npm exec @scope/mcp-server' _run_dj --clean 80 0
+kill "$NPM_HOLD_PID" 2>/dev/null || true
+wait "$NPM_HOLD_PID" 2>/dev/null || true
+expect_no "npm cache: untouched while a process holds a file open under _cacache" \
+  grep -q 'cache clean' "$NPM_CAPTURE"
+expect_yes "npm cache: an open cache file is a SKIP" \
+  grep -q "SKIP npm cache clean (a process has a file open under" "$SANDBOX/dj.log"
+expect_yes "npm cache: an open cache file is counted" test "$(_skips)" -eq "$((NPM_BASE_SKIPS + 1))"
+# Calibration: the same run without the holder cleans.
+_reset_captures
+FAKE_PS_EXTRA='npm exec @scope/mcp-server' _run_dj --clean 80 0
+expect_yes "npm cache: the same run with nothing holding the cache cleans" \
+  grep -qx 'cache clean --force' "$NPM_CAPTURE"
+rm -rf "$FAKE_HOME/.npm"
+
+_reset_captures
+FAKE_LSOF_FAIL=1 _run_dj --clean 80 0 || true
+expect_no "npm cache: a failed open-file listing touches nothing" grep -q 'cache clean' "$NPM_CAPTURE"
+expect_yes "npm cache: and is a SKIP" \
+  grep -q "SKIP npm cache clean (open-file listing failed)" "$SANDBOX/dj.log"
 
 _reset_captures
 CC_DJ_NPM_CACHE=off _run_dj --clean 80 0
@@ -791,7 +840,7 @@ _npx_fixture() {
   rm -rf "$FAKE_HOME/.npm"
   local e old
   old="$(date -v-30d +%Y%m%d%H%M)"
-  for e in aaaaaaaaaaaaaaaa mmmmmmmmmmmmmmmm cccccccccccccccc rrrrrrrrrrrrrrrr; do
+  for e in aaaaaaaaaaaaaaaa mmmmmmmmmmmmmmmm cccccccccccccccc oooooooooooooooo rrrrrrrrrrrrrrrr; do
     mkdir -p "$NPX_DIR/$e/node_modules/pkg"
     printf x > "$NPX_DIR/$e/node_modules/pkg/index.js"
     printf '{}' > "$NPX_DIR/$e/package.json"
@@ -808,18 +857,32 @@ NPX_MCP_LINE="node $NPX_DIR/mmmmmmmmmmmmmmmm/node_modules/.bin/mcp-server --stdi
 # A real process whose working directory is inside an old install, seen by the real lsof.
 ( cd "$NPX_DIR/cccccccccccccccc" && exec sleep 300 ) &
 NPX_CWD_PID=$!
+# A native binary from an install: it holds a file inside it open and no command line names it.
+( exec 7<"$NPX_DIR/oooooooooooooooo/node_modules/pkg/index.js"; exec sleep 300 ) &
+NPX_OPEN_PID=$!
+# A tombstone a previous removal left: the scan never treats it as an install.
+mkdir -p "$NPX_DIR/.trash-zzzzzzzzzzzzzzzz-1"
+touch -t "$(date -v-30d +%Y%m%d%H%M)" "$NPX_DIR/.trash-zzzzzzzzzzzzzzzz-1"
 sleep 1
 FAKE_PS_EXTRA="$NPX_MCP_LINE" _run_dj --clean 80 0
-kill "$NPX_CWD_PID" 2>/dev/null || true
-wait "$NPX_CWD_PID" 2>/dev/null || true
+kill "$NPX_CWD_PID" "$NPX_OPEN_PID" 2>/dev/null || true
+wait "$NPX_CWD_PID" "$NPX_OPEN_PID" 2>/dev/null || true
 expect_no "npx: an install untouched for 30 days and named by nothing is removed" \
   test -e "$NPX_DIR/aaaaaaaaaaaaaaaa"
 expect_yes "npx: and freed bytes are logged" \
-  grep -q "clean: target 'npx installs (unused 14d+)' done (freed=" "$SANDBOX/dj.log"
+  grep -q "clean: target 'npx installs (unmodified 14d+)' done (freed=" "$SANDBOX/dj.log"
 expect_yes "npx: an old install a running process's command line names is kept" \
   test -e "$NPX_DIR/mmmmmmmmmmmmmmmm/node_modules/pkg/index.js"
 expect_yes "npx: an old install a running process works in is kept" \
   test -e "$NPX_DIR/cccccccccccccccc/node_modules/pkg/index.js"
+expect_yes "npx: an old install a running process has a file open in is kept" \
+  test -e "$NPX_DIR/oooooooooooooooo/node_modules/pkg/index.js"
+expect_yes "npx: a removal renames the install inside _npx first, then removes it" \
+  grep -qx -- "-- $NPX_DIR/aaaaaaaaaaaaaaaa $NPX_DIR/.trash-aaaaaaaaaaaaaaaa-[0-9]*" "$MV_CAPTURE"
+expect_no "npx: no tombstone of this run is left behind" \
+  bash -c 'ls -A "$1" | grep -v "^\.trash-zzzzzzzzzzzzzzzz-1$" | grep -q "^\.trash-"' _ "$NPX_DIR"
+expect_yes "npx: an earlier tombstone is not taken for an install" \
+  bash -c 'test -d "$1/.trash-zzzzzzzzzzzzzzzz-1" && ! grep -q "trash-zzzz" "$2"' _ "$NPX_DIR" "$MV_CAPTURE"
 expect_yes "npx: an install with a file modified within the window is kept" \
   test -e "$NPX_DIR/rrrrrrrrrrrrrrrr/node_modules/pkg/index.js"
 expect_yes "npx: the _npx directory itself and the content cache stay" \
@@ -831,6 +894,19 @@ _reset_captures
 FAKE_PS_EXTRA="$NPX_MCP_LINE" _run_dj --clean 80 0
 expect_no "npx: the same install is removed once nothing works in it" \
   test -e "$NPX_DIR/cccccccccccccccc"
+expect_no "npx: and the one held open is removed once nothing holds it" \
+  test -e "$NPX_DIR/oooooooooooooooo"
+
+# Rechecked just before removal: a user that appears after the scan (listing 3 onward -
+# 1 is the npm target, 2 the npx scan) keeps the first victim, and the rest still go.
+_npx_fixture
+_reset_captures
+rm -f "$SANDBOX/ps_count"
+FAKE_PS_COUNTER="$SANDBOX/ps_count" FAKE_PS_LATE_FROM=3 \
+  FAKE_PS_LATE="node $NPX_DIR/aaaaaaaaaaaaaaaa/node_modules/.bin/x" _run_dj --clean 80 0
+expect_yes "npx: an install that came into use after the scan is kept" \
+  test -e "$NPX_DIR/aaaaaaaaaaaaaaaa/node_modules/pkg/index.js"
+expect_no "npx: the other victims of that run are still removed" test -e "$NPX_DIR/cccccccccccccccc"
 
 _npx_fixture
 _reset_captures
@@ -849,9 +925,9 @@ expect_yes "npx: and is counted" test "$(_skips)" -eq "$((NPX_BASE_SKIPS + 2))"
 _npx_fixture
 _reset_captures
 FAKE_LSOF_FAIL=1 _run_dj --clean 80 0 || true
-expect_yes "npx: an lsof that cannot list working directories removes nothing" \
+expect_yes "npx: a failed open-file listing removes nothing" \
   test -e "$NPX_DIR/aaaaaaaaaaaaaaaa/node_modules/pkg/index.js"
-expect_yes "npx: and is a SKIP" grep -q "SKIP npx installs (cannot list working directories)" "$SANDBOX/dj.log"
+expect_yes "npx: and is a SKIP" grep -q "SKIP npx installs (open-file listing failed)" "$SANDBOX/dj.log"
 
 for days in abc 0 -1 1.5; do
   _npx_fixture
@@ -896,7 +972,9 @@ for pct in 15 80; do
 done
 
 for line in 'go test ./...' 'go mod download' 'go build ./cmd/x' 'go generate ./...' \
-    '/opt/homebrew/Cellar/go/1.25/libexec/pkg/tool/darwin_arm64/compile -o x'; do
+    '/opt/homebrew/Cellar/go/1.25/libexec/pkg/tool/darwin_arm64/compile -o x' \
+    'go get example.com/m@latest' 'go list -m all' 'go work sync' 'go -C /src/app list -m all' \
+    '/opt/homebrew/bin/go -C sub mod tidy' '/Users/x/go/bin/gopls' 'gopls -remote=auto serve'; do
   _reset_captures
   FAKE_PROCS="$line" _run_dj --clean 10 0
   expect_no "go modcache: untouched under pressure while '$line' runs" grep -q 'modcache' "$GO_CAPTURE"
