@@ -3292,7 +3292,11 @@ KEEP
         # are, so a dirty tree loses nothing authored. It is still work in progress, so it
         # waits a long idle window first. Measured 2026-10-06: 55 of 90 trees were dirty,
         # and stima-api's held 31.9 GB of node_modules and .next.
-        case "$CC_WJ_TRIM_DIRTY_IDLE_HOURS" in ''|*[!0-9]*) CC_WJ_TRIM_DIRTY_IDLE_HOURS=0 ;; esac
+        # 1-5 digits, base 10: `08` is octal to $(( )), and a huge value wraps `-mmin`.
+        case "$CC_WJ_TRIM_DIRTY_IDLE_HOURS" in
+          ''|*[!0-9]*|??????*) CC_WJ_TRIM_DIRTY_IDLE_HOURS=0 ;;
+          *) CC_WJ_TRIM_DIRTY_IDLE_HOURS=$((10#$CC_WJ_TRIM_DIRTY_IDLE_HOURS)) ;;
+        esac
         if [ "$dirty" != "0" ] && { [ "$CC_WJ_TRIM_DIRTY_IDLE_HOURS" -eq 0 ] ||
              [ "$(_cc_wj_idle "$wt_path" "$CC_WJ_TRIM_DIRTY_IDLE_HOURS")" != yes ]; }; then
           printf "    classification: KEEP(unrebuildable=%s)\n" "$dirty"

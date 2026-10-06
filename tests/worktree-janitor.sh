@@ -1422,8 +1422,13 @@ OUT_DIRTY_OFF="$TMPDIR_ROOT/out-trim-dirty-off.txt"
 CC_WJ_TRIM_DIRTY_IDLE_HOURS=0 _wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable --apply > "$OUT_DIRTY_OFF"
 expect_yes "a zero window never trims a dirty tree" \
   test -d "$DIRTY_WT/node_modules"
+for bad in x 999999; do
+  CC_WJ_TRIM_DIRTY_IDLE_HOURS=$bad _wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable --apply > "$OUT_DIRTY_OFF"
+  expect_yes "a malformed window ($bad) never trims a dirty tree" \
+    test -d "$DIRTY_WT/node_modules"
+done
 OUT_DIRTY_OLD="$TMPDIR_ROOT/out-trim-dirty-old.txt"
-CC_WJ_TRIM_DIRTY_IDLE_HOURS=168 _wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable --apply > "$OUT_DIRTY_OLD"
+CC_WJ_TRIM_DIRTY_IDLE_HOURS=0168 _wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable --apply > "$OUT_DIRTY_OLD"
 expect_no "an idle dirty tree loses its node_modules" \
   test -e "$DIRTY_WT/node_modules"
 expect_yes "and keeps its untracked file" \
