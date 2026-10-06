@@ -458,6 +458,15 @@ printf '#!/usr/bin/env bash\necho "janitor $*" >> "%s"\nexit 3\n' "$ACT_CAPTURE"
 : > "$ACT_CAPTURE"; _run_act $((25 * 1048576))
 expect_yes "act: a failed trim is reported with its status" grep -q 'worktree regenerable trim (rc=3)' "$SANDBOX/dj.log"
 rm -f "$SANDBOX/state/cooldown-act"
+# The janitor yields by its own budget before this caller's kill, so it writes the cursors a
+# TERM would lose and the next act starts past the repositories this one reached.
+printf '#!/usr/bin/env bash\necho "janitor budget=${CC_WJ_SWEEP_BUDGET_SECONDS-unset}" >> "%s"\n' "$ACT_CAPTURE" > "$SANDBOX/act-janitor"
+: > "$ACT_CAPTURE"; _run_act $((25 * 1048576))
+expect_yes "act: the trim's sweep budget is half of CC_DJ_ACT_TRIM_SECONDS" grep -qx 'janitor budget=450' "$ACT_CAPTURE"
+rm -f "$SANDBOX/state/cooldown-act"
+: > "$ACT_CAPTURE"; CC_WJ_SWEEP_BUDGET_SECONDS=60 _run_act $((25 * 1048576))
+expect_yes "act: a smaller budget already set is kept" grep -qx 'janitor budget=60' "$ACT_CAPTURE"
+rm -f "$SANDBOX/state/cooldown-act"
 # A malformed setting skips the action and never aborts the hourly check.
 : > "$ACT_CAPTURE"; CC_DJ_ACT_FREE_GB=08 _run_act $((5 * 1048576))
 expect_yes "act: a floor written 08 is eight GB, not an octal error" grep -q 'go-hook' "$ACT_CAPTURE"
@@ -861,8 +870,13 @@ NPX_CWD_PID=$!
 ( exec 7<"$NPX_DIR/oooooooooooooooo/node_modules/pkg/index.js"; exec sleep 300 ) &
 NPX_OPEN_PID=$!
 # A tombstone a previous removal left: the scan never treats it as an install.
-mkdir -p "$NPX_DIR/.trash-zzzzzzzzzzzzzzzz-1"
-touch -t "$(date -v-30d +%Y%m%d%H%M)" "$NPX_DIR/.trash-zzzzzzzzzzzzzzzz-1"
+# Its removing run is still alive (this shell), so it is that run's to finish.
+NPX_LIVE_TOMB="$NPX_DIR/.trash-zzzzzzzzzzzzzzzz-$$"
+mkdir -p "$NPX_LIVE_TOMB"
+touch -t "$(date -v-30d +%Y%m%d%H%M)" "$NPX_LIVE_TOMB"
+# One a removal killed mid-way left: its process is gone, so nothing will finish it.
+sh -c 'exit 0' & NPX_DEAD_PID=$!; wait "$NPX_DEAD_PID"
+mkdir -p "$NPX_DIR/.trash-yyyyyyyyyyyyyyyy-$NPX_DEAD_PID/node_modules"
 sleep 1
 FAKE_PS_EXTRA="$NPX_MCP_LINE" _run_dj --clean 80 0
 kill "$NPX_CWD_PID" "$NPX_OPEN_PID" 2>/dev/null || true
@@ -880,9 +894,11 @@ expect_yes "npx: an old install a running process has a file open in is kept" \
 expect_yes "npx: a removal renames the install inside _npx first, then removes it" \
   grep -qx -- "-- $NPX_DIR/aaaaaaaaaaaaaaaa $NPX_DIR/.trash-aaaaaaaaaaaaaaaa-[0-9]*" "$MV_CAPTURE"
 expect_no "npx: no tombstone of this run is left behind" \
-  bash -c 'ls -A "$1" | grep -v "^\.trash-zzzzzzzzzzzzzzzz-1$" | grep -q "^\.trash-"' _ "$NPX_DIR"
-expect_yes "npx: an earlier tombstone is not taken for an install" \
-  bash -c 'test -d "$1/.trash-zzzzzzzzzzzzzzzz-1" && ! grep -q "trash-zzzz" "$2"' _ "$NPX_DIR" "$MV_CAPTURE"
+  bash -c 'ls -A "$1" | grep -v "^\.trash-zzzzzzzzzzzzzzzz-" | grep -q "^\.trash-"' _ "$NPX_DIR"
+expect_yes "npx: an earlier tombstone whose run lives is kept, not taken for an install" \
+  bash -c 'test -d "$3" && ! grep -q "trash-zzzz" "$2"' _ "$NPX_DIR" "$MV_CAPTURE" "$NPX_LIVE_TOMB"
+expect_no "npx: a tombstone whose removal died is removed" \
+  test -e "$NPX_DIR/.trash-yyyyyyyyyyyyyyyy-$NPX_DEAD_PID"
 expect_yes "npx: an install with a file modified within the window is kept" \
   test -e "$NPX_DIR/rrrrrrrrrrrrrrrr/node_modules/pkg/index.js"
 expect_yes "npx: the _npx directory itself and the content cache stay" \
