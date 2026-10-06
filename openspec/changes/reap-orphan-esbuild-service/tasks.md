@@ -1,0 +1,3 @@
+- [ ] Orphaned esbuild service pass in `shell/dev-server-reaper.py`, reusing `cwd`, `linked_worktree`, `claimed`, `stop`
+- [ ] Tests in `tests/dev-server-reaper.py`: the positive case and each negative scenario
+- [ ] README row for the dev-server reaper names the esbuild service
