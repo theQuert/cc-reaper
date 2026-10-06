@@ -64,6 +64,9 @@ Environment:
                           (default: 100; off or 0 disables it)
   CC_WJ_PRESSURE_IDLE_HOURS, CC_WJ_PRESSURE_SESSION_GRACE_HOURS
                           The idle window and session lease under pressure (default: 2)
+  CC_WJ_TRIM_DIRTY_IDLE_HOURS
+                          A worktree with uncommitted files is trimmed only after this many
+                          hours untouched (default: 168; 0 never trims a dirty worktree)
   CC_WJ_PRESSURE_TRIM     1 (default): a scheduled apply under pressure also trims the
                           regenerable caches of the worktrees it kept
   CC_WJ_SESSION_LOG       --session log (default: ~/.cc-reaper/logs/worktree-janitor-session.log)
@@ -1692,6 +1695,7 @@ _cc_wj_list_worktrees() {
 # Caches a documented command rebuilds. Kept deliberately short: an entry here is a
 # claim that losing the directory is safe, and the default for anything not named is
 # to keep the worktree, which is the direction that cannot lose work.
+CC_WJ_TRIM_DIRTY_IDLE_HOURS="${CC_WJ_TRIM_DIRTY_IDLE_HOURS:-168}"
 CC_WJ_REGENERABLE="${CC_WJ_REGENERABLE:-node_modules .next .turbo .parcel-cache .svelte-kit .nuxt .astro .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .gradle .nyc_output coverage playwright-report test-results .wrangler-dist}"
 # `.superpowers` is deliberately absent too: it holds brainstorm mockups, SDD
 # ledgers, briefs, reports and review packages - a record of decisions, which no
@@ -3284,7 +3288,17 @@ KEEP
       if [ "$trim" -eq 1 ]; then
         printf "  WORKTREE  %s\n" "$wt_path"
         printf "    branch=%s  dirty=%s  active=%s  recent=%s\n" "$branch" "$dirty" "$active" "$lease"
-        if [ "$dirty" != "0" ]; then
+        # Uncommitted files are never listed, since only ignored regenerable directories
+        # are, so a dirty tree loses nothing authored. It is still work in progress, so it
+        # waits a long idle window first. Measured 2026-10-06: 55 of 90 trees were dirty,
+        # and stima-api's held 31.9 GB of node_modules and .next.
+        # 1-5 digits, base 10: `08` is octal to $(( )), and a huge value wraps `-mmin`.
+        case "$CC_WJ_TRIM_DIRTY_IDLE_HOURS" in
+          ''|*[!0-9]*|??????*) CC_WJ_TRIM_DIRTY_IDLE_HOURS=0 ;;
+          *) CC_WJ_TRIM_DIRTY_IDLE_HOURS=$((10#$CC_WJ_TRIM_DIRTY_IDLE_HOURS)) ;;
+        esac
+        if [ "$dirty" != "0" ] && { [ "$CC_WJ_TRIM_DIRTY_IDLE_HOURS" -eq 0 ] ||
+             [ "$(_cc_wj_idle "$wt_path" "$CC_WJ_TRIM_DIRTY_IDLE_HOURS")" != yes ]; }; then
           printf "    classification: KEEP(unrebuildable=%s)\n" "$dirty"
           total_kept=$((total_kept + 1))
           continue

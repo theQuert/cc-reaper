@@ -1402,6 +1402,40 @@ expect_no "trim apply removes .next only" \
 expect_yes "trim apply leaves authored .gitignore" \
   test -f "$TRIM_WT/.gitignore"
 
+# A dirty tree: its uncommitted file is never a candidate, so only the idle window
+# decides. Fresh, it keeps everything; untouched past the window, only the caches go.
+igit worktree add -q "$IDLE_ROOT/wt-trim-dirty" -b trim-dirty origin/main 2>/dev/null
+DIRTY_WT="$IDLE_ROOT/wt-trim-dirty"
+printf 'node_modules/\n' > "$DIRTY_WT/.gitignore"
+igit -C "$DIRTY_WT" add .gitignore
+igit -C "$DIRTY_WT" commit -qm "declare dirty fixture caches"
+mkdir -p "$DIRTY_WT/node_modules/pkg"
+printf 'package\n' > "$DIRTY_WT/node_modules/pkg/index.js"
+printf 'work in progress\n' > "$DIRTY_WT/draft.txt"
+echo edited >> "$DIRTY_WT/README"
+OUT_DIRTY_FRESH="$TMPDIR_ROOT/out-trim-dirty-fresh.txt"
+CC_WJ_TRIM_DIRTY_IDLE_HOURS=168 _wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable --apply > "$OUT_DIRTY_FRESH"
+expect_yes "a recently touched dirty tree keeps its caches" \
+  test -d "$DIRTY_WT/node_modules"
+age_tree "$DIRTY_WT"
+OUT_DIRTY_OFF="$TMPDIR_ROOT/out-trim-dirty-off.txt"
+CC_WJ_TRIM_DIRTY_IDLE_HOURS=0 _wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable --apply > "$OUT_DIRTY_OFF"
+expect_yes "a zero window never trims a dirty tree" \
+  test -d "$DIRTY_WT/node_modules"
+for bad in x 999999; do
+  CC_WJ_TRIM_DIRTY_IDLE_HOURS=$bad _wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable --apply > "$OUT_DIRTY_OFF"
+  expect_yes "a malformed window ($bad) never trims a dirty tree" \
+    test -d "$DIRTY_WT/node_modules"
+done
+OUT_DIRTY_OLD="$TMPDIR_ROOT/out-trim-dirty-old.txt"
+CC_WJ_TRIM_DIRTY_IDLE_HOURS=0168 _wj_idle --repo "$IDLE_PRIMARY" --trim-regenerable --apply > "$OUT_DIRTY_OLD"
+expect_no "an idle dirty tree loses its node_modules" \
+  test -e "$DIRTY_WT/node_modules"
+expect_yes "and keeps its untracked file" \
+  test -f "$DIRTY_WT/draft.txt"
+expect_yes "and its tracked edit" \
+  grep -q edited "$DIRTY_WT/README"
+
 # The positive control: old everywhere, so it is idle - and it stays idle although the
 # janitor runs `git status` in it, which must not rewrite the index it is about to judge.
 igit worktree add -q "$IDLE_ROOT/wt-old" -b old origin/main 2>/dev/null
