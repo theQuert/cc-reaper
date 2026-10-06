@@ -34,6 +34,9 @@ Environment:
   CC_DJ_CONFIG          Overrides sourced first (default: ~/.cc-reaper/disk-janitor.conf)
   CC_DJ_GO_CACHE_TRIM_DAYS  --clean deletes go build cache entries unused this many days (default: 3);
                         `off` when another reclaimer on the host owns that cache
+  CC_DJ_NPM_CACHE       `off` stops --clean running `npm cache clean --force` (default: on)
+  CC_DJ_NPX_TRIM_DAYS   --clean removes ~/.npm/_npx installs unused this many days, or `off` (default: 14)
+  CC_DJ_GO_MODCACHE     `off` stops --clean running `go clean -modcache` under disk pressure (default: on)
   CC_DJ_HOST_TEMP_REAP  Set to 0 to stop --check reclaiming host temp (default: 1)
   CC_DJ_HOST_TEMP_IDLE_MINUTES  Idle minutes before a temp item is reclaimed (default: 60, min 30)
   CC_DJ_CHROME_CLONE_MIN_AGE_DAYS  Minimum age of a removed code-sign clone (default: 1)
@@ -63,6 +66,9 @@ CC_DJ_DISK_MIN_PCT="${CC_DJ_DISK_MIN_PCT:-15}"
 CC_DJ_TRIM_WORKTREES="${CC_DJ_TRIM_WORKTREES:-1}"
 CC_DJ_COOLDOWN_SECS="${CC_DJ_COOLDOWN_SECS:-3600}"
 CC_DJ_GO_CACHE_TRIM_DAYS="${CC_DJ_GO_CACHE_TRIM_DAYS:-3}"
+CC_DJ_NPM_CACHE="${CC_DJ_NPM_CACHE:-on}"
+CC_DJ_NPX_TRIM_DAYS="${CC_DJ_NPX_TRIM_DAYS:-14}"
+CC_DJ_GO_MODCACHE="${CC_DJ_GO_MODCACHE:-on}"
 CC_DJ_HOST_TEMP_REAP="${CC_DJ_HOST_TEMP_REAP:-1}"
 CC_DJ_HOST_TEMP_IDLE_MINUTES="${CC_DJ_HOST_TEMP_IDLE_MINUTES:-60}"
 CC_DJ_DEV_SERVER_REAP="${CC_DJ_DEV_SERVER_REAP:-report}"
@@ -845,6 +851,181 @@ _cc_dj_go_cache_trim() {
       \( -name '*-a' -o -name '*-d' \) -mmin +"$(( CC_DJ_GO_CACHE_TRIM_DAYS * 1440 ))" -delete
 }
 
+# Every process's full command line (`ww`: an MCP server's path into ~/.npm/_npx is long, and
+# a truncated one would not name the install it runs from). A listing that fails or comes
+# back empty - it always holds at least ps itself - returns non-zero, and a caller that
+# would delete on "nothing names it" must then delete nothing.
+_cc_dj_proc_cmdlines() {
+  local out
+  out="$(ps -axww -o command= 2>/dev/null)" && [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+# Every path this user's processes hold: open files, working directories and running
+# binaries, one `lsof -u` for all of them. Non-zero when lsof cannot be trusted (see
+# `_cc_dj_lsof_usable`) or reports nothing, which it never does for a live user.
+_cc_dj_open_files() {
+  _cc_dj_lsof_usable || return 1
+  local out
+  out="$(lsof -u "$(id -u)" -Fn 2>/dev/null | sed -n 's/^n//p')"
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+# Is a path named by a command line (substring) or held by a process (the path or anything
+# under it)? Both spellings: lsof reports the resolved path, a command line the one it was
+# given. Usage: _cc_dj_path_in_use <path> <command lines> <open paths>
+_cc_dj_path_in_use() {
+  local real p
+  real="$(cd "$1" 2>/dev/null && pwd -P)" || real="$1"
+  for p in "$1" "$real"; do
+    case "$2" in *"$p"*) return 0 ;; esac
+    case $'\n'"$3"$'\n' in *$'\n'"$p"$'\n'*|*$'\n'"$p"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+# The npm content cache (~/.npm/_cacache: `npm cache clean` removes only that). Sessions and
+# MCP servers are its only users here - CI slots keep their own inside their containers. An
+# install reading it mid-run is one thing to wait for; an npx cold start, an `npm exec` that
+# the install pattern rightly ignores, writes it too, so an open file under it is the other.
+# Long-running npx servers hold no cache file and do not keep the weekly clean off.
+_cc_dj_npm_cache_clean() {
+  if [ "$CC_DJ_NPM_CACHE" = off ]; then
+    _cc_dj_log "npm cache: off (CC_DJ_NPM_CACHE=off)"
+    return 0
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    _cc_dj_skip "npm cache clean (npm not found)"
+    return 0
+  fi
+  local procs files cache="$HOME/.npm/_cacache"
+  if ! procs="$(_cc_dj_proc_cmdlines)"; then
+    _cc_dj_skip "npm cache clean (process listing failed)"
+    return 0
+  fi
+  # npm's own title (`npm ci`), or node running the npm shim or npm-cli.js; flags may come
+  # before the command. `.npm/` in an npx path is preceded by a dot, so it does not match.
+  if printf '%s\n' "$procs" | grep -Eq '(^|[ /])npm(-cli\.js)?( +-[^ ]+)* +(install|i|it|install-test|ci|cit|ic|clean-install|install-ci-test|update|up|upgrade|add)( |$)'; then
+    _cc_dj_skip "npm cache clean (an npm install is running)"
+    return 0
+  fi
+  if ! files="$(_cc_dj_open_files)"; then
+    _cc_dj_skip "npm cache clean (open-file listing failed)"
+    return 0
+  fi
+  if _cc_dj_path_in_use "$cache" "" "$files"; then
+    _cc_dj_skip "npm cache clean (a process has a file open under $cache)"
+    return 0
+  fi
+  _cc_dj_clean_target "npm cache clean" npm cache clean --force
+}
+
+# An npx install nothing modified within CC_DJ_NPX_TRIM_DAYS and no process names or holds.
+# Usage: _cc_dj_npx_idle <dir> <command lines> <open paths>
+_cc_dj_npx_idle() {
+  local recent
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  # A find that fails proves nothing about age.
+  recent="$(find "$1" -mmin -"$(( CC_DJ_NPX_TRIM_DAYS * 1440 ))" -print -quit 2>/dev/null)" || return 1
+  [ -z "$recent" ] || return 1
+  ! _cc_dj_path_in_use "$1" "$2" "$3"
+}
+
+# Removes the npx installs it is given, each only if it is a child of ~/.npm/_npx and still
+# idle by a fresh listing taken just before it goes - the scan may be seconds old. Renamed
+# first, in one step, to a dot-named tombstone the scan never selects, so an npx starting
+# meanwhile finds the install absent and reinstalls it rather than finding half of it.
+_cc_dj_npx_remove() {
+  local d procs files tomb
+  for d in "$@"; do
+    case "$d" in "$HOME/.npm/_npx/"?*) ;; *) continue ;; esac
+    if ! procs="$(_cc_dj_proc_cmdlines)" || ! files="$(_cc_dj_open_files)"; then
+      echo "kept $d (listing failed on recheck)"
+      continue
+    fi
+    if ! _cc_dj_npx_idle "$d" "$procs" "$files"; then
+      echo "kept $d (in use or modified since the scan)"
+      continue
+    fi
+    tomb="$HOME/.npm/_npx/.trash-${d##*/}-$$"
+    if [ -e "$tomb" ] || ! mv -- "$d" "$tomb"; then
+      echo "kept $d (could not rename it to $tomb)"
+      continue
+    fi
+    rm -rf -- "$tomb" && echo "removed $d"
+  done
+}
+
+# npx installs, one directory per package set under ~/.npm/_npx, that nothing has modified
+# within CC_DJ_NPX_TRIM_DAYS and no running process names or holds. Long-running MCP servers
+# run from these for days without writing to them, so age alone would delete a live server's
+# code: a command line, working directory or open file inside the install keeps it.
+_cc_dj_npx_trim() {
+  case "$CC_DJ_NPX_TRIM_DAYS" in
+    off)
+      _cc_dj_log "npx installs: off (CC_DJ_NPX_TRIM_DAYS=off)"
+      return 0 ;;
+    ''|*[!0-9]*|0|0*)
+      _cc_dj_skip "npx installs (CC_DJ_NPX_TRIM_DAYS=$CC_DJ_NPX_TRIM_DAYS is not a positive whole number)"
+      return 0 ;;
+  esac
+  local root="$HOME/.npm/_npx"
+  if [ ! -d "$root" ]; then
+    _cc_dj_skip "npx installs (path not found: $root)"
+    return 0
+  fi
+  local procs files
+  if ! procs="$(_cc_dj_proc_cmdlines)"; then
+    _cc_dj_skip "npx installs (process listing failed)"
+    return 0
+  fi
+  if ! files="$(_cc_dj_open_files)"; then
+    _cc_dj_skip "npx installs (open-file listing failed)"
+    return 0
+  fi
+  # `*` skips dot-names, so a tombstone is never taken for an install.
+  local d victims=()
+  for d in "$root"/*; do
+    _cc_dj_npx_idle "$d" "$procs" "$files" && victims+=("$d")
+  done
+  _cc_dj_clean_target "npx installs (unmodified ${CC_DJ_NPX_TRIM_DAYS}d+)" _cc_dj_npx_remove "${victims[@]}"
+}
+
+# The Go module cache, emptied only when the disk is short. Unlike the build cache it is not
+# trimmed by age - go keeps no usage time per module - so the whole of it goes, and every
+# session re-downloads; that is worth it only under pressure. `go clean -modcache` and never
+# a hand-rolled removal: the cache is written read-only and go knows how to remove it.
+_cc_dj_go_modcache() {
+  if [ "$CC_DJ_GO_MODCACHE" = off ]; then
+    _cc_dj_log "go module cache: off (CC_DJ_GO_MODCACHE=off)"
+    return 0
+  fi
+  local free
+  free="$(_cc_dj_free_pct)"
+  if ! [ "$free" -lt "$CC_DJ_DISK_MIN_PCT" ] 2>/dev/null; then
+    _cc_dj_log "go module cache: not under pressure (free=${free}% >= ${CC_DJ_DISK_MIN_PCT}%), untouched"
+    return 0
+  fi
+  if ! command -v go >/dev/null 2>&1; then
+    _cc_dj_skip "go module cache (go not found)"
+    return 0
+  fi
+  # As the build-cache trim, plus the module readers: `go mod`, `get`, `list`, `work`, any of
+  # them after `-C <dir>`, and gopls, which loads modules for as long as an editor is open.
+  # pgrep exits 1 for no match; anything above that is a listing that failed and proves nothing.
+  local rc=0
+  pgrep -f '(^|/)go( -C [^ ]+)? (build|test|run|vet|install|generate|mod|get|list|work)( |$)|(^|/)gopls( |$)|/pkg/tool/[^ ]*/(compile|link|asm|cgo)( |$)' >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    _cc_dj_skip "go module cache (a go build or toolchain process is running)"
+    return 0
+  elif [ "$rc" -ne 1 ]; then
+    _cc_dj_skip "go module cache (process listing failed, rc=$rc)"
+    return 0
+  fi
+  _cc_dj_clean_target "go module cache (disk pressure)" go clean -modcache
+}
+
 # Which configured path grew, and whose it is. Free space alone says only that something
 # did, so every incident used to start with a manual `du` hunt. growth-watch.py samples a
 # rotating, budgeted subset of targets per run and prints `ALERT:growth` lines; this logs
@@ -1081,6 +1262,9 @@ _cc_dj_clean() {
     _cc_dj_skip "bun pm cache rm (bun not found)"
   fi
 
+  _cc_dj_npm_cache_clean
+  _cc_dj_npx_trim
+
   # -- Spotify cache ----------------------------------------------------------
   local spotify_cache="$HOME/Library/Caches/com.spotify.client"
   _cc_dj_clean_dir "Spotify cache" "$spotify_cache"
@@ -1139,6 +1323,9 @@ _cc_dj_clean() {
   _cc_dj_chrome_clones clean
   # Inventory only: what the builder prune above left, and the volumes nothing removes.
   _cc_dj_orbstack_report
+
+  # After every other target, so the space they freed can spare the module cache.
+  _cc_dj_go_modcache
 
   # -- TM snapshot thinning (only when below threshold) ----------------------
   free_after="$(_cc_dj_free_pct)"
