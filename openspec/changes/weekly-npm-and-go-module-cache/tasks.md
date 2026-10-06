@@ -1,3 +1,3 @@
-- [ ] npm cache target, npx age trim and pressure-only Go module cache target in `_cc_dj_clean`
-- [ ] Knobs in `config/disk-janitor.conf`; growth-targets template owners for npm and Go module caches
-- [ ] Tests in `tests/disk-janitor.sh` with fake `npm`, `go`, `ps` and free space
+- [x] npm cache target, npx age trim and pressure-only Go module cache target in `_cc_dj_clean`
+- [x] Knobs in `config/disk-janitor.conf`; growth-targets template owners for npm and Go module caches
+- [x] Tests in `tests/disk-janitor.sh` with fake `npm`, `go`, `ps` and free space

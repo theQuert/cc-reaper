@@ -53,10 +53,11 @@ BREW_CAPTURE="$SANDBOX/brew_calls"
 BUN_CAPTURE="$SANDBOX/bun_calls"
 RM_CAPTURE="$SANDBOX/rm_calls"
 WORKTREE_TRIM_CAPTURE="$SANDBOX/worktree_trim_calls"
+NPM_CAPTURE="$SANDBOX/npm_calls"
 
 touch "$TM_DELETE_CAPTURE" "$OSASCRIPT_CAPTURE" "$DOCKER_CAPTURE" \
       "$GO_CAPTURE" "$YARN_CAPTURE" "$PIP3_CAPTURE" "$BREW_CAPTURE" \
-      "$BUN_CAPTURE" "$RM_CAPTURE" "$WORKTREE_TRIM_CAPTURE"
+      "$BUN_CAPTURE" "$RM_CAPTURE" "$WORKTREE_TRIM_CAPTURE" "$NPM_CAPTURE"
 
 # We set FREE_PCT via the df stub; default below-threshold
 FREE_PCT="${FREE_PCT_OVERRIDE:-10}"
@@ -145,12 +146,46 @@ exit 0
 STUB
 chmod +x "$FAKE_BIN/go"
 
-# pgrep stub: the go cache trim stands down while a build runs. FAKE_GO_BUSY=1 is a build.
+# pgrep stub: the go targets stand down while a build runs. FAKE_GO_BUSY=1 matches any
+# pattern; FAKE_PROCS is a canned process list the pattern (last argument) is judged against,
+# so a test can tell which command lines a target treats as a build.
 cat > "$FAKE_BIN/pgrep" <<'STUB'
 #!/usr/bin/env bash
-[ "${FAKE_GO_BUSY:-0}" = 1 ]
+[ "${FAKE_GO_BUSY:-0}" = 1 ] && exit 0
+[ -n "${FAKE_PROCS-}" ] || exit 1
+printf '%s\n' "$FAKE_PROCS" | grep -Eq -- "${@: -1}"
 STUB
 chmod +x "$FAKE_BIN/pgrep"
+
+# npm stub. Never the real npm: `_run_dj` appends /opt/homebrew/bin, where it lives.
+cat > "$FAKE_BIN/npm" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$NPM_CAPTURE"
+STUB
+chmod +x "$FAKE_BIN/npm"
+
+# ps stub. The janitor's own listing shape gets a canned answer, so a real `npm install`
+# elsewhere on the host cannot change a result; anything else is the real ps.
+# FAKE_PS_FAIL=1 is a listing that fails; FAKE_PS_EXTRA lines are appended to it.
+cat > "$FAKE_BIN/ps" <<'STUB'
+#!/usr/bin/env bash
+if [ "$*" = "-axww -o command=" ]; then
+  [ "${FAKE_PS_FAIL:-0}" = 1 ] && exit 1
+  printf '%s\n' /sbin/launchd "ps -axww -o command="
+  [ -z "${FAKE_PS_EXTRA-}" ] || printf '%s\n' "$FAKE_PS_EXTRA"
+  exit 0
+fi
+exec /bin/ps "$@"
+STUB
+chmod +x "$FAKE_BIN/ps"
+
+# lsof stub: the real lsof unless FAKE_LSOF_FAIL=1, an lsof that can report nothing.
+cat > "$FAKE_BIN/lsof" <<'STUB'
+#!/usr/bin/env bash
+[ "${FAKE_LSOF_FAIL:-0}" = 1 ] && exit 1
+exec /usr/sbin/lsof "$@"
+STUB
+chmod +x "$FAKE_BIN/lsof"
 
 # yarn stub
 cat > "$FAKE_BIN/yarn" <<STUB
@@ -244,7 +279,7 @@ _run_dj() {
 _reset_captures() {
   truncate -s 0 "$TM_DELETE_CAPTURE" "$OSASCRIPT_CAPTURE" "$DOCKER_CAPTURE" \
                 "$GO_CAPTURE" "$YARN_CAPTURE" "$PIP3_CAPTURE" "$BREW_CAPTURE" \
-                "$BUN_CAPTURE" "$RM_CAPTURE" "$WORKTREE_TRIM_CAPTURE"
+                "$BUN_CAPTURE" "$RM_CAPTURE" "$WORKTREE_TRIM_CAPTURE" "$NPM_CAPTURE"
   rm -f "$SANDBOX/state/cooldown-disk" "$SANDBOX/dj.log"
 }
 
@@ -688,6 +723,205 @@ expect_no "clean, daemon unreachable: nothing beyond the probe reaches docker" \
 expect_yes "clean, daemon unreachable: the docker step is a counted skip" \
   bash -c 'grep -q "SKIP docker (daemon unreachable)" "$1" && ! grep -q "SKIPPED=0 " "$1"' \
     _ "$SANDBOX/dj.log"
+
+printf "\n# Test group 4d: --clean and the npm cache\n"
+# The SKIP count on the final line, so a test can prove a target was counted, not just logged.
+_skips() {
+  grep 'clean: finished' "$SANDBOX/dj.log" | tail -1 | grep -oE '(SKIPPED|skipped)=[0-9]+' | grep -oE '[0-9]+'
+}
+_reset_captures
+_run_dj --clean 80 0
+NPM_BASE_SKIPS="$(_skips)"
+expect_yes "npm cache: with no install running, npm cache clean --force runs" \
+  grep -qx 'cache clean --force' "$NPM_CAPTURE"
+expect_yes "npm cache: and freed bytes are logged" \
+  grep -q "clean: target 'npm cache clean' done (freed=" "$SANDBOX/dj.log"
+
+# What a running install looks like in a process list: npm's own title, node running the npm
+# shim, node running npm-cli.js, and an install with a flag ahead of the command.
+for line in 'npm ci' 'node /opt/homebrew/bin/npm ci' 'npm install' 'npm i left-pad' \
+    'node /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js update' 'npm add x' \
+    'npm --silent install'; do
+  _reset_captures
+  FAKE_PS_EXTRA="$line" _run_dj --clean 80 0
+  expect_no "npm cache: untouched while '$line' runs" grep -q 'cache clean' "$NPM_CAPTURE"
+  expect_yes "npm cache: '$line' is a SKIP" \
+    grep -q "SKIP npm cache clean (an npm install is running)" "$SANDBOX/dj.log"
+  expect_yes "npm cache: '$line' is counted" test "$(_skips)" -eq "$((NPM_BASE_SKIPS + 1))"
+done
+
+# MCP servers run from npx installs for days. They read the content cache only to install, so
+# they must not hold the weekly clean off forever.
+for line in 'npm exec @modelcontextprotocol/server-foo' \
+    "node $FAKE_HOME/.npm/_npx/0123456789abcdef/node_modules/.bin/mcp-server" \
+    'npx -y some-mcp' 'node /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js exec srv'; do
+  _reset_captures
+  FAKE_PS_EXTRA="$line" _run_dj --clean 80 0
+  expect_yes "npm cache: '$line' does not stop the clean" grep -qx 'cache clean --force' "$NPM_CAPTURE"
+done
+
+_reset_captures
+FAKE_PS_FAIL=1 _run_dj --clean 80 0
+expect_no "npm cache: a failed process listing touches nothing" grep -q 'cache clean' "$NPM_CAPTURE"
+expect_yes "npm cache: and is a SKIP" \
+  grep -q "SKIP npm cache clean (process listing failed)" "$SANDBOX/dj.log"
+
+_reset_captures
+CC_DJ_NPM_CACHE=off _run_dj --clean 80 0
+expect_no "npm cache: off runs no npm" test -s "$NPM_CAPTURE"
+expect_yes "npm cache: off says so" grep -qF "npm cache: off (CC_DJ_NPM_CACHE=off)" "$SANDBOX/dj.log"
+expect_no "npm cache: off is not a SKIP" grep -q "SKIP npm cache" "$SANDBOX/dj.log"
+expect_yes "npm cache: off is not counted" test "$(_skips)" -eq "$NPM_BASE_SKIPS"
+
+# npm absent: the same stubs minus npm, and only the system directories after them.
+NONPM_BIN="$SANDBOX/bin-nonpm"
+mkdir -p "$NONPM_BIN"
+cp "$FAKE_BIN"/* "$NONPM_BIN"/
+rm -f "$NONPM_BIN/npm"
+_reset_captures
+( FAKE_BIN="$NONPM_BIN"; PATH="$SAFE_SYS_PATH"; export CC_DJ_TOOL_DIRS=""; _run_dj --clean 80 0 ) || true
+expect_no "npm cache: npm absent runs nothing" test -s "$NPM_CAPTURE"
+expect_yes "npm cache: npm absent is a SKIP" grep -q "SKIP npm cache clean (npm not found)" "$SANDBOX/dj.log"
+expect_no "npm cache: npm absent does not report skipped=0" \
+  bash -c 'grep "clean: finished" "$1" | grep -q "skipped=0"' _ "$SANDBOX/dj.log"
+
+printf "\n# Test group 4e: --clean removes npx installs by age\n"
+NPX_DIR="$FAKE_HOME/.npm/_npx"
+_npx_fixture() {
+  rm -rf "$FAKE_HOME/.npm"
+  local e old
+  old="$(date -v-30d +%Y%m%d%H%M)"
+  for e in aaaaaaaaaaaaaaaa mmmmmmmmmmmmmmmm cccccccccccccccc rrrrrrrrrrrrrrrr; do
+    mkdir -p "$NPX_DIR/$e/node_modules/pkg"
+    printf x > "$NPX_DIR/$e/node_modules/pkg/index.js"
+    printf '{}' > "$NPX_DIR/$e/package.json"
+  done
+  # Backdated last and as a whole tree: creating a file bumps its parent's mtime.
+  find "$NPX_DIR" -exec touch -t "$old" {} +
+  # Recent: one file inside it was written just now, though the directory itself is old.
+  printf y > "$NPX_DIR/rrrrrrrrrrrrrrrr/node_modules/pkg/index.js"
+  mkdir -p "$FAKE_HOME/.npm/_cacache"
+}
+_npx_fixture
+_reset_captures
+NPX_MCP_LINE="node $NPX_DIR/mmmmmmmmmmmmmmmm/node_modules/.bin/mcp-server --stdio"
+# A real process whose working directory is inside an old install, seen by the real lsof.
+( cd "$NPX_DIR/cccccccccccccccc" && exec sleep 300 ) &
+NPX_CWD_PID=$!
+sleep 1
+FAKE_PS_EXTRA="$NPX_MCP_LINE" _run_dj --clean 80 0
+kill "$NPX_CWD_PID" 2>/dev/null || true
+wait "$NPX_CWD_PID" 2>/dev/null || true
+expect_no "npx: an install untouched for 30 days and named by nothing is removed" \
+  test -e "$NPX_DIR/aaaaaaaaaaaaaaaa"
+expect_yes "npx: and freed bytes are logged" \
+  grep -q "clean: target 'npx installs (unused 14d+)' done (freed=" "$SANDBOX/dj.log"
+expect_yes "npx: an old install a running process's command line names is kept" \
+  test -e "$NPX_DIR/mmmmmmmmmmmmmmmm/node_modules/pkg/index.js"
+expect_yes "npx: an old install a running process works in is kept" \
+  test -e "$NPX_DIR/cccccccccccccccc/node_modules/pkg/index.js"
+expect_yes "npx: an install with a file modified within the window is kept" \
+  test -e "$NPX_DIR/rrrrrrrrrrrrrrrr/node_modules/pkg/index.js"
+expect_yes "npx: the _npx directory itself and the content cache stay" \
+  bash -c 'test -d "$1/.npm/_npx" && test -d "$1/.npm/_cacache"' _ "$FAKE_HOME"
+
+# Calibration for the cwd case: without that process the same entry goes.
+_npx_fixture
+_reset_captures
+FAKE_PS_EXTRA="$NPX_MCP_LINE" _run_dj --clean 80 0
+expect_no "npx: the same install is removed once nothing works in it" \
+  test -e "$NPX_DIR/cccccccccccccccc"
+
+_npx_fixture
+_reset_captures
+NPX_BASE_SKIPS=""
+_run_dj --clean 80 0
+NPX_BASE_SKIPS="$(_skips)"
+_npx_fixture
+_reset_captures
+FAKE_PS_FAIL=1 _run_dj --clean 80 0
+expect_yes "npx: a failed process listing removes nothing" \
+  test -e "$NPX_DIR/aaaaaaaaaaaaaaaa/node_modules/pkg/index.js"
+expect_yes "npx: and is a SKIP" grep -q "SKIP npx installs (process listing failed)" "$SANDBOX/dj.log"
+# Two SKIPs: the npm cache cannot rule out an install either.
+expect_yes "npx: and is counted" test "$(_skips)" -eq "$((NPX_BASE_SKIPS + 2))"
+
+_npx_fixture
+_reset_captures
+FAKE_LSOF_FAIL=1 _run_dj --clean 80 0 || true
+expect_yes "npx: an lsof that cannot list working directories removes nothing" \
+  test -e "$NPX_DIR/aaaaaaaaaaaaaaaa/node_modules/pkg/index.js"
+expect_yes "npx: and is a SKIP" grep -q "SKIP npx installs (cannot list working directories)" "$SANDBOX/dj.log"
+
+for days in abc 0 -1 1.5; do
+  _npx_fixture
+  _reset_captures
+  CC_DJ_NPX_TRIM_DAYS="$days" _run_dj --clean 80 0
+  expect_yes "npx: retention '$days' removes nothing" test -e "$NPX_DIR/aaaaaaaaaaaaaaaa"
+  expect_yes "npx: retention '$days' is a SKIP naming it" \
+    grep -qF "SKIP npx installs (CC_DJ_NPX_TRIM_DAYS=$days is not a positive whole number)" "$SANDBOX/dj.log"
+done
+
+_npx_fixture
+_reset_captures
+CC_DJ_NPX_TRIM_DAYS=off _run_dj --clean 80 0
+expect_yes "npx: off removes nothing" test -e "$NPX_DIR/aaaaaaaaaaaaaaaa"
+expect_yes "npx: off says so" grep -qF "npx installs: off (CC_DJ_NPX_TRIM_DAYS=off)" "$SANDBOX/dj.log"
+expect_no "npx: off is not a SKIP" grep -q "SKIP npx" "$SANDBOX/dj.log"
+
+_npx_fixture
+_reset_captures
+CC_DJ_NPX_TRIM_DAYS=40 _run_dj --clean 80 0
+expect_yes "npx: a longer retention keeps a 30-day-old install" test -e "$NPX_DIR/aaaaaaaaaaaaaaaa"
+# Later groups share FAKE_HOME and compare run totals; leave no fixture behind.
+rm -rf "$FAKE_HOME/.npm"
+
+printf "\n# Test group 4f: --clean empties the Go module cache only under pressure\n"
+_reset_captures
+_run_dj --clean 10 0
+GOMOD_BASE_SKIPS="$(_skips)"
+expect_yes "go modcache: under pressure with no build, go clean -modcache runs" \
+  grep -qx 'clean -modcache' "$GO_CAPTURE"
+expect_yes "go modcache: and freed bytes are logged" \
+  grep -q "clean: target 'go module cache (disk pressure)' done (freed=" "$SANDBOX/dj.log"
+
+for pct in 15 80; do
+  _reset_captures
+  _run_dj --clean "$pct" 0
+  expect_no "go modcache: at ${pct}% free the module cache is not touched" \
+    grep -q 'modcache' "$GO_CAPTURE"
+  expect_yes "go modcache: at ${pct}% free it says why" \
+    grep -qF "go module cache: not under pressure (free=${pct}% >= 15%)" "$SANDBOX/dj.log"
+  expect_no "go modcache: at ${pct}% free it is not a SKIP" grep -q "SKIP go module cache" "$SANDBOX/dj.log"
+done
+
+for line in 'go test ./...' 'go mod download' 'go build ./cmd/x' 'go generate ./...' \
+    '/opt/homebrew/Cellar/go/1.25/libexec/pkg/tool/darwin_arm64/compile -o x'; do
+  _reset_captures
+  FAKE_PROCS="$line" _run_dj --clean 10 0
+  expect_no "go modcache: untouched under pressure while '$line' runs" grep -q 'modcache' "$GO_CAPTURE"
+  expect_yes "go modcache: '$line' is a SKIP" \
+    grep -q "SKIP go module cache (a go build or toolchain process is running)" "$SANDBOX/dj.log"
+done
+# `go mod` is a module-cache user and not a build-cache user: its SKIP is the only new one.
+_reset_captures
+FAKE_PROCS='go mod download' _run_dj --clean 10 0
+expect_yes "go modcache: the SKIP is counted" test "$(_skips)" -eq "$((GOMOD_BASE_SKIPS + 1))"
+
+_reset_captures
+FAKE_PROCS='cargo build --release' _run_dj --clean 10 0
+expect_yes "go modcache: cargo build is not a go build" grep -qx 'clean -modcache' "$GO_CAPTURE"
+
+_reset_captures
+CC_DJ_GO_MODCACHE=off _run_dj --clean 10 0
+expect_no "go modcache: off runs no go clean under pressure" grep -q 'modcache' "$GO_CAPTURE"
+expect_yes "go modcache: off says so" grep -qF "go module cache: off (CC_DJ_GO_MODCACHE=off)" "$SANDBOX/dj.log"
+expect_no "go modcache: off is not a SKIP" grep -q "SKIP go module cache" "$SANDBOX/dj.log"
+
+# The module cache is go's to remove: it is read-only on disk and `go clean -modcache` knows
+# how. The source never removes it by hand.
+expect_no "go modcache: no hand-rolled removal of pkg/mod in the source" \
+  bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -qE "rm .*pkg/mod|GOMODCACHE"' _ "$ROOT_DIR/shell/disk-janitor.sh"
 
 # ---------------------------------------------------------------------------
 # TEST 5: TM thinning only fires when below threshold AND only passes

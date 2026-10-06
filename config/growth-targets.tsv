@@ -15,7 +15,8 @@ claude-scratchpads	/private/tmp/claude-{uid}/*/*	session-scratchpads
 tmp	/private/tmp	temp
 user-caches	~/Library/Caches	caches
 xdg-cache	~/.cache	caches
-npm-cache	~/.npm	caches
+npm-cache	~/.npm	npm/cc-reaper-weekly
+go-mod-cache	~/go/pkg/mod	go/cc-reaper-weekly-pressure
 claude-transcripts	~/.claude/projects	harness-transcripts
 codex-sessions	~/.codex/sessions	harness-transcripts
 docker-images	docker:Images	docker
