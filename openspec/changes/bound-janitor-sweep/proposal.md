@@ -7,7 +7,7 @@ more than 80 minutes. A sweep holds the repository lock the whole time, so every
 in that window logged "deferred to it and removed nothing". Nothing bounds a sweep's total time:
 each bounded call (`git fetch` 180 s, machine-wide `lsof` up to 180 s, several `gh` proofs of
 30 s) is multiplied by the worktree count. The pressure trim runs only after the removal sweep,
-so the slower the sweep, the later the disk is freed, and it re-runs the machine-wide holder and
+so an unbounded sweep delays it indefinitely; it also re-runs the machine-wide holder and
 session scans before every cache directory. The `lsof` timeouts are hardcoded, so a scan that
 needs 70 s at load 60 fails and the janitor keeps everything.
 
@@ -19,8 +19,6 @@ needs 70 s at load 60 fails and the janitor keeps everything.
 - **Rotation.** A per-repository cursor under `~/.cc-reaper/state/` makes the next sweep start
   after the last worktree examined, so a bounded sweep does not re-examine the same head of the
   list every time.
-- **Trim first under pressure.** A scheduled run under disk pressure runs the trim phase before
-  the removal phase; each phase gets its own budget.
 - **Fewer rescans in trim.** Before a later cache directory in the same worktree, a holder and
   session snapshot younger than `CC_WJ_RECHECK_FRESH_SECONDS` (default 120) is reused instead of
   rescanning the machine. Removal keeps its fresh rescan.

@@ -21,8 +21,8 @@ alone outlasts the budget still makes progress.
 ### Requirement: A bounded sweep rotates where it starts
 The janitor SHALL record, per repository, the last worktree a phase examined in a cursor file
 under `~/.cc-reaper/state/`, and the next run SHALL examine worktrees after that one first and
-wrap around. It SHALL likewise record which repository a phase was sweeping when its budget ran
-out, and the next run of that phase SHALL start with the repository after it. A missing or unreadable cursor SHALL start from the beginning. Report-only runs SHALL
+wrap around. It SHALL likewise record the last repository in which a phase examined a worktree before its
+budget ran out, and the next run of that phase SHALL start with the repository after it. A missing or unreadable cursor SHALL start from the beginning. Report-only runs SHALL
 NOT write the cursor.
 
 #### Scenario: Next sweep resumes
@@ -33,13 +33,9 @@ NOT write the cursor.
 - **WHEN** a phase's budget ran out while repository R1 of R1, R2, R3 was being swept
 - **THEN** the next run of that phase starts with R2, so a large first repository cannot keep the others from ever being examined
 
-### Requirement: Trim runs first under disk pressure
-When a scheduled run is under disk pressure and the trim phase applies, the trim phase SHALL run
-before the removal phase.
-
-#### Scenario: Pressure ordering
-- **WHEN** free space is below `CC_WJ_PRESSURE_FREE_GB` during a scheduled apply run
-- **THEN** the trim phase starts before any worktree is examined for removal
+#### Scenario: Budget runs out while a repository is still being prepared
+- **WHEN** a phase examined worktrees in R1, then its budget ran out during R2's fetch or inventory, before any R2 worktree was examined
+- **THEN** the next run of that phase starts with R2
 
 ### Requirement: Scans have configurable timeouts and one retry
 The machine-wide `lsof` holder scans SHALL use `CC_WJ_LSOF_TIMEOUT_SECONDS` (default 120) and the
