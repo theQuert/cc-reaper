@@ -2427,6 +2427,221 @@ expect_yes "pressure: keeping the tree" test -f "$P_ROOT/wt-unlanded/.gitignore"
 expect_yes "pressure: and its branch" git -C "$P_ROOT/primary" show-ref --verify --quiet refs/heads/unlanded
 expect_yes "pressure: the trim stayed in the repository it was given" \
   test -d "$P2_ROOT/wt-other/node_modules"
+# The trim frees disk first, so a slow removal sweep cannot delay it.
+expect_yes "pressure: the trim phase ends before the removal phase begins" \
+  awk '/trimming regenerable caches/ && !h { h = NR } /^Summary: trimmed=/ && !t { t = NR }
+       /^Summary: removed=/ && !r { r = NR } END { exit !(h && t && r && h < t && t < r) }' "$OUT_P_SCHED"
+
+# ─── A bounded sweep ─────────────────────────────────────────────────────────
+#
+# Each lsof call takes 1.2 s, so the inventory scan alone outlasts a 1 s budget: every
+# apply run examines exactly one worktree, the progress floor, and yields on the next.
+
+BUDGET_STUBS="$TMPDIR_ROOT/stubs-budget"; mkdir -p "$BUDGET_STUBS"
+cat > "$BUDGET_STUBS/lsof" <<STUB
+#!/usr/bin/env bash
+sleep 1.2
+exec "$STUBS_IDLE/lsof" "\$@"
+STUB
+chmod +x "$BUDGET_STUBS/lsof"
+# Every touch is logged, so the lock heartbeat is visible after the lock is gone.
+TOUCH_LOG="$TMPDIR_ROOT/touch.log"
+REAL_TOUCH=$(command -v touch)
+cat > "$BUDGET_STUBS/touch" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TOUCH_LOG"
+exec "$REAL_TOUCH" "\$@"
+STUB
+chmod +x "$BUDGET_STUBS/touch"
+
+B_ROOT="$TMPDIR_ROOT/budget"; mkdir -p "$B_ROOT"
+B_STATE="$TMPDIR_ROOT/budget-state"
+git init -q --bare "$B_ROOT/origin.git" -b main
+git clone -q "$B_ROOT/origin.git" "$B_ROOT/primary" 2>/dev/null
+bgit() { git -C "$B_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$B_ROOT/primary/README"; bgit add README; bgit commit -qm base; bgit push -q origin main
+# Unlanded, so every run keeps all four and each run's order stays visible.
+for n in a b c d; do
+  bgit worktree add -q "$B_ROOT/wt-$n" -b "keep-$n" origin/main 2>/dev/null
+  echo "$n" > "$B_ROOT/wt-$n/$n"; bgit -C "$B_ROOT/wt-$n" add "$n"; bgit -C "$B_ROOT/wt-$n" commit -qm "$n"
+done
+B_LOCK="$(git -C "$B_ROOT/primary" rev-parse --path-format=absolute --git-common-dir)/cc-reaper-worktree-janitor.lock"
+
+run_budget() {
+  CC_WJ_STATE_DIR="$B_STATE" CC_WJ_SWEEP_BUDGET_SECONDS="${BUDGET:-1}" \
+    PATH="$BUDGET_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$B_ROOT/primary" "$@" 2>&1
+}
+# The worktrees a run examined, by name, in order: "a b".
+examined() { sed -n 's|^  WORKTREE  .*/wt-\(.*\)$|\1|p' "$1" | paste -sd' ' -; }
+
+OUT_B_REPORT="$TMPDIR_ROOT/out-budget-report.txt"
+run_budget > "$OUT_B_REPORT"
+expect_yes "budget: a report-only run is not bounded" test "$(examined "$OUT_B_REPORT")" = "a b c d"
+expect_no "budget: a report-only run writes no cursor" \
+  bash -c 'ls "$1" 2>/dev/null | grep -q cursor' _ "$B_STATE"
+
+for want in a b c d a; do
+  OUT_B="$TMPDIR_ROOT/out-budget-$want.txt"
+  B_RC=0
+  run_budget --apply > "$OUT_B" || B_RC=$?
+  expect_yes "budget: the next apply run resumes after the last examined, examining $want" \
+    test "$(examined "$OUT_B")" = "$want"
+  expect_yes "budget: a run that yielded on budget exits 0 ($want)" test "$B_RC" -eq 0
+  expect_yes "budget: and released the lock ($want)" test ! -e "$B_LOCK"
+done
+expect_yes "budget: the yield is said with its budget, elapsed time and unexamined count" \
+  grep -q 'budget exhausted: budget=1s elapsed=[0-9]*s unexamined=3' "$OUT_B"
+expect_yes "budget: and logged" grep -q 'budget exhausted: budget=1s elapsed=[0-9]*s unexamined=3' "$CC_WJ_LOG"
+expect_yes "budget: unexamined worktrees are kept" \
+  bash -c 'for n in a b c d; do [ -d "$1/wt-$n" ] || exit 1; done' _ "$B_ROOT"
+
+chmod 000 "$B_STATE"/*cursor*
+OUT_B_UNREAD="$TMPDIR_ROOT/out-budget-unreadable.txt"
+B_RC=0; run_budget --apply > "$OUT_B_UNREAD" || B_RC=$?
+chmod 644 "$B_STATE"/*cursor* 2>/dev/null
+expect_yes "budget: an unreadable cursor starts from the beginning" \
+  test "$(examined "$OUT_B_UNREAD")" = "a"
+expect_yes "budget: and fails nothing" test "$B_RC" -eq 0
+
+: > "$TOUCH_LOG"
+OUT_B_ALL="$TMPDIR_ROOT/out-budget-unbounded.txt"
+BUDGET=0 run_budget --apply > "$OUT_B_ALL"
+expect_yes "budget: 0 is unbounded, and wraps from the cursor" test "$(examined "$OUT_B_ALL")" = "b c d a"
+expect_no "budget: an unbounded run never yields" file_has "$OUT_B_ALL" "budget exhausted"
+expect_yes "budget: the lock is refreshed at every worktree boundary" \
+  test "$(grep -cxF -- "$B_LOCK" "$TOUCH_LOG")" -ge 4
+expect_no "budget: a malformed budget fails the run" \
+  env CC_WJ_SWEEP_BUDGET_SECONDS=x PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$B_ROOT/primary" --apply
+
+# The removal phase: past its budget it removes none of the worktrees left, and a session
+# sweep started afterwards takes the lock instead of deferring.
+BR_ROOT="$TMPDIR_ROOT/budget-removal"; mkdir -p "$BR_ROOT"
+git init -q --bare "$BR_ROOT/origin.git" -b main
+git clone -q "$BR_ROOT/origin.git" "$BR_ROOT/primary" 2>/dev/null
+brgit() { git -C "$BR_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$BR_ROOT/primary/README"; brgit add README; brgit commit -qm base; brgit push -q origin main
+for n in 1 2 3; do brgit worktree add -q "$BR_ROOT/wt-$n" -b "landed-$n" origin/main 2>/dev/null; done
+BR_LOCK="$(git -C "$BR_ROOT/primary" rev-parse --path-format=absolute --git-common-dir)/cc-reaper-worktree-janitor.lock"
+OUT_BR="$TMPDIR_ROOT/out-budget-removal.txt"
+BR_RC=0
+CC_WJ_STATE_DIR="$B_STATE" CC_WJ_SWEEP_BUDGET_SECONDS=1 PATH="$BUDGET_STUBS:$STUBS_IDLE:$PATH" \
+  bash "$WJ" --repo "$BR_ROOT/primary" --apply > "$OUT_BR" 2>&1 || BR_RC=$?
+expect_yes "budget: the removal phase finishes the worktree it started" test ! -d "$BR_ROOT/wt-1"
+expect_yes "budget: and removes none of those left" test -d "$BR_ROOT/wt-2" -a -d "$BR_ROOT/wt-3"
+expect_yes "budget: counting them" grep -q 'budget exhausted: .* unexamined=2' "$OUT_BR"
+expect_yes "budget: exiting 0" test "$BR_RC" -eq 0
+expect_yes "budget: with the lock released" test ! -e "$BR_LOCK"
+BR_SLOG="$TMPDIR_ROOT/budget-session.log"
+printf '{"session_id":"x","cwd":"%s"}\n' "$BR_ROOT/primary" |
+  CC_WJ_STATE_DIR="$B_STATE" CC_WJ_SESSION_APPLY=1 CC_WJ_SESSION_LOG="$BR_SLOG" \
+  CLAUDE_PROJECT_DIR="$BR_ROOT/primary" PATH="$STUBS_IDLE:$PATH" bash "$WJ" --session
+S_LOG="$BR_SLOG" wait_session_end 1
+expect_no "budget: a session sweep after the yield does not defer" file_has "$BR_SLOG" "deferred to it"
+expect_yes "budget: it resumes after the removed worktree" \
+  test "$(examined "$BR_SLOG")" = "2 3"
+expect_yes "budget: and removes what the yield left" test ! -d "$BR_ROOT/wt-2" -a ! -d "$BR_ROOT/wt-3"
+
+# ─── Scan timeouts and one retry ─────────────────────────────────────────────
+
+RETRY_STUBS="$TMPDIR_ROOT/stubs-retry"; mkdir -p "$RETRY_STUBS"
+LSOF_CALLS="$TMPDIR_ROOT/lsof-calls"
+export LSOF_CALLS
+# The first LSOF_SLOW_CALLS invocations outlast a 1 s bound; every call is logged.
+cat > "$RETRY_STUBS/lsof" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\$LSOF_CALLS"
+[ "\$(wc -l < "\$LSOF_CALLS")" -le "\${LSOF_SLOW_CALLS:-0}" ] && sleep 3
+exec "$STUBS_IDLE/lsof" "\$@"
+STUB
+chmod +x "$RETRY_STUBS/lsof"
+RETRY_SCAN="$TMPDIR_ROOT/retry-scan"; mkdir -p "$RETRY_SCAN"
+
+expect_yes "scan timeouts default to 120 s for lsof and 30 s for the lock registry" \
+  bash -c 'source "$1" >/dev/null 2>&1; unset CC_WJ_LSOF_TIMEOUT_SECONDS CC_WJ_LOCK_SCAN_TIMEOUT_SECONDS
+           [ "$(_cc_wj_lsof_timeout_seconds)" = 120 ] && [ "$(_cc_wj_lock_scan_timeout_seconds)" = 30 ]' _ "$WJ"
+holder_scan_with_slow() { # <slow calls>
+  : > "$LSOF_CALLS"
+  LSOF_SLOW_CALLS="$1" CC_WJ_LSOF_TIMEOUT_SECONDS=1 PATH="$RETRY_STUBS:$PATH" \
+    bash -c 'source "$1" >/dev/null 2>&1; _cc_wj_scan_holders "$2"' _ "$WJ" "$RETRY_SCAN"
+}
+expect_yes "a holder scan that times out once succeeds on its retry" holder_scan_with_slow 1
+expect_yes "  after exactly one retry" test "$(wc -l < "$LSOF_CALLS" | tr -d ' ')" -eq 3
+expect_no "a holder scan whose retry also times out fails" holder_scan_with_slow 99
+expect_yes "  after exactly two attempts" test "$(wc -l < "$LSOF_CALLS" | tr -d ' ')" -eq 2
+
+RETRY_LOCKS="$TMPDIR_ROOT/retry-codex-locks"; mkdir -p "$RETRY_LOCKS"
+lock_scan_with_slow() { # <slow calls>
+  : > "$LSOF_CALLS"
+  LSOF_SLOW_CALLS="$1" CC_WJ_LOCK_SCAN_TIMEOUT_SECONDS=1 CC_WJ_CODEX_LOCKS="$RETRY_LOCKS" \
+    PATH="$RETRY_STUBS:$PATH" bash -c 'source "$1" >/dev/null 2>&1; _cc_wj_scan_codex_sessions' _ "$WJ"
+}
+expect_yes "a lock registry scan that times out once succeeds on its retry" lock_scan_with_slow 1
+expect_no "a lock registry scan whose retry also times out fails" lock_scan_with_slow 99
+expect_yes "  after exactly two attempts" test "$(wc -l < "$LSOF_CALLS" | tr -d ' ')" -eq 2
+
+RT_ROOT="$TMPDIR_ROOT/retry"; mkdir -p "$RT_ROOT"
+git init -q --bare "$RT_ROOT/origin.git" -b main
+git clone -q "$RT_ROOT/origin.git" "$RT_ROOT/primary" 2>/dev/null
+rtgit() { git -C "$RT_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$RT_ROOT/primary/README"; rtgit add README; rtgit commit -qm base; rtgit push -q origin main
+rtgit worktree add -q "$RT_ROOT/wt-landed" -b landed origin/main 2>/dev/null
+: > "$LSOF_CALLS"
+OUT_RT_FAIL="$TMPDIR_ROOT/out-retry-fail.txt"
+LSOF_SLOW_CALLS=99 CC_WJ_LSOF_TIMEOUT_SECONDS=1 PATH="$RETRY_STUBS:$STUBS_IDLE:$PATH" \
+  bash "$WJ" --repo "$RT_ROOT/primary" --apply > "$OUT_RT_FAIL" 2>&1
+expect_yes "both attempts timing out keeps every worktree" test -d "$RT_ROOT/wt-landed"
+expect_yes "  as a failed process scan" file_has "$OUT_RT_FAIL" "the process scan failed"
+: > "$LSOF_CALLS"
+OUT_RT_OK="$TMPDIR_ROOT/out-retry-ok.txt"
+LSOF_SLOW_CALLS=1 CC_WJ_LSOF_TIMEOUT_SECONDS=1 PATH="$RETRY_STUBS:$STUBS_IDLE:$PATH" \
+  bash "$WJ" --repo "$RT_ROOT/primary" --apply > "$OUT_RT_OK" 2>&1
+expect_no "a sweep proceeds with the retry's snapshot" test -d "$RT_ROOT/wt-landed"
+for knob in CC_WJ_LSOF_TIMEOUT_SECONDS CC_WJ_LOCK_SCAN_TIMEOUT_SECONDS CC_WJ_RECHECK_FRESH_SECONDS; do
+  expect_no "a malformed $knob fails the run" \
+    env "$knob=x" PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$RT_ROOT/primary" --apply
+done
+
+# ─── Trim reuses a fresh snapshot within one worktree ───────────────────────
+
+TF_ROOT="$TMPDIR_ROOT/trim-fresh"; mkdir -p "$TF_ROOT"
+git init -q --bare "$TF_ROOT/origin.git" -b main
+git clone -q "$TF_ROOT/origin.git" "$TF_ROOT/primary" 2>/dev/null
+tfgit() { git -C "$TF_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$TF_ROOT/primary/README"; tfgit add README; tfgit commit -qm base; tfgit push -q origin main
+tfgit worktree add -q "$TF_ROOT/wt" -b trim-fresh origin/main 2>/dev/null
+TF_WT="$TF_ROOT/wt"
+printf 'node_modules/\n.next/\n' > "$TF_WT/.gitignore"; tfgit -C "$TF_WT" add .gitignore; tfgit -C "$TF_WT" commit -qm caches
+tf_caches() { mkdir -p "$TF_WT/node_modules/p" "$TF_WT/.next/c"; echo 1 > "$TF_WT/node_modules/p/i.js"; echo 1 > "$TF_WT/.next/c/d"; }
+# Holder scans in a trim run: the inventory's, then one per rescan before a directory.
+tf_trim_scans() { # [fresh seconds]
+  tf_caches; : > "$LSOF_CALLS"
+  env ${1:+CC_WJ_RECHECK_FRESH_SECONDS="$1"} PATH="$RETRY_STUBS:$STUBS_IDLE:$PATH" \
+    bash "$WJ" --repo "$TF_ROOT/primary" --trim-regenerable --apply > "$TMPDIR_ROOT/out-trim-fresh.txt" 2>&1
+  grep -c -- '-d cwd' "$LSOF_CALLS"
+}
+expect_yes "trim: a later directory reuses a snapshot younger than CC_WJ_RECHECK_FRESH_SECONDS" \
+  test "$(tf_trim_scans)" -eq 2
+expect_yes "  and both directories are trimmed" test ! -e "$TF_WT/node_modules" -a ! -e "$TF_WT/.next"
+expect_yes "trim: a snapshot as old as the window is rescanned before a later directory" \
+  test "$(tf_trim_scans 0)" -eq 3
+# The stale case still keeps the remaining directory when a holder appears on the rescan.
+TF_STUBS="$TMPDIR_ROOT/stubs-trim-fresh"; mkdir -p "$TF_STUBS"
+cat > "$TF_STUBS/lsof" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\$LSOF_CALLS"
+if [ "\$(grep -c -- '-d cwd' "\$LSOF_CALLS")" -ge 3 ]; then
+  case " \$* " in *" -d cwd "*) printf 'p1\nn/\np9\nn%s\n' "$(phys "$TF_WT")"; exit 0 ;; esac
+fi
+exec "$STUBS_IDLE/lsof" "\$@"
+STUB
+chmod +x "$TF_STUBS/lsof"
+tf_caches; : > "$LSOF_CALLS"
+OUT_TF_RACE="$TMPDIR_ROOT/out-trim-fresh-race.txt"
+CC_WJ_RECHECK_FRESH_SECONDS=0 PATH="$TF_STUBS:$STUBS_IDLE:$PATH" \
+  bash "$WJ" --repo "$TF_ROOT/primary" --trim-regenerable --apply > "$OUT_TF_RACE" 2>&1
+expect_yes "trim: a holder found by the rescan keeps the remaining directory" \
+  bash -c '[ -e "$1/node_modules" ] || [ -e "$1/.next" ]' _ "$TF_WT"
+expect_yes "  and says why" file_has "$OUT_TF_RACE" "→ kept: "
 
 # ─── Final result ─────────────────────────────────────────────────────────────
 

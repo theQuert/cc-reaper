@@ -198,7 +198,26 @@ pattern that names no path, so the file goes on keeping its worktree.
   times out on a pipe left open. Unless exactly one `cwd` parses to an absolute path that
   still resolves, only report: the one worktree you must not touch is then unknown.
 - **With every external command bounded** — `lsof`, `git fetch`, `gh` — by a timeout that kills
-  the process group. `gh` ignores `SIGALRM` and `lsof` resets its own alarms.
+  the process group. `gh` ignores `SIGALRM` and `lsof` resets its own alarms. The
+  machine-wide `lsof` scans take `CC_WJ_LSOF_TIMEOUT_SECONDS` (120) and the Codex lock
+  registry scan `CC_WJ_LOCK_SCAN_TIMEOUT_SECONDS` (30); a scan that times out is retried once
+  before it counts as failed, and a failed scan still keeps everything.
+- **With the sweep itself bounded.** Bounding each command does not bound their product with
+  the worktree count: at load 50-70 one scheduled sweep ran 5913 s, holding the lock, so every
+  SessionEnd sweep meanwhile deferred and removed nothing. Each phase of an apply run (the
+  removal sweep, the scheduled trim) stops examining worktrees after
+  `CC_WJ_SWEEP_BUDGET_SECONDS` (1800; `0` is unbounded), finishes the worktree it started,
+  releases the lock, logs `budget exhausted` with the elapsed seconds and how many it left,
+  and exits 0. The first worktree of a phase is examined whatever the clock says, so a phase
+  whose setup alone outlasts the budget still makes progress. A per-repository, per-phase
+  cursor under `~/.cc-reaper/state/` (`CC_WJ_STATE_DIR`) makes the next apply run start
+  after the last worktree examined, in path order, wrapping round; report runs neither read
+  nor write it. The lock is refreshed at every worktree boundary.
+- **Freeing disk first under pressure.** A scheduled apply under disk pressure runs the trim
+  phase before the removal phase, each with its own budget. Before a later cache directory
+  of the same worktree the trim reuses a holder and session snapshot younger than
+  `CC_WJ_RECHECK_FRESH_SECONDS` (120) instead of rescanning the machine; every claim, holder
+  and content check is still asked against it. Removal always rescans.
 
 The common hook command is:
 
