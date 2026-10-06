@@ -496,10 +496,9 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
 
 
 def orphan(rows, ports, pid, min_age, now, janitor, claims, claim_timeout=900):
-    """(why it stays, worktree) for an esbuild service; why is None when it is abandoned."""
-    ppid, pgid, _, lstart, _ = rows[pid]
-    if ppid != 1:
-        return "its parent is alive", None
+    """(why it stays, worktree) for an esbuild service reparented to launchd (the caller
+    checks; a process cannot leave launchd); why is None when it is abandoned."""
+    _, pgid, _, lstart, _ = rows[pid]
     begun = started(lstart)
     if begun is None or now - begun < min_age:
         return "younger than the minimum age", None
