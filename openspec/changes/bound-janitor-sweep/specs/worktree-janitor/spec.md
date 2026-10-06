@@ -6,11 +6,13 @@ worktrees once it has run `CC_WJ_SWEEP_BUDGET_SECONDS` (default 1800; `0` means 
 phase that stops this way SHALL release the repository lock before the run moves on or exits,
 SHALL log the budget, the elapsed seconds and the number of worktrees left unexamined, SHALL keep
 every unexamined worktree, and SHALL NOT by itself make the run exit non-zero. A worktree whose
-examination has started SHALL be finished, so a removal is never cut midway.
+examination has started SHALL be finished, so a removal is never cut midway. A phase SHALL
+examine at least one worktree before it may stop on budget, so a repository whose preparation
+alone outlasts the budget still makes progress.
 
 #### Scenario: Budget exhausted
 - **WHEN** a scheduled sweep passes its budget with worktrees left to examine
-- **THEN** it removes none of them, releases the lock, logs `budget exhausted` with the counts, and exits 0
+- **THEN** it removes none of the worktrees it did not examine, releases the lock, logs `budget exhausted` with the counts, and exits 0
 
 #### Scenario: Session sweep after a yield
 - **WHEN** a session sweep starts after a scheduled sweep yielded on budget
@@ -19,12 +21,17 @@ examination has started SHALL be finished, so a removal is never cut midway.
 ### Requirement: A bounded sweep rotates where it starts
 The janitor SHALL record, per repository, the last worktree a phase examined in a cursor file
 under `~/.cc-reaper/state/`, and the next run SHALL examine worktrees after that one first and
-wrap around. A missing or unreadable cursor SHALL start from the beginning. Report-only runs SHALL
+wrap around. It SHALL likewise record which repository a phase was sweeping when its budget ran
+out, and the next run of that phase SHALL start with the repository after it. A missing or unreadable cursor SHALL start from the beginning. Report-only runs SHALL
 NOT write the cursor.
 
 #### Scenario: Next sweep resumes
 - **WHEN** a sweep yielded after examining worktrees A and B of A, B, C, D
 - **THEN** the next sweep examines C, D, A, B in that order
+
+#### Scenario: Repositories rotate too
+- **WHEN** a phase's budget ran out while repository R1 of R1, R2, R3 was being swept
+- **THEN** the next run of that phase starts with R2, so a large first repository cannot keep the others from ever being examined
 
 ### Requirement: Trim runs first under disk pressure
 When a scheduled run is under disk pressure and the trim phase applies, the trim phase SHALL run
