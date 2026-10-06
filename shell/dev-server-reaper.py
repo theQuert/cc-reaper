@@ -47,7 +47,15 @@ A launcher tree is stopped only when every one of these holds:
 Nothing is judged by file times: a page being viewed writes no file, and a stack with
 its own ticker writes one every minute. A tree something is connected to, or that is
 published, is listed as SERVING for a person to decide on, never stopped. Every probe that fails or cannot decide
-keeps the tree. Stopping is SIGTERM to every process in the tree, then SIGKILL to those
+keeps the tree.
+
+An esbuild `--service` (the stdio build service wrangler and vite spawn) whose parent died
+is stopped too: run from a `node_modules` esbuild binary, reparented to launchd, no child,
+no socket but its dead stdio pair, the minimum age, no agent or launcher left in its process
+group, cwd in a linked worktree with no live claim. Twelve sat 5-7 days on 2026-10-06 while
+swap was 13.6 of 14.3 GB, each holding memory for a dev server that no longer existed.
+
+Stopping is SIGTERM to every process in the tree, then SIGKILL to those
 still alive after the grace period; each pid is signalled only while its start time still
 matches the scan, so a reused pid is never hit.
 """
@@ -81,6 +89,7 @@ PRESSURE_LOG = Path(os.environ.get("CC_DEV_SERVER_PRESSURE_LOG",
                                    Path.home() / "stima-watch" / "host" / "pressure.log"))
 PRESSURE_LOOKBACK = 3600
 STATE_DIR = Path.home() / ".cc-reaper" / "state" / "dev-server-idle"
+ESBUILD = re.compile(r"/node_modules/(?:\.bin|(?:.+/)?@esbuild/[^/]+/bin)/esbuild$")
 
 
 def launcher(command):
@@ -113,6 +122,13 @@ def launcher(command):
         if value is not None:
             return int(value) if value.isdigit() and 0 < int(value) < 65536 else 0
     return 0
+
+
+def esbuild_service(command):
+    """Whether argv[0] is a node_modules esbuild binary run with --service."""
+    args = command.split()
+    return bool(args and ESBUILD.search(args[0])
+                and any(a == "--service" or a.startswith("--service=") for a in args[1:]))
 
 
 def processes():
@@ -338,6 +354,24 @@ def cwd(pid):
     return Path(names[0]) if probe.returncode == 0 and len(names) == 1 else None
 
 
+def sockets(pid):
+    """Whether the process holds an internet socket, or a unix socket that listens or has a
+    peer; None when lsof cannot say. A unix socket whose peer is gone (`->(none)`, the stdio
+    pair of a service whose parent died) is neither."""
+    try:
+        probe = subprocess.run(["lsof", "-nP", "-p", str(pid), "-Ftn"],
+                               capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = probe.stdout.splitlines()
+    if probe.returncode != 0 or lines[:1] != [f"p{pid}"]:
+        return None
+    for kind, name in zip(lines, lines[1:]):
+        if kind in ("tIPv4", "tIPv6") or (kind == "tunix" and name != "n->(none)"):
+            return True
+    return False
+
+
 def linked_worktree(path):
     """The top of the linked worktree holding path; None for a primary checkout or no repo."""
     def git(*args):
@@ -461,6 +495,32 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
     return "reap", why, worktree, members, port, state
 
 
+def orphan(rows, ports, pid, min_age, now, janitor, claims, claim_timeout=900):
+    """(why it stays, worktree) for an esbuild service; why is None when it is abandoned."""
+    ppid, pgid, _, lstart, _ = rows[pid]
+    if ppid != 1:
+        return "its parent is alive", None
+    begun = started(lstart)
+    if begun is None or now - begun < min_age:
+        return "younger than the minimum age", None
+    if any(row[0] == pid for row in rows.values()):
+        return "it has a child", None
+    if any(other != pid and row[1] == pgid and (AGENT.search(row[4]) or launcher(row[4]) is not None)
+           for other, row in rows.items()):
+        return "an agent or launcher shares its process group", None
+    if ports.get(pid) or sockets(pid) is not False:
+        return "it has a socket, or the socket probe failed", None
+    where = cwd(pid)
+    worktree = linked_worktree(where) if where else None
+    if worktree is None:
+        return "not in a linked worktree", None
+    if worktree not in claims:
+        claims[worktree] = claimed(worktree, janitor, claim_timeout)
+    if claims[worktree]:
+        return "a live session claims the worktree, or the claim check failed", worktree
+    return None, worktree
+
+
 def stop(members, snapshot, grace, send=os.kill, sleep=time.sleep):
     """TERM then KILL members whose start time still matches.
 
@@ -507,8 +567,21 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
     rss_kb = 0
     claims = {}
     prune_idle(state_dir, rows)
+    orphans = []
     for root in sorted(rows):
         ppid, _, _, _, command = rows[root]
+        if ppid == 1 and esbuild_service(command):
+            why, worktree = orphan(rows, ports, root, min_age, now, janitor, claims, claim_timeout)
+            label = f"pid={root} worktree={worktree or '-'} cmd={command[:80]!r}"
+            if why:
+                print(f"KEEP {label} (esbuild service: {why})")
+                continue
+            candidates += 1
+            if apply:
+                orphans.append((root, label))
+            else:
+                print(f"CANDIDATE {label} (esbuild service with no parent; {rows[root][2] // 1024} MB)")
+            continue
         if ppid != 1 or launcher(command) is None:
             continue
         verdict, reason, worktree, members, port, state = judge(
@@ -547,6 +620,28 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
             print(f"STOPPED {label} ({reason}; {len(signalled)} processes, {size // 1024} MB{note})")
         else:
             print(f"KEEP {label} (changed before it could be stopped{note})")
+    if orphans:
+        # Rechecked like a tree, then stopped together so they share one grace period. The
+        # claim answers are reused: one janitor call per worktree per run.
+        fresh_rows, fresh = processes(), listening()
+        chosen = {}
+        for pid, label in orphans:
+            if (fresh_rows is None or fresh is None or pid not in fresh_rows
+                    or fresh_rows[pid][3] != rows[pid][3]
+                    or orphan(fresh_rows, fresh, pid, min_age, now, janitor, claims, claim_timeout)[0]):
+                print(f"KEEP {label} (changed, or unreadable, at the recheck)")
+            else:
+                chosen[pid] = label
+        signalled, denied = stop(list(chosen), {p: fresh_rows[p][3] for p in chosen}, grace,
+                                 send=send, sleep=sleep) if chosen else ([], [])
+        for pid, label in chosen.items():
+            if pid in signalled:
+                reaped += 1
+                rss_kb += rows[pid][2]
+                print(f"STOPPED {label} (esbuild service with no parent; {rows[pid][2] // 1024} MB)")
+            else:
+                print(f"KEEP {label} (changed before it could be stopped"
+                      + (", not permitted to signal it)" if pid in denied else ")"))
     print(f"dev servers: stopped={reaped}/{candidates} rss={rss_kb // 1024}MB idle-window={window}h"
           + (f" ({short_why})" if short else "") + ("" if apply else " (report only)"))
     return reaped, candidates

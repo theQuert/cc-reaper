@@ -26,7 +26,7 @@ NEW = "Sun Oct  4 11:30:00 2026"
 WT = Path("/wt/docs-m9")
 
 
-class ReaperTest(unittest.TestCase):
+class Fixture(unittest.TestCase):
     def setUp(self):
         self.rows = {}
         self.ports = {}
@@ -41,6 +41,7 @@ class ReaperTest(unittest.TestCase):
         self.state = Path(temp.name)
         self.sent = []
         self.claim_calls = []
+        self.socket_pids = set()
         for name, fake in (("processes", lambda: dict(self.rows)),
                            ("listening", lambda: dict(self.ports)),
                            ("cwd", lambda pid: self.cwds.get(pid)),
@@ -48,7 +49,8 @@ class ReaperTest(unittest.TestCase):
                            ("connected", lambda: set(self.connections) or None),
                            ("served_ports", lambda: set(self.forwarded)),
                            ("pressure", lambda: self.short),
-                           ("claimed", self.fake_claimed)):
+                           ("claimed", self.fake_claimed),
+                           ("sockets", lambda pid: pid in self.socket_pids)):
             patcher = mock.patch.object(reaper, name, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -79,6 +81,8 @@ class ReaperTest(unittest.TestCase):
     def terms(self):
         return sorted(p for p, s in self.sent if s == signal.SIGTERM)
 
+
+class ReaperTest(Fixture):
     def test_unserved_tree_is_stopped_whole(self):
         self.server(100)
         self.assertEqual(self.run_reap(), (1, 1))
@@ -506,6 +510,150 @@ class ReaperTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.run_reap()
         self.assertEqual(self.sent, [])
+
+
+ESBUILD = f"{WT}/site/node_modules/wrangler/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.27.3 --ping"
+
+
+class EsbuildTest(Fixture):
+    """An esbuild --service whose wrangler dev died, reparented to launchd."""
+
+    def esbuild(self, pid, ppid=1, pgid=None, lstart=OLD, cmd=ESBUILD, where=WT):
+        self.rows[pid] = (ppid, pgid or pid - 1, 13000, lstart, cmd)
+        self.cwds[pid] = where
+        self.worktrees[WT] = WT
+
+    def test_an_orphaned_esbuild_service_is_stopped(self):
+        self.esbuild(7171)
+        self.assertEqual(self.run_reap(), (1, 1))
+        self.assertEqual(self.terms(), [7171])
+
+    def test_report_mode_lists_it_and_signals_nothing(self):
+        self.esbuild(7171)
+        self.assertEqual(self.run_reap(apply=False), (0, 1))
+        self.assertEqual(self.sent, [])
+
+    def test_orphans_sharing_a_group_all_go_with_one_claim_check(self):
+        self.esbuild(30608, pgid=4234)
+        self.esbuild(84624, pgid=4234)
+        self.esbuild(7171)
+        self.assertEqual(self.run_reap(), (3, 3))
+        self.assertEqual(self.terms(), [7171, 30608, 84624])
+        self.assertEqual(self.claim_calls, [WT])
+
+    def test_a_dot_bin_esbuild_counts(self):
+        self.esbuild(7171, cmd=f"{WT}/node_modules/.bin/esbuild --service=0.19.2 --ping")
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_a_live_parent_keeps_it(self):
+        self.esbuild(7171, ppid=7000)
+        self.rows[7000] = (1, 7000, 10, OLD, "node /x/wrangler-dist/cli.js dev")
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_launcher_in_its_group_keeps_it(self):
+        self.esbuild(7171, pgid=7098)
+        self.rows[7098] = (1, 7098, 10, OLD, "node /x/node_modules/.bin/wrangler dev")
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_an_agent_in_its_group_keeps_it(self):
+        self.esbuild(7171, pgid=7098)
+        self.rows[7098] = (1, 7098, 10, OLD, "/Users/x/.local/bin/claude --resume abc")
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_young_one_is_kept(self):
+        self.esbuild(7171, lstart=NEW)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_socket_keeps_it(self):
+        self.esbuild(7171)
+        self.socket_pids.add(7171)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.esbuild(7171)
+        self.socket_pids.clear()
+        self.ports[7171] = {5000}
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_child_keeps_it(self):
+        self.esbuild(7171)
+        self.rows[7200] = (7171, 7200, 10, OLD, "sleep 100")
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_primary_checkout_is_kept(self):
+        self.esbuild(7171, where=Path("/repo/primary"))
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_claimed_worktree_is_kept(self):
+        self.esbuild(7171)
+        self.claims.add(WT)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_every_failed_probe_keeps_it(self):
+        self.esbuild(7171)
+        reaper.sockets.side_effect = lambda pid: None
+        self.assertEqual(self.run_reap(), (0, 0))
+        reaper.sockets.side_effect = lambda pid: False
+        del self.cwds[7171]
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.cwds[7171] = WT
+        reaper.claimed.side_effect = lambda wt, j, t=900: True   # claimed() maps failure to True
+        self.assertEqual(self.run_reap(), (0, 0))
+        reaper.claimed.side_effect = self.fake_claimed
+        reaper.processes.side_effect = lambda: None
+        with self.assertRaises(RuntimeError):
+            self.run_reap()
+        self.assertEqual(self.sent, [])
+
+    def test_a_socket_opened_by_the_recheck_keeps_it(self):
+        self.esbuild(7171)
+        calls = []
+
+        def later(pid):
+            calls.append(pid)
+            return len(calls) > 1
+        reaper.sockets.side_effect = later
+        self.assertEqual(self.run_reap(), (0, 1))
+        self.assertEqual(self.sent, [])
+
+    def test_only_an_esbuild_service_binary_matches(self):
+        for cmd in (ESBUILD,
+                    "/x/node_modules/@esbuild/linux-x64/bin/esbuild --service",
+                    "/x/node_modules/.bin/esbuild --service=0.19.2"):
+            self.assertTrue(reaper.esbuild_service(cmd), cmd)
+        for cmd in ("node /x/node_modules/.bin/esbuild --service=0.19.2",
+                    "/x/node_modules/.bin/esbuild src/index.ts --bundle",
+                    "/usr/local/bin/esbuild --service=0.19.2",
+                    f"tmux new-session -d {ESBUILD}",
+                    f"/Users/x/.local/bin/claude --bg run {ESBUILD}", ""):
+            self.assertFalse(reaper.esbuild_service(cmd), cmd)
+
+
+class SocketsTest(unittest.TestCase):
+    def run_lsof(self, stdout, rc=0):
+        with mock.patch.object(reaper.subprocess, "run", return_value=mock.Mock(returncode=rc, stdout=stdout)):
+            return reaper.sockets(7171)
+
+    def test_a_dead_stdio_socketpair_is_not_a_socket(self):
+        files = "p7171\nfcwd\ntDIR\nn/wt\nf0\ntunix\nn->(none)\nf1\ntunix\nn->(none)\nf3\ntKQUEUE\nncount=0\n"
+        self.assertFalse(self.run_lsof(files))
+        self.assertTrue(self.run_lsof(files + "f4\ntunix\nn->0x8561a0dfe2fdb8fc\n"))
+        self.assertTrue(self.run_lsof(files + "f4\ntunix\nn/tmp/x.sock\n"))
+        self.assertTrue(self.run_lsof(files + "f4\ntIPv4\nn127.0.0.1:5000\n"))
+        self.assertTrue(self.run_lsof(files + "f4\ntIPv6\nn*:5000\n"))
+
+    def test_a_failed_probe_is_unknown(self):
+        self.assertIsNone(self.run_lsof("", rc=1))
+        self.assertIsNone(self.run_lsof("p9\nfcwd\ntDIR\nn/\n"))
+        with mock.patch.object(reaper.subprocess, "run",
+                               side_effect=reaper.subprocess.TimeoutExpired("lsof", 30)):
+            self.assertIsNone(reaper.sockets(7171))
 
 
 class ClaimsTest(unittest.TestCase):
