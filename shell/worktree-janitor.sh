@@ -69,6 +69,16 @@ Environment:
                           hours untouched (default: 168; 0 never trims a dirty worktree)
   CC_WJ_PRESSURE_TRIM     1 (default): a scheduled apply under pressure also trims the
                           regenerable caches of the worktrees it kept
+  CC_WJ_SWEEP_BUDGET_SECONDS
+                          Seconds each phase of an apply run may examine worktrees before
+                          it yields to the next sweep, which resumes where it stopped
+                          (default: 1800; 0 is unbounded)
+  CC_WJ_LSOF_TIMEOUT_SECONDS, CC_WJ_LOCK_SCAN_TIMEOUT_SECONDS
+                          Bounds on the machine-wide lsof scans and the Codex lock registry
+                          scan, each retried once on a timeout (default: 120, 30)
+  CC_WJ_RECHECK_FRESH_SECONDS
+                          A trim reuses a holder/session snapshot younger than this before a
+                          later cache directory of the same worktree (default: 120)
   CC_WJ_SESSION_LOG       --session log (default: ~/.cc-reaper/logs/worktree-janitor-session.log)
   CC_WJ_CLAUDE_SESSIONS  Claude live-session registry (default: ~/.claude/sessions)
   CC_WJ_CLAUDE_PROJECTS  Claude transcript registry (default: ~/.claude/projects)
@@ -198,6 +208,28 @@ _cc_wj_fetch_timeout_seconds() {
   [ "$n" -gt 0 ] || return 1
   echo "$n"
 }
+
+# A whole number of seconds below 100000 on stdout; fails on anything else, and on 0 unless
+# $2 is `zero-ok`.
+_cc_wj_seconds() {
+  case "$1" in ''|*[!0-9]*|??????*) return 1 ;; esac
+  [ $((10#$1)) -gt 0 ] || [ "${2:-}" = zero-ok ] || return 1
+  echo $((10#$1))
+}
+
+# On 2026-10-06, at load 50-70, scheduled sweeps ran 1667 s, 5913 s and over 80 minutes,
+# holding the repository lock throughout, so every SessionEnd sweep in that window deferred
+# and removed nothing. Each phase of an apply run (the removal sweep, the scheduled trim)
+# stops examining worktrees past this budget and leaves the rest to the next sweep. 0 is
+# unbounded.
+_cc_wj_sweep_budget_seconds() { _cc_wj_seconds "${CC_WJ_SWEEP_BUDGET_SECONDS:-1800}" zero-ok; }
+# How old a holder and session snapshot may be and still decide a later cache directory of
+# the same worktree in a trim. 0 rescans before every directory.
+_cc_wj_recheck_fresh_seconds() { _cc_wj_seconds "${CC_WJ_RECHECK_FRESH_SECONDS:-120}" zero-ok; }
+# The machine-wide lsof scans: one at load 60 needed 70 s against a hardcoded 60.
+_cc_wj_lsof_timeout_seconds() { _cc_wj_seconds "${CC_WJ_LSOF_TIMEOUT_SECONDS:-120}"; }
+# The Codex writer-lock registry scan, `lsof +D` over one small directory.
+_cc_wj_lock_scan_timeout_seconds() { _cc_wj_seconds "${CC_WJ_LOCK_SCAN_TIMEOUT_SECONDS:-30}"; }
 
 # Run a command under a time bound that ends its whole process group; exit 124 on expiry.
 #
@@ -346,6 +378,17 @@ _cc_wj_discover_repos() {
 
 # ─── Holders ──────────────────────────────────────────────────────────────────
 
+# Run a bounded scan into file $2, and once more when the first attempt timed out (124):
+# under load a scan can miss one bound, and a second attempt is cheaper than a sweep that
+# keeps everything. Any other failure, or a second timeout, is final.
+_cc_wj_scan_retry() { # <seconds> <output file> <command...>
+  local secs="$1" out="$2" rc
+  shift 2
+  _cc_wj_with_timeout "$secs" "$@" > "$out" 2>/dev/null; rc=$?
+  [ "$rc" -eq 124 ] || return "$rc"
+  _cc_wj_with_timeout "$secs" "$@" > "$out" 2>/dev/null
+}
+
 # Scan every process's working directory and every open file on the machine, once, into
 # $1/cwd and $1/open as one path per line. Fails when either scan fails or comes back
 # empty.
@@ -367,10 +410,11 @@ _cc_wj_discover_repos() {
 # every non-ASCII byte is escaped the same way, and the names are decoded back to raw bytes.
 # $1/decoded exists only when they were; without perl the names stay as lsof spelled them.
 _cc_wj_scan_holders() {
-  local dir="$1" f
+  local dir="$1" f secs
   command -v lsof >/dev/null 2>&1 || return 1
-  _cc_wj_with_timeout 60 env LC_ALL=C lsof -n -P -d cwd -Fn > "$dir/cwd.raw" 2>/dev/null || return 1
-  _cc_wj_with_timeout 120 env LC_ALL=C lsof -n -P -Fn > "$dir/open.raw" 2>/dev/null || return 1
+  secs="$(_cc_wj_lsof_timeout_seconds)" || return 1
+  _cc_wj_scan_retry "$secs" "$dir/cwd.raw" env LC_ALL=C lsof -n -P -d cwd -Fn || return 1
+  _cc_wj_scan_retry "$secs" "$dir/open.raw" env LC_ALL=C lsof -n -P -Fn || return 1
   rm -f "$dir/decoded"
   if command -v perl >/dev/null 2>&1; then
     for f in cwd open; do
@@ -1031,13 +1075,19 @@ PY
 _cc_wj_scan_codex_sessions() {
   local locks="${CC_WJ_CODEX_LOCKS:-$HOME/.codex/thread-writer-locks}"
   local state="${CC_WJ_CODEX_STATE_DB:-$HOME/.codex/state_5.sqlite}"
-  local raw rc path base tid sqlite row cwd rollout resolved count lock_mtime now attempts attempt
+  local raw rc path base tid sqlite row cwd rollout resolved count lock_mtime now attempts attempt secs
   [ -e "$locks" ] || return 0
   if [ ! -d "$locks" ] || [ ! -r "$locks" ] || [ ! -x "$locks" ]; then
     _CC_WJ_ACTIVE_ERROR="the Codex writer-lock registry $locks is unreadable"
     return 1
   fi
-  raw="$(_cc_wj_with_timeout 15 lsof -n -P -Fn +D "$locks" 2>/dev/null)"; rc=$?
+  secs="$(_cc_wj_lock_scan_timeout_seconds)" || {
+    _CC_WJ_ACTIVE_ERROR="CC_WJ_LOCK_SCAN_TIMEOUT_SECONDS=${CC_WJ_LOCK_SCAN_TIMEOUT_SECONDS:-} is not a positive whole number below 100000"
+    return 1
+  }
+  # One retry on a timeout, as for the holder scans.
+  raw="$(_cc_wj_with_timeout "$secs" lsof -n -P -Fn +D "$locks" 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 124 ] && { raw="$(_cc_wj_with_timeout "$secs" lsof -n -P -Fn +D "$locks" 2>/dev/null)"; rc=$?; }
   # lsof uses 1 for a successful search with no matching open file.
   if [ "$rc" -ge 2 ]; then
     _CC_WJ_ACTIVE_ERROR="the Codex writer-lock registry $locks could not be scanned"
@@ -2064,7 +2114,8 @@ _cc_wj_regenerable_dirs() {
 
 _cc_wj_trim_regenerable() {
   local wt="$1" work="$2" apply="$3" session_grace="$4" idle_window="${5:-}" dir bytes before after list_file list_rc
-  local count=0 trimmed=0 reclaimed=0 active_rc recent_rc
+  local count=0 trimmed=0 reclaimed=0 active_rc recent_rc fresh scanned_at="" now
+  fresh="$(_cc_wj_recheck_fresh_seconds)" || fresh=0
   [ "$LSOF_OK" = yes ] || { printf 'KEEP(process-scan-unknown)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'; return 0; }
   [ "$ACTIVE_OK" = yes ] || { printf 'KEEP(session-scan-unknown)\nTRIM_RESULT count=0 trimmed=0 reclaimed=0\n'; return 0; }
   if _cc_wj_held "$work" "$wt"; then
@@ -2108,10 +2159,17 @@ _cc_wj_trim_regenerable() {
     [ "$apply" -eq 1 ] || continue
 
     # Recheck the safety boundary immediately before every directory removal.
-    # A session may start after inventory but before the first or a later cache.
-    if ! _cc_wj_scan_holders "$work" || ! _cc_wj_scan_active_sessions "$session_grace"; then
-      printf '    → kept: holder or session scan became unavailable\n'
-      break
+    # A session may start after inventory but before the first or a later cache. The
+    # machine is rescanned before the first directory of a worktree, and before a later
+    # one once that snapshot is CC_WJ_RECHECK_FRESH_SECONDS old: at load 60 each rescan
+    # costs a machine-wide lsof, once per cache directory. Every check below still runs.
+    now="$(date +%s)"
+    if [ -z "$scanned_at" ] || [ $((now - scanned_at)) -ge "$fresh" ]; then
+      if ! _cc_wj_scan_holders "$work" || ! _cc_wj_scan_active_sessions "$session_grace"; then
+        printf '    → kept: holder or session scan became unavailable\n'
+        break
+      fi
+      scanned_at="$now"
     fi
     _cc_wj_active_claim "$wt" trim; active_rc=$?
     [ "$active_rc" -eq 0 ] && { printf '    → kept: %s\n' "$_CC_WJ_ACTIVE_REASON"; break; }
@@ -2889,6 +2947,16 @@ _cc_wj_lock() {
   _cc_wj_lock_write "$lock"
 }
 
+# Best effort: a cursor that cannot be written costs only where the next sweep starts.
+_cc_wj_cursor_write() { # <cursor file> <worktree>
+  [ -n "$1" ] || return 0
+  mkdir -p "$(dirname "$1")" 2>/dev/null
+  printf '%s\n' "$2" > "$1.tmp.${_CC_WJ_RUN_PID:-$$}" 2>/dev/null &&
+    mv -f "$1.tmp.${_CC_WJ_RUN_PID:-$$}" "$1" 2>/dev/null ||
+    rm -f "$1.tmp.${_CC_WJ_RUN_PID:-$$}" 2>/dev/null
+  return 0
+}
+
 # Released only while it is still ours: after a takeover it belongs to somebody else.
 _cc_wj_unlock() {
   [ "$(cat "$1/pid" 2>/dev/null)" = "${_CC_WJ_RUN_PID:-$$}" ] && rm -f "$1/pid" "$1/cmd" && rmdir "$1" 2>/dev/null
@@ -2993,7 +3061,8 @@ _cc_wj_run_inner() {
     return 2
   fi
 
-  local idle_hours session_grace_hours abandon_hours status_timeout fetch_timeout
+  local idle_hours session_grace_hours abandon_hours status_timeout fetch_timeout sweep_budget phase_start knob
+  phase_start="$(date +%s)"
   if ! idle_hours="$(_cc_wj_idle_hours)"; then
     echo "worktree-janitor: CC_WJ_IDLE_HOURS=${CC_WJ_IDLE_HOURS:-} is not a whole number of hours below 100000; scanned and removed nothing" >&2
     return 2
@@ -3014,6 +3083,16 @@ _cc_wj_run_inner() {
     echo "worktree-janitor: CC_WJ_FETCH_TIMEOUT_SECONDS=${CC_WJ_FETCH_TIMEOUT_SECONDS:-} is not a positive whole number below 100000; scanned and removed nothing" >&2
     return 2
   fi
+  if ! sweep_budget="$(_cc_wj_sweep_budget_seconds)"; then
+    echo "worktree-janitor: CC_WJ_SWEEP_BUDGET_SECONDS=${CC_WJ_SWEEP_BUDGET_SECONDS:-} is not a whole number below 100000; scanned and removed nothing" >&2
+    return 2
+  fi
+  for knob in recheck_fresh lsof_timeout lock_scan_timeout; do
+    if ! "_cc_wj_${knob}_seconds" >/dev/null; then
+      echo "worktree-janitor: CC_WJ_$(printf '%s' "$knob" | tr '[:lower:]' '[:upper:]')_SECONDS is not a valid whole number of seconds below 100000; scanned and removed nothing" >&2
+      return 2
+    fi
+  done
 
   if [ "$claims_only" -eq 1 ]; then
     if ! _cc_wj_scan_active_sessions "$session_grace_hours"; then
@@ -3156,6 +3235,32 @@ KEEP
   fi
 
   local repo lock lock_rc skipped=0
+  # The phase budget and rotation. `examined` counts worktrees this phase started; the
+  # first is examined whatever the clock says, so a phase whose setup alone outlasts the
+  # budget still moves the cursor on. A yield is never a failure.
+  local common cursor cursor_file phase=removal budget_hit=0 examined=0 wt_total=0 wt_index=0 elapsed=0 unexamined=0 repo_wts
+  local repo_cursor_file="" progress_common="" rr rr_found=0 rr_after=() rr_through=()
+  [ "$trim" -eq 1 ] && phase=trim
+  # Repositories rotate too: the next apply run of a phase starts with the repository after
+  # the last one in which it examined a worktree before its budget ran out - not merely the
+  # one it was fetching or listing, which would then be skipped again - so a large first
+  # repository cannot keep the others from ever being examined. Same rules as the worktree
+  # cursor; an unknown one keeps the order, and a phase that examined nothing writes none.
+  if [ "$apply" -eq 1 ]; then
+    repo_cursor_file="$(_cc_wj_state_dir)/repo-cursor-$phase"
+    cursor="$(head -n 1 "$repo_cursor_file" 2>/dev/null)"
+    if [ -n "$cursor" ]; then
+      for rr in "${repos[@]}"; do
+        if [ "$rr_found" -eq 1 ]; then
+          rr_after+=("$rr")
+        else
+          rr_through+=("$rr")
+          [ "$(git -C "$rr" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" = "$cursor" ] && rr_found=1
+        fi
+      done
+      [ "$rr_found" -eq 1 ] && repos=(${rr_after[@]+"${rr_after[@]}"} "${rr_through[@]}")
+    fi
+  fi
   # Declared once, outside the loop: zsh prints the value of an already-set local that is
   # declared again.
   local active lease landed idle referenced classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes task_done wt_idle_hours
@@ -3173,9 +3278,25 @@ KEEP
       continue
     fi
 
+    if [ "$apply" -eq 1 ] && [ "$budget_hit" -eq 0 ] && [ "$sweep_budget" -gt 0 ] && [ "$examined" -gt 0 ]; then
+      elapsed=$(( $(date +%s) - phase_start ))
+      [ "$elapsed" -ge "$sweep_budget" ] && budget_hit=1
+    fi
+    # Past the budget a repository is not locked, fetched or judged, only counted.
+    if [ "$budget_hit" -eq 1 ]; then
+      repo_wts="$(git -C "$repo" worktree list --porcelain 2>/dev/null | grep -c '^worktree ')"
+      [ "${repo_wts:-0}" -gt 1 ] && unexamined=$((unexamined + repo_wts - 1))
+      continue
+    fi
+
     lock=""
+    cursor_file=""
     if [ "$apply" -eq 1 ]; then
-      lock="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/cc-reaper-worktree-janitor.lock"
+      common="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+      lock="$common/cc-reaper-worktree-janitor.lock"
+      # One cursor per repository and phase, so the scheduled trim does not move where
+      # the removal sweep starts.
+      cursor_file="$(_cc_wj_state_dir)/worktree-cursor-$phase-$(printf '%s' "$common" | cksum | awk '{ print $1 }')"
       lock_rc=0
       _cc_wj_lock "$lock" || lock_rc=$?
       if [ "$lock_rc" -ne 0 ]; then
@@ -3212,7 +3333,36 @@ KEEP
       [ -n "$lock" ] && _cc_wj_unlock "$lock"
       continue
     fi
+    # In path order, starting after the worktree the last apply run of this phase examined
+    # and wrapping round: a bounded sweep would otherwise re-examine the head of the list
+    # every time. By order rather than by name, because the last one examined is often the
+    # one it removed. A missing or unreadable cursor starts at the beginning; a report run
+    # neither reads nor writes one.
+    cursor=""
+    [ -n "$cursor_file" ] && cursor="$(head -n 1 "$cursor_file" 2>/dev/null)"
+    LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$work/inventory" |
+      CC_WJ_CURSOR="$cursor" LC_ALL=C awk -F'\t' '$1 > ENVIRON["CC_WJ_CURSOR"] { print; next }
+        { rest = rest $0 "\n" } END { printf "%s", rest }' > "$work/inventory.rotated" &&
+      mv -f "$work/inventory.rotated" "$work/inventory"
+    wt_total="$(wc -l < "$work/inventory" | tr -d ' ')"
+    wt_index=0
     while IFS=$'\t' read -r wt_path branch dirty ahead push_state pins; do
+      if [ "$apply" -eq 1 ]; then
+        if [ "$sweep_budget" -gt 0 ] && [ "$examined" -gt 0 ]; then
+          elapsed=$(( $(date +%s) - phase_start ))
+          if [ "$elapsed" -ge "$sweep_budget" ]; then
+            budget_hit=1
+            unexamined=$((unexamined + wt_total - wt_index))
+            break
+          fi
+        fi
+        # The heartbeat: a sweep that is still deciding is not a dead holder.
+        [ -n "$lock" ] && touch "$lock" 2>/dev/null
+        _cc_wj_cursor_write "$cursor_file" "$wt_path"
+        examined=$((examined + 1))
+        progress_common="$common"
+      fi
+      wt_index=$((wt_index + 1))
 
       if [ "$dirty" = "UNSAFE-PATH" ]; then
         printf "  WORKTREE  %s\n" "$wt_path"
@@ -3558,6 +3708,11 @@ KEEP
 
     [ -n "$lock" ] && _cc_wj_unlock "$lock"
   done
+  if [ "$budget_hit" -eq 1 ]; then
+    echo "worktree-janitor: $phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined; kept them for the next sweep, which resumes after the last examined"
+    _cc_wj_log_write "$phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined"
+    [ -n "$progress_common" ] && _cc_wj_cursor_write "$repo_cursor_file" "$progress_common"
+  fi
   _cc_wj_remove_private_temp "$work"
   if [ -n "${BASH_VERSION:-}" ]; then
     trap - INT TERM HUP

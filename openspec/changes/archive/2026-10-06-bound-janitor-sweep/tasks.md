@@ -1,0 +1,5 @@
+- [x] Sweep budget per phase, lock release on yield, exit 0, unexamined kept; lock refreshed at every worktree boundary
+- [x] Per-repository rotation cursor under `~/.cc-reaper/state/`, written only by apply runs
+- [x] Trim recheck reuses a snapshot younger than `CC_WJ_RECHECK_FRESH_SECONDS`
+- [x] `CC_WJ_LSOF_TIMEOUT_SECONDS`, `CC_WJ_LOCK_SCAN_TIMEOUT_SECONDS`, one retry on timeout
+- [x] Tests in `tests/worktree-janitor.sh`; knobs in `config/worktree-janitor.conf` and `docs/worktree-reclamation.md`
