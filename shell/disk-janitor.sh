@@ -358,9 +358,10 @@ _cc_dj_low_disk_act() {
     # The janitor yields by its own sweep budget at half the bound, so it writes its cursors
     # and releases its lock; the kill at the bound then only catches one worktree that hung.
     # A TERM loses the repository cursor, and every act would restart in the same repository.
-    budget=$(( trim_s / 2 ))
+    # The janitor reads 0 as unbounded, so neither the halved bound nor a caller's 0 may pass one.
+    budget=$(( trim_s / 2 )); [ "$budget" -ge 1 ] || budget=1
     case "${CC_WJ_SWEEP_BUDGET_SECONDS:-}" in
-      ''|*[!0-9]*) ;;
+      ''|*[!0-9]*|0|00*) ;;
       *) [ "$((10#$CC_WJ_SWEEP_BUDGET_SECONDS))" -lt "$budget" ] && budget=$((10#$CC_WJ_SWEEP_BUDGET_SECONDS)) ;;
     esac
     rc=0; _cc_dj_run_bounded "$trim_s" env CC_WJ_SWEEP_BUDGET_SECONDS="$budget" "$janitor" --trim-regenerable --apply >/dev/null 2>&1 || rc=$?

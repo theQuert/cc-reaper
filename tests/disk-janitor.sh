@@ -467,6 +467,12 @@ rm -f "$SANDBOX/state/cooldown-act"
 : > "$ACT_CAPTURE"; CC_WJ_SWEEP_BUDGET_SECONDS=60 _run_act $((25 * 1048576))
 expect_yes "act: a smaller budget already set is kept" grep -qx 'janitor budget=60' "$ACT_CAPTURE"
 rm -f "$SANDBOX/state/cooldown-act"
+: > "$ACT_CAPTURE"; CC_WJ_SWEEP_BUDGET_SECONDS=0 _run_act $((25 * 1048576))
+expect_yes "act: a caller's 0, which the janitor reads as unbounded, does not lift the cap" grep -qx 'janitor budget=450' "$ACT_CAPTURE"
+rm -f "$SANDBOX/state/cooldown-act"
+: > "$ACT_CAPTURE"; CC_DJ_ACT_TRIM_SECONDS=1 _run_act $((25 * 1048576))
+expect_yes "act: a 1-second bound still gives a bounded sweep" grep -qx 'janitor budget=1' "$ACT_CAPTURE"
+rm -f "$SANDBOX/state/cooldown-act"
 # A malformed setting skips the action and never aborts the hourly check.
 : > "$ACT_CAPTURE"; CC_DJ_ACT_FREE_GB=08 _run_act $((5 * 1048576))
 expect_yes "act: a floor written 08 is eight GB, not an octal error" grep -q 'go-hook' "$ACT_CAPTURE"
