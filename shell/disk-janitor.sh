@@ -45,7 +45,8 @@ Environment:
   CC_DJ_DEV_SERVER_MIN_HOURS  Never judge a dev server younger than this (default: 6)
   CC_DJ_ACT_FREE_GB     --check acts below this many free GB, or `off` (default: 30)
   CC_DJ_ACT_COOLDOWN_SECS  Seconds between two low-disk actions (default: 10800)
-  CC_DJ_ACT_TRIM_SECONDS   Bound on the worktree regenerable trim it runs (default: 900)
+  CC_DJ_ACT_TRIM_SECONDS   Bound on the worktree regenerable trim it runs (default: 900); the
+                           janitor gets half of it as CC_WJ_SWEEP_BUDGET_SECONDS
   CC_DJ_ALERT_ISSUE     owner/repo#N to comment on after acting; unset = log only
   CC_DJ_GROWTH_TARGETS  Growth targets for --check (default: ~/.cc-reaper/growth-targets.tsv)
   CC_DJ_GROWTH_INTERVAL_HOURS / _BUDGET_SECONDS / _WINDOW_HOURS / _ALERT_GB / _KEY_TIMEOUT
@@ -316,7 +317,7 @@ _cc_dj_run_bounded() {
 # to CC_DJ_ALERT_ISSUE, where a person reads it; the desktop notification stays as well.
 _cc_dj_low_disk_act() {
   local free_kb="$1" lock="$CC_DJ_STATE_DIR/low-disk-act.lock" before after step_before rc body hook janitor
-  local v floor_gb trim_s cool_s
+  local v floor_gb trim_s cool_s budget
   [ "$CC_DJ_ACT_FREE_GB" = off ] && return 0
   # A bad value logs and skips the action; it never aborts the rest of the hourly check.
   for v in CC_DJ_ACT_FREE_GB CC_DJ_ACT_TRIM_SECONDS CC_DJ_ACT_COOLDOWN_SECS; do
@@ -354,7 +355,16 @@ _cc_dj_low_disk_act() {
   janitor="${CC_DJ_ACT_WORKTREE_JANITOR:-$HOME/.cc-reaper/worktree-janitor.sh}"
   step_before="$(_cc_dj_free_kb)"
   if [ "$CC_DJ_TRIM_WORKTREES" = 1 ] && [ -x "$janitor" ]; then
-    rc=0; _cc_dj_run_bounded "$trim_s" "$janitor" --trim-regenerable --apply >/dev/null 2>&1 || rc=$?
+    # The janitor yields by its own sweep budget at half the bound, so it writes its cursors
+    # and releases its lock; the kill at the bound then only catches one worktree that hung.
+    # A TERM loses the repository cursor, and every act would restart in the same repository.
+    # The janitor reads 0 as unbounded, so neither the halved bound nor a caller's 0 may pass one.
+    budget=$(( trim_s / 2 )); [ "$budget" -ge 1 ] || budget=1
+    case "${CC_WJ_SWEEP_BUDGET_SECONDS:-}" in
+      ''|*[!0-9]*|0|00*) ;;
+      *) [ "$((10#$CC_WJ_SWEEP_BUDGET_SECONDS))" -lt "$budget" ] && budget=$((10#$CC_WJ_SWEEP_BUDGET_SECONDS)) ;;
+    esac
+    rc=0; _cc_dj_run_bounded "$trim_s" env CC_WJ_SWEEP_BUDGET_SECONDS="$budget" "$janitor" --trim-regenerable --apply >/dev/null 2>&1 || rc=$?
     case "$rc" in 0) rc=done ;; 124) rc="stopped after ${trim_s}s" ;; *) rc="rc=$rc" ;; esac
     body="$body"$'\n'"- worktree regenerable trim ($rc): $(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before )))"
   else
@@ -984,8 +994,15 @@ _cc_dj_npx_trim() {
     _cc_dj_skip "npx installs (open-file listing failed)"
     return 0
   fi
-  # `*` skips dot-names, so a tombstone is never taken for an install.
+  # A tombstone whose removing process is gone was left by a run killed mid-removal; nothing
+  # else will finish it. One whose process lives is still being removed.
   local d victims=()
+  for d in "$root"/.trash-*-[0-9]*; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    case "${d##*-}" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "${d##*-}" 2>/dev/null || rm -rf -- "$d"
+  done
+  # `*` skips dot-names, so a tombstone is never taken for an install.
   for d in "$root"/*; do
     _cc_dj_npx_idle "$d" "$procs" "$files" && victims+=("$d")
   done

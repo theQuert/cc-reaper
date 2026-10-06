@@ -361,8 +361,9 @@ The weekly clean SHALL remove a direct child of `~/.npm/_npx` only when nothing 
 modified within `CC_DJ_NPX_TRIM_DAYS` days (default 14) and no running process's command line,
 working directory or open file is inside it. Each entry SHALL be rechecked immediately before
 it is removed, and removed by first renaming it out of `~/.npm/_npx` in one step, so a later
-npx sees it absent rather than half removed. A process or open-file listing that fails SHALL
-remove nothing. A value
+npx sees it absent rather than half removed. A tombstone whose removing process is no longer
+running SHALL be removed by the next clean; one whose process still runs SHALL be kept. A process
+or open-file listing that fails SHALL remove nothing. A value
 that is not a positive whole number and not `off` SHALL remove nothing and log `SKIP` naming it.
 
 #### Scenario: An old, unused install
@@ -380,6 +381,10 @@ that is not a positive whole number and not `off` SHALL remove nothing and log `
 #### Scenario: A recent install
 - **WHEN** an `_npx` entry was modified within the window
 - **THEN** it is kept
+
+#### Scenario: A removal was killed after the rename
+- **WHEN** `~/.npm/_npx` holds a `.trash-<entry>-<pid>` tombstone and no process `<pid>` runs
+- **THEN** the next clean removes it, and a tombstone whose `<pid>` runs is kept
 
 ### Requirement: The Go module cache is emptied only under disk pressure while no Go build runs
 The weekly clean SHALL run `go clean -modcache` only when the data volume's free space is below
