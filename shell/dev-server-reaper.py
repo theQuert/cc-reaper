@@ -84,9 +84,10 @@ IDLE_HOURS = 12
 PRESSURE_IDLE_HOURS = 3
 # Runs further apart than this cannot vouch for the time between them.
 MAX_SAMPLE_GAP = 2 * 3600
-# The host's 5-minute pressure samples ("<UTC>Z ... mp=<level> ..."), read when present.
-PRESSURE_LOG = Path(os.environ.get("CC_DEV_SERVER_PRESSURE_LOG",
-                                   Path.home() / "stima-watch" / "host" / "pressure.log"))
+# A host's 5-minute pressure samples ("<UTC>Z ... mp=<level> ..."). The sampler is the
+# host's own, so the path is set where the host is configured (disk-janitor.conf exports
+# it); unset, only the live level is read.
+PRESSURE_LOG = os.environ.get("CC_DEV_SERVER_PRESSURE_LOG", "")
 PRESSURE_LOOKBACK = 3600
 STATE_DIR = Path.home() / ".cc-reaper" / "state" / "dev-server-idle"
 ESBUILD = re.compile(r"/node_modules/(?:\.bin|(?:.+/)?@esbuild/[^/]+/bin)/esbuild$")
@@ -296,6 +297,8 @@ def pressure(log=None, now=None):
     if level.isdigit() and int(level) >= 2:
         return True, f"memory pressure level {level}"
     log = PRESSURE_LOG if log is None else log
+    if not log:
+        return False, ""
     now = time.time() if now is None else now
     try:
         with open(log, "rb") as f:

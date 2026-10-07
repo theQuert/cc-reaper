@@ -64,6 +64,10 @@ git pull
 ./install.sh
 ```
 
+**Is what runs what this checkout ships?** `./install.sh --check` compares every deployed
+script and LaunchAgent with the checkout, changes nothing, and exits 1 on any difference.
+Policy files you tuned (`*.conf`, `growth-targets.tsv`) are listed, never counted as drift.
+
 On macOS 14 or later, build and open the optional local companion after installation:
 
 ```bash

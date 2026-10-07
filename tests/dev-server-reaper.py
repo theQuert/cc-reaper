@@ -794,6 +794,15 @@ class PressureTest(unittest.TestCase):
         with mock.patch.object(reaper.subprocess, "run", return_value=mock.Mock(stdout="1\n")):
             self.assertEqual(reaper.pressure(log="/nonexistent/pressure.log", now=now), (False, ""))
 
+    def test_no_log_is_configured_by_default(self):
+        # The sampler is host-specific (stima-watch on one machine); unset, only the live
+        # level is read, and a log path is never guessed.
+        self.assertEqual(reaper.PRESSURE_LOG, os.environ.get("CC_DEV_SERVER_PRESSURE_LOG", ""))
+        with mock.patch.object(reaper, "PRESSURE_LOG", ""), \
+             mock.patch.object(reaper.subprocess, "run", return_value=mock.Mock(stdout="1\n")), \
+             mock.patch("builtins.open", side_effect=AssertionError("opened a log")):
+            self.assertEqual(reaper.pressure(), (False, ""))
+
 
 class ConnectedTest(unittest.TestCase):
     def test_both_ends_count_and_empty_is_a_failed_probe(self):
