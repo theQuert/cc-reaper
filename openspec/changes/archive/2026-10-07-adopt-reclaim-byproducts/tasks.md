@@ -1,4 +1,4 @@
 - [x] Move script and suite; label, uid scratch root, harness liveness gate.
 - [x] Legacy agent retirement, with cases for retire and for a sweep in progress.
 - [x] `install.sh` payload and one-time schedule hint; install suites green.
-- [ ] Cut over this host: deploy, `--install-launchd 3h`, legacy retired, scheduled run observed.
+- [x] Cut over this host: deployed, `--install-launchd 3h` installed com.cc-reaper.reclaim-byproducts and retired com.claude.reclaim-byproducts (2026-10-07 12:28); its RunAtLoad firing skipped on the shared stamp.
