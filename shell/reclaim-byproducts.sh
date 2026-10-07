@@ -418,6 +418,11 @@ live_session_ids() {
 
 reap_scratchpads() {
   [ -d "$SCRATCH_ROOT" ] || { log "scratchpads: $SCRATCH_ROOT does not exist, nothing to reap"; return 0; }
+  # /tmp is shared and the root is named by uid, so another account could have made it.
+  if [ -L "$SCRATCH_ROOT" ] || [ ! -O "$SCRATCH_ROOT" ]; then
+    log "scratchpads: $SCRATCH_ROOT is a link or not owned by $(id -un); nothing reaped" >&2
+    FAILED=1; return 0
+  fi
   local reaped=0 kept=0 bytes=0 d sid verdict rc
   local pressure=0 live="" free window=$IDLE_HOURS
   free="$(free_gb)"
@@ -430,7 +435,8 @@ reap_scratchpads() {
     fi
   fi
   for d in "$SCRATCH_ROOT"/*/*; do
-    [ -d "$d" ] || continue
+    # A link at either level points anywhere; it is never a scratchpad.
+    [ -d "$d" ] && [ ! -L "$d" ] && [ ! -L "${d%/*}" ] || continue
     sid="$(basename "$d")"
     # Only a session directory. /tmp/claude-501 also holds loose probe files and
     # directories nobody names a session, and those are not this reaper's business.
@@ -802,28 +808,53 @@ reap_caches() {
 
 # ---------------------------------------------------------------- launchd
 
-# The agent the skills repository installed before this moved here. Retired once this one
-# is installed: two agents running one sweep race over the same directories. Unloading signals
-# a sweep in progress, so a running one is waited for and, past the wait, left loaded and named.
-# The plist is moved aside, never deleted, so the move can be undone by hand.
+# The agent the skills repository installed before this moved here. It shares this one's
+# log and stamp, so it is retired BEFORE the probe: otherwise its sweep could answer the
+# probe, or run beside this agent's first catch-up run, and nothing here holds a lock.
+# Disabled first so launchd starts no new run, then waited on while a sweep is in progress
+# (unloading signals it), then unloaded and its plist moved aside, never deleted. If this
+# install then fails, restore_legacy_agent puts it back exactly as it was.
+LEGACY_ASIDE=""
 retire_legacy_agent() {
   local legacy="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist" waited=0
   local wait="${BYPRODUCT_LEGACY_WAIT_SECONDS:-900}" aside="$HOME/.cc-reaper/state/retired-agents"
+  local target="gui/$(id -u)/$LEGACY_LABEL"
   [ -f "$legacy" ] || return 0
-  while "$LAUNCHCTL" print "gui/$(id -u)/$LEGACY_LABEL" 2>/dev/null | grep -q 'state = running'; do
+  "$LAUNCHCTL" disable "$target" 2>/dev/null || true
+  while "$LAUNCHCTL" print "$target" 2>/dev/null | grep -q 'state = running'; do
     if [ "$waited" -ge "$wait" ]; then
-      echo "$LEGACY_LABEL is still running a sweep; left loaded beside $LABEL - re-run --install-launchd to retire it" >&2
-      return 0
+      "$LAUNCHCTL" enable "$target" 2>/dev/null || true
+      echo "$LEGACY_LABEL is still running a sweep after ${wait}s; nothing was changed - re-run --install-launchd" >&2
+      exit 1
     fi
     sleep 5; waited=$((waited + 5))
   done
   "$LAUNCHCTL" unload "$legacy" 2>/dev/null || true
-  mkdir -p "$aside" && mv "$legacy" "$aside/$LEGACY_LABEL.$(date +%Y%m%d%H%M%S).plist" \
-    && echo "retired $LEGACY_LABEL (plist kept in $aside)"
+  LEGACY_ASIDE="$aside/$LEGACY_LABEL.$(date +%Y%m%d%H%M%S).plist"
+  if ! { mkdir -p "$aside" && mv "$legacy" "$LEGACY_ASIDE"; }; then
+    LEGACY_ASIDE=""
+    "$LAUNCHCTL" enable "$target" 2>/dev/null || true
+    "$LAUNCHCTL" load "$legacy" 2>/dev/null || true
+    echo "could not move $legacy aside; it is loaded again and nothing was installed" >&2
+    exit 1
+  fi
+}
+restore_legacy_agent() {
+  [ -n "$LEGACY_ASIDE" ] && [ -f "$LEGACY_ASIDE" ] || return 0
+  local legacy="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
+  mv "$LEGACY_ASIDE" "$legacy" && "$LAUNCHCTL" enable "gui/$(id -u)/$LEGACY_LABEL" 2>/dev/null
+  "$LAUNCHCTL" load "$legacy" 2>/dev/null || true
+  echo "restored $LEGACY_LABEL, since this install did not complete" >&2
 }
 
 install_launchd() {
   local at="${1:-04:00}" plist logf
+  # The plist names this copy. Run from a checkout, that is a task worktree the janitor will
+  # reclaim, and the agent would fail silently from then on: install from the deployed copy.
+  if git -C "$HERE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "refusing to schedule $HERE/reclaim-byproducts.sh: it is inside a git checkout; run ~/.cc-reaper/reclaim-byproducts.sh --install-launchd" >&2
+    exit 1
+  fi
   # Two cadences, one installer. StartCalendarInterval is a wall-clock time and can only
   # say "daily at 04:00"; StartInterval is a PERIOD in seconds and is the only launchd key
   # that repeats on one. What it does not do is keep counting while the machine is away:
@@ -919,8 +950,12 @@ PLIST
   if [ -n "$prev" ] && [ "$final" = "$prev" ] && "$LAUNCHCTL" print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
     echo "$LABEL is already installed $mode and loaded; nothing changed (log: $logf)"
     retire_legacy_agent
+    [ -z "$LEGACY_ASIDE" ] || echo "retired $LEGACY_LABEL (plist kept in ${LEGACY_ASIDE%/*})"
+    LEGACY_ASIDE=""
     return 0
   fi
+
+  retire_legacy_agent
 
   # No RunAtLoad on the probe plist: loading it would fire the job once and the kickstart
   # below again, and on a backlogged machine one dry run is six minutes.
@@ -1006,7 +1041,8 @@ PLIST
   "$LAUNCHCTL" unload "$plist" 2>/dev/null || true
   "$LAUNCHCTL" load "$plist" || { echo "could not load $plist" >&2; exit 1; }
   echo "installed $LABEL $mode (log: $logf); its probe run reaped nothing"
-  retire_legacy_agent
+  [ -z "$LEGACY_ASIDE" ] || echo "retired $LEGACY_LABEL (plist kept in ${LEGACY_ASIDE%/*})"
+  LEGACY_ASIDE=""
 }
 
 # ---------------------------------------------------------------- main
@@ -1018,7 +1054,7 @@ case "${1:-}" in
   # part, minutes - and no stamp, so the scheduled full sweep is not pushed back.
   --go-cache) rotate_log; log "== go cache only $(now_iso) (pid $$) =="; reap_go_cache; exit 0 ;;
   --if-stale) CHECK_STALE=1 ;;
-  --install-launchd) install_launchd "${2:-04:00}"; exit 0 ;;
+  --install-launchd) trap restore_legacy_agent EXIT; install_launchd "${2:-04:00}"; exit 0 ;;
   --self-test) exec bash "$REPO_HERE/../tests/reclaim-byproducts.sh" ;;
   -h|--help) usage; exit 0 ;;
   '') ;;

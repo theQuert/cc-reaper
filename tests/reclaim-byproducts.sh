@@ -246,6 +246,34 @@ check "a volume whose age cannot be read is kept" "$OUT" "" \
 check "a six-hour-old volume is kept at the default volume age" "$OUT" "" \
   "volume WOULD be reaped: $HEX_MID"
 
+# ------------------------------------------------- links are never followed
+#
+# The scratchpad root follows the invoking uid (/tmp/claude-<uid>), and /tmp is shared: on a
+# machine where that directory does not exist yet, another account can create it first. A
+# root that is a link or not ours is refused, and a link at either level below it is never
+# a scratchpad - its target can be anywhere, and `rm -rf` would be deciding about that.
+build_fixture "$WORK/sl"
+U5="55555555-5555-5555-5555-555555555555"; U6="66666666-6666-6666-6666-666666666666"
+mkdir -p "$WORK/sl/outside/$U5" "$WORK/sl/outside2"
+touch -t "$OLD_TS" "$WORK/sl/outside/$U5"
+ln -s "$WORK/sl/outside" "$WORK/sl/scratch/linked"
+ln -s "$WORK/sl/outside2" "$WORK/sl/scratch/proj/$U6"
+OUT_SL="$(run_real "$WORK/sl" "$SCRIPT")"
+if [ -d "$WORK/sl/outside/$U5" ] && [ -d "$WORK/sl/outside2" ] && [ -L "$WORK/sl/scratch/proj/$U6" ]; then
+  pass "a linked project or scratchpad is never reaped"
+else
+  fail "a linked project or scratchpad is never reaped: $OUT_SL"
+fi
+build_fixture "$WORK/sr"
+mv "$WORK/sr/scratch" "$WORK/sr/real-scratch"; ln -s "$WORK/sr/real-scratch" "$WORK/sr/scratch"
+OUT_SR="$(run_real "$WORK/sr" "$SCRIPT")"
+if [ -d "$WORK/sr/real-scratch/proj/11111111-1111-1111-1111-111111111111" ] \
+   && printf '%s' "$OUT_SR" | grep -q 'scratchpads: .* is a link or not owned'; then
+  pass "a scratchpad root that is a link is refused"
+else
+  fail "a scratchpad root that is a link is refused: $OUT_SR"
+fi
+
 # ------------------------------------------------- one knob was gating two questions
 #
 # BYPRODUCT_IDLE_HOURS was the scratchpad's idle threshold AND the anonymous volume's
@@ -672,6 +700,7 @@ install_fixture() {
 PLIST="$HOME/Library/LaunchAgents/com.cc-reaper.reclaim-byproducts.plist"
 fire() {
   [ -f "$PLIST" ] || return 0
+  [ -f "$HOME/.no-fire" ] && return 0   # a job that cannot start: the probe sees nothing
   local logf a args=()
   logf="$(sed -n 's|.*<key>StandardOutPath</key><string>\(.*\)</string>.*|\1|p' "$PLIST" | head -1)"
   [ -n "$logf" ] || return 0
@@ -767,6 +796,28 @@ if [ ! -e "$(legacy_plist "$WORK/lg")" ] && ls "$WORK/lg/home/.cc-reaper/state/r
   pass "its plist is unloaded and kept aside, not deleted"
 else
   fail "its plist is unloaded and kept aside, not deleted"
+fi
+
+# An install that fails after the old agent was retired must put it back: otherwise the
+# machine is left with no reaper at all.
+install_fixture "$WORK/lf" "$SCRIPT"
+mkdir -p "$WORK/lf/home/Library/LaunchAgents"; echo '<plist/>' > "$(legacy_plist "$WORK/lf")"
+touch "$WORK/lf/home/.no-fire"
+OUT_LF="$(run_install "$WORK/lf" 3h 2>&1)"
+if [ -f "$(legacy_plist "$WORK/lf")" ] && printf '%s' "$OUT_LF" | grep -q "restored com.claude.reclaim-byproducts"; then
+  pass "a failed install restores the skills-era agent"
+else
+  fail "a failed install restores the skills-era agent (got: $OUT_LF)"
+fi
+
+# Scheduled from a checkout, the agent would point into a worktree the janitor reclaims.
+install_fixture "$WORK/gc" "$SCRIPT"
+git -C "$WORK/gc/hook" init -q 2>/dev/null
+OUT_GC="$(run_install "$WORK/gc" 3h 2>&1)"
+if printf '%s' "$OUT_GC" | grep -q 'inside a git checkout' && [ ! -f "$(agent_plist "$WORK/gc")" ]; then
+  pass "installing from a git checkout is refused"
+else
+  fail "installing from a git checkout is refused (got: $OUT_GC)"
 fi
 
 install_fixture "$WORK/lr" "$SCRIPT"
