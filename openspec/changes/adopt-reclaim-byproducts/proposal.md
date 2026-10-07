@@ -15,12 +15,13 @@ from cc-reaper alone.
 
 - `shell/reclaim-byproducts.sh` and `tests/reclaim-byproducts.sh` move here from skills
   `hooks/` and `tests/` at b54143d, behaviour unchanged except:
-  - the LaunchAgent label is `com.cc-reaper.reclaim-byproducts`; after a successful install
-    the skills-era `com.claude.reclaim-byproducts` is unloaded and its plist moved to
-    `~/.cc-reaper/state/retired-agents/`. A sweep it is running is waited for
-    (`BYPRODUCT_LEGACY_WAIT_SECONDS`, default 900) and never signalled; past the wait it is
-    left loaded and named.
-  - the scratchpad root defaults to `/tmp/claude-$(id -u)`, not uid 501;
+  - the LaunchAgent label is `com.cc-reaper.reclaim-byproducts`. Before the probe, the
+    skills-era `com.claude.reclaim-byproducts` (same log and stamp) is disabled, waited on
+    while a sweep runs (`BYPRODUCT_LEGACY_WAIT_SECONDS`, default 900; never signalled),
+    unloaded and its plist moved to `~/.cc-reaper/state/retired-agents/`; a failed or
+    inconclusive install restores it. Installing from a git checkout is refused.
+  - the scratchpad root defaults to `/tmp/claude-$(id -u)`, not uid 501, and must be the
+    user's own and not a link; a link below it is never a scratchpad;
   - the liveness gate defaults to `~/.claude/hooks/path-in-use.sh` (the harness's), since
     the deployed copy has no sibling; without it the run still refuses.
 - `install.sh` deploys it with the other scripts, so `--check` covers it, and prints the
