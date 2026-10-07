@@ -1,0 +1,3 @@
+- [x] `tests/install-check.sh` red, then `install.sh --check` and the shared payload list.
+- [x] Pressure log opt-in, with a test that no path is guessed.
+- [x] Live check on this host: every deployed copy current, policies reported.

@@ -35,6 +35,61 @@ if [ "$WORKTREE_INTERVAL_SECONDS" -lt 300 ] || [ "$WORKTREE_INTERVAL_SECONDS" -g
   exit 1
 fi
 
+# What step 5 deploys under ~/.cc-reaper, and the LaunchAgents it renders: one list, read by
+# the deploy and by --check, so the check can never compare a different set than was shipped.
+CC_PAYLOAD="shell/resource-watch.sh shell/disk-janitor.sh shell/worktree-janitor.sh
+shell/cc-monitor.sh shell/claude-cleanup.sh shell/guard-runner.sh shell/chrome-clone-janitor.py
+shell/growth-watch.py shell/host-temp-reaper.py shell/dev-server-reaper.py
+hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
+CC_AGENTS="resource-watch disk-check weekly-clean guard worktree-janitor"
+
+# --check: compare the deployed copies with this checkout and change nothing. A deployed
+# script or LaunchAgent that differs, or is missing, is drift (exit 1). The policies and the
+# growth targets are the operator's, so a difference there is reported, never drift. The
+# orphan monitor is optional (daemon choice a uses proc-janitor), so it is compared only
+# where it is installed.
+if [ "${1:-}" = "--check" ]; then
+  REAPER_DIR="$HOME_DIR/.cc-reaper"; PLIST_DIR="$HOME_DIR/Library/LaunchAgents"; drift=0
+  _cc_cmp() { # source, deployed, optional
+    if [ ! -e "$2" ]; then
+      [ "${3:-}" = optional ] && return 0
+      echo "MISSING  $2"; drift=1
+    elif cmp -s "$1" "$2"; then echo "current  $2"
+    else echo "DRIFT    $2 (differs from ${1#"$SCRIPT_DIR"/})"; drift=1
+    fi
+  }
+  for f in $CC_PAYLOAD; do _cc_cmp "$SCRIPT_DIR/$f" "$REAPER_DIR/$(basename "$f")"; done
+  _cc_cmp "$SCRIPT_DIR/launchd/cc-reaper-monitor.sh" "$REAPER_DIR/cc-reaper-monitor.sh" optional
+  rendered="$(mktemp)"
+  for AGENT in $CC_AGENTS orphan-monitor; do
+    plist="$PLIST_DIR/com.cc-reaper.$AGENT.plist"
+    # The worktree interval is chosen at install time; render with the installed one.
+    if [ "$AGENT" = worktree-janitor ]; then
+      interval="$(plutil -extract StartInterval raw "$plist" 2>/dev/null || echo 3600)"
+      sed -e "s|__HOME__|$HOME_DIR|g" -e "s|<integer>3600</integer>|<integer>$interval</integer>|" \
+        "$SCRIPT_DIR/launchd/com.cc-reaper.$AGENT.plist" > "$rendered"
+    else
+      sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/com.cc-reaper.$AGENT.plist" > "$rendered"
+    fi
+    _cc_cmp "$rendered" "$plist" "$( [ "$AGENT" = orphan-monitor ] && echo optional)"
+  done
+  rm -f "$rendered"
+  # What an install retires: still present means it was never re-run, and the retired
+  # inventory agent would race the janitor with its own rule.
+  for f in "$REAPER_DIR/lifecycle-reclaim.sh" "$PLIST_DIR/com.claude.worktree-inventory.plist"; do
+    [ ! -e "$f" ] || { echo "RETIRED  $f is still installed"; drift=1; }
+  done
+  for f in worktree-janitor.conf disk-janitor.conf growth-targets.tsv; do
+    if [ ! -e "$REAPER_DIR/$f" ]; then echo "MISSING  $REAPER_DIR/$f"; drift=1
+    elif cmp -s "$SCRIPT_DIR/config/$f" "$REAPER_DIR/$f"; then echo "current  $REAPER_DIR/$f"
+    else echo "policy   $REAPER_DIR/$f differs from config/$f (operator-owned; review with diff)"
+    fi
+  done
+  [ "$drift" -eq 0 ] && echo "cc-reaper: deployed copies match this checkout" \
+    || echo "cc-reaper: DRIFT - re-run ./install.sh to deploy this checkout"
+  exit "$drift"
+fi
+
 # An interrupted install must not read like a finished one.
 #
 # Measured 2026-09-01: a run that blocked at the daemon prompt had already updated the
@@ -451,15 +506,8 @@ mkdir -p "$PLIST_DIR"
 # claude-cleanup + guard-runner ship too: the guard agent sources the DEPLOYED
 # claude-cleanup.sh (a launchd agent has no TCC access to a ~/Documents checkout),
 # with guard-runner.sh next to it.
-for SCRIPT in resource-watch disk-janitor worktree-janitor cc-monitor claude-cleanup guard-runner; do
-  _cc_deploy "$SCRIPT_DIR/shell/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
-done
-_cc_deploy "$SCRIPT_DIR/shell/chrome-clone-janitor.py" "$REAPER_DIR/chrome-clone-janitor.py"
-_cc_deploy "$SCRIPT_DIR/shell/growth-watch.py" "$REAPER_DIR/growth-watch.py"
-_cc_deploy "$SCRIPT_DIR/shell/host-temp-reaper.py" "$REAPER_DIR/host-temp-reaper.py"
-_cc_deploy "$SCRIPT_DIR/shell/dev-server-reaper.py" "$REAPER_DIR/dev-server-reaper.py"
-for SCRIPT in worktree-session-end stop-cleanup-orphans; do
-  _cc_deploy "$SCRIPT_DIR/hooks/$SCRIPT.sh" "$REAPER_DIR/$SCRIPT.sh"
+for f in $CC_PAYLOAD; do
+  _cc_deploy "$SCRIPT_DIR/$f" "$REAPER_DIR/$(basename "$f")"
 done
 # Retired 2026-09-23: nothing ever called it, and the builder prune it gated now runs in
 # `disk-janitor --clean`. A stale copy would still name the removed --orbstack-clean mode.
@@ -501,7 +549,7 @@ else
   echo "  growth targets preserved at $GW_TARGETS (repository default differs; review with diff)"
 fi
 
-for AGENT in resource-watch disk-check weekly-clean guard worktree-janitor; do
+for AGENT in $CC_AGENTS; do
   AGENT_LABEL="com.cc-reaper.$AGENT"
   AGENT_PLIST="$PLIST_DIR/$AGENT_LABEL.plist"
   if [ "$AGENT" = "worktree-janitor" ]; then
