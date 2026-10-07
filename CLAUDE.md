@@ -15,6 +15,7 @@ cc-reaper is a shell-based utility that cleans up orphan Claude Code/Codex proce
 - `shell/worktree-janitor.sh` — Shared Claude/Codex worktree inventory and gated removal (clean, unheld, no live/recent harness claim, landed, idle); `--claims` for read-only claim/lease evidence, `--session` for either harness, and `--scheduled` for the guarantee layer. The method is in `docs/worktree-reclamation.md`
 - `config/worktree-janitor.conf` — Cross-device 48-hour/session/schedule policy deployed under `~/.cc-reaper`
 - `shell/reclaim-byproducts.sh` — Session scratchpads, anonymous Docker volumes, go build cache, reclaim archives; its own LaunchAgent via `--install-launchd` (adopted from the skills repository 2026-10-07)
+- `shell/orbstack-memory-trim.sh` — Drops the OrbStack guest's clean caches when its VM process holds over a quarter of RAM; `com.cc-reaper.orbstack-memory-trim` every 15 min (adopted from stima-api 2026-10-07)
 - `hooks/worktree-session-end.sh` — Thin shared Claude/Codex SessionEnd trigger
 - `proc-janitor/config.toml` — Daemon config with target patterns, whitelist, and grace period settings
 - `launchd/` — macOS LaunchAgent scripts for zero-dependency background monitoring
