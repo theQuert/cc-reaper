@@ -812,8 +812,14 @@ fi
 
 # Scheduled from a checkout, the agent would point into a worktree the janitor reclaims.
 install_fixture "$WORK/gc" "$SCRIPT"
-git -C "$WORK/gc/hook" init -q 2>/dev/null
+git -C "$WORK/gc/hook" init -q 2>/dev/null && git -C "$WORK/gc/hook" add reclaim-byproducts.sh
 OUT_GC="$(run_install "$WORK/gc" 3h 2>&1)"
+# A deployed copy that merely sits under a repository (a dotfiles repo at $HOME) is not a
+# checkout of this script, and installs.
+install_fixture "$WORK/gd" "$SCRIPT"
+git -C "$WORK/gd" init -q 2>/dev/null
+OUT_GD="$(run_install "$WORK/gd" 3h 2>&1)"
+check "a copy under an unrelated repository still installs" "$OUT_GD" "installed com.cc-reaper.reclaim-byproducts"
 if printf '%s' "$OUT_GC" | grep -q 'inside a git checkout' && [ ! -f "$(agent_plist "$WORK/gc")" ]; then
   pass "installing from a git checkout is refused"
 else

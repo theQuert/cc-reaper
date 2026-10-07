@@ -824,8 +824,8 @@ retire_legacy_agent() {
   while "$LAUNCHCTL" print "$target" 2>/dev/null | grep -q 'state = running'; do
     if [ "$waited" -ge "$wait" ]; then
       "$LAUNCHCTL" enable "$target" 2>/dev/null || true
-      echo "$LEGACY_LABEL is still running a sweep after ${wait}s; nothing was changed - re-run --install-launchd" >&2
-      exit 1
+      echo "$LEGACY_LABEL is still running a sweep after ${wait}s; it was left as it was - re-run --install-launchd" >&2
+      return 1
     fi
     sleep 5; waited=$((waited + 5))
   done
@@ -835,8 +835,8 @@ retire_legacy_agent() {
     LEGACY_ASIDE=""
     "$LAUNCHCTL" enable "$target" 2>/dev/null || true
     "$LAUNCHCTL" load "$legacy" 2>/dev/null || true
-    echo "could not move $legacy aside; it is loaded again and nothing was installed" >&2
-    exit 1
+    echo "could not move $legacy aside; it is loaded again as it was" >&2
+    return 1
   fi
 }
 restore_legacy_agent() {
@@ -851,7 +851,7 @@ install_launchd() {
   local at="${1:-04:00}" plist logf
   # The plist names this copy. Run from a checkout, that is a task worktree the janitor will
   # reclaim, and the agent would fail silently from then on: install from the deployed copy.
-  if git -C "$HERE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if git -C "$HERE" ls-files --error-unmatch reclaim-byproducts.sh >/dev/null 2>&1; then
     echo "refusing to schedule $HERE/reclaim-byproducts.sh: it is inside a git checkout; run ~/.cc-reaper/reclaim-byproducts.sh --install-launchd" >&2
     exit 1
   fi
@@ -949,13 +949,13 @@ PLIST
   <key>RunAtLoad</key><true/>')"
   if [ -n "$prev" ] && [ "$final" = "$prev" ] && "$LAUNCHCTL" print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
     echo "$LABEL is already installed $mode and loaded; nothing changed (log: $logf)"
-    retire_legacy_agent
-    [ -z "$LEGACY_ASIDE" ] || echo "retired $LEGACY_LABEL (plist kept in ${LEGACY_ASIDE%/*})"
+    retire_legacy_agent || true   # this install is already in place; a busy old agent is only named
+    [ -z "$LEGACY_ASIDE" ] || echo "retired $LEGACY_LABEL (plist kept in ${LEGACY_ASIDE%/*}; to undo: move it back, launchctl enable gui/$(id -u)/$LEGACY_LABEL, launchctl load it)"
     LEGACY_ASIDE=""
     return 0
   fi
 
-  retire_legacy_agent
+  retire_legacy_agent || exit 1
 
   # No RunAtLoad on the probe plist: loading it would fire the job once and the kickstart
   # below again, and on a backlogged machine one dry run is six minutes.
@@ -1039,9 +1039,11 @@ PLIST
   write_plist '<string>--if-stale</string>' '
   <key>RunAtLoad</key><true/>'
   "$LAUNCHCTL" unload "$plist" 2>/dev/null || true
-  "$LAUNCHCTL" load "$plist" || { echo "could not load $plist" >&2; exit 1; }
+  # On failure the old agent is restored; a RunAtLoad plist left here would load beside it at
+  # the next login.
+  "$LAUNCHCTL" load "$plist" || { rm -f "$plist"; echo "could not load $plist; removed it" >&2; exit 1; }
   echo "installed $LABEL $mode (log: $logf); its probe run reaped nothing"
-  [ -z "$LEGACY_ASIDE" ] || echo "retired $LEGACY_LABEL (plist kept in ${LEGACY_ASIDE%/*})"
+  [ -z "$LEGACY_ASIDE" ] || echo "retired $LEGACY_LABEL (plist kept in ${LEGACY_ASIDE%/*}; to undo: move it back, launchctl enable gui/$(id -u)/$LEGACY_LABEL, launchctl load it)"
   LEGACY_ASIDE=""
 }
 
