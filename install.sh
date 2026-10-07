@@ -40,8 +40,8 @@ fi
 CC_PAYLOAD="shell/resource-watch.sh shell/disk-janitor.sh shell/worktree-janitor.sh
 shell/cc-monitor.sh shell/claude-cleanup.sh shell/guard-runner.sh shell/chrome-clone-janitor.py
 shell/growth-watch.py shell/host-temp-reaper.py shell/dev-server-reaper.py shell/reclaim-byproducts.sh
-hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
-CC_AGENTS="resource-watch disk-check weekly-clean guard worktree-janitor"
+shell/orbstack-memory-trim.sh hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
+CC_AGENTS="resource-watch disk-check weekly-clean guard worktree-janitor orbstack-memory-trim"
 
 # --check: compare the deployed copies with this checkout and change nothing. A deployed
 # script or LaunchAgent that differs, or is missing, is drift (exit 1). The policies and the
@@ -591,6 +591,7 @@ echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
 echo "  worktree-janitor: every $WORKTREE_INTERVAL_SECONDS seconds + at load; 48h idle policy from ~/.cc-reaper/worktree-janitor.conf"
 echo "                    SessionEnd trigger: ~/.cc-reaper/worktree-session-end.sh <claude|codex>"
 echo "  guard:          runaway-MCP reaper every 10 min (60+ minutes of sustained CPU samples; re-checks and signals each known MCP PID alone)"
+echo "  orbstack-memory-trim: drops the OrbStack guest's caches every 15 min when its VM holds over a quarter of RAM (no-op without OrbStack)"
 
 # Claude has one global hook file, so the installer can migrate it safely.  Codex hooks
 # are repository-owned; checked-in .codex/hooks.json files should invoke the same deployed

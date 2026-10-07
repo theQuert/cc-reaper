@@ -500,6 +500,7 @@ What cc-reaper reclaims under rule 5 on its own:
 | A dev server (`npm run dev/preview/start`, `wrangler dev`, `next dev/start`, `vite`, `react-scripts start`) that serves nobody | `dev-server-reaper.py` from the hourly `--check`: launcher reparented to launchd, 6h old, cwd in a linked worktree, no agent in the tree or its process group, no live session claim (`worktree-janitor.sh --claims`), nothing publishing it (a listening process taking its worktree as an argument, such as a review front, or a `tailscale serve` handler to its port), and either not listening on the `--port` it names or the 20 above it (stopped at once), or, for a hot-reload dev server (`react-scripts start`, `next dev`, `vite` but not `vite preview`, `webpack serve`, judged from the commands its tree runs), listening with no TCP connection to that port (any port it listens on, for `react-scripts start`) at every hourly run, no two more than 2h apart, for 12h - 3h while the kernel memory pressure level is 2+, now or in any sample of the last hour in `CC_DEV_SERVER_PRESSURE_LOG` (`mp=<level>` lines; unset by default, export it from `disk-janitor.conf`) - and again before stopping. It runs beside the rest of `--check`, not after it, so a slow low-disk trim cannot delay it. A listening server without hot reload (`next start`, `vite preview`, `wrangler dev`) holds no connection between requests and is always taken as serving. TERM, then KILL after 10s, each pid only while its start time matches. `CC_DJ_DEV_SERVER_REAP=report` (default) lists, `apply` stops and comments on `CC_DJ_ALERT_ISSUE`. A tree with a connection or a publisher is only listed. The same pass stops an orphaned esbuild `--service` (the stdio build service a `wrangler dev` or `vite` leaves when it dies): a `node_modules` esbuild binary reparented to launchd, 6h old, no child, no socket but its dead stdio pair, no agent or launcher left in its process group, cwd in a linked worktree with no live claim, rechecked before the signal |
 | Worktrees | `worktree-janitor.sh` (landed, unheld, no session, idle) |
 | Session scratchpads (`/tmp/claude-<uid>/<project>/<session>`), anonymous Docker volumes, the go build cache, old reclaim archives, dead caches you list | `reclaim-byproducts.sh` under its own LaunchAgent `com.cc-reaper.reclaim-byproducts` (every 3h and at login, `--if-stale`): a scratchpad only when the harness's `~/.claude/hooks/path-in-use.sh` says free, idle 24h (6h under disk pressure with no live session record). Schedule it once with `~/.cc-reaper/reclaim-byproducts.sh --install-launchd 3h`; the installer fires the real agent as a dry run first and retires the skills-era `com.claude.reclaim-byproducts`. `--dry-run` reports, `--self-test` runs the suite from a checkout |
+| OrbStack guest page cache holding host memory (macOS pressure never reaches the Linux guest) | `orbstack-memory-trim.sh` under `com.cc-reaper.orbstack-memory-trim`, every 15 min: when the OrbStack VM process holds more than a quarter of RAM (`ORBSTACK_TRIM_LIMIT_MIB`), a throwaway privileged container on the `orbstack` context drops the guest's clean caches. Nothing restarts or is deleted; a hung trim is killed after `ORBSTACK_TRIM_TIMEOUT_SECONDS` (120). No-op without OrbStack. Log: `~/.cc-reaper/logs/orbstack-memory-trim.log` |
 
 ### Growth watch
 
@@ -813,6 +814,7 @@ cc-reaper/
 │   ├── com.cc-reaper.resource-watch.plist  # System snapshot agent (10-min interval)
 │   ├── com.cc-reaper.disk-check.plist      # Read-only disk check agent (hourly)
 │   ├── com.cc-reaper.weekly-clean.plist    # Rebuildable-cache clean agent (Sun 04:00)
+│   ├── com.cc-reaper.orbstack-memory-trim.plist # OrbStack guest cache trim (15-min interval)
 │   └── com.cc-reaper.worktree-janitor.plist # Shared worktree sweep (6-hour interval)
 ├── proc-janitor/
 │   └── config.toml                 # proc-janitor daemon config (alternative to LaunchAgent)
@@ -822,6 +824,7 @@ cc-reaper/
 │   ├── resource-watch.sh           # System snapshot + threshold alerting
 │   ├── disk-janitor.sh             # Disk check (--check) / rebuildable-cache clean (--clean)
 │   ├── growth-watch.py             # Budgeted per-target size samples + growth alerts
+│   ├── orbstack-memory-trim.sh     # Drops OrbStack guest caches when its VM holds over 1/4 of RAM
 │   └── worktree-janitor.sh         # Git worktree inventory + gated removal (dry-run default)
 ├── tests/
 │   ├── agent-process-patterns.sh   # Cleanup-candidate matcher validation

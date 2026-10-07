@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cc-reaper.orbstack-memory-trim</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>exec "$HOME/.cc-reaper/orbstack-memory-trim.sh" &gt;&gt;"$HOME/.cc-reaper/logs/orbstack-memory-trim.log" 2&gt;&amp;1</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+</dict></plist>
