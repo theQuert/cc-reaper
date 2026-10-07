@@ -74,6 +74,11 @@ if [ "${1:-}" = "--check" ]; then
     _cc_cmp "$rendered" "$plist" "$( [ "$AGENT" = orphan-monitor ] && echo optional)"
   done
   rm -f "$rendered"
+  # What an install retires: still present means it was never re-run, and the retired
+  # inventory agent would race the janitor with its own rule.
+  for f in "$REAPER_DIR/lifecycle-reclaim.sh" "$PLIST_DIR/com.claude.worktree-inventory.plist"; do
+    [ ! -e "$f" ] || { echo "RETIRED  $f is still installed"; drift=1; }
+  done
   for f in worktree-janitor.conf disk-janitor.conf growth-targets.tsv; do
     if [ ! -e "$REAPER_DIR/$f" ]; then echo "MISSING  $REAPER_DIR/$f"; drift=1
     elif cmp -s "$SCRIPT_DIR/config/$f" "$REAPER_DIR/$f"; then echo "current  $REAPER_DIR/$f"

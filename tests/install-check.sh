@@ -64,6 +64,12 @@ out="$(run --check 2>&1)"; rc=$?
   && ok "an edited LaunchAgent is drift" || bad "edited plist: rc=$rc: $out"
 run >/dev/null 2>&1
 
+: > "$H/.cc-reaper/lifecycle-reclaim.sh"
+out="$(run --check 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'RETIRED.*lifecycle-reclaim.sh' \
+  && ok "a retired file still installed is drift" || bad "retired file: rc=$rc: $out"
+run >/dev/null 2>&1
+
 # A worktree interval chosen at install time is the operator's, not drift.
 HOME="$H" PATH="$S:$PATH" CC_REAPER_DAEMON=b CC_REAPER_WORKTREE_INTERVAL_SECONDS=1800 \
   bash "$ROOT_DIR/install.sh" < /dev/null >/dev/null 2>&1
