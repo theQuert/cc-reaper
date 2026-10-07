@@ -1,0 +1,4 @@
+- [x] Move script and suite; label, uid scratch root, harness liveness gate.
+- [x] Legacy agent retirement, with cases for retire and for a sweep in progress.
+- [x] `install.sh` payload and one-time schedule hint; install suites green.
+- [ ] Cut over this host: deploy, `--install-launchd 3h`, legacy retired, scheduled run observed.

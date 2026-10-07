@@ -39,7 +39,7 @@ fi
 # the deploy and by --check, so the check can never compare a different set than was shipped.
 CC_PAYLOAD="shell/resource-watch.sh shell/disk-janitor.sh shell/worktree-janitor.sh
 shell/cc-monitor.sh shell/claude-cleanup.sh shell/guard-runner.sh shell/chrome-clone-janitor.py
-shell/growth-watch.py shell/host-temp-reaper.py shell/dev-server-reaper.py
+shell/growth-watch.py shell/host-temp-reaper.py shell/dev-server-reaper.py shell/reclaim-byproducts.sh
 hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
 CC_AGENTS="resource-watch disk-check weekly-clean guard worktree-janitor"
 
@@ -509,6 +509,13 @@ mkdir -p "$PLIST_DIR"
 for f in $CC_PAYLOAD; do
   _cc_deploy "$SCRIPT_DIR/$f" "$REAPER_DIR/$(basename "$f")"
 done
+# The byproducts reaper schedules itself: its installer fires the real agent once as a dry
+# run and refuses an agent that cannot start (launchd's /bin/bash needs Full Disk Access),
+# which takes minutes, so it is a step of its own rather than part of every update.
+if ! launchctl print "$AGENT_UI/com.cc-reaper.reclaim-byproducts" >/dev/null 2>&1; then
+  echo "  byproducts reaper not scheduled; install it with:"
+  echo "    $REAPER_DIR/reclaim-byproducts.sh --install-launchd 3h"
+fi
 # Retired 2026-09-23: nothing ever called it, and the builder prune it gated now runs in
 # `disk-janitor --clean`. A stale copy would still name the removed --orbstack-clean mode.
 rm -f "$REAPER_DIR/lifecycle-reclaim.sh"
