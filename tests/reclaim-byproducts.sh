@@ -1057,30 +1057,30 @@ check "a cache still over the ceiling at the floor is emptied" "$OUT_FLOOR" \
   "go clean -cache GOCACHE=$WORK/gf/gocache" "go-stub: wrong GOCACHE"
 
 # Disk pressure lowers the ceiling by what the volume is short of the 30GB floor. Six
-# entries after the age trim, 26GB free: 4GB short, so a 3GB ceiling (the loop runs while at or above it) - the
+# entries after the age trim, 56GB free: 4GB short, so a 3GB ceiling (the loop runs while at or above it) - the
 # halving takes everything down to the 270m step and leaves the 2h entry, and the cache is
 # not emptied, because emptying stays the fixed ceiling's call.
 build_fixture "$WORK/gp"
-OUT_PRESS="$(FREE_GB_OVERRIDE=26 go_ceiling_run "$WORK/gp" "$SCRIPT" 99999)"
+OUT_PRESS="$(FREE_GB_OVERRIDE=56 go_ceiling_run "$WORK/gp" "$SCRIPT" 99999)"
 check "a disk under the free floor lowers the ceiling for that run" "$OUT_PRESS" \
-  "26GB free is under the 30GB floor; ceiling 3GB"
+  "56GB free is under the 60GB floor; ceiling 3GB"
 check "and trims idle-first down to the horizon floor, without emptying" "$OUT_PRESS" \
   "left: ./aa/fresh-d ./cc/h2-d $" "go clean"
 # 1GB short takes only the idlest entry.
 build_fixture "$WORK/gq"
-OUT_PRESS1="$(FREE_GB_OVERRIDE=29 go_ceiling_run "$WORK/gq" "$SCRIPT" 99999)"
+OUT_PRESS1="$(FREE_GB_OVERRIDE=59 go_ceiling_run "$WORK/gq" "$SCRIPT" 99999)"
 check "a small shortfall trims only as far as it needs" "$OUT_PRESS1" \
   "left: ./aa/fresh-d ./cc/h10-d ./cc/h2-d ./cc/h20-d ./cc/h5-d $"
 # At the floor nothing changes.
 build_fixture "$WORK/gr"
-OUT_PRESS0="$(FREE_GB_OVERRIDE=30 go_ceiling_run "$WORK/gr" "$SCRIPT" 99999)"
+OUT_PRESS0="$(FREE_GB_OVERRIDE=60 go_ceiling_run "$WORK/gr" "$SCRIPT" 99999)"
 check "a disk at the free floor leaves the ceiling alone" "$OUT_PRESS0" \
   "left: ./aa/fresh-d ./cc/h10-d ./cc/h2-d ./cc/h20-d ./cc/h48-d ./cc/h5-d $" "under the"
 # Under pressure a running go build no longer stops the idle trims, but it still stops
-# the full clear: 26GB free, a build running, and a 1GB fixed ceiling the trim cannot
+# the full clear: 56GB free, a build running, and a 1GB fixed ceiling the trim cannot
 # reach - entries go down to the horizon floor and the cache is not emptied.
 build_fixture "$WORK/gb"
-OUT_PRESS_BUSY="$(FREE_GB_OVERRIDE=26 GO_BUSY_OVERRIDE=1 go_ceiling_run "$WORK/gb" "$SCRIPT" 1)"
+OUT_PRESS_BUSY="$(FREE_GB_OVERRIDE=56 GO_BUSY_OVERRIDE=1 go_ceiling_run "$WORK/gb" "$SCRIPT" 1)"
 check "under pressure a running build does not stop the idle trims" "$OUT_PRESS_BUSY" \
   "left: ./aa/fresh-d ./cc/h2-d $" "reaping nothing"
 check "but it still stops the full clear" "$OUT_PRESS_BUSY" \
@@ -1096,7 +1096,7 @@ check "and still stops the full clear" "$OUT_BUSY_IDLE" \
 
 # --go-cache runs that section alone: no scratchpad sweep, no stamp.
 build_fixture "$WORK/gg"
-OUT_GO_ONLY="$(go_ceiling_fixture "$WORK/gg"; FREE_GB_OVERRIDE=26 PATH_PREFIX_OVERRIDE="$WORK/gg/gobin" _run "$WORK/gg" "$SCRIPT" --go-cache; ls "$WORK/gg/stamp" 2>&1)"
+OUT_GO_ONLY="$(go_ceiling_fixture "$WORK/gg"; FREE_GB_OVERRIDE=56 PATH_PREFIX_OVERRIDE="$WORK/gg/gobin" _run "$WORK/gg" "$SCRIPT" --go-cache; ls "$WORK/gg/stamp" 2>&1)"
 check "--go-cache trims the go cache under pressure" "$OUT_GO_ONLY" \
   "ceiling 3GB" "scratchpad"
 check "--go-cache writes no stamp" "$OUT_GO_ONLY" "No such file"
