@@ -134,9 +134,13 @@ GO_CACHE_DIR="${BYPRODUCT_GO_CACHE_DIR:-$HOME/Library/Caches/go-build}"
 # merge-gate - the only required check - queued for 90 minutes. Whatever the data volume
 # is short of this floor comes off the ceiling for that run, through the same idle-first
 # halving; the cache is still only ever EMPTIED at the fixed ceiling, never for pressure.
-# 30 = the CI floor plus room for the cache to grow between two runs. 0 turns it off.
+# 60 = the CI floor plus room for the cache to grow between two runs. It was 30 until
+# 2026-10-08: the cache regrew 25 -> 33GB in the two hours after a sweep and the data
+# volume reached 39GB free, so a floor at 30 only engaged after CI was already close to
+# its own 20GB line. Raising the floor costs only entries idle over 180m, which no build is
+# using; raising the fixed ceiling instead would also move the full clear. 0 turns it off.
 # BYPRODUCT_FREE_GB stands in for df, for the self-test only.
-GO_FREE_FLOOR_GB="${BYPRODUCT_GO_FREE_FLOOR_GB:-30}"
+GO_FREE_FLOOR_GB="${BYPRODUCT_GO_FREE_FLOOR_GB:-60}"
 
 # A tagged image is not a dangling one, so the reaper above never sees it. Only images
 # that opt in by name are taken: `apertis-prepared:<sha>`, one per release-lane commit.
