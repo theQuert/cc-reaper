@@ -718,6 +718,72 @@ colon-separated list in `CC_REAPER_CODEX_REPOS` when installing):
 }
 ```
 
+## WIP backup (opt-in)
+
+`shell/wip-backup.sh` keeps a snapshot of every active Claude Code worktree on its own `origin`,
+at `refs/wip/macmini/<branch>`, so a Mac outage or a dead disk loses at most ten minutes of
+uncommitted or unpushed work. Whoever takes over an issue can start from that snapshot
+(stima-api `docs/OPERATING-MODEL.md`, Mac outage protocol). It runs every 10 minutes from
+`com.cc-reaper.wip-backup`.
+
+- **Active** means a live `claude` process has its cwd in the worktree (`lsof`), or a file in it
+  changed in the last 6 hours (`.git` and `node_modules` aside). Branches `main` and `master`
+  (the canonical checkout) are skipped.
+- **Snapshot:** HEAD plus staged, unstaged and untracked non-ignored files. It is built in a
+  temporary `GIT_INDEX_FILE` (`read-tree`, `add -A`, `write-tree`, `commit-tree -p HEAD`), so the
+  worktree, its index, its stash and its branches are never touched. Files over 20 MB are left
+  out and logged.
+- **Push:** only when the snapshot's tree or parent differs from the remote ref, and only that
+  ref is force-updated. A clean worktree whose HEAD is already pushed needs no snapshot. There is
+  one `git ls-remote` per repository per run, and none on an idle machine except an hourly cleanup.
+- **Cleanup:** a WIP ref is deleted only when no worktree has the branch checked out and no live
+  session is in one. In addition, either the remote branch must be merged into the remote's
+  default branch, or the branch must be gone from both the remote and the local repository with a
+  snapshot more than 72 hours old. Branches are never deleted.
+- **Scratchpads** (`/private/tmp/claude-<uid>/<project>/<session>/scratchpad`) are pruned by
+  the byproducts reaper, not here. Its rule is stricter than a plain age cut: idle 24h and free by
+  the path-in-use liveness gate, never forced. Make sure that reaper is scheduled (below).
+
+The label is host-specific, so `install.sh` does not enable the backup. Install it on the Mac
+mini only, from a checkout at or after this change. Nothing else needs installing: `git`, `lsof`
+and `find` are stock. The remote must be reachable without a prompt from a LaunchAgent: HTTPS
+with the macOS keychain or `gh auth setup-git`, or SSH with a key that needs no agent prompt.
+
+```bash
+# install (Mac mini)
+cd ~/GitHub/cc-reaper && git pull --ff-only
+mkdir -p ~/.cc-reaper/logs ~/.cc-reaper/state
+install -m 755 shell/wip-backup.sh ~/.cc-reaper/wip-backup.sh
+~/.cc-reaper/wip-backup.sh --dry-run          # what it would push and delete; changes nothing
+cp launchd/com.cc-reaper.wip-backup.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-reaper.wip-backup.plist
+launchctl print gui/$(id -u)/com.cc-reaper.wip-backup | grep -E 'state|last exit'
+tail -n 5 ~/.cc-reaper/logs/wip-backup.log    # one line per push/delete, a "done:" line per run
+
+# scratchpad pruning: schedule the byproducts reaper if it is not already
+launchctl print gui/$(id -u)/com.cc-reaper.reclaim-byproducts >/dev/null 2>&1 ||
+  ~/.cc-reaper/reclaim-byproducts.sh --install-launchd 3h
+
+# uninstall: stops the agent; the refs already pushed stay until you delete them
+launchctl bootout gui/$(id -u)/com.cc-reaper.wip-backup
+rm -f ~/Library/LaunchAgents/com.cc-reaper.wip-backup.plist ~/.cc-reaper/wip-backup.sh
+rm -rf ~/.cc-reaper/state/wip-backup
+# optional, per repository: remove every snapshot this host pushed
+git ls-remote origin 'refs/wip/macmini/*' | cut -f2 | xargs -n1 git push origin --delete
+```
+
+Restore a snapshot on another machine:
+
+```bash
+git fetch origin 'refs/wip/macmini/claude/3632-x:refs/wip/macmini/claude/3632-x'
+git log -1 --stat refs/wip/macmini/claude/3632-x   # parent = the branch HEAD it was taken on
+git worktree add ../restore-3632 refs/wip/macmini/claude/3632-x   # detached, with the WIP as one commit
+```
+
+Tune with `~/.cc-reaper/wip-backup.conf`, which is sourced when present: `WIP_REPOS` (default
+`$HOME/GitHub/*`), `WIP_RECENT_MINUTES` (360), `WIP_MAX_MB` (20), `WIP_GONE_GRACE_HOURS` (72),
+`WIP_SKIP_BRANCHES` (`main master`).
+
 ## macOS Companion App (local)
 
 cc-reaper includes a native SwiftUI menu bar app for status visibility and safe manual actions. It reads the existing `cc-monitor --once --json` contract and delegates cleanup to the existing shell engine; process discovery, classification, and termination policy remain in the tested shell scripts.
@@ -815,6 +881,7 @@ cc-reaper/
 │   ├── com.cc-reaper.disk-check.plist      # Read-only disk check agent (hourly)
 │   ├── com.cc-reaper.weekly-clean.plist    # Rebuildable-cache clean agent (Sun 04:00)
 │   ├── com.cc-reaper.orbstack-memory-trim.plist # OrbStack guest cache trim (15-min interval)
+│   ├── com.cc-reaper.wip-backup.plist      # Opt-in WIP snapshots to refs/wip/macmini/* (10-min interval)
 │   └── com.cc-reaper.worktree-janitor.plist # Shared worktree sweep (6-hour interval)
 ├── proc-janitor/
 │   └── config.toml                 # proc-janitor daemon config (alternative to LaunchAgent)
@@ -825,6 +892,7 @@ cc-reaper/
 │   ├── disk-janitor.sh             # Disk check (--check) / rebuildable-cache clean (--clean)
 │   ├── growth-watch.py             # Budgeted per-target size samples + growth alerts
 │   ├── orbstack-memory-trim.sh     # Drops OrbStack guest caches when its VM holds over 1/4 of RAM
+│   ├── wip-backup.sh               # Opt-in: snapshot active worktrees to refs/wip/<label>/<branch>
 │   └── worktree-janitor.sh         # Git worktree inventory + gated removal (dry-run default)
 ├── tests/
 │   ├── agent-process-patterns.sh   # Cleanup-candidate matcher validation
@@ -834,6 +902,7 @@ cc-reaper/
 │   ├── resource-watch.sh           # Snapshot / threshold / cooldown tests (stubbed)
 │   ├── disk-janitor.sh             # Read-only check / forbidden-flag / thinning tests (stubbed)
 │   ├── growth-watch.sh             # Sampling order / budget / status / growth alert tests (stubbed)
+│   ├── wip-backup.sh               # Snapshot contents / push-on-change / ref cleanup (bare remote)
 │   └── worktree-janitor.sh         # Fixture-repo gate + apply tests
 └── README.md
 ```

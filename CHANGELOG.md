@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+- **`wip-backup.sh` pushes Claude worktree WIP to `refs/wip/macmini/<branch>` every 10 minutes
+  (opt-in, #85).** Worktrees with a live `claude` cwd or a change in the last 6 hours are
+  snapshotted (HEAD plus staged, unstaged and untracked non-ignored files, built in a temporary
+  index, files over 20 MB left out) and pushed only on change, force-updating only their own ref.
+  A ref is deleted once no worktree holds the branch and it is merged, or gone everywhere for 72
+  hours. Branches are never deleted. Scratchpad pruning stays with `reclaim-byproducts.sh`.
+  `com.cc-reaper.wip-backup` is installed by hand (README, "WIP backup"), not by `install.sh`.
+
 ### Changed
 - **The growth targets template no longer lists `~/.Trash`.** macOS privacy protection
   denies it to a LaunchAgent without Full Disk Access, so the first scheduled run recorded
