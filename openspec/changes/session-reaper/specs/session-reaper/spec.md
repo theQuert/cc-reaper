@@ -12,14 +12,22 @@ The session reaper SHALL consider only interactive Claude Code sessions whose se
 - **THEN** it is kept as `waiting`
 
 ### Requirement: Reaping never stops background work or overwrites input
-The reaper SHALL re-read the session status and SHALL type `/exit` only when the cursor sits after an empty prompt and no dialog or menu is on screen. When the background-task exit menu appears it SHALL press Esc (Stay) and skip the session. It SHALL kill the tmux session only after the claude process has exited, and SHALL record the session in the closed-sessions log and on each claimed issue with its resume command.
+Before acting the reaper SHALL re-read the session file and skip the session if its status or status time changed since the sweep read it, if claude is not its tty's foreground process, or if the current tmux name is protected. It SHALL type `/exit` only when the cursor sits after an empty prompt and no dialog or menu is on screen, and SHALL press Enter only if the prompt line then reads exactly `/exit`, otherwise removing the typed text and skipping. When the background-task exit menu appears it SHALL press Esc (Stay) and skip the session. Only after the claude process has exited SHALL it close claude's pane, and the tmux session (targeted by id) only when that pane was its only one, and SHALL record the session in the closed-sessions log and on each claimed issue with its resume command.
+
+#### Scenario: The cursor was moved into a draft
+- **WHEN** the prompt line does not read exactly `/exit` after typing
+- **THEN** the typed characters are removed, Enter is never pressed, and the report says `skipped:input-not-empty`
+
+#### Scenario: The tmux session has other windows
+- **WHEN** claude's pane is not the session's only pane
+- **THEN** only that pane is closed and the other windows keep running
 
 #### Scenario: Background work is running
 - **WHEN** `/exit` opens the "Exit and stop tasks / Move to background / Stay" menu
 - **THEN** the reaper selects Stay, the session and its tasks keep running, and the report says `skipped:background-tasks`
 
 ### Requirement: Every reap is verified and a failure is never silent
-After each reap the reaper SHALL check that every process in the pre-exit descendant snapshot (pid and start time) is gone, that the tmux session and the session file no longer exist, and that no owned worktree has a `locked` file or `index.lock`. Any failure SHALL raise a local notification independent of GitHub, a comment on the configured tracking issue, and a non-zero exit, and SHALL appear in the report.
+After each reap the reaper SHALL check that every process in the pre-exit descendant snapshot (pid and start time) is gone, that claude's pane, the tmux session when it was killed, and the session file no longer exist, and that no owned worktree has a `locked` file or `index.lock`. Any failure SHALL raise a local notification independent of GitHub, a comment on the configured tracking issue, and a non-zero exit, and SHALL appear in the report.
 
 #### Scenario: A child outlives claude
 - **WHEN** a process from the snapshot is still running after the reap

@@ -799,11 +799,16 @@ the deployed config sets `APPLY=1`.**
 - **Done** means the latest assistant text has a `SESSION-DONE: <summary>` line or says the topic
   is finished, or every issue the session claimed is closed. Claims come from worktrees whose
   `claude-task-worktree` marker names the session; the issue number is read from the branch.
-- **Reap:** `/exit` is typed only at an empty prompt with no dialog on screen. If the background
-  task menu appears, Esc selects Stay and the session is skipped. The tmux session is killed
-  after claude exits; the closed-sessions log and each claimed issue get the resume command.
-- **Verify:** the pre-exit process tree, the tmux session and the session file must be gone, and
-  no owned worktree may be locked. A failure notifies, comments on `TRACKING_ISSUE`, exits 1.
+- **Reap:** first it re-checks that the session file is unchanged since the sweep read it, that
+  claude is the pane's foreground process, and that the current tmux name is not protected.
+  `/exit` is typed only at an empty prompt with no dialog on screen, and Enter is pressed only if
+  the prompt then reads exactly `/exit` (otherwise the text is taken back out). If the background
+  task menu appears, Esc selects Stay and the session is skipped. After claude exits its pane is
+  closed, and the tmux session too when that was its only pane; other windows are left alone.
+  The closed-sessions log and each claimed issue get the resume command.
+- **Verify:** the pre-exit process tree, the pane (and the tmux session when it was killed) and
+  the session file must be gone, and no owned worktree may be locked. A failure notifies,
+  comments on `TRACKING_ISSUE` (orphans by executable name only), and exits 1.
 
 ```bash
 # install (the host that runs the tmux sessions)
