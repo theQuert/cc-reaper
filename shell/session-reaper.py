@@ -354,8 +354,9 @@ def verify(s, snapshot):
         fails.append(f"claude pid {s['pid']} still running")
     orphans = survivors(table, snapshot)
     if orphans:
+        # Executable name only: arguments can carry credentials, and this text goes to an issue.
         fails.append("orphan processes: " + ", ".join(
-            f"{p} {table[p][2][:60]}" for p, _ in orphans))
+            f"{p} {os.path.basename(table[p][2].split(' ', 1)[0])}" for p, _ in orphans))
     if tmux("has-session", "-t", f"={s['tmux']}")[0] == 0:
         fails.append(f"tmux session {s['tmux']} still exists")
     if Path(s["file"]).exists():
