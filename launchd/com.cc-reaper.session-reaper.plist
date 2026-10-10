@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cc-reaper.session-reaper</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>f="$HOME/.cc-reaper/logs/session-reaper.log"; mkdir -p "${f%/*}"; [ "$(wc -c &lt;"$f" 2&gt;/dev/null || echo 0)" -gt 5000000 ] &amp;&amp; mv "$f" "$f.1"; exec /usr/bin/env python3 "$HOME/.cc-reaper/session-reaper.py" &gt;&gt;"$f" 2&gt;&amp;1</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict></plist>

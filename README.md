@@ -784,6 +784,47 @@ Tune with `~/.cc-reaper/wip-backup.conf`, which is sourced when present: `WIP_RE
 `$HOME/GitHub/*`), `WIP_RECENT_MINUTES` (360), `WIP_MAX_MB` (20), `WIP_GONE_GRACE_HOURS` (72),
 `WIP_SKIP_BRANCHES` (`main master`).
 
+## Session reaper (opt-in)
+
+`shell/session-reaper.py` closes interactive Claude Code sessions in tmux once their work is
+finished, so `tmux ls` shows who is still working and idle sessions stop holding memory. It runs
+every 30 minutes from `com.cc-reaper.session-reaper` and calls no model. **It only reports until
+the deployed config sets `APPLY=1`.**
+
+- **Considered:** sessions in `~/.claude/sessions/*.json` with `kind: interactive` and a `tmux`
+  pane that still holds the same pid and start time. Background sessions are never touched.
+- **Kept** when any gate holds; the report names it: `protected`, `status:<busy|shell>`,
+  `idle:<n><threshold`, `shell-child`, `loop-pending`, `scheduled-task`, `waiting`,
+  `claim-unknown`, `issue-open:#n`, `uncommitted:<worktree>`, `unpushed:<worktree>`.
+- **Done** means the latest assistant text has a `SESSION-DONE: <summary>` line or says the topic
+  is finished, or every issue the session claimed is closed. Claims come from worktrees whose
+  `claude-task-worktree` marker names the session; the issue number is read from the branch.
+- **Reap:** first it re-checks that the session file is unchanged since the sweep read it, that
+  claude is the pane's foreground process, and that the current tmux name is not protected.
+  `/exit` is typed only at an empty prompt with no dialog on screen, and Enter is pressed only if
+  the prompt then reads exactly `/exit` (otherwise the text is taken back out). If the background
+  task menu appears, Esc selects Stay and the session is skipped. After claude exits its pane is
+  closed, and the tmux session too when that was its only pane; other windows are left alone.
+  The closed-sessions log and each claimed issue get the resume command.
+- **Verify:** the pre-exit process tree, the pane (and the tmux session when it was killed) and
+  the session file must be gone, and no owned worktree may be locked. A failure notifies,
+  comments on `TRACKING_ISSUE` (orphans by executable name only), and exits 1.
+
+```bash
+# install (the host that runs the tmux sessions)
+cd ~/GitHub/cc-reaper && git pull --ff-only
+install -m 755 shell/session-reaper.py ~/.cc-reaper/session-reaper.py
+[ -f ~/.cc-reaper/session-reaper.conf ] || install -m 600 config/session-reaper.conf ~/.cc-reaper/
+~/.cc-reaper/session-reaper.py                  # report only; prints the report path
+~/.cc-reaper/session-reaper.py --only <tmux> --apply   # reap one session now
+cp launchd/com.cc-reaper.session-reaper.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-reaper.session-reaper.plist
+
+# uninstall
+launchctl bootout gui/$(id -u)/com.cc-reaper.session-reaper
+rm -f ~/Library/LaunchAgents/com.cc-reaper.session-reaper.plist ~/.cc-reaper/session-reaper.py
+```
+
 ## macOS Companion App (local)
 
 cc-reaper includes a native SwiftUI menu bar app for status visibility and safe manual actions. It reads the existing `cc-monitor --once --json` contract and delegates cleanup to the existing shell engine; process discovery, classification, and termination policy remain in the tested shell scripts.

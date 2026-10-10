@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- **`session-reaper.py` closes finished Claude Code sessions in tmux (opt-in, report-only by
+  default).** Every 30 minutes `com.cc-reaper.session-reaper` keeps any session that is busy,
+  recently active, running background work, waiting on a person, protected, not yet done
+  (`SESSION-DONE:` line or every claimed issue closed) or holding unpushed work. Otherwise it types
+  `/exit` at an empty prompt (Stay if the background-task menu appears), kills the tmux session,
+  and verifies the process tree, tmux session, session file and worktree locks are gone; a failure
+  notifies, comments on a tracking issue and exits 1. Installed by hand (README, "Session reaper").
 - **`wip-backup.sh` pushes Claude worktree WIP to `refs/wip/macmini/<branch>` every 10 minutes
   (opt-in, #85).** Worktrees with a live `claude` cwd or a change in the last 6 hours are
   snapshotted (HEAD plus staged, unstaged and untracked non-ignored files, built in a temporary

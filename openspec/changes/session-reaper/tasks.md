@@ -1,0 +1,4 @@
+- [x] Gate, transcript, prompt and verifier tests, the verifier calibrated against a real surviving process, tmux session and lock.
+- [x] Live on the host: a finished disposable session reaped and verified; a session with a background task left on Stay; a draft left intact; a second window left running.
+- [x] Report-only run over every live session, each with the gate that keeps it.
+- [ ] `APPLY=1` on the host after a person confirms.
