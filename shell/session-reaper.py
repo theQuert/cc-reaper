@@ -34,6 +34,7 @@ DEFAULTS = {
     "REPORT": "~/.cc-reaper/state/session-reaper-report.md",
     "TRACKING_ISSUE": "",  # owner/repo#N that receives verification failures
     "JANITOR": "~/.cc-reaper/worktree-janitor.sh",
+    "WAITING_EXTRA": "",  # extra regex alternatives that mean "waiting on a person"
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
@@ -43,7 +44,7 @@ EXIT_WAIT_SECONDS = 20
 DONE_RE = re.compile(r"(?m)^\W*SESSION-DONE:\s*(.+)$")
 DONE_PHRASE_RE = re.compile(r"這個主題(已經)?結束|may be closed", re.I)
 WAITING_RE = re.compile(
-    r"production-authorization|authoriz|approv|授權|批准|等你|等 ?Leo|你決定|請確認", re.I
+    r"production-authorization|authoriz|approv|授權|批准|等你|你決定|請確認", re.I
 )
 ISSUE_RE = re.compile(r"(?:^|/)(\d{3,6})(?:-|$)")
 MENU_TEXT = "Exit and stop tasks"
@@ -118,21 +119,48 @@ def tmux(*args):
     return run(["tmux", *args], timeout=10)
 
 
+def pane_exists(pane):
+    # `display -t <missing pane>` exits 0 with empty output, so ask for the id and compare.
+    rc, out = tmux("display", "-p", "-t", pane, "#{pane_id}")
+    return rc == 0 and out.strip() == pane
+
+
 def pane_state(pane):
-    rc, out = tmux("display", "-p", "-t", pane, "#{session_name}\t#{pane_pid}\t#{cursor_x}\t#{cursor_y}")
-    if rc:
+    rc, out = tmux("display", "-p", "-t", pane, "#{pane_id}\t#{session_name}\t#{session_id}\t"
+                   "#{pane_pid}\t#{cursor_x}\t#{cursor_y}\t#{window_panes}\t#{session_windows}")
+    fields = out.rstrip("\n").split("\t")
+    if rc or len(fields) != 8 or fields[0] != pane:
         return None
-    name, pane_pid, cx, cy = out.rstrip("\n").split("\t")
+    _, name, sid, pane_pid, cx, cy, panes, windows = fields
     rc, screen = tmux("capture-pane", "-p", "-t", pane)
-    return {"session": name, "pane_pid": int(pane_pid), "cx": int(cx), "cy": int(cy), "screen": screen}
+    return {"session": name, "session_id": sid, "pane_pid": int(pane_pid), "cx": int(cx),
+            "cy": int(cy), "alone": panes == "1" and windows == "1", "screen": screen}
+
+
+def cursor_line(state):
+    lines = state["screen"].split("\n")
+    # The prompt glyph is followed by a no-break space.
+    return lines[state["cy"]].replace("\xa0", " ").rstrip() if state["cy"] < len(lines) else ""
+
+
+def foreground(pid):
+    """claude owns its terminal: not stopped, and in the tty's foreground process group."""
+    rc, stat = run(["ps", "-o", "stat=", "-p", str(pid)])
+    return rc == 0 and "+" in stat and "T" not in stat
+
+
+def vim_mode():
+    try:
+        return json.loads((HOME / ".claude.json").read_text()).get("editorMode") == "vim"
+    except (OSError, ValueError):
+        return False
 
 
 def empty_prompt(state):
     """The cursor sits right after an empty `❯ ` and no dialog or menu is on screen."""
-    lines = state["screen"].split("\n")
     if any(t in state["screen"] for t in DIALOG_TEXT + (MENU_TEXT,)):
         return False
-    return state["cy"] < len(lines) and lines[state["cy"]].startswith("❯") and state["cx"] == 2
+    return cursor_line(state).startswith("❯") and state["cx"] == 2
 
 
 # ---------- git ----------
@@ -289,6 +317,8 @@ def gather(cfg, now):
         found.append({
             "file": str(f), "pid": pid, "sid": sid, "cwd": cwd, "name": d.get("name", ""),
             "tmux": state["session"], "pane": pane, "status": d.get("status"),
+            "status_at": d.get("statusUpdatedAt"), "start": table[pid][1], "fg": foreground(pid),
+            "vim": vim_mode(),
             "idle_min": (now - d.get("statusUpdatedAt", now * 1000) / 1000) / 60,
             "bg_shells": [p for p, (pp, _, cmd) in table.items()
                           if pp == pid and "shell-snapshots/" in cmd],
@@ -299,12 +329,24 @@ def gather(cfg, now):
     return found
 
 
+def protected(cfg, *names):
+    return any(fnmatch.fnmatch(n, p) for p in cfg["PROTECT"].split() for n in names if n)
+
+
+def waiting_re(cfg):
+    extra = cfg.get("WAITING_EXTRA", "")
+    return re.compile(WAITING_RE.pattern + ("|" + extra if extra else ""), re.I)
+
+
 def decide(s, cfg):
     """Return the list of reasons that keep the session; empty means reap."""
     keep = []
-    pats = cfg["PROTECT"].split()
-    if any(fnmatch.fnmatch(n, p) for p in pats for n in (s["tmux"], s["name"]) if n):
+    if protected(cfg, s["tmux"], s["name"]):
         keep.append("protected")
+    if not s.get("fg", True):
+        keep.append("not-foreground")
+    if s.get("vim"):
+        keep.append("vim-mode")
     if s["status"] != "idle":
         keep.append(f"status:{s['status']}")
     elif s["idle_min"] < float(cfg["IDLE_MINUTES"]):
@@ -315,7 +357,7 @@ def decide(s, cfg):
         keep.append("loop-pending")
     if s["crons"] > 0 or s["scheduled"]:
         keep.append("scheduled-task")
-    if s["asking"] or WAITING_RE.search(DONE_RE.sub("", s["last_text"])):
+    if s["asking"] or waiting_re(cfg).search(DONE_RE.sub("", s["last_text"])):
         keep.append("waiting")
     if not (DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])):
         states = [issue_state(r, n) for r, n in s["claims"]]
@@ -357,8 +399,10 @@ def verify(s, snapshot):
         # Executable name only: arguments can carry credentials, and this text goes to an issue.
         fails.append("orphan processes: " + ", ".join(
             f"{p} {os.path.basename(table[p][2].split(' ', 1)[0])}" for p, _ in orphans))
-    if tmux("has-session", "-t", f"={s['tmux']}")[0] == 0:
-        fails.append(f"tmux session {s['tmux']} still exists")
+    if pane_exists(s["pane"]):
+        fails.append(f"tmux pane {s['pane']} still exists")
+    if s.get("killed_session") and tmux("has-session", "-t", s["session_id"])[0] == 0:
+        fails.append(f"tmux session {s['tmux']} ({s['session_id']}) still exists")
     if Path(s["file"]).exists():
         fails.append(f"session file {s['file']} still exists")
     for w in s["owned"]:
@@ -371,17 +415,33 @@ def verify(s, snapshot):
 
 def reap(s, cfg, now):
     """Return (outcome, failures). outcome is reaped, or skipped:<why>."""
+    # Everything gather saw may be minutes old: re-check that nobody has touched the session.
+    try:
+        fresh = json.loads(Path(s["file"]).read_text())
+    except (OSError, ValueError):
+        return "skipped:session-file-unreadable", []
+    if fresh.get("status") != "idle" or fresh.get("statusUpdatedAt") != s["status_at"]:
+        return "skipped:session-changed", []
     table = ps_table()
-    fresh = json.loads(Path(s["file"]).read_text()) if Path(s["file"]).exists() else {}
-    if fresh.get("status") != "idle" or s["pid"] not in table:
-        return "skipped:no-longer-idle", []
-    s["start"] = table[s["pid"]][1]
+    if s["pid"] not in table or table[s["pid"]][1] != s["start"] or not foreground(s["pid"]):
+        return "skipped:not-foreground", []
     state = pane_state(s["pane"])
-    if not state or not empty_prompt(state):
+    if not state or not is_ancestor(table, state["pane_pid"], s["pid"]):
+        return "skipped:pane-changed", []
+    if protected(cfg, state["session"], s["name"]):
+        return "skipped:protected", []
+    if not empty_prompt(state):
         return "skipped:prompt-not-empty", []
+    s["tmux"], s["session_id"] = state["session"], state["session_id"]
+    alone = state["alone"]
     snapshot = descendants(table, s["pid"])
     tmux("send-keys", "-t", s["pane"], "-l", "/exit")
-    time.sleep(0.3)
+    time.sleep(0.5)
+    typed = pane_state(s["pane"])
+    if not typed or cursor_line(typed) != "❯ /exit":
+        # The input was not empty after all (cursor moved into a draft): take our text back out.
+        tmux("send-keys", "-t", s["pane"], *["BSpace"] * len("/exit"))
+        return "skipped:input-not-empty", []
     tmux("send-keys", "-t", s["pane"], "Enter")
     deadline = time.time() + EXIT_WAIT_SECONDS
     while time.time() < deadline:
@@ -408,7 +468,9 @@ def reap(s, cfg, now):
     for ref in s["claims"]:
         comment(ref, f"Session `{s['tmux']}` (`{s['sid']}`) finished and was reaped by session-reaper. "
                      f"Resume it with `cd {s['cwd']} && claude --resume {s['sid']}`.")
-    tmux("kill-session", "-t", f"={s['tmux']}")
+    # Kill only what this session owned: the whole tmux session if it was its only pane.
+    s["killed_session"] = alone
+    tmux("kill-session", "-t", s["session_id"]) if alone else tmux("kill-pane", "-t", s["pane"])
     time.sleep(1)
     return "reaped", verify(s, snapshot)
 
@@ -453,18 +515,25 @@ def main(argv=None):
         return 0
     now = time.time()
     rows, failures, reaped = [], [], 0
-    for s in gather(cfg, now):
-        if args.only and s["tmux"] != args.only:
-            continue
-        keep = decide(s, cfg)
-        outcome = "keep" if keep else ("reap" if apply else "would-reap")
-        if not keep and apply:
-            outcome, fails = reap(s, cfg, now)
-            reaped += outcome == "reaped"
-            failures += [f"{s['tmux']} ({s['sid']}): {f}" for f in fails]
-            if outcome == "reaped":
-                outcome = "reaped, verified" if not fails else "reaped, VERIFY FAILED"
-        rows.append(report_line(s, keep, outcome))
+    try:
+        for s in gather(cfg, now):
+            if args.only and s["tmux"] != args.only:
+                continue
+            keep, outcome = [], "error"
+            try:
+                keep = decide(s, cfg)
+                outcome = "keep" if keep else ("reap" if apply else "would-reap")
+                if not keep and apply:
+                    outcome, fails = reap(s, cfg, now)
+                    reaped += outcome == "reaped"
+                    failures += [f"{s['tmux']} ({s['sid']}): {f}" for f in fails]
+                    if outcome == "reaped":
+                        outcome = "reaped, verified" if not fails else "reaped, VERIFY FAILED"
+            except Exception as e:  # one bad session must not cost the others their report
+                failures.append(f"{s['tmux']} ({s['sid']}): {type(e).__name__}: {e}")
+            rows.append(report_line(s, keep, outcome))
+    except Exception as e:
+        failures.append(f"sweep aborted: {type(e).__name__}: {e}")
     mode = "apply" if apply else "report-only"
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
     report = [f"# session-reaper {mode} {stamp}", "",

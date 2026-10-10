@@ -54,6 +54,8 @@ class Decide(unittest.TestCase):
             "claim-unknown": dict(last_text="all good"),
             "issue-open:#2": dict(last_text="", claims=[("o/r", "1"), ("o/r", "2")]),
             "uncommitted:wt": dict(owned=[{"problems": ["uncommitted:wt"]}]),
+            "not-foreground": dict(fg=False),
+            "vim-mode": dict(vim=True),
         }
         for reason, kw in cases.items():
             with self.subTest(reason):
@@ -80,6 +82,12 @@ class Decide(unittest.TestCase):
     def test_a_request_for_authorization_is_waiting_even_when_done(self):
         text = "SESSION-DONE: staged\n\n等 Leo 的 production-authorization 才能上線。"
         self.assertIn("waiting", self.keep(last_text=text))
+
+    def test_extra_waiting_patterns_come_from_the_config(self):
+        text = "SESSION-DONE: drafted\n\nwaiting for Pat"
+        self.assertEqual(self.keep(last_text=text), [])
+        with mock.patch.dict(CFG, WAITING_EXTRA="waiting for Pat"):
+            self.assertIn("waiting", self.keep(last_text=text))
 
     def test_the_done_line_itself_does_not_read_as_waiting(self):
         self.assertEqual(self.keep(last_text="SESSION-DONE: PR approved and merged"), [])
@@ -144,12 +152,33 @@ class Prompt(unittest.TestCase):
         self.assertTrue(reaper.empty_prompt(self.state(f"{self.SEP}\n❯ \n{self.SEP}")))
         self.assertTrue(reaper.empty_prompt(self.state(f"{self.SEP}\n❯ Try \"fix lint\"\n{self.SEP}")))
 
+    def test_typed_text_is_read_through_the_no_break_space(self):
+        self.assertEqual(reaper.cursor_line(self.state("x\n❯\xa0/exit  \ny")), "❯ /exit")
+
     def test_a_draft_a_dialog_or_the_exit_menu_disqualify(self):
         self.assertFalse(reaper.empty_prompt(self.state(f"{self.SEP}\n❯ hello\n{self.SEP}", cx=7)))
         dialog = f"  ❯ 1. Yes\n  Enter to confirm · Esc to cancel\n{self.SEP}\n❯ \n{self.SEP}"
         self.assertFalse(reaper.empty_prompt(self.state(dialog, cy=3)))
         menu = f"   ❯ 1. Exit and stop tasks\n     3. Stay\n{self.SEP}\n❯ \n"
         self.assertFalse(reaper.empty_prompt(self.state(menu, cy=3)))
+
+
+class ReapRecheck(unittest.TestCase):
+    """reap() acts on minutes-old facts, so it re-reads the session file before touching tmux."""
+
+    def test_a_session_used_since_the_sweep_started_is_skipped(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        f = d / "1.json"
+        s = {"file": str(f), "status_at": 1000, "pid": 1, "start": "x", "pane": "%0"}
+        with mock.patch.object(reaper, "tmux") as tmux:
+            f.write_text(json.dumps({"status": "idle", "statusUpdatedAt": 2000}))
+            self.assertEqual(reaper.reap(s, CFG, 0), ("skipped:session-changed", []))
+            f.write_text(json.dumps({"status": "busy", "statusUpdatedAt": 1000}))
+            self.assertEqual(reaper.reap(s, CFG, 0), ("skipped:session-changed", []))
+            f.unlink()
+            self.assertEqual(reaper.reap(s, CFG, 0), ("skipped:session-file-unreadable", []))
+            tmux.assert_not_called()
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
@@ -169,10 +198,13 @@ class Verify(unittest.TestCase):
         (d / "index.lock").write_text("")
         time.sleep(0.2)
         start = reaper.ps_table()[child.pid][1]
-        s = {"pid": 999999, "start": "", "tmux": name, "file": str(d / "session.json"),
-             "owned": [{"path": d, "gitdir": d}]}
+        pane, sid = subprocess.run(["tmux", "display", "-p", "-t", f"={name}:", "#{pane_id} #{session_id}"],
+                                   capture_output=True, text=True, check=True).stdout.split()
+        s = {"pid": 999999, "start": "", "tmux": name, "pane": pane, "session_id": sid,
+             "killed_session": True, "file": str(d / "session.json"), "owned": [{"path": d, "gitdir": d}]}
         fails = reaper.verify(s, [(child.pid, start)])
-        for needle in (f"orphan processes: {child.pid}", f"tmux session {name}", "session file",
+        for needle in (f"orphan processes: {child.pid}", f"tmux pane {pane}", f"tmux session {name}",
+                       "session file",
                        "is locked", "index.lock"):
             self.assertTrue(any(needle in f for f in fails), (needle, fails))
 
