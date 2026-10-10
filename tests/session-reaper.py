@@ -80,7 +80,7 @@ class Decide(unittest.TestCase):
                 self.assertEqual(self.keep(last_text=text), [])
 
     def test_a_request_for_authorization_is_waiting_even_when_done(self):
-        text = "SESSION-DONE: staged\n\n等 Leo 的 production-authorization 才能上線。"
+        text = "SESSION-DONE: staged\n\n等 production-authorization 才能上線。"
         self.assertIn("waiting", self.keep(last_text=text))
 
     def test_extra_waiting_patterns_come_from_the_config(self):

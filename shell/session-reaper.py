@@ -469,8 +469,14 @@ def reap(s, cfg, now):
         comment(ref, f"Session `{s['tmux']}` (`{s['sid']}`) finished and was reaped by session-reaper. "
                      f"Resume it with `cd {s['cwd']} && claude --resume {s['sid']}`.")
     # Kill only what this session owned: the whole tmux session if it was its only pane.
-    s["killed_session"] = alone
-    tmux("kill-session", "-t", s["session_id"]) if alone else tmux("kill-pane", "-t", s["pane"])
+    # Recount just before the kill: a window opened during the exit wait must survive. A pane
+    # that closed with claude leaves nothing of this session's to kill.
+    still_alone = False
+    if pane_exists(s["pane"]):
+        state = pane_state(s["pane"])
+        still_alone = alone and bool(state and state["alone"])
+        tmux("kill-session", "-t", s["session_id"]) if still_alone else tmux("kill-pane", "-t", s["pane"])
+    s["killed_session"] = still_alone
     time.sleep(1)
     return "reaped", verify(s, snapshot)
 
