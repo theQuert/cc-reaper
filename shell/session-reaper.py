@@ -35,6 +35,12 @@ DEFAULTS = {
     "TRACKING_ISSUE": "",  # owner/repo#N that receives verification failures
     "JANITOR": "~/.cc-reaper/worktree-janitor.sh",
     "WAITING_EXTRA": "",  # extra regex alternatives that mean "waiting on a person"
+    "SUBAGENT_QUIET_MINUTES": "30",  # a subagent or workflow transcript written this recently is still running
+    "PROMPT_RE": r"\(y/n\)|do you want to proceed|waiting for input|NEEDS_HUMAN",  # on screen: asks a person
+    "RELAY_DIR": "",  # pending <issue>-*.json requests for a claimed issue keep the session; empty: off
+    "RELAY_MAX_AGE_HOURS": "48",  # an older request no longer counts as pending
+    "HANDOFF_ROOT": "",  # a path under it named in the last message must exist; empty: off
+    "REAPED_DIR": "~/.cc-reaper/state/reaped",  # one record per reaped tmux name, written before /exit
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
@@ -47,6 +53,11 @@ WAITING_RE = re.compile(
     r"production-authorization|authoriz|approv|授權|批准|等你|你決定|請確認", re.I
 )
 ISSUE_RE = re.compile(r"(?:^|/)(\d{3,6})(?:-|$)")
+PATH_RE = re.compile(r"(?:~|/)[\w./@+-]+")
+# Keep reasons added after the first 48 h of live reaping: a row kept only by these is one the
+# earlier gates would have reaped, which is what the report-only comparison looks for.
+NEW_GATES = ("subagent-active", "handoff-")
+BACKGROUND_ONLY = {"status:shell", "shell-child"}
 MENU_TEXT = "Exit and stop tasks"
 DIALOG_TEXT = ("Enter to confirm", "Esc to cancel")
 
@@ -286,6 +297,51 @@ def transcript_facts(path, now):
     return facts
 
 
+def subagent_activity(sid, now, quiet_minutes):
+    """Subagent and workflow transcripts of this session written in the last quiet_minutes.
+    They run inside the claude process: no child process shows them, and status may read idle."""
+    recent = 0
+    for sub in ("subagents", "workflows"):
+        for f in PROJECTS_DIR.glob(f"*/{sid}/{sub}/**/*"):
+            try:
+                recent += f.is_file() and now - f.stat().st_mtime < quiet_minutes * 60
+            except OSError:
+                continue
+    return recent
+
+
+def relay_pending(cfg, claims, now):
+    """Claimed issues with a relay request still waiting: `<issue>-*.json` at the top of RELAY_DIR
+    (answered ones are renamed `.done` or moved to a subdirectory), younger than RELAY_MAX_AGE_HOURS."""
+    if not cfg["RELAY_DIR"]:
+        return []
+    root = Path(os.path.expanduser(cfg["RELAY_DIR"]))
+    max_age = float(cfg["RELAY_MAX_AGE_HOURS"]) * 3600
+    out = []
+    for _, num in claims:
+        for f in root.glob(f"{num}-*.json"):
+            try:
+                if now - f.stat().st_mtime < max_age:
+                    out.append(num)
+                    break
+            except OSError:
+                continue
+    return out
+
+
+def missing_handoffs(cfg, text):
+    """Concrete paths under HANDOFF_ROOT named in the last message that do not exist."""
+    if not cfg["HANDOFF_ROOT"]:
+        return []
+    root = os.path.expanduser(cfg["HANDOFF_ROOT"]).rstrip("/") + "/"
+    out = []
+    for raw in PATH_RE.findall(text):
+        path = os.path.expanduser(raw.rstrip(".,)"))
+        if path.startswith(root) and path != root and not os.path.exists(path) and path not in out:
+            out.append(path)
+    return out
+
+
 # ---------- gather and decide ----------
 
 def gather(cfg, now):
@@ -323,9 +379,12 @@ def gather(cfg, now):
             "bg_shells": [p for p, (pp, _, cmd) in table.items()
                           if pp == pid and "shell-snapshots/" in cmd],
             "scheduled": (Path(cwd) / ".claude" / "scheduled_tasks.json").exists(),
+            "sub_active": subagent_activity(sid, now, float(cfg["SUBAGENT_QUIET_MINUTES"])),
+            "screen_tail": "\n".join(state["screen"].rstrip("\n").split("\n")[-15:]),
             "owned": owned, "claims": claims, "descendants": len(descendants(table, pid)),
             **transcript_facts(transcript_path(sid), now),
         })
+        found[-1]["relay_pending"] = relay_pending(cfg, claims, now)
     return found
 
 
@@ -359,6 +418,13 @@ def decide(s, cfg):
         keep.append("scheduled-task")
     if s["asking"] or waiting_re(cfg).search(DONE_RE.sub("", s["last_text"])):
         keep.append("waiting")
+    if s.get("sub_active"):
+        keep.append("subagent-active")
+    if s.get("relay_pending"):
+        keep.append("handoff-pending:relay#" + ",#".join(s["relay_pending"]))
+    if cfg["PROMPT_RE"] and re.search(cfg["PROMPT_RE"], s.get("screen_tail", ""), re.I):
+        keep.append("handoff-pending:prompt")
+    keep.extend("handoff-missing:" + os.path.basename(p) for p in missing_handoffs(cfg, s["last_text"]))
     if not (DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])):
         states = [issue_state(r, n) for r, n in s["claims"]]
         if not s["claims"]:
@@ -413,6 +479,32 @@ def verify(s, snapshot):
     return fails
 
 
+def write_record(s, cfg, now, status):
+    """The context a person or `--resume` needs once the session is gone, written before /exit."""
+    d = Path(os.path.expanduser(cfg["REAPED_DIR"]))
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{s['tmux']}.json"
+    rec = {"tmux": s["tmux"], "name": s.get("name", ""), "sid": s["sid"], "cwd": s["cwd"],
+           "claims": [f"{r}#{n}" for r, n in s["claims"]],
+           "worktrees": [{"path": str(w["path"]), "branch": w.get("branch", "")} for w in s["owned"]],
+           "last_text": s["last_text"][-2000:], "at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
+           "status": status,
+           "resume": f"tmux new-session -d -s {s['tmux']} -c {s['cwd']} 'claude --resume {s['sid']}'"}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=1) + "\n")
+    tmp.replace(path)
+    return path
+
+
+def mark_record(path, outcome):
+    try:
+        rec = json.loads(path.read_text())
+        rec["status"] = "reaped" if outcome == "reaped" else f"aborted:{outcome}"
+        path.write_text(json.dumps(rec, ensure_ascii=False, indent=1) + "\n")
+    except (OSError, ValueError):
+        pass
+
+
 def reap(s, cfg, now):
     """Return (outcome, failures). outcome is reaped, or skipped:<why>."""
     # Everything gather saw may be minutes old: re-check that nobody has touched the session.
@@ -435,6 +527,7 @@ def reap(s, cfg, now):
     s["tmux"], s["session_id"] = state["session"], state["session_id"]
     alone = state["alone"]
     snapshot = descendants(table, s["pid"])
+    s["record"] = write_record(s, cfg, now, "exiting")
     tmux("send-keys", "-t", s["pane"], "-l", "/exit")
     time.sleep(0.5)
     typed = pane_state(s["pane"])
@@ -496,8 +589,10 @@ def report_line(s, keep, outcome):
     wt = ",".join(w["path"].name for w in s["owned"]) or "-"
     issues = ",".join(f"#{n}" for _, n in s["claims"]) or "-"
     plan = f"pid {s['pid']}+{s['descendants']} desc; tmux {s['tmux']}; worktrees {wt}"
+    background_only = "yes" if keep and set(keep) <= BACKGROUND_ONLY else "-"
+    new_only = "yes" if keep and all(k.startswith(NEW_GATES) for k in keep) else "-"
     return (f"| {s['tmux']} | `{s['sid'][:8]}` | {s['status']} {s['idle_min']:.0f}m | {issues} | "
-            f"{outcome} | {', '.join(keep) or '-'} | {plan} |")
+            f"{outcome} | {', '.join(keep) or '-'} | {background_only} | {new_only} | {plan} |")
 
 
 def main(argv=None):
@@ -531,6 +626,8 @@ def main(argv=None):
                 outcome = "keep" if keep else ("reap" if apply else "would-reap")
                 if not keep and apply:
                     outcome, fails = reap(s, cfg, now)
+                    if s.get("record"):
+                        mark_record(s["record"], outcome)
                     reaped += outcome == "reaped"
                     failures += [f"{s['tmux']} ({s['sid']}): {f}" for f in fails]
                     if outcome == "reaped":
@@ -544,8 +641,9 @@ def main(argv=None):
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
     report = [f"# session-reaper {mode} {stamp}", "",
               f"idle threshold {cfg['IDLE_MINUTES']} min; protected: {cfg['PROTECT'] or '(none)'}", "",
-              "| tmux | session | status idle | issues | outcome | keeps it | verification target |",
-              "|---|---|---|---|---|---|---|", *rows]
+              "| tmux | session | status idle | issues | outcome | keeps it | held only by background shells "
+              "| kept only by new gates | verification target |",
+              "|---|---|---|---|---|---|---|---|---|", *rows]
     if failures:
         report += ["", "## Verification failures", *[f"- {f}" for f in failures]]
     out = Path(os.path.expanduser(cfg["REPORT"]))

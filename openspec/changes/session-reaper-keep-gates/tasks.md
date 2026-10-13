@@ -1,0 +1,4 @@
+- [x] Keep gates `subagent-active`, `handoff-pending:relay#N`, `handoff-pending:prompt`, `handoff-missing:<file>`
+- [x] Pre-exit record in `REAPED_DIR`, marked after the exit attempt
+- [x] Report columns "held only by background shells" and "kept only by new gates"
+- [x] Tests in `tests/session-reaper.py`; report-only run against live sessions
