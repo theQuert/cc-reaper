@@ -220,5 +220,81 @@ class Verify(unittest.TestCase):
         self.assertEqual(reaper.survivors(table, [(42, "Sat Oct 10 00:00:00 2026")]), [])
 
 
+class NewKeepGates(unittest.TestCase):
+    """Subagents, undelivered handoffs and the pre-exit record: gates that only ever keep a session."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.cfg = dict(CFG, RELAY_DIR=str(self.tmp / "relay"), HANDOFF_ROOT=str(self.tmp / "handoffs"),
+                        REAPED_DIR=str(self.tmp / "reaped"))
+
+    def keep(self, **kw):
+        with mock.patch.object(reaper, "worktree_state", return_value=[]):
+            return reaper.decide(session(**kw), self.cfg)
+
+    def test_a_recent_subagent_or_workflow_transcript_counts_as_activity(self):
+        now = time.time()
+        with mock.patch.object(reaper, "PROJECTS_DIR", self.tmp):
+            for sub, age in (("subagents", 60), ("workflows/run1", 60), ("subagents", 7200)):
+                d = self.tmp / "proj" / "sid1" / sub
+                d.mkdir(parents=True, exist_ok=True)
+                f = d / f"agent-{age}-{sub.replace('/', '-')}.jsonl"
+                f.write_text("{}")
+                os.utime(f, (now - age, now - age))
+            self.assertEqual(reaper.subagent_activity("sid1", now, 30), 2)
+            self.assertEqual(reaper.subagent_activity("other", now, 30), 0)
+        self.assertIn("subagent-active", self.keep(sub_active=1))
+        self.assertEqual(self.keep(sub_active=0), [])
+
+    def test_a_pending_relay_request_for_a_claimed_issue_keeps_the_session(self):
+        relay = self.tmp / "relay"
+        (relay / "done").mkdir(parents=True)
+        now = time.time()
+        (relay / "41-sign.json").write_text("{}")
+        (relay / "42-sign.json.done").write_text("{}")
+        (relay / "done" / "43-sign.json").write_text("{}")
+        old = relay / "44-sign.json"
+        old.write_text("{}")
+        os.utime(old, (now - 3 * 86400, now - 3 * 86400))
+        claims = [("o/r", n) for n in ("41", "42", "43", "44", "45")]
+        self.assertEqual(reaper.relay_pending(self.cfg, claims, now), ["41"])
+        self.assertEqual(reaper.relay_pending(dict(self.cfg, RELAY_DIR=""), claims, now), [])
+        self.assertIn("handoff-pending:relay#41", self.keep(relay_pending=["41"]))
+
+    def test_a_question_to_a_person_on_screen_keeps_the_session(self):
+        self.assertIn("handoff-pending:prompt", self.keep(screen_tail="Do you want to proceed?\n❯ 1. Yes"))
+        self.assertEqual(self.keep(screen_tail="❯ \xa0"), [])
+
+    def test_a_named_handoff_that_does_not_exist_keeps_the_session(self):
+        root = self.tmp / "handoffs"
+        root.mkdir()
+        (root / "ready.md").write_text("x")
+        text = f"SESSION-DONE: wrote {root}/ready.md, and the follow-up goes in {root}/later.md."
+        self.assertEqual(reaper.missing_handoffs(self.cfg, text), [f"{root}/later.md"])
+        self.assertIn("handoff-missing:later.md", self.keep(last_text=text))
+        self.assertEqual(reaper.missing_handoffs(dict(self.cfg, HANDOFF_ROOT=""), text), [])
+
+    def test_report_marks_background_only_and_new_gate_only_rows(self):
+        s = session(pid=1, descendants=0, sid="abcdef0123")
+        row = lambda keep: reaper.report_line(s, keep, "keep").split(" | ")  # noqa: E731
+        self.assertEqual(row(["status:shell", "shell-child"])[6:8], ["yes", "-"])
+        self.assertEqual(row(["subagent-active", "handoff-missing:x.md"])[6:8], ["-", "yes"])
+        self.assertEqual(row(["subagent-active", "issue-open:#2"])[6:8], ["-", "-"])
+        self.assertEqual(row([])[6:8], ["-", "-"])
+
+    def test_the_record_is_written_before_exit_and_marked_after(self):
+        s = session(sid="sid-1", cwd="/w", claims=[("o/r", "7")],
+                    owned=[{"path": Path("/w/t"), "branch": "b"}], last_text="SESSION-DONE: ok")
+        path = reaper.write_record(s, self.cfg, time.time(), "exiting")
+        rec = json.loads(path.read_text())
+        self.assertEqual((rec["status"], rec["sid"], rec["claims"]), ("exiting", "sid-1", ["o/r#7"]))
+        self.assertEqual(rec["resume"], "tmux new-session -d -s work -c /w 'claude --resume sid-1'")
+        reaper.mark_record(path, "skipped:background-tasks")
+        self.assertEqual(json.loads(path.read_text())["status"], "aborted:skipped:background-tasks")
+        reaper.mark_record(path, "reaped")
+        self.assertEqual(json.loads(path.read_text())["status"], "reaped")
+
+
 if __name__ == "__main__":
     unittest.main()

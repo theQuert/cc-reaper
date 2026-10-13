@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Added
+- **`session-reaper.py` keeps sessions whose work the process tree cannot show.** The reaper
+  only ever keeps more with these gates, never reaps more:
+  - `subagent-active`: a subagent or workflow transcript was written recently;
+  - `handoff-pending:relay#N`: a request is pending for a claimed issue;
+  - `handoff-pending:prompt`: a question to a person is on screen;
+  - `handoff-missing:<file>`: a handoff named in the last message does not exist.
+
+  Before `/exit` it writes `REAPED_DIR/<tmux>.json` with the resume command. The report gains the
+  columns "held only by background shells" and "kept only by new gates".
 - **`session-reaper.py` closes finished Claude Code sessions in tmux (opt-in, report-only by
   default).** Every 30 minutes `com.cc-reaper.session-reaper` keeps any session that is busy,
   recently active, running background work, waiting on a person, protected, not yet done
