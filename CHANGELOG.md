@@ -9,6 +9,20 @@
   `refs/wip/macmini/<worktree>-<UTC stamp>` and is read back (`--apply` only; a report prints
   `would push wip`). The report summary adds `estimated-reclaimable`. `wip-backup.sh` never
   deletes those snapshot refs. Set `CC_WJ_RECLAIM_PUSHED=0` for landed-on-base only.
+- **Disk guard in `resource-watch.sh`.** Every 10 minutes: free space under `CC_RW_DISK_ALERT_GB`
+  (40) raises `ALERT:disk-low` and a notification; under `CC_RW_DISK_ACT_GB` (25) it runs
+  `worktree-janitor.sh --scheduled` then `reclaim-byproducts.sh`, at most once per
+  `CC_RW_ACT_COOLDOWN_SECS` (1800), output in `resource-watch-act.log`. The launchd job now carries
+  a PATH with `/opt/homebrew/bin`.
+- **`reclaim-byproducts.sh --go-cache-cap`** (run by resource-watch every 10 minutes): above
+  `CC_GO_CACHE_MAX_GB` (20) the go build cache loses files oldest-mtime-first down to
+  `CC_GO_CACHE_TARGET_GB` (12), never one modified within `CC_GO_CACHE_MIN_AGE_MIN` (60). The age
+  trim is now `BYPRODUCT_GO_CACHE_TRIM_HOURS` (default 24, was 3 days) and a full reap also runs
+  `go clean -testcache`.
+- **Session temp reaper** (in every full `reclaim-byproducts.sh` run): scratchpad
+  `tasks/*.output` over 200 MiB, idle 24h and held by no process, and the `tmp/` of finished
+  (`done`/`stopped`/`failed`) `~/.claude/jobs/*` idle 24h. A directory named `push` is never entered.
+- `docs/spotlight-exclusions.md`: what keeps a folder out of Spotlight on macOS 26 without root.
 - **`session-reaper.py` keeps sessions whose work the process tree cannot show.** The reaper
   only ever keeps more with these gates, never reaps more:
   - `subagent-active`: a subagent or workflow transcript was written recently;

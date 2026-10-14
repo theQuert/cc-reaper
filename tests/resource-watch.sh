@@ -51,7 +51,7 @@ STUB
 cat > "$stub_dir/df" <<'STUB'
 #!/usr/bin/env bash
 echo "Filesystem   1K-blocks      Used Available Capacity Mounted on"
-echo "/dev/disk3s5 976562500 195312500 104858562     20%  /System/Volumes/Data"
+echo "/dev/disk3s5 976562500 195312500 ${CC_RW_TEST_DF_KB:-104858562}     20%  /System/Volumes/Data"
 STUB
 
 # fake vm_stat: pages (4096 byte pages)
@@ -105,6 +105,9 @@ STUB
 
 chmod +x "$stub_dir/top" "$stub_dir/df" "$stub_dir/vm_stat" \
          "$stub_dir/sysctl" "$stub_dir/osascript"
+
+# Hermetic: no case may reach the deployed reclaim scripts (a real go cache cap or sweep).
+export CC_RW_RECLAIM_SCRIPT=/nonexistent/reclaim-byproducts.sh CC_RW_JANITOR_SCRIPT=/nonexistent/worktree-janitor.sh
 
 # Helper: run a fresh snapshot in a controlled environment
 # Usage: run_snapshot [extra env vars as VAR=val ...]
@@ -470,6 +473,72 @@ expect_yes "T11f: and the newest is this run's" \
 
 expect_yes "T11g: a first run starts the sample file with one sample" \
   test "$(wc -l < "$(cat "$t1_oascript.statedir")/disk-free-samples")" -eq 1
+
+
+# ---------------------------------------------------------------------------
+# T12: disk guard. Alert below 40GB free; below 25GB run worktree-janitor --scheduled and
+# reclaim-byproducts, at most once per 30 minutes; the go cache cap runs on every snapshot.
+# ---------------------------------------------------------------------------
+GB=1048576
+guard_dir=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+for name in janitor reclaim; do
+  cat > "$guard_dir/$name.sh" <<STUB
+#!/usr/bin/env bash
+echo "$name \$*" >> "\$CC_RW_TEST_CALLS"
+STUB
+done
+
+guard_case() {
+  local dir=$1 free_gb=$2
+  shift 2
+  mkdir -p "$dir/state"
+  (
+    export PATH="$stub_dir:$PATH"
+    export CC_RW_LOG="$dir/resource-watch.log" CC_RW_STATE_DIR="$dir/state"
+    export CC_RW_OSASCRIPT_LOG="$dir/osascript" CC_RW_TEST_CALLS="$dir/calls"
+    export CC_RW_TEST_DF_KB=$(( free_gb * GB ))
+    export CC_RW_JANITOR_SCRIPT="$guard_dir/janitor.sh" CC_RW_RECLAIM_SCRIPT="$guard_dir/reclaim.sh"
+    for pair in "$@"; do export "$pair"; done
+    bash "$ROOT_DIR/shell/resource-watch.sh"
+  ) || true
+  touch "$dir/osascript" "$dir/calls"
+}
+
+g1=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+guard_case "$g1" 60
+expect_no  "T12a: 60GB free raises no disk-low" grep -q 'ALERT:disk-low' "$g1/resource-watch.log"
+expect_yes "T12a: but the go cache cap still runs" grep -qx 'reclaim --go-cache-cap' "$g1/calls"
+expect_no  "T12a: and nothing else does" grep -qE 'janitor|^reclaim $' "$g1/calls"
+
+g2=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+guard_case "$g2" 30
+expect_yes "T12b: 30GB free logs ALERT:disk-low" grep -q 'ALERT:disk-low' "$g2/resource-watch.log"
+expect_yes "T12b: and notifies once" test "$(grep -c 'disk-low' "$g2/osascript")" -eq 1
+expect_no  "T12b: without running the reclaim" test -f "$g2/state/cooldown-disk-act"
+
+g3=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+guard_case "$g3" 20
+expect_yes "T12c: 20GB free runs the janitor --scheduled, then reclaim-byproducts (apply, no flag)" \
+  test "$(grep -v -- --go-cache-cap "$g3/calls" | tr '\n' '|')" = "janitor --scheduled|reclaim |"
+expect_yes "T12c: and still alerts" grep -q 'ALERT:disk-low' "$g3/resource-watch.log"
+guard_case "$g3" 20
+expect_yes "T12d: a second run inside 30 minutes does not reclaim again" \
+  test "$(grep -c '^janitor' "$g3/calls")" -eq 1
+expect_yes "T12d: but caps the go cache again" test "$(grep -c -- --go-cache-cap "$g3/calls")" -eq 2
+touch -t "$(date -v-31M +%Y%m%d%H%M 2>/dev/null || date -d '31 minutes ago' +%Y%m%d%H%M)" "$g3/state/cooldown-disk-act"
+guard_case "$g3" 20
+expect_yes "T12d: after the cooldown it reclaims again" test "$(grep -c '^janitor' "$g3/calls")" -eq 2
+
+g4=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+guard_case "$g4" 20 CC_RW_DISK_ACT_GB=0
+expect_no "T12e: CC_RW_DISK_ACT_GB=0 turns the reclaim off" grep -q '^janitor' "$g4/calls"
+g5=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+guard_case "$g5" 30 CC_RW_DISK_ACT_GB=35
+expect_yes "T12e: the act threshold is a knob" grep -q '^janitor' "$g5/calls"
+g6=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+guard_case "$g6" 30 CC_RW_DISK_ALERT_GB=20 CC_RW_GO_CAP=0
+expect_no "T12e: the alert threshold is a knob" grep -q 'ALERT:disk-low' "$g6/resource-watch.log"
+expect_no "T12e: CC_RW_GO_CAP=0 stops the cap" grep -q -- --go-cache-cap "$g6/calls"
 
 if [ "$failures" -gt 0 ]; then
   printf "%s test failure(s)\n" "$failures"

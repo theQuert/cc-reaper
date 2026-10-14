@@ -30,6 +30,14 @@ Environment:
   CC_RW_DISK_MIN_PCT   Disk free % below which alert fires (default: 15)
   CC_RW_MEM_MIN_PCT    Memory free % below which alert fires when compressor also high (default: 5)
   CC_RW_DISK_DROP_GB   Disk free fall in GB, against a 25-45 minute old sample, that alerts; 0 disables (default: 10)
+  CC_RW_DISK_ALERT_GB  Disk free GB below which ALERT:disk-low fires (default: 40); 0 disables
+  CC_RW_DISK_ACT_GB    Disk free GB below which the reclaim runs by itself: worktree-janitor
+                       --scheduled, then reclaim-byproducts (default: 25); 0 disables
+  CC_RW_ACT_COOLDOWN_SECS  Seconds between two reclaim runs (default: 1800)
+  CC_RW_RECLAIM_SCRIPT     reclaim-byproducts.sh to run (default: ~/.cc-reaper/reclaim-byproducts.sh)
+  CC_RW_JANITOR_SCRIPT     worktree-janitor.sh to run (default: ~/.cc-reaper/worktree-janitor.sh)
+  CC_RW_GO_CAP         Set to 0 to stop the every-run `reclaim-byproducts.sh --go-cache-cap` (default: 1)
+Reclaim output goes to resource-watch-act.log beside CC_RW_LOG.
 EOF
 }
 
@@ -72,6 +80,13 @@ _cc_rw_mem_min_pct() {
 _cc_rw_disk_drop_gb() {
   local v="${CC_RW_DISK_DROP_GB:-10}"
   [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] || v=10
+  echo "$v"
+}
+
+# Non-negative number knob (decimals allowed); a bad value falls back to the default.
+_cc_rw_num() {
+  local v="${!1:-$2}"
+  [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] || v=$2
   echo "$v"
 }
 
@@ -264,6 +279,43 @@ _cc_rw_maybe_notify() {
 }
 
 # ---------------------------------------------------------------------------
+# Disk guard: below CC_RW_DISK_ACT_GB free, run the reclaim by itself
+# ---------------------------------------------------------------------------
+
+# 0 when $1 < $2 and $2 > 0 (a limit of 0 is "off"); also 1 for an unreadable $1.
+_cc_rw_below() {
+  awk -v f="$1" -v l="$2" 'BEGIN { exit !(f ~ /^[0-9.]+$/ && l + 0 > 0 && f + 0 < l + 0) }'
+}
+
+# The reclaim, once per CC_RW_ACT_COOLDOWN_SECS. Foreground on purpose: launchd kills a job's
+# stray children when the job exits, so a backgrounded sweep would die with this run. The
+# stamp is touched BEFORE the work, so a sweep that overruns the cooldown is not started twice.
+# Order is the byproducts doc's: the worktree sweep first, because a reclaimed tree orphans
+# what reclaim-byproducts then collects.
+# Args: <free GB> <now epoch>
+_cc_rw_disk_act() {
+  local free=$1 now=$2 stamp mtime cool actlog janitor reclaim
+  stamp="$(_cc_rw_state_dir)/cooldown-disk-act"
+  cool=$(_cc_rw_num CC_RW_ACT_COOLDOWN_SECS 1800)
+  if [ -f "$stamp" ]; then
+    mtime=$(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp" 2>/dev/null || echo 0)
+    [ $(( now - mtime )) -lt "${cool%.*}" ] && return 1
+  fi
+  touch "$stamp" 2>/dev/null || return 1
+  actlog="$(dirname "$(_cc_rw_log_path)")/resource-watch-act.log"
+  janitor="${CC_RW_JANITOR_SCRIPT:-$HOME/.cc-reaper/worktree-janitor.sh}"
+  reclaim="${CC_RW_RECLAIM_SCRIPT:-$HOME/.cc-reaper/reclaim-byproducts.sh}"
+  _cc_rw_bound_log "$actlog"
+  {
+    echo "== disk act $(date '+%Y-%m-%dT%H:%M:%S') free=${free}GB =="
+    if [ -f "$janitor" ]; then bash "$janitor" --scheduled; echo "worktree-janitor --scheduled rc=$?"; else echo "no $janitor"; fi
+    if [ -f "$reclaim" ]; then bash "$reclaim"; echo "reclaim-byproducts rc=$?"; else echo "no $reclaim"; fi
+    echo "== disk act done $(date '+%Y-%m-%dT%H:%M:%S') free=$(_cc_rw_collect_disk | awk '{print $1}')GB =="
+  } >> "$actlog" 2>&1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Core snapshot function
 # ---------------------------------------------------------------------------
 
@@ -329,6 +381,11 @@ _cc_rw_snapshot() {
   [ "$load_breach" = "true" ] && markers="${markers} ALERT:load"
   [ "$disk_breach" = "true" ] && markers="${markers} ALERT:disk"
   [ -n "$drop_gb" ]           && markers="${markers} ALERT:disk-drop"
+  local alert_gb act_gb disk_low=false disk_act=false
+  alert_gb=$(_cc_rw_num CC_RW_DISK_ALERT_GB 40); act_gb=$(_cc_rw_num CC_RW_DISK_ACT_GB 25)
+  _cc_rw_below "$disk_free_gb" "$alert_gb" && disk_low=true
+  _cc_rw_below "$disk_free_gb" "$act_gb" && disk_act=true
+  [ "$disk_low" = "true" ]    && markers="${markers} ALERT:disk-low"
   [ "$mem_breach"  = "true" ] && markers="${markers} ALERT:mem"
   markers="${markers# }"   # ltrim space
 
@@ -352,8 +409,18 @@ _cc_rw_snapshot() {
   [ -n "$drop_gb" ] && _cc_rw_maybe_notify "disk-drop" \
     "disk free fell ${drop_gb}GB within 45 minutes, now ${disk_free_gb}GB" "$now"
 
+  [ "$disk_low" = "true" ] && _cc_rw_maybe_notify "disk-low" \
+    "disk free ${disk_free_gb}GB below ${alert_gb}GB" "$now"
+
   [ "$mem_breach"  = "true" ] && _cc_rw_maybe_notify "mem" \
     "mem free ${mem_free_pct}% below ${mem_min_pct}% and compressor ${compressor_gb}GB above ${comp_threshold_gb}GB" "$now"
+
+  # --- disk guard: the cap every run, the full reclaim only below the act line ---
+  local reclaim_script="${CC_RW_RECLAIM_SCRIPT:-$HOME/.cc-reaper/reclaim-byproducts.sh}"
+  if [ "${CC_RW_GO_CAP:-1}" != "0" ] && [ -f "$reclaim_script" ]; then
+    bash "$reclaim_script" --go-cache-cap >> "$(dirname "$log_file")/resource-watch-act.log" 2>&1
+  fi
+  [ "$disk_act" = "true" ] && _cc_rw_disk_act "$disk_free_gb" "$now"
 
   # deterministic exit: a false tail-test (`[ ... ] && notify`) must not leak
   # rc=1 into launchd's last-exit-status on healthy runs

@@ -9,7 +9,8 @@
 # daemon, the archive a previous reclaim wrote. On 2026-09-11 those three came to
 # 20.5 GiB, 6.5 GB and 2.3 GB, and every one of them was freed by hand.
 #
-# Five reapers, one rule each, all fail-closed:
+# Six reapers, one rule each, all fail-closed (the sixth, session temp, and the go cache's
+# size cap are described at their functions):
 #
 #   scratchpads  /tmp/claude-<uid>/<project>/<session-uuid>  — only when path-in-use.sh
 #                says free. UNKNOWN is treated as in use. Idle 24h, or 6h under disk
@@ -57,6 +58,9 @@
 #   reclaim-byproducts.sh              reap now, whatever the stamp says
 #   reclaim-byproducts.sh --dry-run    report what would be reaped, touch nothing
 #   reclaim-byproducts.sh --go-cache   trim the go build cache only, now (no stamp)
+#   reclaim-byproducts.sh --go-cache-cap   delete go build cache files oldest-first when it is
+#                                      over CC_GO_CACHE_MAX_GB (20) down to CC_GO_CACHE_TARGET_GB
+#                                      (12), never one modified in CC_GO_CACHE_MIN_AGE_MIN (60) min
 #   reclaim-byproducts.sh --if-stale   reap only if the last completed reap is older than
 #                                      the gate - BYPRODUCT_MIN_MINUTES, or failing that
 #                                      BYPRODUCT_MIN_HOURS (default 12) - the agent's path
@@ -125,7 +129,32 @@ ARCHIVE_DAYS="${BYPRODUCT_ARCHIVE_RETENTION_DAYS:-30}"
 # does what Go's own policy does, just sooner. The ceiling is the backstop for the case
 # the age trim cannot reach - a burst inside the window - and it trims by idleness before
 # it ever empties the cache (see reap_go_cache).
-GO_CACHE_TRIM_DAYS="${BYPRODUCT_GO_CACHE_TRIM_DAYS:-3}"
+# The age trim is in HOURS, 24 by default: at 26 GiB/hour of growth (2026-10-14, one entry
+# per worktree path and package) a 3-day horizon keeps weeks of dead copies. Go refreshes an
+# entry's mtime on use at most hourly, so 24h is far past any build's working set. The older
+# DAYS knob still works for an install that set it, and loses to HOURS.
+GO_CACHE_TRIM_HOURS="${BYPRODUCT_GO_CACHE_TRIM_HOURS:-}"
+if [ -z "$GO_CACHE_TRIM_HOURS" ]; then
+  if [ -z "${BYPRODUCT_GO_CACHE_TRIM_DAYS:-}" ]; then GO_CACHE_TRIM_HOURS=24
+  else
+    case "$BYPRODUCT_GO_CACHE_TRIM_DAYS" in
+      ''|*[!0-9]*|??????*) GO_CACHE_TRIM_HOURS="$BYPRODUCT_GO_CACHE_TRIM_DAYS" ;; # refused below
+      *) GO_CACHE_TRIM_HOURS=$((10#$BYPRODUCT_GO_CACHE_TRIM_DAYS * 24)) ;;
+    esac
+  fi
+fi
+# The size cap, run every 10 minutes by resource-watch (--go-cache-cap) and inside every full
+# reap: above MAX_GB, delete files oldest-mtime-first until TARGET_GB is left, never a file
+# modified within MIN_AGE_MIN minutes (a build may be reading it). Decimals allowed.
+GO_CAP_MAX_GB="${CC_GO_CACHE_MAX_GB:-20}"
+GO_CAP_TARGET_GB="${CC_GO_CACHE_TARGET_GB:-12}"
+GO_CAP_MIN_AGE_MIN="${CC_GO_CACHE_MIN_AGE_MIN:-60}"
+# Session temp (reap_session_temp): a task output file this big, untouched this long and held
+# by no process, and the tmp/ of a finished ~/.claude/jobs entry untouched this long.
+SESSION_TMP_OUTPUT_MB="${BYPRODUCT_TASK_OUTPUT_MB:-200}"
+SESSION_TMP_IDLE_HOURS="${BYPRODUCT_SESSION_TMP_IDLE_HOURS:-24}"
+JOBS_DIR="${BYPRODUCT_JOBS_DIR:-$HOME/.claude/jobs}"
+LSOF="${BYPRODUCT_LSOF_BIN:-lsof}"
 GO_CACHE_MAX_GB="${BYPRODUCT_GO_CACHE_MAX_GB:-30}"
 GO_CACHE_DIR="${BYPRODUCT_GO_CACHE_DIR:-$HOME/Library/Caches/go-build}"
 # A fixed ceiling says nothing about the disk around the cache. On 2026-10-04 the cache
@@ -336,7 +365,10 @@ if [ $((MIN_MINUTES % 60)) -eq 0 ]; then GATE="$((MIN_MINUTES / 60))h"; else GAT
 # BSD `find -mtime +0` rounds up to the next whole day, so a tree touched an hour ago
 # reads as a day old. Minutes are the only unit that means what it says here.
 IDLE_MINUTES=$((IDLE_HOURS * 60))
-GO_TRIM_MINUTES=$((GO_CACHE_TRIM_DAYS * 1440))
+case "$GO_CACHE_TRIM_HOURS" in
+  ''|*[!0-9]*|??????*) GO_TRIM_MINUTES=0 ;;   # reap_go_cache refuses it by name
+  *) GO_CACHE_TRIM_HOURS=$((10#$GO_CACHE_TRIM_HOURS)); GO_TRIM_MINUTES=$((GO_CACHE_TRIM_HOURS * 60)) ;;
+esac
 
 # The Bash tool's `find` is bfs, which rejects `-newermt '-6 hours'`. Every find below
 # is the system one by absolute path for that reason.
@@ -632,8 +664,8 @@ go_stale_entries() {
 
 reap_go_cache() {
   [ -d "$GO_CACHE_DIR" ] || { log "go cache: $GO_CACHE_DIR does not exist, nothing to reap"; return 0; }
-  case "$GO_CACHE_TRIM_DAYS" in ''|*[!0-9]*) log "go cache: BYPRODUCT_GO_CACHE_TRIM_DAYS is not a whole number of days; reaping nothing"; return 0 ;; esac
-  [ "$GO_CACHE_TRIM_DAYS" -eq 0 ] && { log "go cache: trim disabled"; return 0; }
+  case "$GO_CACHE_TRIM_HOURS" in ''|*[!0-9]*|??????*) log "go cache: BYPRODUCT_GO_CACHE_TRIM_HOURS (or _DAYS) is not a whole number of hours; reaping nothing"; return 0 ;; esac
+  [ "$GO_CACHE_TRIM_HOURS" -eq 0 ] && { log "go cache: trim disabled"; return 0; }
   # The idle trims never wait for a running go build; only the full clear below does.
   # With a dozen sessions some go build is nearly always running: on 2026-10-04 the first
   # pressure run stood down on it with 24GB free and falling, and on 2026-10-05 the sweep
@@ -653,7 +685,8 @@ reap_go_cache() {
   if [ "$DRY" -eq 1 ]; then
     local n
     n="$(go_stale_entries | wc -l | tr -d ' ')"
-    log "go cache WOULD trim ${n} entr(ies) older than ${GO_CACHE_TRIM_DAYS}d (cache is ${before:-?}GB)"
+    log "go cache WOULD trim ${n} entr(ies) older than ${GO_CACHE_TRIM_HOURS}h (cache is ${before:-?}GB)"
+    go_lru_cap
     [ -n "$before" ] && [ "$before" -ge "$GO_CACHE_MAX_GB" ] 2>/dev/null \
       && log "go cache WOULD then trim idle entries, halving the horizon to no less than 180m, and clear it only if still at or above the ${GO_CACHE_MAX_GB}GB ceiling"
     return 0
@@ -664,7 +697,12 @@ reap_go_cache() {
   # the ceiling's job, not this one's.
   go_stale_entries -delete
   after="$(go_cache_gb)"
-  log "go cache: trimmed entries older than ${GO_CACHE_TRIM_DAYS}d (${before:-?}GB -> ${after:-?}GB)"
+  log "go cache: trimmed entries older than ${GO_CACHE_TRIM_HOURS}h (${before:-?}GB -> ${after:-?}GB)"
+  go_lru_cap
+  # Expires cached test RESULTS (writes testexpire.txt); it frees no bytes itself, the age
+  # trim and the cap above do. Never in --go-cache-cap, which runs every 10 minutes.
+  GOCACHE="$GO_CACHE_DIR" go clean -testcache 2>/dev/null && log "go cache: expired the test result cache"
+  after="$(go_cache_gb)"
 
   local ceiling="$GO_CACHE_MAX_GB"
   case "$pressed:$after" in
@@ -703,6 +741,103 @@ reap_go_cache() {
     GOCACHE="$GO_CACHE_DIR" go clean -cache 2>/dev/null || rm -rf "${GO_CACHE_DIR:?}/"* 2>/dev/null
     log "go cache: was still ${after}GB after the trim, at or above the ${GO_CACHE_MAX_GB}GB ceiling; cleared it"
   fi
+}
+
+# The size cap. Age alone cannot hold a cache that grows 26 GiB/hour (2026-10-14): every
+# worktree path is a new key, so the same packages are rebuilt and cached once per tree.
+# Above CC_GO_CACHE_MAX_GB, files go oldest-mtime-first until CC_GO_CACHE_TARGET_GB is left,
+# and never a file modified within CC_GO_CACHE_MIN_AGE_MIN minutes. The same entries as
+# go_stale_entries (`<hash>-a`/`-d` in the two-hex-digit subdirectories), so the top-level
+# files and fuzz/ stay. A deleted entry is a miss, never an error.
+# go_lru_victims <size KiB> <target KiB> <min age minutes> prints the victims' paths.
+go_lru_victims() {
+  local size_kb="$1" target_kb="$2" min_age="$3" need_blocks
+  need_blocks=$(( (size_kb - target_kb) * 2 ))   # stat %b counts 512-byte blocks
+  "$FIND" "$GO_CACHE_DIR" -mindepth 2 -maxdepth 2 -path "$GO_CACHE_DIR/[0-9a-f][0-9a-f]/*" \
+    \( -name '*-a' -o -name '*-d' \) -type f -mmin +"$min_age" \
+    -exec /usr/bin/stat -f '%m %b %N' {} + 2>/dev/null \
+    | sort -n | awk -v need="$need_blocks" '
+        { sum += $2; sub(/^[0-9]+ [0-9]+ /, ""); print; if (sum >= need) exit }'
+}
+
+go_lru_cap() {
+  [ -d "$GO_CACHE_DIR" ] || return 0
+  local v max_kb target_kb n
+  for v in "$GO_CAP_MAX_GB" "$GO_CAP_TARGET_GB"; do
+    case "$v" in ''|*[!0-9.]*|*.*.*|.|*.) log "go cache cap: '$v' is not a number of GB; capping nothing"; return 0 ;; esac
+  done
+  case "$GO_CAP_MIN_AGE_MIN" in ''|*[!0-9]*|??????*) log "go cache cap: CC_GO_CACHE_MIN_AGE_MIN is not a whole number of minutes; capping nothing"; return 0 ;; esac
+  max_kb="$(awk -v g="$GO_CAP_MAX_GB" 'BEGIN{printf "%d", g * 1048576}')"
+  target_kb="$(awk -v g="$GO_CAP_TARGET_GB" 'BEGIN{printf "%d", g * 1048576}')"
+  [ "$target_kb" -le "$max_kb" ] || { log "go cache cap: target ${GO_CAP_TARGET_GB}GB is above max ${GO_CAP_MAX_GB}GB; capping nothing"; return 0; }
+  local before after list
+  before="$(kb_of "$GO_CACHE_DIR")"
+  [ "${before:-0}" -gt "$max_kb" ] || return 0   # the common case is silent: it runs every 10 minutes
+  list="$(mktemp "${TMPDIR:-/tmp}/go-lru.XXXXXX")" || return 0
+  go_lru_victims "$before" "$target_kb" "$((10#$GO_CAP_MIN_AGE_MIN))" > "$list"
+  n="$(wc -l < "$list" | tr -d ' ')"
+  if [ "$DRY" -eq 1 ]; then
+    log "go cache cap WOULD delete ${n} file(s) oldest-first (cache is $(as_gb "$before"), max ${GO_CAP_MAX_GB}GB, target ${GO_CAP_TARGET_GB}GB, none modified within ${GO_CAP_MIN_AGE_MIN}m)"
+  else
+    tr '\n' '\0' < "$list" | xargs -0 rm -f 2>/dev/null
+    after="$(kb_of "$GO_CACHE_DIR")"
+    log "go cache cap: $(as_gb "$before") is over ${GO_CAP_MAX_GB}GB; deleted ${n} file(s) oldest-first, none modified within ${GO_CAP_MIN_AGE_MIN}m -> $(as_gb "$after") (target ${GO_CAP_TARGET_GB}GB)"
+    [ "${after:-0}" -le "$target_kb" ] || log "go cache cap: still over the target; what remains was modified within ${GO_CAP_MIN_AGE_MIN}m"
+  fi
+  rm -f "$list"
+}
+
+# ---------------------------------------------------------------- session temp
+
+# 0 when some process holds $1 open (a file, or anything under a directory with +D).
+# Fail closed: no lsof, or an lsof that cannot see this user's own process, is "held".
+path_is_held() {
+  local out
+  command -v "$LSOF" >/dev/null 2>&1 || return 0
+  "$LSOF" -p "$$" -d cwd -Fn 2>/dev/null | grep -q '^n/' || return 0
+  if [ -d "$1" ]; then out="$("$LSOF" -t +D "$1" 2>/dev/null)"; else out="$("$LSOF" -t -- "$1" 2>/dev/null)"; fi
+  [ -n "$out" ]
+}
+
+# Two things nothing ever clears once their session is over, 52 GiB on 2026-10-14:
+#  - $SCRATCH_ROOT/<project>/<session>/tasks/*.output over 200 MiB, untouched 24h, held by no
+#    process (one was 5.1 GiB, three days old). The whole scratchpad stays: the session may
+#    be resumed. Any directory named `push` is pruned from the walk, never entered.
+#  - $JOBS_DIR/<job>/tmp contents, when state.json says the job is done, stopped or failed
+#    (a `blocked` job may resume) and neither state.json nor timeline.jsonl changed for 24h.
+#    The directory itself stays, with state.json and the timeline.
+reap_session_temp() {
+  local mb="$SESSION_TMP_OUTPUT_MB" hrs="$SESSION_TMP_IDLE_HOURS" n=0 kept=0 bytes=0 f kb d st
+  case "$mb:$hrs" in *[!0-9:]*|:*|*:) log "session temp: BYPRODUCT_TASK_OUTPUT_MB / BYPRODUCT_SESSION_TMP_IDLE_HOURS are not whole numbers; reaping nothing"; return 0 ;; esac
+  if [ -d "$SCRATCH_ROOT" ] && [ ! -L "$SCRATCH_ROOT" ] && [ -O "$SCRATCH_ROOT" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if path_is_held "$f"; then log "task output kept: $f — held by a process (or lsof unusable)"; kept=$((kept + 1)); continue; fi
+      kb="$(kb_of "$f")"; bytes=$((bytes + kb))
+      if [ "$DRY" -eq 1 ]; then log "task output WOULD be removed: $f ($(as_gb "$kb"))"
+      else rm -f "$f" 2>/dev/null && log "task output removed: $f ($(as_gb "$kb"))" || { log "task output could not be removed: $f" >&2; FAILED=1; continue; }
+      fi
+      n=$((n + 1))
+    done < <("$FIND" "$SCRATCH_ROOT" -mindepth 1 -maxdepth 4 -name push -prune -o \
+               -path '*/tasks/*.output' -type f -size +"$((mb * 1024))"k -mmin +"$((hrs * 60))" -print 2>/dev/null)
+  fi
+  if [ -d "$JOBS_DIR" ] && [ ! -L "$JOBS_DIR" ]; then
+    for d in "$JOBS_DIR"/*/; do
+      d="${d%/}"
+      [ -f "$d/state.json" ] && [ -d "$d/tmp" ] && [ ! -L "$d/tmp" ] || continue
+      st="$(/usr/bin/plutil -extract state raw -o - "$d/state.json" 2>/dev/null)" || continue
+      case "$st" in done|stopped|failed) ;; *) continue ;; esac
+      [ -z "$("$FIND" "$d/state.json" "$d/timeline.jsonl" -mmin -"$((hrs * 60))" -print -quit 2>/dev/null)" ] || continue
+      [ -n "$("$FIND" "$d/tmp" -mindepth 1 -print -quit 2>/dev/null)" ] || continue
+      if path_is_held "$d/tmp"; then log "job tmp kept: $d/tmp — held by a process (or lsof unusable)"; kept=$((kept + 1)); continue; fi
+      kb="$(kb_of "$d/tmp")"; bytes=$((bytes + kb))
+      if [ "$DRY" -eq 1 ]; then log "job tmp WOULD be emptied: $d/tmp ($(as_gb "$kb"))"
+      else "$FIND" "$d/tmp" -mindepth 1 -delete 2>/dev/null; log "job tmp emptied: $d/tmp ($(as_gb "$kb"))"
+      fi
+      n=$((n + 1))
+    done
+  fi
+  log "session temp: $n reaped, $kept kept, $(freed_mb "$bytes")"
 }
 
 # ---------------------------------------------------------------- archives
@@ -1059,6 +1194,8 @@ case "${1:-}" in
   # loop, when it starts declining jobs). No scratchpad liveness gate - that is the slow
   # part, minutes - and no stamp, so the scheduled full sweep is not pushed back.
   --go-cache) rotate_log; log "== go cache only $(now_iso) (pid $$) =="; reap_go_cache; exit 0 ;;
+  # The size cap alone, for resource-watch's 10-minute cadence: silent unless over the cap.
+  --go-cache-cap) go_lru_cap; exit 0 ;;
   --if-stale) CHECK_STALE=1 ;;
   --install-launchd) trap restore_legacy_agent EXIT; install_launchd "${2:-04:00}"; exit 0 ;;
   --self-test) exec bash "$REPO_HERE/../tests/reclaim-byproducts.sh" ;;
@@ -1096,6 +1233,7 @@ if [ "$CHECK_STALE" -eq 1 ] && ran_recently; then
 fi
 
 log "-- scratchpads"; reap_scratchpads
+log "-- session temp"; reap_session_temp
 log "-- go cache";   reap_go_cache
 log "-- docker";      reap_docker
 log "-- archives";    reap_archives

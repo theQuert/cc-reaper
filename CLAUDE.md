@@ -15,6 +15,7 @@ cc-reaper is a shell-based utility that cleans up orphan Claude Code/Codex proce
 - `shell/worktree-janitor.sh` — Shared Claude/Codex worktree inventory and gated removal (clean, unheld, no live/recent harness claim, landed, idle); `--claims` for read-only claim/lease evidence, `--session` for either harness, and `--scheduled` for the guarantee layer. The method is in `docs/worktree-reclamation.md`
 - `config/worktree-janitor.conf` — Cross-device 48-hour/session/schedule policy deployed under `~/.cc-reaper`
 - `shell/reclaim-byproducts.sh` — Session scratchpads, anonymous Docker volumes, go build cache, reclaim archives; its own LaunchAgent via `--install-launchd` (adopted from the skills repository 2026-10-07)
+- `shell/resource-watch.sh` — also the disk guard: `ALERT:disk-low` under 40 GB free, the reclaim (`worktree-janitor.sh --scheduled`, then `reclaim-byproducts.sh`) under 25 GB with a 30-minute cooldown, and `reclaim-byproducts.sh --go-cache-cap` every run. Tests: `tests/resource-watch.sh` (T12), `tests/disk-guard.sh`
 - `shell/orbstack-memory-trim.sh` — Drops the OrbStack guest's clean caches when its VM process holds over a quarter of RAM; `com.cc-reaper.orbstack-memory-trim` every 15 min (adopted from stima-api 2026-10-07)
 - `hooks/worktree-session-end.sh` — Thin shared Claude/Codex SessionEnd trigger
 - `proc-janitor/config.toml` — Daemon config with target patterns, whitelist, and grace period settings
@@ -113,6 +114,7 @@ bash tests/protection-classes.sh       # Validate protection classes, runaway se
 bash tests/monitor-selection.sh        # LaunchAgent monitor body: what it signals (no CPU-based selection)
 bash tests/guard-runaway.sh            # claude-guard runaway phase run whole under bash and zsh: known MCP servers, CPU sampled across runs, each re-checked PID alone
 bash tests/install-rc-source.sh        # install.sh rc lines source the deployed copies; a stale one is repaired only when nothing else names the script
+bash tests/disk-guard.sh             # go cache LRU cap, session-temp reaper (task outputs, finished job tmp/)
 bash tests/worktree-janitor.sh         # Validate worktree gates, landing proofs, declarations, session mode, lock
 bash -n shell/claude-cleanup.sh        # Syntax check
 bash -n shell/cc-monitor.sh            # Syntax check
