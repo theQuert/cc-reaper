@@ -132,6 +132,12 @@ check "no branch was deleted by the cleanup" '[ -n "$(rref refs/heads/feat/4-mer
 rm -rf "$WIP_STATE_DIR"
 WIP_GONE_GRACE_HOURS=0 run
 check "after the grace a gone branch's WIP ref is deleted" '[ -z "$(rref refs/wip/macmini/feat/6-gone)" ] && [ -n "$(rref refs/wip/macmini/feat/5-local)" ]'
+# worktree-janitor's pre-removal snapshot, <worktree>-<UTC stamp>, has no branch of that name
+# and is the only copy of what the worktree held: the cleanup must never treat it as gone.
+SNAP=refs/wip/macmini/old-worktree-20260101T000000Z
+git -C "$P" push -q origin "$(git -C "$P" rev-parse HEAD):$SNAP"
+rm -rf "$WIP_STATE_DIR"; WIP_GONE_GRACE_HOURS=0 run
+check "a janitor pre-removal snapshot is never cleaned up as a gone branch" '[ -n "$(rref $SNAP)" ]'
 # A live session in a worktree whose branch is merged keeps the ref.
 git -C "$P" worktree add -q "$WORK/w4b" feat/4-merged
 echo more > "$WORK/w4b/f.txt"; echo "$WORK/w4b" > "$WORK/live"; run; : > "$WORK/live"

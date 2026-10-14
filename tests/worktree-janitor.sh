@@ -175,6 +175,10 @@ export CC_WJ_IDLE_HOURS=0
 # The disk pressure tier reads this host's real free space, so it is off here and turned
 # on only by its own cases.
 export CC_WJ_PRESSURE_FREE_GB=off
+# This suite judges the landed-only policy; pushed-work reclamation (CC_WJ_RECLAIM_PUSHED) has
+# its own suite, tests/worktree-janitor-reclaim.sh, and would turn this suite's dirty fixture
+# (whose HEAD is on origin/main) into a wip push.
+export CC_WJ_RECLAIM_PUSHED=0
 
 # ─── Runner helpers ───────────────────────────────────────────────────────────
 

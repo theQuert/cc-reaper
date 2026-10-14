@@ -3,6 +3,12 @@
 ## [Unreleased]
 
 ### Added
+- **`worktree-janitor` reclaims work origin already holds (`CC_WJ_RECLAIM_PUSHED`, default on).** A
+  clean worktree whose HEAD is in a branch origin lists now is `REMOVABLE(pushed)`; one with only
+  tracked edits or untracked files is `REMOVABLE(wip-pushed)` after a snapshot reaches
+  `refs/wip/macmini/<worktree>-<UTC stamp>` and is read back (`--apply` only; a report prints
+  `would push wip`). The report summary adds `estimated-reclaimable`. `wip-backup.sh` never
+  deletes those snapshot refs. Set `CC_WJ_RECLAIM_PUSHED=0` for landed-on-base only.
 - **`session-reaper.py` keeps sessions whose work the process tree cannot show.** The reaper
   only ever keeps more with these gates, never reaps more:
   - `subagent-active`: a subagent or workflow transcript was written recently;
