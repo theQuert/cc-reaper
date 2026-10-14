@@ -103,6 +103,32 @@ A worktree with an **operation in progress** (`rebase-merge`, `rebase-apply`, `B
 `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD` in its git dir) is kept: that state exists
 nowhere else.
 
+## Work origin already holds
+
+Landing is not the only way work is safe: a commit origin lists in a branch is on another
+machine. `CC_WJ_RECLAIM_PUSHED` (default 1) adds two outcomes, and every other gate (holders,
+harness claims, idle window, git state) is asked unchanged:
+
+| Classification | When | Before the removal |
+|---|---|---|
+| `REMOVABLE(pushed)` | clean, HEAD contained in a branch tip origin lists now | nothing |
+| `REMOVABLE(wip-pushed)` | only tracked edits or untracked non-ignored files stand in the way, and HEAD is landed or pushed | a snapshot (HEAD plus those files, built in a private index) is sent to `refs/wip/<label>/<worktree>-<UTC stamp>`, read back with `ls-remote`, and re-taken to prove the tree did not change; the checkout is then removed with a single `--force` |
+
+Things that are easy to get wrong:
+
+- **Pushed is asked of origin, not of `origin/<branch>`.** The run fetches only the base, so a
+  remote-tracking ref can name a branch deleted or rewritten since. One `ls-remote` per
+  repository per run; if it fails nothing counts as pushed.
+- **A report sends nothing.** It prints `would push wip: N entries to <ref>`; only `--apply`
+  makes the ref, right before the removal, so a refused or failed push keeps the worktree.
+- **A snapshot holds no ignored file.** An ignored file nothing rebuilds (`.env`, a local
+  database) keeps the tree as before. A nested repository would be recorded as a bare commit
+  id, so it fails the snapshot and keeps the tree.
+- **Snapshots are never garbage-collected.** `wip-backup.sh` leaves refs named `*-<stamp>`
+  alone; they are the only copy of what was removed. Delete one by hand when you are done.
+- The single `--force` lets git drop the verified edits; it does not override a lock
+  (`git_keep` already keeps locked trees). Branches are still never deleted.
+
 ## Byproducts only the repository knows about
 
 Built-in lists cover what every project has (`node_modules`, `.venv`, `.next`,

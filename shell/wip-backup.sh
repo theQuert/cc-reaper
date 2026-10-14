@@ -163,6 +163,9 @@ cleanup_refs() {  # $1 = repo; $TMP/held lists every branch checked out in it, $
   now="$(date +%s)"
   grep "	refs/wip/$LABEL/" "$TMP/remote" | while IFS="	" read -r sha ref; do
     branch="${ref#refs/wip/$LABEL/}"
+    # worktree-janitor's pre-removal snapshots, <worktree>-<UTC stamp>: no branch of that
+    # name exists, so the rule below would delete the only copy of a removed worktree.
+    case "$branch" in *-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) continue ;; esac
     grep -qxF -- "$branch" "$TMP/held" && continue     # a worktree still has it: keep
     grep -qxF -- "$branch" "$TMP/livebr" && continue
     tip="$(remote_sha "refs/heads/$branch")"

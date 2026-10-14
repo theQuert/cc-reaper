@@ -55,6 +55,11 @@ Environment:
   CC_WJ_STATE_DIR         State directory for cooldown files (default: ~/.cc-reaper/state)
   CC_WJ_IDLE_HOURS        Keep a worktree modified within this many hours (default: 48)
   CC_WJ_SESSION_GRACE_HOURS Keep a worktree after mapped harness activity (default: 48)
+  CC_WJ_RECLAIM_PUSHED    1 (default): a worktree whose HEAD origin already holds is removable;
+                          tracked edits and untracked files are first pushed to
+                          refs/wip/$CC_WJ_WIP_LABEL/<name>-<UTC stamp> (only with --apply)
+                          and read back. 0: landed on the base branch only
+  CC_WJ_WIP_LABEL         Namespace under refs/wip/ for those snapshots (default: macmini)
   CC_WJ_NOTIFY_MIN_GB     Disk savings threshold in GB to trigger notification (default: 1)
   CC_WJ_COOLDOWN_SECS     Notification cooldown in seconds (default: 3600)
   CC_WJ_BASE_BRANCH       Integration branch (default: origin's default branch)
@@ -2627,6 +2632,91 @@ _cc_wj_live_claim() { # <waive: yes|no> <worktree> [all|cwd|tool]
   done
 }
 
+# ─── Pushed work ──────────────────────────────────────────────────────────────
+
+# 1 when pushed work may be reclaimed (CC_WJ_RECLAIM_PUSHED, default on), 0 otherwise.
+_cc_wj_reclaim_pushed() { if [ "${CC_WJ_RECLAIM_PUSHED:-1}" = 1 ]; then echo 1; else echo 0; fi; }
+
+# Ask origin, now, for its branch tips and keep those whose commit this clone has, one
+# per line, in file $2. A remote-tracking ref is only as fresh as the last fetch and the
+# run fetches only the base, so "pushed" is judged against this listing instead.
+# Fails, leaving the file empty, when origin cannot be asked: nothing is then pushed.
+_CC_WJ_TIPS_OK=0
+_cc_wj_prepare_tips() { # <repo> <file>
+  local repo="$1" out="$2" t
+  _CC_WJ_TIPS_OK=0
+  : > "$out"
+  t="$(_cc_wj_fetch_timeout_seconds)" || return 1
+  _cc_wj_with_timeout "$t" git -C "$repo" ls-remote origin 'refs/heads/*' 2>/dev/null |
+    awk '{ print $1 }' |
+    git -C "$repo" cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null |
+    awk '$2 == "commit" { print $1 }' > "$out.tmp" || return 1
+  # An empty answer is a failed ask, not a remote with no branches.
+  [ -s "$out.tmp" ] || { rm -f "$out.tmp"; return 1; }
+  mv -f "$out.tmp" "$out" && _CC_WJ_TIPS_OK=1
+}
+
+# yes when HEAD of worktree $1 is contained in a branch tip listed in file $2.
+_cc_wj_pushed() { # <worktree> <tips file>
+  local unpushed
+  [ "$_CC_WJ_TIPS_OK" -eq 1 ] || { echo no; return; }
+  # Commits of HEAD that no tip reaches; none at all means HEAD is on origin.
+  unpushed="$({ echo HEAD; echo --not; cat "$2"; } | git -C "$1" rev-list -n 1 --stdin 2>/dev/null)" ||
+    { echo no; return; }
+  if [ -z "$unpushed" ]; then echo yes; else echo no; fi
+}
+
+# Succeeds when the only things worktree $1 would lose are tracked edits and untracked
+# files that are not ignored - what a WIP snapshot carries. An ignored file that is not
+# regenerable (`!!`), or a status that could not be read, is not in the snapshot.
+# $2 as for `_cc_wj_pins`.
+_cc_wj_wip_ok() { # <worktree> [archive list file]
+  local out
+  out="$(_cc_wj_pins "$1" "${2:-}")" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out" | grep -q '^!! ' && return 1
+  return 0
+}
+
+# Print the tree id of everything worktree $1 holds that a snapshot can keep: HEAD plus
+# tracked edits plus untracked non-ignored files, built in a private index so the worktree
+# and its real index are untouched. Fails on an unreadable file or on a nested repository
+# (a gitlink would record only a commit id, not the files).
+_cc_wj_wip_tree() { # <worktree>
+  local wt="$1" idx tree head
+  head="$(git -C "$wt" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" || return 1
+  idx="$(mktemp -u "${TMPDIR:-/tmp}/cc-wj-wip.XXXXXX")"
+  tree="$(export GIT_INDEX_FILE="$idx"
+          git --no-optional-locks -c core.fsmonitor=false -C "$wt" read-tree "$head" 2>/dev/null &&
+          git --no-optional-locks -c core.fsmonitor=false -C "$wt" add -A >/dev/null 2>&1 &&
+          git --no-optional-locks -c core.fsmonitor=false -C "$wt" write-tree 2>/dev/null)"
+  rm -f "$idx"
+  [ -n "$tree" ] || return 1
+  git -C "$wt" diff-tree -r "$head" "$tree" 2>/dev/null | awk '$2 == "160000" { bad = 1 } END { exit bad }' ||
+    return 1
+  printf '%s\n' "$tree"
+}
+
+# Send a snapshot of worktree $2 (repo $1) to $3 on origin and prove it arrived: origin
+# must list that ref at the commit made here, and the worktree must still hold exactly the
+# tree that was sent. Anything less returns 1 and the worktree stays.
+_cc_wj_wip_send() { # <repo> <worktree> <ref>
+  local repo="$1" wt="$2" ref="$3" head tree commit t again
+  t="$(_cc_wj_fetch_timeout_seconds)" || return 1
+  git check-ref-format "$ref" 2>/dev/null || return 1
+  head="$(git -C "$wt" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" || return 1
+  tree="$(_cc_wj_wip_tree "$wt")" || return 1
+  commit="$(GIT_AUTHOR_NAME=cc-reaper GIT_COMMITTER_NAME=cc-reaper \
+            GIT_AUTHOR_EMAIL=cc-reaper@localhost GIT_COMMITTER_EMAIL=cc-reaper@localhost \
+            git -C "$wt" commit-tree "$tree" -p "$head" -m "wip: $(basename "$wt") before reclaim" 2>/dev/null)" || return 1
+  GIT_TERMINAL_PROMPT=0 _cc_wj_with_timeout "$t" git -C "$repo" push -q --no-progress origin "$commit:$ref" >/dev/null 2>&1 || return 1
+  [ "$(_cc_wj_with_timeout "$t" git -C "$repo" ls-remote origin "$ref" 2>/dev/null | awk '{ print $1 }')" = "$commit" ] ||
+    return 1
+  again="$(_cc_wj_wip_tree "$wt")" || return 1
+  [ "$again" = "$tree" ] || return 1
+  _CC_WJ_WIP_COMMIT="$commit"
+}
+
 # ─── Classification ───────────────────────────────────────────────────────────
 
 # Print KEEP(<reason>) or REMOVABLE. Every gate that was not shown to hold keeps: an empty
@@ -2644,6 +2734,8 @@ _cc_wj_classify() {
                              # or one closed unmerged at this HEAD (`_cc_wj_closed_at_head`),
                              # or, for a detached HEAD, a ref contains it (`_cc_wj_referenced`)
   local referenced="${10:-no}" # "yes" when a branch, tag or remote ref contains the HEAD
+  local pushed="${11:-no}"   # "yes" when origin lists a branch containing the HEAD
+  local wip="${12:-no}"      # "yes" when its edits reach refs/wip on origin before removal
 
   if [ "$dirty" = "MISSING" ]; then
     echo "KEEP(missing-dir)"
@@ -2681,7 +2773,7 @@ _cc_wj_classify() {
       # waits forever -- which is what kept 27 GB standing on the reporting host. Removal
       # still takes only the checkout and leaves the branch, so the commits survive either
       # way; what changes is whether the disk does.
-      [ "$abandoned" = "yes" ] || { echo "KEEP(unlanded)"; return ; }
+      [ "$abandoned" = "yes" ] || [ "$pushed" = "yes" ] || { echo "KEEP(unlanded)"; return ; }
       ;;
   esac
 
@@ -2700,6 +2792,16 @@ _cc_wj_classify() {
     return
   fi
 
+  # Removal still takes only the checkout. These two are removable because origin holds
+  # the commits (pushed) and, for edits, because a snapshot reaches refs/wip first.
+  if [ "$wip" = "yes" ]; then
+    echo "REMOVABLE(wip-pushed)"
+    return
+  fi
+  case "$landed" in
+    ancestor|content|pr) ;;
+    *) [ "$abandoned" = "yes" ] || { echo "REMOVABLE(pushed)"; return; } ;;
+  esac
   echo "REMOVABLE"
 }
 
@@ -2846,10 +2948,11 @@ _cc_wj_pin_detached() {
 _cc_wj_remove_worktree() {
   local repo="$1"
   local wt_path="$2"
+  local force="${3:-}"   # --force only for a worktree whose edits are verified on origin
 
   _cc_wj_log_write "removing worktree: $wt_path (repo: $repo)"
 
-  if git -C "$repo" worktree remove "$wt_path" 2>/dev/null; then
+  if git -C "$repo" worktree remove ${force:+"$force"} "$wt_path" 2>/dev/null; then
     _cc_wj_log_write "removed: $wt_path"
     return 0
   fi
@@ -3263,6 +3366,8 @@ KEEP
   fi
   # Declared once, outside the loop: zsh prints the value of an already-set local that is
   # declared again.
+  local reclaim pushed wip wip_dirty wip_ref wip_name total_pushed=0 total_wip=0 total_estimate=0
+  reclaim="$(_cc_wj_reclaim_pushed)"
   local active lease landed idle referenced classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes task_done wt_idle_hours
   # Said once, because the absence is otherwise silent: every squash-merged worktree just
   # reads KEEP(unlanded). That is how the scheduled sweep went without landed=pr for weeks.
@@ -3322,6 +3427,14 @@ KEEP
       # launchd report a healthy sweep even though an entire repository was ineligible
       # only because its fresh-base proof could not run.
       skipped=1
+    fi
+
+    # Origin's branch tips, asked fresh once per repository: "pushed" is judged against
+    # them, never against a remote-tracking ref nobody refreshed.
+    _CC_WJ_TIPS_OK=0
+    if [ "$trim" -eq 0 ] && [ "$reclaim" = 1 ]; then
+      _cc_wj_prepare_tips "$repo" "$work/tips" ||
+        echo "worktree-janitor: $repo: origin's branches could not be listed, so nothing in it counts as pushed"
     fi
 
     # Collected to completion before anything is judged. Read as it is produced, the
@@ -3395,6 +3508,26 @@ KEEP
       [ "$trim" -eq 0 ] && [ "$dirty" = "0" ] && task_done="$(_cc_wj_done "$wt_path")"
       wt_idle_hours="$idle_hours"
       [ "$task_done" = yes ] && wt_idle_hours=0
+      # Only tracked edits and untracked files stand in the way: a snapshot of them reaches
+      # refs/wip on origin before removal, so every gate below is asked as of a clean tree.
+      # An ignored file that is not regenerable is not in a snapshot and keeps the tree.
+      wip="no"; wip_dirty=""; wip_ref=""
+      case "$dirty" in
+        ''|0|*[!0-9]*) ;;
+        *)
+          if [ "$trim" -eq 0 ] && [ "$reclaim" = 1 ]; then
+            case "$pins" in
+              *'!! '*) ;;
+              *)
+                if _cc_wj_wip_ok "$wt_path"; then
+                  wip="yes"; wip_dirty="$dirty"; dirty=0
+                  wip_name="$(basename "$wt_path")"; wip_name="${wip_name//[^A-Za-z0-9._-]/-}"
+                  wip_name="$(printf '%s' "$wip_name" | sed 's/^[.-]*//')"
+                  wip_ref="refs/wip/${CC_WJ_WIP_LABEL:-macmini}/${wip_name}-$(date -u +%Y%m%dT%H%M%SZ)"
+                fi ;;
+            esac
+          fi ;;
+      esac
       # A dirty or unreadable git state already keeps the worktree. Do not spend seconds
       # rereading large harness transcripts to prove an additional keep reason that cannot
       # change the outcome. Clean candidates still take every holder/session veto below.
@@ -3490,14 +3623,23 @@ KEEP
       idle="-"
       abandoned="no"
       referenced="no"
+      pushed="no"
       head0="$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)"
       if [ "$dirty" = "0" ] && [ "$active" = "no" ] && [ "$lease" = "no" ]; then
         [ "$branch" = "(detached)" ] && referenced="$(_cc_wj_referenced "$wt_path")"
         landed="$(_cc_wj_landed "$wt_path")"
+        [ "$landed" = no ] && pushed="$(_cc_wj_pushed "$wt_path" "$work/tips")"
         case "$landed" in
           ancestor|content|pr) idle="$(_cc_wj_idle "$wt_path" "$wt_idle_hours")" ;;
           unfetched) ;;
           *)
+            if [ "$pushed" = yes ]; then
+              # On origin already: only the ordinary idle window is left to ask.
+              idle="$(_cc_wj_idle "$wt_path" "$wt_idle_hours")"
+              [ "$branch" = "(detached)" ] && referenced=yes
+            elif [ "$wip" = yes ]; then
+              :  # edits of work that is neither landed nor on origin stay put
+            else
             # The abandoned question, asked in cost order: the tree walk before the network
             # call, and the network call only for a tree that has already sat out the long
             # window. Most unlanded worktrees are recent, so most pay neither.
@@ -3517,6 +3659,7 @@ KEEP
                 abandoned="$(_cc_wj_never_had_pr "$wt_path")"
                 [ "$abandoned" = "yes" ] || abandoned="$(_cc_wj_closed_at_head "$wt_path")"
               fi
+            fi
             fi
             ;;
         esac
@@ -3548,7 +3691,7 @@ KEEP
       if [ -z "$classification" ] && [ "$dirty" = "0" ] && [ "$active" = "no" ] &&
          [ "$lease" = "no" ] &&
          { [ "$landed" = ancestor ] || [ "$landed" = content ] || [ "$landed" = pr ] ||
-           [ "$abandoned" = "yes" ]; } &&
+           [ "$abandoned" = "yes" ] || [ "$pushed" = "yes" ]; } &&
          [ "$idle" = "yes" ]; then
         _cc_wj_live_claim "$task_done" "$wt_path" tool; active_rc=$?
         case "$active_rc" in
@@ -3565,12 +3708,17 @@ KEEP
         fi
       fi
       [ -n "$classification" ] ||
-        classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle" "$lease" "$abandoned" "$referenced")
+        classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle" "$lease" "$abandoned" "$referenced" "$pushed" "$wip")
 
       printf "  WORKTREE  %s\n" "$wt_path"
       printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s  recent=%s  landed=%s  idle=%s\n" \
-        "$branch" "$dirty" "$ahead" "$push_state" "$active" "$lease" "$landed" "$idle"
+        "$branch" "${wip_dirty:-$dirty}" "$ahead" "$push_state" "$active" "$lease" "$landed" "$idle"
       printf "    classification: %s\n" "$classification"
+      case "$classification" in
+        'REMOVABLE(pushed)') printf "    pushed: origin lists a branch that contains HEAD\n" ;;
+        'REMOVABLE(wip-pushed)')
+          [ "$apply" -eq 1 ] || printf "    would push wip: %s entries to %s\n" "$wip_dirty" "$wip_ref" ;;
+      esac
       [ "$active_detail" = "-" ] || printf "    active claim: %s\n" "$active_detail"
       [ "$lease_detail" = "-" ] || printf "    session lease: %s\n" "$lease_detail"
       [ "$task_done" != yes ] || printf "    done: claude-task-done at HEAD %s\n" "${head0:0:12}"
@@ -3597,8 +3745,15 @@ KEEP
       esac
 
       case "$classification" in
-        REMOVABLE)
+        REMOVABLE|REMOVABLE\(*\))
           total_removable=$((total_removable + 1))
+          [ "$classification" = 'REMOVABLE(pushed)' ] && total_pushed=$((total_pushed + 1))
+          [ "$classification" = 'REMOVABLE(wip-pushed)' ] && total_wip=$((total_wip + 1))
+          if [ "$apply" -ne 1 ]; then
+            # What a removal would free; measured here, for the candidates only.
+            bytes=$(du -sk "$wt_path" 2>/dev/null | awk '{print $1 * 1024}') || bytes=0
+            total_estimate=$((total_estimate + ${bytes:-0}))
+          fi
           if [ "$apply" -eq 1 ]; then
             # A task can start after the inventory snapshot without yet opening any file
             # in the worktree.  Refresh both harness registries before the destructive
@@ -3658,7 +3813,8 @@ KEEP
             # The same read lists what the removal must copy out first.
             : > "$work/archive-list"
             if _cc_wj_held "$work" "$wt_path" ||
-               [ "$(_cc_wj_undiscounted_count "$wt_path" "$work/archive-list")" != "0" ] ||
+               { if [ "$wip" = yes ]; then ! _cc_wj_wip_ok "$wt_path" "$work/archive-list"
+                 else [ "$(_cc_wj_undiscounted_count "$wt_path" "$work/archive-list")" != "0" ]; fi; } ||
                [ "$(_cc_wj_idle "$wt_path" "$wt_idle_hours")" != "yes" ] ||
                [ -z "$head0" ] ||
                [ "$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)" != "$head0" ] ||
@@ -3680,13 +3836,24 @@ KEEP
               printf "    → archived %s file(s) to %s\n" \
                 "$(wc -l < "$work/archive-list" | tr -d ' ')" "$_CC_WJ_ARCHIVE_DEST"
             fi
+            if [ "$wip" = yes ]; then
+              # Last step before the one irreversible one, and the only way a dirty tree is
+              # removed: its edits must be on origin, read back, and unchanged since.
+              if ! _cc_wj_wip_send "$repo" "$wt_path" "$wip_ref"; then
+                printf "    → kept: its edits could not be pushed to %s and read back\n" "$wip_ref"
+                total_kept=$((total_kept + 1))
+                continue
+              fi
+              printf "    → wip pushed: %s at %s\n" "$wip_ref" "$_CC_WJ_WIP_COMMIT"
+              _cc_wj_log_write "wip pushed: $wip_ref $_CC_WJ_WIP_COMMIT for $wt_path"
+            fi
             if [ "$branch" = "(detached)" ] && [ "$landed" != "ancestor" ] &&
                ! _cc_wj_pin_detached "$wt_path" "$head0"; then
               printf "    → kept: its detached HEAD could not be pinned before removal\n"
               total_kept=$((total_kept + 1))
               continue
             fi
-            if _cc_wj_remove_worktree "$repo" "$wt_path"; then
+            if _cc_wj_remove_worktree "$repo" "$wt_path" "$([ "$wip" = yes ] && echo --force)"; then
               total_removed=$((total_removed + 1))
               total_reclaimed=$((total_reclaimed + bytes))
               printf "    → removed (%s bytes reclaimed)\n" "$bytes"
@@ -3765,8 +3932,9 @@ KEEP
       "$total_removed" "$gb_str" "$total_kept"
     _cc_wj_log_write "summary: removed=$total_removed reclaimed=${total_reclaimed}B kept=$total_kept"
   else
-    printf "Summary: removable=%d  kept=%d  (dry-run; use --apply to remove)\n" \
-      "$total_removable" "$total_kept"
+    printf "Summary: removable=%d  kept=%d  (dry-run; use --apply to remove)  pushed=%d  wip=%d  estimated-reclaimable=%s GB\n" \
+      "$total_removable" "$total_kept" "$total_pushed" "$total_wip" \
+      "$(awk -v b="$total_estimate" 'BEGIN { printf "%.2f", b / 1073741824 }')"
   fi
 
   # Notification fires only on --apply pass (report-only runs don't measure bytes)
