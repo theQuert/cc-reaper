@@ -1045,7 +1045,7 @@ check "over the ceiling, the idlest entries go first" "$OUT_FITS" \
 check "and the trim stops once the cache fits" "$OUT_FITS" \
   "left: ./aa/fresh-d ./cc/h2-d ./cc/h5-d $" "idle over 270m"
 check "and a cache brought under the ceiling is not emptied" "$OUT_FITS" "" \
-  "go clean"
+  "go clean -cache"
 
 # A 1GB ceiling the idle trim cannot reach: it halves down to 270m and no further, so the
 # 2h entry survives it, and only then is the cache emptied - the one GO_CACHE_DIR names.
@@ -1065,7 +1065,7 @@ OUT_PRESS="$(FREE_GB_OVERRIDE=56 go_ceiling_run "$WORK/gp" "$SCRIPT" 99999)"
 check "a disk under the free floor lowers the ceiling for that run" "$OUT_PRESS" \
   "56GB free is under the 60GB floor; ceiling 3GB"
 check "and trims idle-first down to the horizon floor, without emptying" "$OUT_PRESS" \
-  "left: ./aa/fresh-d ./cc/h2-d $" "go clean"
+  "left: ./aa/fresh-d ./cc/h2-d $" "go clean -cache"
 # 1GB short takes only the idlest entry.
 build_fixture "$WORK/gq"
 OUT_PRESS1="$(FREE_GB_OVERRIDE=59 go_ceiling_run "$WORK/gq" "$SCRIPT" 99999)"
@@ -1084,7 +1084,7 @@ OUT_PRESS_BUSY="$(FREE_GB_OVERRIDE=56 GO_BUSY_OVERRIDE=1 go_ceiling_run "$WORK/g
 check "under pressure a running build does not stop the idle trims" "$OUT_PRESS_BUSY" \
   "left: ./aa/fresh-d ./cc/h2-d $" "reaping nothing"
 check "but it still stops the full clear" "$OUT_PRESS_BUSY" \
-  "leaving the ceiling alone" "go clean"
+  "leaving the ceiling alone" "go clean -cache"
 # Without pressure too: a build running, plenty free, a 1GB ceiling - the idle halving
 # still runs to the horizon floor, and only the clear stands down.
 build_fixture "$WORK/gn"
@@ -1092,7 +1092,7 @@ OUT_BUSY_IDLE="$(GO_BUSY_OVERRIDE=1 go_ceiling_run "$WORK/gn" "$SCRIPT" 1)"
 check "a running build does not stop the idle trims without pressure either" "$OUT_BUSY_IDLE" \
   "left: ./aa/fresh-d ./cc/h2-d $" "reaping nothing"
 check "and still stops the full clear" "$OUT_BUSY_IDLE" \
-  "leaving the ceiling alone" "go clean"
+  "leaving the ceiling alone" "go clean -cache"
 
 # --go-cache runs that section alone: no scratchpad sweep, no stamp.
 build_fixture "$WORK/gg"

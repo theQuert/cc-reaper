@@ -18,6 +18,13 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- The disk guard runs reclaim-byproducts.sh, which calls go and docker -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
     <!-- Run at reduced scheduling priority -->
     <key>Nice</key>
     <integer>10</integer>
