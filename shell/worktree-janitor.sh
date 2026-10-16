@@ -527,6 +527,8 @@ TOKENS
         { w = "" }')
       [ -n "$label" ] || label="${f##*/}"
       if [ -f "$dir/launchd-paths.raw" ]; then
+        LC_ALL=C sort -u "$dir/launchd-paths.raw" > "$dir/launchd-paths.uniq" &&
+          mv -f "$dir/launchd-paths.uniq" "$dir/launchd-paths.raw"
         while IFS= read -r tok; do
           printf '%s\t%s\n' "$label" "$tok" >> "$dir/launchd-paths"
         done < "$dir/launchd-paths.raw"
@@ -541,6 +543,12 @@ TOKENS
           case "${prog##*/}" in
             python*|bash|sh|zsh|dash|ksh|node|ruby|perl|php|env)
               idx=1; scripted=""
+              # `env python3 x.py`: the command word is skipped like the interpreter itself.
+              if [ "${prog##*/}" = env ]; then
+                while [ "$idx" -lt "${#args[@]}" ]; do
+                  case "${args[$idx]}" in -*|*=*) idx=$((idx + 1)) ;; *) idx=$((idx + 1)); break ;; esac
+                done
+              fi
               while [ "$idx" -lt "${#args[@]}" ]; do
                 arg="${args[$idx]}"; idx=$((idx + 1))
                 case "$arg" in

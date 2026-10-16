@@ -2775,6 +2775,9 @@ $LD_ROOT/wt-10/x"
   echo 'print(1)' > "$LD_ROOT/script-ok.py"
   ld_plist "$LD_AGENTS/ok.plist" test.ok '' "/usr/bin/python3
 $LD_ROOT/script-ok.py"
+  ld_plist "$LD_AGENTS/envgone.plist" test.env '' "/usr/bin/env
+python3
+$LD_ROOT/env-gone.py"
   ld_plist "$LD_AGENTS/missing.plist" test.missing '' "/usr/bin/python3
 $LD_ROOT/not-a-worktree/gone.py"
   # A disabled plist is not a job.
@@ -2813,6 +2816,8 @@ $LD_ROOT/wt-plain/x"
     file_has "$OUT_LD" "launchd-missing-program:test.missing $LD_ROOT/not-a-worktree/gone.py"
   expect_yes "launchd: a script that exists is not reported" \
     bash -c '! grep -q "launchd-missing-program:test.ok\|launchd-missing-program:test.near" "$1"' _ "$OUT_LD"
+  expect_yes "launchd: the script behind /usr/bin/env python3 is checked too" \
+    file_has "$OUT_LD" "launchd-missing-program:test.env $LD_ROOT/env-gone.py"
   expect_yes "launchd: the script of an interpreter is checked, so a missing one is reported" \
     file_has "$OUT_LD" "launchd-missing-program:test.ref $LD_ROOT/wt-ref/ops/feed.py"
   expect_yes "launchd: a report removed nothing and left the plist alone" \
