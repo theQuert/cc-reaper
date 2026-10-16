@@ -676,7 +676,8 @@ def main(argv=None):
     except Exception as e:
         failures.append(f"sweep aborted: {type(e).__name__}: {e}")
     try:
-        idle_list(cfg, seen, now)
+        if not args.only:  # a one-session run would overwrite the list with that session alone
+            idle_list(cfg, seen, now)
     except Exception as e:  # a report-only list must not stop the report
         failures.append(f"idle list: {type(e).__name__}: {e}")
     mode = "apply" if apply else "report-only"
