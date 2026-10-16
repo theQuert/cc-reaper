@@ -103,6 +103,18 @@ A worktree with an **operation in progress** (`rebase-merge`, `rebase-apply`, `B
 `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD` in its git dir) is kept: that state exists
 nowhere else.
 
+## A launchd job is a holder between runs
+
+A job that runs a script from a worktree has no process most of the time, so the `lsof` and
+session scans cannot see it; it fails every run once the checkout is gone. Every
+`*.plist` in `CC_WJ_LAUNCHAGENTS_DIRS` (default `~/Library/LaunchAgents`, `/Library/LaunchAgents`,
+`/Library/LaunchDaemons`; `*.disabled*` skipped) is read with `plutil`, and a worktree containing
+any absolute path a string value names, as written or with symlinks resolved, is
+`KEEP(launchd-target:<Label>)`. The match is on whole path components (`wt-1` is not `wt-10`) and is
+made again right before a removal. A plist that cannot be parsed is `KEEP(launchd-scan-unknown)`
+for every worktree in the run. A program or interpreter script that does not exist is only
+printed, as `launchd-missing-program:<Label> <path>`.
+
 ## Work origin already holds
 
 Landing is not the only way work is safe: a commit origin lists in a branch is on another
