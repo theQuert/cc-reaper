@@ -247,6 +247,24 @@ def blocks(entry):
     return c if isinstance(c, list) else []
 
 
+CRON_TTL = 7 * 86400  # Claude Code expires a recurring session cron after 7 days
+
+
+def cron_pending(inp, created, now):
+    """Whether a CronCreate can still fire: a one-shot pinned to a date that has passed already fired
+    (and nobody calls CronDelete on it), and a recurring one expires CRON_TTL after creation."""
+    if str(inp.get("recurring", True)).lower() not in ("false", "0"):
+        return now - created < CRON_TTL
+    f = str(inp.get("cron", "")).split()
+    if len(f) != 5 or not all(x.isdigit() for x in f[:4]):
+        return True  # not a pinned date: count it, as before
+    year = time.localtime(created).tm_year
+    at = time.mktime((year, int(f[3]), int(f[2]), int(f[1]), int(f[0]), 0, 0, 0, -1))
+    if at < created:  # a pinned date earlier in the year than the creation means next year
+        at = time.mktime((year + 1, int(f[3]), int(f[2]), int(f[1]), int(f[0]), 0, 0, 0, -1))
+    return at > now - 120
+
+
 def ts(entry):
     try:
         return calendar.timegm(time.strptime(entry["timestamp"][:19], "%Y-%m-%dT%H:%M:%S"))
@@ -276,7 +294,7 @@ def transcript_facts(path, now):
                     # A wakeup that already fired left its turn; only a future one is pending.
                     due = ts(e) + float(inp.get("delaySeconds") or 0)
                     facts["loop"] = not inp.get("stop") and due > now - 120
-                elif b.get("name") == "CronCreate":
+                elif b.get("name") == "CronCreate" and cron_pending(inp, ts(e), now):
                     facts["crons"] += 1
                 elif b.get("name") == "CronDelete":
                     facts["crons"] -= 1
