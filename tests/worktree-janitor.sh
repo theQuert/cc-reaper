@@ -2858,7 +2858,7 @@ STUB
   LD2_AGENTS="$LD_ROOT/agents2"; mkdir -p "$LD2_AGENTS"
   LD_HOME="$LD_ROOT/home"; LD_UHOME="$LD_ROOT/uhome"
   for n in q1 q2 q4 q5 q9 ml; do ldgit worktree add -q "$LD_ROOT/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
-  for n in h1 h2 h3 h4; do ldgit worktree add -q "$LD_HOME/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
+  for n in h1 h2 h3 h4 h5 h6; do ldgit worktree add -q "$LD_HOME/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
   for n in u1 u2; do ldgit worktree add -q "$LD_UHOME/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
   ld_raw() { # <file> <label> <extra keys> <ProgramArguments strings, verbatim xml>
     printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n<key>Label</key>\n<string>%s</string>\n%s\n<key>ProgramArguments</key>\n<array>\n%s\n</array>\n</dict>\n</plist>\n' "$2" "$3" "$4" > "$1"
@@ -2889,6 +2889,18 @@ $LD_ROOT/wt-ml/run.sh</string>"
   ld_raw "$LD2_AGENTS/q7.plist" test.q7 '' "<string>/bin/sh</string>
 <string>-c</string>
 <string>~/wt-h3/run.sh &lt;/dev/null</string>"
+  # The home variable inside its own quotes, the common way to write it.
+  ld_raw "$LD2_AGENTS/q10.plist" test.q10 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>exec \"\$HOME\"/wt-h5/run.sh</string>"
+  ld_raw "$LD2_AGENTS/q11.plist" test.q11 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>cd \"\${HOME}\"/wt-h6 &amp;&amp; ./run.sh</string>"
+  # A bare home (`cd ~/`, `$HOME/` as a directory) names no worktree, and must not stall the scan.
+  ld_raw "$LD2_AGENTS/q12.plist" test.q12 '<key>WorkingDirectory</key>
+<string>$HOME/</string>' "<string>/bin/sh</string>
+<string>-c</string>
+<string>cd ~/ ; ./x</string>"
   # With a UserName, $HOME is that user's home (dscl), not the janitor's.
   ld_raw "$LD2_AGENTS/u.plist" test.u '<key>UserName</key>
 <string>ldtester</string>' "<string>/bin/sh</string>
@@ -2908,8 +2920,9 @@ exit 56
 STUB
   chmod +x "$LD3_STUBS/dscl"
   OUT_LD2="$TMPDIR_ROOT/out-ld2.txt"
+  # A scan that never ends is a failure, not a hang of the suite: 120 s is far above a real run.
   HOME="$LD_HOME" PATH="$LD3_STUBS:$STUBS_IDLE:$PATH" CC_WJ_LAUNCHAGENTS_DIRS="$LD2_AGENTS" \
-    bash "$WJ" --repo "$LD_ROOT/primary" > "$OUT_LD2" 2>&1
+    perl -e 'alarm shift; exec @ARGV' 120 bash "$WJ" --repo "$LD_ROOT/primary" > "$OUT_LD2" 2>&1
   ld_kept() { ld_block "$OUT_LD2" "$1" | grep -q "classification: KEEP(launchd-target:$2)"; }
   ld_removable() { ld_block "$OUT_LD2" "$1" | grep -q "classification: REMOVABLE"; }
   expect_yes "launchd: a double-quoted path in a shell string keeps its worktree" ld_kept wt-q1 test.q1
@@ -2920,6 +2933,9 @@ STUB
   expect_yes "launchd: a path on the third line of a string keeps its worktree" ld_kept wt-ml test.ml
   expect_yes "launchd: \${HOME} after && and before | keeps its worktree" ld_kept wt-h2 test.q6
   expect_yes "launchd: ~/ before a < redirect keeps its worktree" ld_kept wt-h3 test.q7
+  expect_yes "launchd: a bare ~/ or \$HOME/ in a plist does not stall the scan" ld_kept wt-q1 test.q1
+  expect_yes "launchd: a quoted \"\$HOME\"/ path keeps its worktree" ld_kept wt-h5 test.q10
+  expect_yes "launchd: a quoted \"\${HOME}\"/ path after cd keeps its worktree" ld_kept wt-h6 test.q11
   expect_yes "launchd: with a UserName, \$HOME is that user's home" ld_kept wt-u1 test.u
   expect_yes "launchd: and then not the janitor's own home" ld_removable wt-h4
   expect_yes "launchd: a longer name that starts with a worktree's does not keep it" ld_removable wt-q9

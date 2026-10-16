@@ -516,13 +516,15 @@ _cc_wj_scan_launchd() {
         # a path: blanks, `=` `:` (a `--x=/p` argument, a PATH list), quotes, `; & | ( ) < >`
         # and the backtick. `~/` and `$HOME/` are kept as written, for the home of the
         # plist's user once the whole plist is read.
+        # A third cut drops the quotes first, so `"$HOME"/wt/run.sh` stays one word.
         while IFS= read -r tok; do
-          case "$tok" in /*|'~/'*|'$HOME/'*|'${HOME}/'*) ;; *) continue ;; esac
-          tok="${tok%/}"; [ -n "$tok" ] || continue
+          tok="${tok%/}"
+          case "$tok" in /?*|'~'|'~/'*|'$HOME'|'$HOME/'*|'${HOME}'|'${HOME}/'*) ;; *) continue ;; esac
           printf '%s\n' "$tok" >> "$dir/launchd-paths.raw"
         done <<TOKENS
 $val
 $(printf '%s' "$val" | LC_ALL=C awk '{ gsub(/[=: \t"\047;&|()<>`]/, "\n"); print }')
+$(printf '%s' "$val" | LC_ALL=C awk '{ gsub(/["\047]/, ""); gsub(/[=: \t;&|()<>`]/, "\n"); print }')
 TOKENS
       done < <(printf '%s\n' "$xml" | LC_ALL=C awk '
         function emit(s) { s = dec(s)
@@ -553,10 +555,10 @@ TOKENS
         home=""
         while IFS= read -r tok; do
           case "$tok" in
-            '~/'*|'$HOME/'*|'${HOME}/'*)
+            '~'|'~/'*|'$HOME'|'$HOME/'*|'${HOME}'|'${HOME}/'*)
               if [ -z "$home" ]; then home="$(_cc_wj_launchd_home "$user")"; home="${home%/}"; fi
               [ -n "$home" ] || continue
-              tok="$home/${tok#*/}" ;;
+              case "$tok" in */*) tok="$home/${tok#*/}" ;; *) tok="$home" ;; esac ;;
           esac
           printf '%s\t%s\n' "$label" "$tok" >> "$dir/launchd-paths"
         done < "$dir/launchd-paths.raw"
@@ -598,6 +600,8 @@ TOKENS
   # A path that does not exist (yet, or any more) is resolved through its nearest ancestor
   # that does, so /var/x/wt/run.sh still reads as /private/var/x/wt/run.sh.
   cut -f2 "$dir/launchd-paths" | LC_ALL=C sort -u | while IFS= read -r tok; do
+    # Only an absolute path can be walked up to `/`; anything else would never end.
+    case "$tok" in /*) ;; *) continue ;; esac
     d="$tok"; rest=""
     while [ ! -e "$d" ] && [ "$d" != / ]; do
       rest="/${d##*/}$rest"; d="${d%/*}"; [ -n "$d" ] || d=/
