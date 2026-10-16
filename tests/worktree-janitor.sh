@@ -172,6 +172,8 @@ export CC_WJ_ARCHIVE_DIR="$TMPDIR_ROOT/no-archive"
 # Fixtures are created seconds before they are judged. The idle gate has its own cases
 # below; everywhere else it is set to a window nothing can fall inside.
 export CC_WJ_IDLE_HOURS=0
+# Never the developer's own launchd agents; the cases that read plists point this at a fixture.
+export CC_WJ_LAUNCHD_DIRS="$TMPDIR_ROOT/no-launchd-agents"
 # The disk pressure tier reads this host's real free space, so it is off here and turned
 # on only by its own cases.
 export CC_WJ_PRESSURE_FREE_GB=off
@@ -271,6 +273,46 @@ lsof_default
 
 expect_yes "an empty open-file scan keeps every worktree" \
   file_after "$OUT_OPEN_FAIL" "wt-clean" 4 "KEEP(active-session)"
+
+# ─── A launchd job holds its files only between ticks ────────────────────────
+#
+# 2026-10-15: a StartInterval agent ran a script inside a pushed task worktree every 60 s.
+# No process held the path between ticks, so the sweep removed it and the job failed for
+# 16 hours. A path a launchd agent plist names counts as held.
+
+LAUNCHD_DIR="$TMPDIR_ROOT/launchd-agents"
+mkdir -p "$LAUNCHD_DIR"
+write_plist() { # <file> <path named by ProgramArguments>
+  cat > "$1" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>test.job</string>
+<key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>$2</string></array>
+<key>StartInterval</key><integer>60</integer>
+</dict></plist>
+PLIST
+}
+
+write_plist "$LAUNCHD_DIR/other.plist" "$TMPDIR_ROOT/elsewhere/job.py"
+OUT_LD_CTL="$TMPDIR_ROOT/out-ld-ctl.txt"
+CC_WJ_LAUNCHD_DIRS="$LAUNCHD_DIR" _wj_idle --repo "$PRIMARY" > "$OUT_LD_CTL"
+expect_yes "a launchd plist naming another path leaves a worktree removable" \
+  file_after "$OUT_LD_CTL" "wt-clean" 4 "REMOVABLE"
+
+# Spelled as its author typed it (/var/...), not as lsof reports it (/private/var/...).
+write_plist "$LAUNCHD_DIR/job.plist" "$WT_CLEAN/mac_feed.py"
+plutil -convert binary1 "$LAUNCHD_DIR/job.plist" 2>/dev/null || true
+OUT_LD="$TMPDIR_ROOT/out-ld.txt"
+CC_WJ_LAUNCHD_DIRS="$LAUNCHD_DIR" _wj_idle --repo "$PRIMARY" > "$OUT_LD"
+expect_yes "a path named by a launchd agent plist keeps the worktree" \
+  file_after "$OUT_LD" "wt-clean" 4 "KEEP(active-session)"
+
+printf 'not a plist' > "$LAUNCHD_DIR/broken.plist"
+rm -f "$LAUNCHD_DIR/job.plist"
+OUT_LD_BAD="$TMPDIR_ROOT/out-ld-bad.txt"
+CC_WJ_LAUNCHD_DIRS="$LAUNCHD_DIR" _wj_idle --repo "$PRIMARY" > "$OUT_LD_BAD"
+expect_yes "an unreadable plist neither fails the scan nor keeps a worktree" \
+  file_after "$OUT_LD_BAD" "wt-clean" 4 "REMOVABLE"
 
 # ─── Idle is measured, not assumed ───────────────────────────────────────────
 #
