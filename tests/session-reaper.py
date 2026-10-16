@@ -296,5 +296,59 @@ class NewKeepGates(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text())["status"], "reaped")
 
 
+class IdleList(unittest.TestCase):
+    """The idle list is a report: who is listed, once-a-day inbox posting, off by default."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        p = mock.patch.object(reaper, "HOME", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+        self.cfg = dict(CFG, IDLE_LIST_HOURS="6", IDLE_LIST_FILE=str(self.tmp / "list.md"),
+                        IDLE_LIST_INBOX=str(self.tmp / "inbox.md"), IDLE_LIST_EXCLUDE="skip-*")
+        self.now = time.mktime((2026, 10, 16, 12, 0, 0, 0, 0, -1))
+
+    def listed(self, cfg=None, now=None, **kw):
+        s = session(sid="abcdef0123", **kw)
+        reaper.idle_list(cfg or self.cfg, [(s, [], kw.get("outcome", "keep"))], now or self.now)
+        return "abcdef01" in (self.tmp / "list.md").read_text()
+
+    def test_idle_seven_hours_without_claims_is_listed_even_when_protected(self):
+        self.assertTrue(self.listed(idle_min=420))
+        self.assertTrue(self.listed(idle_min=420, tmux="keep-me"))
+
+    def test_a_claimed_issue_keeps_it_off_the_list(self):
+        self.assertFalse(self.listed(idle_min=420, claims=[("o/r", "1")]))
+
+    def test_below_the_threshold_is_not_listed(self):
+        self.assertFalse(self.listed(idle_min=300))
+
+    def test_excluded_busy_and_reaped_sessions_are_not_listed(self):
+        self.assertFalse(self.listed(idle_min=420, tmux="skip-me"))
+        self.assertFalse(self.listed(idle_min=420, status="busy"))
+        self.assertFalse(self.listed(idle_min=420, outcome="reaped, verified"))
+
+    def test_inbox_section_is_appended_once_per_day(self):
+        inbox = self.tmp / "inbox.md"
+        self.listed(idle_min=420)
+        self.listed(idle_min=420)
+        self.assertEqual(inbox.read_text().count("## key=IDLE-SESSIONS-2026-10-16"), 1)
+        self.assertIn("abcdef01", inbox.read_text())
+        self.listed(idle_min=420, now=self.now + 86400)
+        self.assertEqual(inbox.read_text().count("## key=IDLE-SESSIONS-"), 2)
+        self.assertIn("## key=IDLE-SESSIONS-2026-10-17", inbox.read_text())
+
+    def test_an_empty_list_posts_none(self):
+        self.listed(idle_min=10)
+        self.assertIn("\nnone\n", (self.tmp / "inbox.md").read_text())
+
+    def test_off_by_default_writes_nothing(self):
+        self.assertEqual(reaper.DEFAULTS["IDLE_LIST_HOURS"], "0")
+        reaper.idle_list(dict(self.cfg, IDLE_LIST_HOURS="0"), [(session(sid="abcdef0123", idle_min=900), [], "keep")],
+                         self.now)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()
