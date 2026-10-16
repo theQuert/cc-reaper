@@ -66,6 +66,7 @@ export CC_WJ_CLAUDE_SESSIONS="$T/claude-sessions" CC_WJ_CLAUDE_PROJECTS="$T/clau
 export CC_WJ_CODEX_LOCKS="$T/no-codex-locks" CC_WJ_CODEX_STATE_DB="$T/no-codex.sqlite"
 export CC_WJ_ARCHIVE_DIR="$T/no-archive"
 unset CC_WJ_RECLAIM_PUSHED
+export CC_WJ_LAUNCHAGENTS_DIRS="$T/no-launchagents"
 wj() { PATH="$STUBS:$PATH" bash "$WJ" --repo "$PRIMARY" "$@" 2>&1; }
 phys() { (cd -P "$1" 2>/dev/null && pwd); }
 block() { awk -v w="wt-$2" '/^  WORKTREE/ { on = index($0, w) && substr($0, length($0) - length(w) + 1) == w } on' "$1"; }

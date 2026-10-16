@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- **`worktree-janitor` keeps a worktree a launchd job runs from (`CC_WJ_LAUNCHAGENTS_DIRS`).**
+  `tech.stima.event-gateway-feed` ran `mac_feed.py` from a worktree the new pushed-work reclaim
+  removed; between its runs it has no process, so no holder scan saw it, and it exited 2 every
+  minute for 16 hours. Every plist in `~/Library/LaunchAgents`, `/Library/LaunchAgents` and
+  `/Library/LaunchDaemons` (`*.disabled*` skipped) is now read, and a worktree containing a path
+  it names is `KEEP(launchd-target:<Label>)`, in the report and again right before a removal.
+  An unparseable plist keeps every worktree (`KEEP(launchd-scan-unknown)`). A plist whose
+  program or interpreter script does not exist is reported as
+  `launchd-missing-program:<Label> <path>`, never unloaded or edited. Paths are found the way a
+  shell reads them: inside quotes, after `;` `&` `|` `( ) < >`, in a value spanning several lines,
+  and under `~/` or `$HOME/` (the plist's `UserName` home, else the janitor's).
 - **`worktree-janitor` reclaims work origin already holds (`CC_WJ_RECLAIM_PUSHED`, default on).** A
   clean worktree whose HEAD is in a branch origin lists now is `REMOVABLE(pushed)`; one with only
   tracked edits or untracked files is `REMOVABLE(wip-pushed)` after a snapshot reaches

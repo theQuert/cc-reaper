@@ -181,6 +181,9 @@ export CC_WJ_PRESSURE_FREE_GB=off
 # its own suite, tests/worktree-janitor-reclaim.sh, and would turn this suite's dirty fixture
 # (whose HEAD is on origin/main) into a wip push.
 export CC_WJ_RECLAIM_PUSHED=0
+# Never this machine's LaunchAgents: a plist there is a veto the fixtures did not write. The
+# launchd cases below point the scan at plists they write themselves.
+export CC_WJ_LAUNCHAGENTS_DIRS="$TMPDIR_ROOT/no-launchagents"
 
 # ─── Runner helpers ───────────────────────────────────────────────────────────
 
@@ -2776,6 +2779,212 @@ CC_WJ_RECHECK_FRESH_SECONDS=0 PATH="$TF_STUBS:$STUBS_IDLE:$PATH" \
 expect_yes "trim: a holder found by the rescan keeps the remaining directory" \
   bash -c '[ -e "$1/node_modules" ] || [ -e "$1/.next" ]' _ "$TF_WT"
 expect_yes "  and says why" file_has "$OUT_TF_RACE" "→ kept: "
+
+# ─── A launchd job's script is a holder no process scan can see ─────────────
+#
+# tech.stima.event-gateway-feed ran a script from a reclaimed worktree every minute and was
+# between runs, so lsof showed nothing: the checkout went, and the job exited 2 for 16 hours.
+# A plist that names a path under a worktree keeps that worktree.
+
+LD_ROOT="$TMPDIR_ROOT/launchd"; LD_AGENTS="$LD_ROOT/agents"; mkdir -p "$LD_AGENTS"
+git init -q --bare "$LD_ROOT/origin.git" -b main
+git clone -q "$LD_ROOT/origin.git" "$LD_ROOT/primary" 2>/dev/null
+ldgit() { git -C "$LD_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$LD_ROOT/primary/README"; ldgit add README; ldgit commit -qm base; ldgit push -q origin main
+for n in 1 10 ref wd late plain; do ldgit worktree add -q "$LD_ROOT/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
+ld_plist() { # <file> <label> <extra keys xml> <program arguments, one per line>
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n'
+    printf '<key>Label</key><string>%s</string>\n' "$2"
+    printf '%s\n' "$3"
+    if [ -n "${4:-}" ]; then
+      printf '<key>ProgramArguments</key><array>\n'
+      printf '%s\n' "$4" | while IFS= read -r a; do printf '<string>%s</string>\n' "$a"; done
+      printf '</array>\n'
+    fi
+    printf '</dict>\n</plist>\n'; } > "$1"
+}
+ld_report() { PATH="$STUBS_IDLE:$PATH" CC_WJ_LAUNCHAGENTS_DIRS="$LD_AGENTS" bash "$WJ" --repo "$LD_ROOT/primary" "$@" 2>&1; }
+ld_block() { awk -v w="$2" '/^  WORKTREE/ { on = (substr($0, length($0) - length(w) + 1) == w) } on' "$1"; }
+
+if command -v plutil >/dev/null 2>&1; then
+  ld_plist "$LD_AGENTS/ref.plist" test.ref '' "/usr/bin/python3
+$LD_ROOT/wt-ref/ops/feed.py
+--config
+$LD_ROOT/wt-ref/ops/rules.yaml"
+  ld_plist "$LD_AGENTS/near.plist" test.near '' "/bin/echo
+$LD_ROOT/wt-10/x"
+  ld_plist "$LD_AGENTS/wd.plist" test.wd "<key>WorkingDirectory</key><string>$LD_ROOT/wt-wd</string>" "/bin/echo"
+  echo 'print(1)' > "$LD_ROOT/script-ok.py"
+  ld_plist "$LD_AGENTS/ok.plist" test.ok '' "/usr/bin/python3
+$LD_ROOT/script-ok.py"
+  ld_plist "$LD_AGENTS/envgone.plist" test.env '' "/usr/bin/env
+python3
+$LD_ROOT/env-gone.py"
+  ld_plist "$LD_AGENTS/missing.plist" test.missing '' "/usr/bin/python3
+$LD_ROOT/not-a-worktree/gone.py"
+  # A disabled plist is not a job.
+  ld_plist "$LD_AGENTS/plain.plist.disabled-20261008" test.plain '' "/bin/echo
+$LD_ROOT/wt-plain/x"
+  printf 'this is not a property list\n' > "$LD_AGENTS/broken.plist"
+
+  OUT_LD_BAD="$TMPDIR_ROOT/out-ld-bad.txt"
+  ld_report > "$OUT_LD_BAD"
+  expect_yes "launchd: an unparseable plist keeps even an unreferenced worktree" \
+    bash -c 'awk -v w=wt-plain "/^  WORKTREE/ { on = (substr(\$0, length(\$0) - length(w) + 1) == w) } on" "$1" | grep -q "classification: KEEP(launchd-scan-unknown)"' _ "$OUT_LD_BAD"
+  expect_yes "launchd: and says which plist it could not read" file_has "$OUT_LD_BAD" "broken.plist"
+  ld_report --apply > /dev/null
+  expect_yes "launchd: an --apply with an unparseable plist removes nothing" \
+    bash -c 'for n in 1 10 ref wd late plain; do [ -d "$1/wt-$n" ] || exit 1; done' _ "$LD_ROOT"
+  rm -f "$LD_AGENTS/broken.plist"
+
+  OUT_LD="$TMPDIR_ROOT/out-ld.txt"
+  ld_report > "$OUT_LD"
+  ld_block "$OUT_LD" wt-ref > "$TMPDIR_ROOT/b-ld-ref"
+  ld_block "$OUT_LD" wt-10 > "$TMPDIR_ROOT/b-ld-10"
+  ld_block "$OUT_LD" wt-1 > "$TMPDIR_ROOT/b-ld-1"
+  ld_block "$OUT_LD" wt-wd > "$TMPDIR_ROOT/b-ld-wd"
+  ld_block "$OUT_LD" wt-plain > "$TMPDIR_ROOT/b-ld-plain"
+  expect_yes "launchd: a ProgramArguments path under a worktree keeps it, naming the job" \
+    file_has "$TMPDIR_ROOT/b-ld-ref" "classification: KEEP(launchd-target:test.ref)"
+  expect_yes "launchd: wt-10 is kept by a job that names it" \
+    file_has "$TMPDIR_ROOT/b-ld-10" "classification: KEEP(launchd-target:test.near)"
+  expect_yes "launchd: a path under wt-10 does not keep wt-1" \
+    file_has "$TMPDIR_ROOT/b-ld-1" "classification: REMOVABLE"
+  expect_yes "launchd: a WorkingDirectory keeps its worktree" \
+    file_has "$TMPDIR_ROOT/b-ld-wd" "classification: KEEP(launchd-target:test.wd)"
+  expect_yes "launchd: a disabled plist keeps nothing, so an unreferenced worktree is REMOVABLE as before" \
+    file_has "$TMPDIR_ROOT/b-ld-plain" "classification: REMOVABLE"
+  expect_yes "launchd: a plist whose program does not exist is reported, not acted on" \
+    file_has "$OUT_LD" "launchd-missing-program:test.missing $LD_ROOT/not-a-worktree/gone.py"
+  expect_yes "launchd: a script that exists is not reported" \
+    bash -c '! grep -q "launchd-missing-program:test.ok\|launchd-missing-program:test.near" "$1"' _ "$OUT_LD"
+  expect_yes "launchd: the script behind /usr/bin/env python3 is checked too" \
+    file_has "$OUT_LD" "launchd-missing-program:test.env $LD_ROOT/env-gone.py"
+  expect_yes "launchd: the script of an interpreter is checked, so a missing one is reported" \
+    file_has "$OUT_LD" "launchd-missing-program:test.ref $LD_ROOT/wt-ref/ops/feed.py"
+  expect_yes "launchd: a report removed nothing and left the plist alone" \
+    bash -c '[ -f "$1/missing.plist" ] && [ -d "$2/wt-1" ]' _ "$LD_AGENTS" "$LD_ROOT"
+
+  # The scan is taken again right before the removal: a job installed meanwhile still keeps it.
+  # The holder scans are the run's (1), the removal of wt-1 (2) and the removal of wt-late (3),
+  # in path order; the plist appears with the third, after wt-late was judged removable.
+  LD_STUBS="$TMPDIR_ROOT/stubs-launchd"; mkdir -p "$LD_STUBS"; LD_CALLS="$TMPDIR_ROOT/ld-lsof-calls"; : > "$LD_CALLS"
+  cat > "$LD_STUBS/lsof" <<STUB
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$LD_CALLS"
+if [ "\$(grep -c -- '-d cwd' "$LD_CALLS")" -ge 3 ]; then
+  cat > "$LD_AGENTS/late.plist" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>test.late</string>
+<key>ProgramArguments</key><array><string>/bin/echo</string><string>$LD_ROOT/wt-late/x</string></array></dict></plist>
+PL
+fi
+exec "$STUBS_IDLE/lsof" "\$@"
+STUB
+  chmod +x "$LD_STUBS/lsof"
+  OUT_LD_APPLY="$TMPDIR_ROOT/out-ld-apply.txt"
+  PATH="$LD_STUBS:$STUBS_IDLE:$PATH" CC_WJ_LAUNCHAGENTS_DIRS="$LD_AGENTS" \
+    bash "$WJ" --repo "$LD_ROOT/primary" --apply > "$OUT_LD_APPLY" 2>&1
+  expect_no "launchd: --apply removes an unreferenced worktree" test -d "$LD_ROOT/wt-plain"
+  expect_no "launchd: --apply removes wt-1, which only a wt-10 reference could have kept" test -d "$LD_ROOT/wt-1"
+  expect_yes "launchd: --apply keeps every referenced worktree" \
+    bash -c 'for n in 10 ref wd; do [ -d "$1/wt-$n" ] || exit 1; done' _ "$LD_ROOT"
+  expect_yes "launchd: a job installed after the first scan still keeps its worktree at removal" \
+    test -d "$LD_ROOT/wt-late"
+  expect_yes "launchd: and the run says the job appeared before removal" \
+    file_has "$OUT_LD_APPLY" "launchd job test.late"
+
+  # The same scan reads the way a shell reads a command line: a path inside quotes, after a
+  # `;`, in parentheses, written under $HOME, or on a later line of a string still keeps its
+  # worktree. Each case is a worktree only that one plist names.
+  LD2_AGENTS="$LD_ROOT/agents2"; mkdir -p "$LD2_AGENTS"
+  LD_HOME="$LD_ROOT/home"; LD_UHOME="$LD_ROOT/uhome"
+  for n in q1 q2 q4 q5 q9 ml; do ldgit worktree add -q "$LD_ROOT/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
+  for n in h1 h2 h3 h4 h5 h6; do ldgit worktree add -q "$LD_HOME/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
+  for n in u1 u2; do ldgit worktree add -q "$LD_UHOME/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
+  ld_raw() { # <file> <label> <extra keys> <ProgramArguments strings, verbatim xml>
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n<key>Label</key>\n<string>%s</string>\n%s\n<key>ProgramArguments</key>\n<array>\n%s\n</array>\n</dict>\n</plist>\n' "$2" "$3" "$4" > "$1"
+  }
+  ld_raw "$LD2_AGENTS/q1.plist" test.q1 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>exec \"$LD_ROOT/wt-q1/run.sh\" &gt;&gt;/tmp/x.log</string>"
+  ld_raw "$LD2_AGENTS/q2.plist" test.q2 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>exec '$LD_ROOT/wt-q2/run.sh'</string>"
+  ld_raw "$LD2_AGENTS/q3.plist" test.q3 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>exec \"\$HOME/wt-h1/run.sh\"</string>"
+  ld_raw "$LD2_AGENTS/q4.plist" test.q4 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>cd $LD_ROOT/wt-q4;./run.sh</string>"
+  ld_raw "$LD2_AGENTS/q5.plist" test.q5 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>($LD_ROOT/wt-q5/run.sh)</string>"
+  ld_raw "$LD2_AGENTS/ml.plist" test.ml '' "<string>/bin/bash</string>
+<string>-c</string>
+<string>set -e
+cd /
+$LD_ROOT/wt-ml/run.sh</string>"
+  ld_raw "$LD2_AGENTS/q6.plist" test.q6 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>a=1 &amp;&amp; \${HOME}/wt-h2/run.sh | cat</string>"
+  ld_raw "$LD2_AGENTS/q7.plist" test.q7 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>~/wt-h3/run.sh &lt;/dev/null</string>"
+  # The home variable inside its own quotes, the common way to write it.
+  ld_raw "$LD2_AGENTS/q10.plist" test.q10 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>exec \"\$HOME\"/wt-h5/run.sh</string>"
+  ld_raw "$LD2_AGENTS/q11.plist" test.q11 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>cd \"\${HOME}\"/wt-h6 &amp;&amp; ./run.sh</string>"
+  # A bare home (`cd ~/`, `$HOME/` as a directory) names no worktree, and must not stall the scan.
+  ld_raw "$LD2_AGENTS/q12.plist" test.q12 '<key>WorkingDirectory</key>
+<string>$HOME/</string>' "<string>/bin/sh</string>
+<string>-c</string>
+<string>cd ~/ ; ./x</string>"
+  # With a UserName, $HOME is that user's home (dscl), not the janitor's.
+  ld_raw "$LD2_AGENTS/u.plist" test.u '<key>UserName</key>
+<string>ldtester</string>' "<string>/bin/sh</string>
+<string>-c</string>
+<string>\$HOME/wt-u1/run.sh; \$HOME/wt-h4/run.sh</string>"
+  # wt-q9 is named by no job; only a longer name that starts with it is.
+  ld_raw "$LD2_AGENTS/q9.plist" test.q9 '' "<string>/bin/echo</string>
+<string>not-a-path
+$LD_ROOT/wt-q9x/run.sh</string>"
+  LD3_STUBS="$TMPDIR_ROOT/stubs-launchd-dscl"; mkdir -p "$LD3_STUBS"
+  cat > "$LD3_STUBS/dscl" <<STUB
+#!/usr/bin/env bash
+if [ "\$*" = ". -read /Users/ldtester NFSHomeDirectory" ]; then
+  printf 'NFSHomeDirectory: %s\\n' "$LD_UHOME"; exit 0
+fi
+exit 56
+STUB
+  chmod +x "$LD3_STUBS/dscl"
+  OUT_LD2="$TMPDIR_ROOT/out-ld2.txt"
+  # A scan that never ends is a failure, not a hang of the suite: 120 s is far above a real run.
+  HOME="$LD_HOME" PATH="$LD3_STUBS:$STUBS_IDLE:$PATH" CC_WJ_LAUNCHAGENTS_DIRS="$LD2_AGENTS" \
+    perl -e 'alarm shift; exec @ARGV' 120 bash "$WJ" --repo "$LD_ROOT/primary" > "$OUT_LD2" 2>&1
+  ld_kept() { ld_block "$OUT_LD2" "$1" | grep -q "classification: KEEP(launchd-target:$2)"; }
+  ld_removable() { ld_block "$OUT_LD2" "$1" | grep -q "classification: REMOVABLE"; }
+  expect_yes "launchd: a double-quoted path in a shell string keeps its worktree" ld_kept wt-q1 test.q1
+  expect_yes "launchd: a single-quoted path in a shell string keeps its worktree" ld_kept wt-q2 test.q2
+  expect_yes "launchd: a \$HOME path in a shell string keeps its worktree" ld_kept wt-h1 test.q3
+  expect_yes "launchd: a path after cd and ; keeps its worktree" ld_kept wt-q4 test.q4
+  expect_yes "launchd: a path in parentheses keeps its worktree" ld_kept wt-q5 test.q5
+  expect_yes "launchd: a path on the third line of a string keeps its worktree" ld_kept wt-ml test.ml
+  expect_yes "launchd: \${HOME} after && and before | keeps its worktree" ld_kept wt-h2 test.q6
+  expect_yes "launchd: ~/ before a < redirect keeps its worktree" ld_kept wt-h3 test.q7
+  expect_yes "launchd: a bare ~/ or \$HOME/ in a plist does not stall the scan" ld_kept wt-q1 test.q1
+  expect_yes "launchd: a quoted \"\$HOME\"/ path keeps its worktree" ld_kept wt-h5 test.q10
+  expect_yes "launchd: a quoted \"\${HOME}\"/ path after cd keeps its worktree" ld_kept wt-h6 test.q11
+  expect_yes "launchd: with a UserName, \$HOME is that user's home" ld_kept wt-u1 test.u
+  expect_yes "launchd: and then not the janitor's own home" ld_removable wt-h4
+  expect_yes "launchd: a longer name that starts with a worktree's does not keep it" ld_removable wt-q9
+  expect_yes "launchd: an unreferenced worktree under the user's home stays REMOVABLE" ld_removable wt-u2
+else
+  printf 'ok - launchd: skipped, plutil is not available on this host\n'
+fi
 
 # ─── Final result ─────────────────────────────────────────────────────────────
 
