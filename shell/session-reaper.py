@@ -41,6 +41,10 @@ DEFAULTS = {
     "RELAY_MAX_AGE_HOURS": "48",  # an older request no longer counts as pending
     "HANDOFF_ROOT": "",  # a path under it named in the last message must exist; empty: off
     "REAPED_DIR": "~/.cc-reaper/state/reaped",  # one record per reaped tmux name, written before /exit
+    "IDLE_LIST_HOURS": "0",  # list idle/shell sessions with no claimed issue idle this long; 0: off
+    "IDLE_LIST_FILE": "~/.cc-reaper/state/idle-sessions.md",  # rewritten every sweep with that list
+    "IDLE_LIST_INBOX": "",  # a path: append the list once per local day under ## key=IDLE-SESSIONS-<date>; empty: off
+    "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
@@ -392,6 +396,39 @@ def protected(cfg, *names):
     return any(fnmatch.fnmatch(n, p) for p in cfg["PROTECT"].split() for n in names if n)
 
 
+def idle_list(cfg, seen, now):
+    """Report-only list of long-idle sessions without a claim (for a person); decides nothing."""
+    hours = float(cfg["IDLE_LIST_HOURS"])
+    if hours <= 0:
+        return
+    names = cfg["IDLE_LIST_EXCLUDE"].split()
+    rows = [f"| {s['tmux']} | `{s['sid'][:8]}` | {s['status']} | {s['idle_min'] / 60:.1f} | "
+            f"{','.join(w['path'].name for w in s['owned']) or '-'} | {', '.join(keep) or '-'} |"
+            for s, keep, outcome in seen
+            if s["status"] in ("idle", "shell") and s["idle_min"] >= hours * 60 and not s["claims"]
+            and not outcome.startswith("reaped")
+            and not any(fnmatch.fnmatch(n, p) for p in names for n in (s["tmux"], s["name"]) if n)]
+    head = ["| tmux | session | status | idle h | worktrees | still kept by |", "|---|---|---|---|---|---|"]
+    body = [*head, *rows] if rows else ["none"]
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
+    out = Path(os.path.expanduser(cfg["IDLE_LIST_FILE"]))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join([f"# idle sessions {stamp}", "", f"idle >= {cfg['IDLE_LIST_HOURS']} h, no claimed issue", "",
+                              *body]) + "\n")
+    inbox = cfg["IDLE_LIST_INBOX"]
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    posted = HOME / ".cc-reaper" / "state" / "idle-list-posted.txt"
+    if inbox and (not posted.exists() or posted.read_text().strip() != day):
+        path = Path(os.path.expanduser(inbox))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write("\n".join(["", f"## key=IDLE-SESSIONS-{day}", "", *body]) + "\n")
+        posted.parent.mkdir(parents=True, exist_ok=True)
+        tmp = posted.with_name(posted.name + ".tmp")
+        tmp.write_text(day + "\n")
+        os.replace(tmp, posted)
+
+
 def waiting_re(cfg):
     extra = cfg.get("WAITING_EXTRA", "")
     return re.compile(WAITING_RE.pattern + ("|" + extra if extra else ""), re.I)
@@ -615,7 +652,7 @@ def main(argv=None):
         print("session-reaper: another run holds the lock")
         return 0
     now = time.time()
-    rows, failures, reaped = [], [], 0
+    rows, failures, reaped, seen = [], [], 0, []
     try:
         for s in gather(cfg, now):
             if args.only and s["tmux"] != args.only:
@@ -635,8 +672,14 @@ def main(argv=None):
             except Exception as e:  # one bad session must not cost the others their report
                 failures.append(f"{s['tmux']} ({s['sid']}): {type(e).__name__}: {e}")
             rows.append(report_line(s, keep, outcome))
+            seen.append((s, keep, outcome))
     except Exception as e:
         failures.append(f"sweep aborted: {type(e).__name__}: {e}")
+    try:
+        if not args.only:  # a one-session run would overwrite the list with that session alone
+            idle_list(cfg, seen, now)
+    except Exception as e:  # a report-only list must not stop the report
+        failures.append(f"idle list: {type(e).__name__}: {e}")
     mode = "apply" if apply else "report-only"
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
     report = [f"# session-reaper {mode} {stamp}", "",
