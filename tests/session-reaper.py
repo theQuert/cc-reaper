@@ -126,6 +126,21 @@ class Transcript(unittest.TestCase):
                         self.assistant(self.tool("CronDelete"))])
         self.assertEqual(reaper.transcript_facts(p, self.NOW)["crons"], 1)
 
+    def test_a_fired_one_shot_or_expired_recurring_cron_is_not_pending(self):
+        def pinned(days):  # local-time cron fields for NOW + days
+            t = time.localtime(self.NOW + days * 86400)
+            return f"{t.tm_min} {t.tm_hour} {t.tm_mday} {t.tm_mon} *"
+        fired = self.write([self.assistant(self.tool("CronCreate", cron=pinned(-0.5), recurring=False),
+                                           at="2026-10-10T00:00:00.000Z")])
+        future = self.write([self.assistant(self.tool("CronCreate", cron=pinned(1), recurring=False))])
+        expired = self.write([self.assistant(self.tool("CronCreate", cron="*/5 * * * *"),
+                                             at="2026-10-01T00:00:00.000Z")])
+        fresh = self.write([self.assistant(self.tool("CronCreate", cron="*/5 * * * *"))])
+        self.assertEqual(reaper.transcript_facts(fired, self.NOW)["crons"], 0)
+        self.assertEqual(reaper.transcript_facts(future, self.NOW)["crons"], 1)
+        self.assertEqual(reaper.transcript_facts(expired, self.NOW)["crons"], 0)
+        self.assertEqual(reaper.transcript_facts(fresh, self.NOW)["crons"], 1)
+
     def test_last_text_and_pending_question_ignore_sidechains(self):
         p = self.write([
             self.assistant({"type": "text", "text": "SESSION-DONE: one"}),
