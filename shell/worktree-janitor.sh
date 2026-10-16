@@ -92,6 +92,8 @@ Environment:
   CC_WJ_CODEX_STATE_DB   Codex local state database (default: ~/.codex/state_5.sqlite)
   CC_WJ_TOOL_DIRS        Directories appended to PATH when executed, for `gh` under launchd
                          (default: /opt/homebrew/bin:/usr/local/bin:~/.local/bin; empty: none)
+  CC_WJ_LAUNCHD_DIRS     Colon-separated directories of launchd agent plists; every absolute path a
+                         plist names counts as held (default: ~/Library/LaunchAgents; empty: none)
   CC_WJ_ARCHIVE_DIR      Where --apply copies archive:-declared files before a removal
                          (default: ~/.cc-reaper/archive)
   CC_WJ_ARCHIVE_MAX_BYTES Largest file an archive: declaration lets leave (default: 1048576)
@@ -394,6 +396,32 @@ _cc_wj_scan_retry() { # <seconds> <output file> <command...>
   _cc_wj_with_timeout "$secs" "$@" > "$out" 2>/dev/null
 }
 
+# Absolute paths named by launchd agent plists, one per line. A StartInterval job holds its
+# script and config only while it runs, so between ticks no process names the worktree they
+# live in and the lsof scan sees nothing (2026-10-15: tech.stima.event-gateway-feed ran
+# `python3 <worktree>/.../mac_feed.py` every 60 s; an idle-window sweep removed the worktree
+# and the job then failed ~1,230 times). A plist that cannot be read names nothing: this
+# only ever adds holders, so it can never make the scan fail or a worktree removable.
+_cc_wj_launchd_paths() {
+  local d f p
+  command -v plutil >/dev/null 2>&1 || return 0
+  while IFS= read -r d; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
+    for f in "$d"/*.plist; do
+      [ -f "$f" ] || continue
+      plutil -convert xml1 -o - -- "$f" 2>/dev/null |
+        sed -n 's|^.*<string>\(/[^<]*\)</string>.*$|\1|p' |
+        sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g' |
+        while IFS= read -r p; do
+          printf '%s\n' "$p"
+          # lsof reports physical paths; a plist spells what its author typed.
+          [ -d "${p%/*}" ] && _cc_wj_realpath "$p"
+        done
+    done
+  done <<< "$(printf '%s' "${CC_WJ_LAUNCHD_DIRS-$HOME/Library/LaunchAgents}" | tr ':' '\n')"
+  return 0
+}
+
 # Scan every process's working directory and every open file on the machine, once, into
 # $1/cwd and $1/open as one path per line. Fails when either scan fails or comes back
 # empty.
@@ -432,7 +460,9 @@ _cc_wj_scan_holders() {
       sed -n 's/^n//p' "$dir/$f.raw" > "$dir/$f"
     done
   fi
-  [ -s "$dir/cwd" ] && [ -s "$dir/open" ]
+  [ -s "$dir/cwd" ] && [ -s "$dir/open" ] || return 1
+  _cc_wj_launchd_paths >> "$dir/open" 2>/dev/null
+  return 0
 }
 
 # Whether a scan in $1 names worktree $2, or anything under it, by either spelling: git
