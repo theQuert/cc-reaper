@@ -458,6 +458,146 @@ _cc_wj_held() {
   return 1
 }
 
+# ─── launchd targets ──────────────────────────────────────────────────────────
+
+# A launchd job that runs a script from a worktree is a holder no process scan can see: it
+# has no process between runs, so lsof shows nothing, and the job fails every run once the
+# checkout is gone (tech.stima.event-gateway-feed, 16 hours, 2026-10-15). The plists that
+# can start such a job are read instead.
+#
+# CC_WJ_LAUNCHAGENTS_DIRS, colon-separated, replaces the default three directories.
+# A name containing `.disabled` is not a job. A plist that cannot be read fails the scan,
+# and a failed scan keeps every worktree, as a failed lsof scan does.
+_cc_wj_launchd_dirs() {
+  printf '%s\n' "${CC_WJ_LAUNCHAGENTS_DIRS:-$HOME/Library/LaunchAgents:/Library/LaunchAgents:/Library/LaunchDaemons}" |
+    tr ':' '\n'
+}
+
+# Scan every plist into $1/launchd-paths (`label<TAB>absolute path`: every absolute path
+# found in any string value, as written and with symlinks resolved) and
+# $1/launchd-missing (`label<TAB>program path` for a program that does not exist).
+# Sets _CC_WJ_LAUNCHD_ERROR and fails when a plist cannot be read.
+_CC_WJ_LAUNCHD_ERROR=""
+_cc_wj_scan_launchd() {
+  local dir="$1" d f xml label val kind idx prog scripted arg tok real
+  local -a args
+  _CC_WJ_LAUNCHD_ERROR=""
+  : > "$dir/launchd-paths"; : > "$dir/launchd-missing"
+  while IFS= read -r d; do
+    [ -n "$d" ] && [ -d "$d" ] && [ -r "$d" ] || continue
+    for f in "$d"/*.plist; do
+      [ -f "$f" ] || continue
+      case "${f##*/}" in *.disabled*) continue ;; esac
+      if ! command -v plutil >/dev/null 2>&1; then
+        _CC_WJ_LAUNCHD_ERROR="plutil is not available to read $f"; return 1
+      fi
+      xml="$(plutil -convert xml1 -o - -- "$f" 2>/dev/null)" && [ -n "$xml" ] || {
+        _CC_WJ_LAUNCHD_ERROR="the launchd plist $f could not be parsed"; return 1; }
+      label=""; prog=""; args=()
+      # Strings only: kind S any string, L the Label, G the Program, A a ProgramArguments item.
+      while IFS=$'\t' read -r kind val; do
+        case "$kind" in
+          L) [ -n "$label" ] || label="$val" ;;
+          G) prog="$val" ;;
+          A) args+=("$val") ;;
+        esac
+        # Each absolute path in the value: whole, and cut at `=`, `:` and blanks (a `--x=/p`
+        # argument, a PATH list).
+        while IFS= read -r tok; do
+          case "$tok" in /*) ;; *) continue ;; esac
+          tok="${tok%/}"; [ -n "$tok" ] || continue
+          printf '%s\n' "$tok" >> "$dir/launchd-paths.raw"
+        done <<TOKENS
+$val
+$(printf '%s' "$val" | tr '=: \t' '\n\n\n\n')
+TOKENS
+      done < <(printf '%s\n' "$xml" | LC_ALL=C awk '
+        function dec(s) { gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&quot;/, "\"", s)
+                          gsub(/&apos;/, "\047", s); gsub(/&amp;/, "\\&", s); return s }
+        /<key>/ { w = ""; if ($0 ~ /<key>Label<\/key>/) w = "L"
+                  else if ($0 ~ /<key>Program<\/key>/) w = "G"
+                  else if ($0 ~ /<key>ProgramArguments<\/key>/) pa = 1
+                  next }
+        /<array\/>/ { pa = 0; next }
+        /<array>/ { if (pa == 1) pa = 2; next }
+        /<\/array>/ { if (pa == 2) pa = 0; next }
+        /<string>/ { s = $0; sub(/^.*<string>/, "", s); sub(/<\/string>.*$/, "", s); s = dec(s)
+                     if (pa == 2) print "A\t" s; else if (w != "") print w "\t" s; else print "S\t" s
+                     w = ""; next }
+        { w = "" }')
+      [ -n "$label" ] || label="${f##*/}"
+      if [ -f "$dir/launchd-paths.raw" ]; then
+        while IFS= read -r tok; do
+          printf '%s\t%s\n' "$label" "$tok" >> "$dir/launchd-paths"
+        done < "$dir/launchd-paths.raw"
+        rm -f "$dir/launchd-paths.raw"
+      fi
+      # The program: Program, else the first argument; when that is an interpreter, the
+      # script it runs is the first later argument that is not an option.
+      [ -n "$prog" ] || prog="${args[0]:-}"
+      case "$prog" in
+        /*)
+          [ -e "$prog" ] || printf '%s\t%s\n' "$label" "$prog" >> "$dir/launchd-missing"
+          case "${prog##*/}" in
+            python*|bash|sh|zsh|dash|ksh|node|ruby|perl|php|env)
+              idx=1; scripted=""
+              while [ "$idx" -lt "${#args[@]}" ]; do
+                arg="${args[$idx]}"; idx=$((idx + 1))
+                case "$arg" in
+                  -c|-*c|-m|-e) break ;;  # the next word is a command, a module or code
+                  -*|*=*) continue ;;
+                  *[[:space:]]*) ;;  # a command line, not a file
+                  /*) scripted="$arg" ;;
+                esac
+                break
+              done
+              [ -z "$scripted" ] || [ -e "$scripted" ] ||
+                printf '%s\t%s\n' "$label" "$scripted" >> "$dir/launchd-missing"
+              ;;
+          esac ;;
+      esac
+    done
+  done < <(_cc_wj_launchd_dirs)
+  # Symlinks resolved, once per distinct path: most tokens are PATH entries every job shares.
+  # A path that does not exist (yet, or any more) is resolved through its nearest ancestor
+  # that does, so /var/x/wt/run.sh still reads as /private/var/x/wt/run.sh.
+  cut -f2 "$dir/launchd-paths" | LC_ALL=C sort -u | while IFS= read -r tok; do
+    d="$tok"; rest=""
+    while [ ! -e "$d" ] && [ "$d" != / ]; do
+      rest="/${d##*/}$rest"; d="${d%/*}"; [ -n "$d" ] || d=/
+    done
+    real="$(_cc_wj_realpath "$d")"; real="${real%/}$rest"
+    [ "$real" = "$tok" ] || printf '%s\t%s\n' "$tok" "$real"
+  done > "$dir/launchd-real"
+  if [ -s "$dir/launchd-real" ]; then
+    LC_ALL=C awk -F'\t' -v OFS='\t' 'NR == FNR { m[$1] = $2; next } $2 in m { print $1, m[$2] }' \
+      "$dir/launchd-real" "$dir/launchd-paths" > "$dir/launchd-paths.real" &&
+      cat "$dir/launchd-paths.real" >> "$dir/launchd-paths"
+  fi
+  return 0
+}
+
+# Print the label of a job whose plist names worktree $2 or anything under it, by either
+# spelling of the worktree. Whole path components: /x/wt-1 is not /x/wt-10.
+_cc_wj_launchd_target() { # <scan dir> <worktree>
+  local dir="$1" wt="${2%/}" real
+  real="$(_cc_wj_realpath "$wt")"
+  CC_WJ_A="$wt" CC_WJ_B="${real%/}" LC_ALL=C awk -F'\t' '
+    BEGIN { a = ENVIRON["CC_WJ_A"]; b = ENVIRON["CC_WJ_B"] }
+    { t = $2
+      if (t == a || t == b || index(t, a "/") == 1 || (b != "" && index(t, b "/") == 1)) { print $1; exit } }
+  ' "$dir/launchd-paths"
+}
+
+# KEEP(...) when launchd forbids removing worktree $2, empty otherwise. $LAUNCHD_OK is the
+# caller's record of whether the scan worked.
+_cc_wj_launchd_keep() { # <scan dir> <worktree> <ok: yes|no>
+  local label
+  [ "$3" = yes ] || { echo "KEEP(launchd-scan-unknown)"; return 0; }
+  label="$(_cc_wj_launchd_target "$1" "$2")"
+  [ -z "$label" ] || echo "KEEP(launchd-target:$label)"
+}
+
 # ─── Harness activity claims ────────────────────────────────────────────────
 
 # lsof proves that a process currently holds a path.  It cannot prove that an app task
@@ -3284,7 +3424,7 @@ _cc_wj_run_inner() {
 
   # Holder scans, taken once per run into files and taken again right before each removal.
   local work old_exit="" old_int="" old_term="" old_hup="" cleanup_exit_installed=0
-  local LSOF_OK="yes" ACTIVE_OK="yes" activity_blind=0
+  local LSOF_OK="yes" ACTIVE_OK="yes" LAUNCHD_OK="yes" ld_keep ld_label ld_path activity_blind=0
   work="$(mktemp -d "${TMPDIR:-/tmp}/cc-wj.XXXXXX")" || {
     echo "worktree-janitor: no temporary directory for the process scan; scanned and removed nothing" >&2
     return 1
@@ -3322,6 +3462,15 @@ _cc_wj_run_inner() {
     ACTIVE_OK="no"
     activity_blind=1
     echo "worktree-janitor: $_CC_WJ_ACTIVE_ERROR, so no worktree can be shown free of active sessions" >&2
+  fi
+  # Launchd jobs that run from a worktree. A program that no longer exists is only reported.
+  if _cc_wj_scan_launchd "$work"; then
+    while IFS=$'\t' read -r ld_label ld_path; do
+      [ -n "$ld_label" ] && echo "worktree-janitor: launchd-missing-program:$ld_label $ld_path"
+    done < "$work/launchd-missing"
+  else
+    LAUNCHD_OK="no"
+    echo "worktree-janitor: $_CC_WJ_LAUNCHD_ERROR, so no worktree can be shown free of launchd jobs" >&2
   fi
 
   # The checkout the calling session stands in, kept whatever else is true of it:
@@ -3709,6 +3858,12 @@ KEEP
       fi
       [ -n "$classification" ] ||
         classification=$(_cc_wj_classify "$wt_path" "$dirty" "$active" "$LSOF_OK" "$branch" "$landed" "$idle" "$lease" "$abandoned" "$referenced" "$pushed" "$wip")
+      # A launchd job that runs from the tree has no process to hold it between runs.
+      case "$classification" in
+        REMOVABLE|REMOVABLE\(*\))
+          ld_keep="$(_cc_wj_launchd_keep "$work" "$wt_path" "$LAUNCHD_OK")"
+          [ -z "$ld_keep" ] || classification="$ld_keep" ;;
+      esac
 
       printf "  WORKTREE  %s\n" "$wt_path"
       printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s  recent=%s  landed=%s  idle=%s\n" \
@@ -3807,6 +3962,20 @@ KEEP
             if ! _cc_wj_scan_holders "$work"; then
               LSOF_OK="no"
               printf "    → kept: the process scan failed right before removal\n"
+              total_kept=$((total_kept + 1))
+              continue
+            fi
+            # Launchd plists are read again too: a job can be installed after the first scan.
+            if ! _cc_wj_scan_launchd "$work"; then
+              LAUNCHD_OK="no"
+              printf "    → kept: %s, so launchd jobs are unknown\n" "$_CC_WJ_LAUNCHD_ERROR"
+              total_kept=$((total_kept + 1))
+              continue
+            fi
+            LAUNCHD_OK="yes"
+            ld_keep="$(_cc_wj_launchd_target "$work" "$wt_path")"
+            if [ -n "$ld_keep" ]; then
+              printf "    → kept: launchd job %s runs from it\n" "$ld_keep"
               total_kept=$((total_kept + 1))
               continue
             fi
