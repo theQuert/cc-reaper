@@ -473,13 +473,22 @@ _cc_wj_launchd_dirs() {
     tr ':' '\n'
 }
 
+# The home `~/` and `$HOME/` mean to a job: its UserName's, else the janitor's own.
+_cc_wj_launchd_home() { # <UserName, may be empty>
+  local h=""
+  if [ -n "$1" ] && command -v dscl >/dev/null 2>&1; then
+    h="$(dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | LC_ALL=C awk '/^NFSHomeDirectory:/ { sub(/^NFSHomeDirectory: */, ""); print; exit }')"
+  fi
+  case "$h" in /*) printf '%s\n' "$h" ;; *) printf '%s\n' "${HOME:-}" ;; esac
+}
+
 # Scan every plist into $1/launchd-paths (`label<TAB>absolute path`: every absolute path
 # found in any string value, as written and with symlinks resolved) and
 # $1/launchd-missing (`label<TAB>program path` for a program that does not exist).
 # Sets _CC_WJ_LAUNCHD_ERROR and fails when a plist cannot be read.
 _CC_WJ_LAUNCHD_ERROR=""
 _cc_wj_scan_launchd() {
-  local dir="$1" d f xml label val kind idx prog scripted arg tok real
+  local dir="$1" d f xml label val kind idx prog scripted arg tok real user home
   local -a args
   _CC_WJ_LAUNCHD_ERROR=""
   : > "$dir/launchd-paths"; : > "$dir/launchd-missing"
@@ -493,43 +502,62 @@ _cc_wj_scan_launchd() {
       fi
       xml="$(plutil -convert xml1 -o - -- "$f" 2>/dev/null)" && [ -n "$xml" ] || {
         _CC_WJ_LAUNCHD_ERROR="the launchd plist $f could not be parsed"; return 1; }
-      label=""; prog=""; args=()
-      # Strings only: kind S any string, L the Label, G the Program, A a ProgramArguments item.
+      label=""; prog=""; user=""; args=()
+      # Strings only: kind S any string, L the Label, G the Program, A a ProgramArguments item,
+      # U the UserName.
       while IFS=$'\t' read -r kind val; do
         case "$kind" in
           L) [ -n "$label" ] || label="$val" ;;
           G) prog="$val" ;;
+          U) user="$val" ;;
           A) args+=("$val") ;;
         esac
-        # Each absolute path in the value: whole, and cut at `=`, `:` and blanks (a `--x=/p`
-        # argument, a PATH list).
+        # Each absolute path in the value: whole, and cut where a shell would end a word or
+        # a path: blanks, `=` `:` (a `--x=/p` argument, a PATH list), quotes, `; & | ( ) < >`
+        # and the backtick. `~/` and `$HOME/` are kept as written, for the home of the
+        # plist's user once the whole plist is read.
         while IFS= read -r tok; do
-          case "$tok" in /*) ;; *) continue ;; esac
+          case "$tok" in /*|'~/'*|'$HOME/'*|'${HOME}/'*) ;; *) continue ;; esac
           tok="${tok%/}"; [ -n "$tok" ] || continue
           printf '%s\n' "$tok" >> "$dir/launchd-paths.raw"
         done <<TOKENS
 $val
-$(printf '%s' "$val" | tr '=: \t' '\n\n\n\n')
+$(printf '%s' "$val" | LC_ALL=C awk '{ gsub(/[=: \t"\047;&|()<>`]/, "\n"); print }')
 TOKENS
       done < <(printf '%s\n' "$xml" | LC_ALL=C awk '
+        function emit(s) { s = dec(s)
+                           if (pa == 2) print "A\t" s; else if (w != "") print w "\t" s; else print "S\t" s
+                           w = "" }
         function dec(s) { gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&quot;/, "\"", s)
                           gsub(/&apos;/, "\047", s); gsub(/&amp;/, "\\&", s); return s }
+        acc { if ($0 ~ /<\/string>/) { s = $0; sub(/<\/string>.*$/, "", s); acc = 0; emit(buf " " s) }
+              else buf = buf " " $0
+              next }
         /<key>/ { w = ""; if ($0 ~ /<key>Label<\/key>/) w = "L"
+                  else if ($0 ~ /<key>UserName<\/key>/) w = "U"
                   else if ($0 ~ /<key>Program<\/key>/) w = "G"
                   else if ($0 ~ /<key>ProgramArguments<\/key>/) pa = 1
                   next }
         /<array\/>/ { pa = 0; next }
         /<array>/ { if (pa == 1) pa = 2; next }
         /<\/array>/ { if (pa == 2) pa = 0; next }
-        /<string>/ { s = $0; sub(/^.*<string>/, "", s); sub(/<\/string>.*$/, "", s); s = dec(s)
-                     if (pa == 2) print "A\t" s; else if (w != "") print w "\t" s; else print "S\t" s
-                     w = ""; next }
+        /<string>/ { s = $0; sub(/^.*<string>/, "", s)
+                     # A value with newlines runs on to the line with the closing tag; it is one value.
+                     if (s !~ /<\/string>/) { buf = s; acc = 1; next }
+                     sub(/<\/string>.*$/, "", s); emit(s); next }
         { w = "" }')
       [ -n "$label" ] || label="${f##*/}"
       if [ -f "$dir/launchd-paths.raw" ]; then
         LC_ALL=C sort -u "$dir/launchd-paths.raw" > "$dir/launchd-paths.uniq" &&
           mv -f "$dir/launchd-paths.uniq" "$dir/launchd-paths.raw"
+        home=""
         while IFS= read -r tok; do
+          case "$tok" in
+            '~/'*|'$HOME/'*|'${HOME}/'*)
+              if [ -z "$home" ]; then home="$(_cc_wj_launchd_home "$user")"; home="${home%/}"; fi
+              [ -n "$home" ] || continue
+              tok="$home/${tok#*/}" ;;
+          esac
           printf '%s\t%s\n' "$label" "$tok" >> "$dir/launchd-paths"
         done < "$dir/launchd-paths.raw"
         rm -f "$dir/launchd-paths.raw"

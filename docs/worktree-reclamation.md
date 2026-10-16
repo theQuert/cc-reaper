@@ -115,6 +115,11 @@ made again right before a removal. A plist that cannot be parsed is `KEEP(launch
 for every worktree in the run. A program or interpreter script that does not exist is only
 printed, as `launchd-missing-program:<Label> <path>`.
 
+A string is read the way a shell reads a command line: a path ends at a blank, `=`, `:`, a quote,
+`;`, `&`, `|`, `(`, `)`, `<`, `>` or a backtick, a value that runs over several lines is one value, and a
+leading `~/`, `$HOME/` or `${HOME}/` is the home of the plist's `UserName` (from `dscl`), else the
+janitor's own `$HOME`.
+
 ## Work origin already holds
 
 Landing is not the only way work is safe: a commit origin lists in a branch is on another

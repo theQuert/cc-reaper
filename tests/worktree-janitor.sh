@@ -2851,6 +2851,79 @@ STUB
     test -d "$LD_ROOT/wt-late"
   expect_yes "launchd: and the run says the job appeared before removal" \
     file_has "$OUT_LD_APPLY" "launchd job test.late"
+
+  # The same scan reads the way a shell reads a command line: a path inside quotes, after a
+  # `;`, in parentheses, written under $HOME, or on a later line of a string still keeps its
+  # worktree. Each case is a worktree only that one plist names.
+  LD2_AGENTS="$LD_ROOT/agents2"; mkdir -p "$LD2_AGENTS"
+  LD_HOME="$LD_ROOT/home"; LD_UHOME="$LD_ROOT/uhome"
+  for n in q1 q2 q4 q5 q9 ml; do ldgit worktree add -q "$LD_ROOT/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
+  for n in h1 h2 h3 h4; do ldgit worktree add -q "$LD_HOME/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
+  for n in u1 u2; do ldgit worktree add -q "$LD_UHOME/wt-$n" -b "ld-$n" origin/main 2>/dev/null; done
+  ld_raw() { # <file> <label> <extra keys> <ProgramArguments strings, verbatim xml>
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n<key>Label</key>\n<string>%s</string>\n%s\n<key>ProgramArguments</key>\n<array>\n%s\n</array>\n</dict>\n</plist>\n' "$2" "$3" "$4" > "$1"
+  }
+  ld_raw "$LD2_AGENTS/q1.plist" test.q1 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>exec \"$LD_ROOT/wt-q1/run.sh\" &gt;&gt;/tmp/x.log</string>"
+  ld_raw "$LD2_AGENTS/q2.plist" test.q2 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>exec '$LD_ROOT/wt-q2/run.sh'</string>"
+  ld_raw "$LD2_AGENTS/q3.plist" test.q3 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>exec \"\$HOME/wt-h1/run.sh\"</string>"
+  ld_raw "$LD2_AGENTS/q4.plist" test.q4 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>cd $LD_ROOT/wt-q4;./run.sh</string>"
+  ld_raw "$LD2_AGENTS/q5.plist" test.q5 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>($LD_ROOT/wt-q5/run.sh)</string>"
+  ld_raw "$LD2_AGENTS/ml.plist" test.ml '' "<string>/bin/bash</string>
+<string>-c</string>
+<string>set -e
+cd /
+$LD_ROOT/wt-ml/run.sh</string>"
+  ld_raw "$LD2_AGENTS/q6.plist" test.q6 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>a=1 &amp;&amp; \${HOME}/wt-h2/run.sh | cat</string>"
+  ld_raw "$LD2_AGENTS/q7.plist" test.q7 '' "<string>/bin/sh</string>
+<string>-c</string>
+<string>~/wt-h3/run.sh &lt;/dev/null</string>"
+  # With a UserName, $HOME is that user's home (dscl), not the janitor's.
+  ld_raw "$LD2_AGENTS/u.plist" test.u '<key>UserName</key>
+<string>ldtester</string>' "<string>/bin/sh</string>
+<string>-c</string>
+<string>\$HOME/wt-u1/run.sh; \$HOME/wt-h4/run.sh</string>"
+  # wt-q9 is named by no job; only a longer name that starts with it is.
+  ld_raw "$LD2_AGENTS/q9.plist" test.q9 '' "<string>/bin/echo</string>
+<string>not-a-path
+$LD_ROOT/wt-q9x/run.sh</string>"
+  LD3_STUBS="$TMPDIR_ROOT/stubs-launchd-dscl"; mkdir -p "$LD3_STUBS"
+  cat > "$LD3_STUBS/dscl" <<STUB
+#!/usr/bin/env bash
+if [ "\$*" = ". -read /Users/ldtester NFSHomeDirectory" ]; then
+  printf 'NFSHomeDirectory: %s\\n' "$LD_UHOME"; exit 0
+fi
+exit 56
+STUB
+  chmod +x "$LD3_STUBS/dscl"
+  OUT_LD2="$TMPDIR_ROOT/out-ld2.txt"
+  HOME="$LD_HOME" PATH="$LD3_STUBS:$STUBS_IDLE:$PATH" CC_WJ_LAUNCHAGENTS_DIRS="$LD2_AGENTS" \
+    bash "$WJ" --repo "$LD_ROOT/primary" > "$OUT_LD2" 2>&1
+  ld_kept() { ld_block "$OUT_LD2" "$1" | grep -q "classification: KEEP(launchd-target:$2)"; }
+  ld_removable() { ld_block "$OUT_LD2" "$1" | grep -q "classification: REMOVABLE"; }
+  expect_yes "launchd: a double-quoted path in a shell string keeps its worktree" ld_kept wt-q1 test.q1
+  expect_yes "launchd: a single-quoted path in a shell string keeps its worktree" ld_kept wt-q2 test.q2
+  expect_yes "launchd: a \$HOME path in a shell string keeps its worktree" ld_kept wt-h1 test.q3
+  expect_yes "launchd: a path after cd and ; keeps its worktree" ld_kept wt-q4 test.q4
+  expect_yes "launchd: a path in parentheses keeps its worktree" ld_kept wt-q5 test.q5
+  expect_yes "launchd: a path on the third line of a string keeps its worktree" ld_kept wt-ml test.ml
+  expect_yes "launchd: \${HOME} after && and before | keeps its worktree" ld_kept wt-h2 test.q6
+  expect_yes "launchd: ~/ before a < redirect keeps its worktree" ld_kept wt-h3 test.q7
+  expect_yes "launchd: with a UserName, \$HOME is that user's home" ld_kept wt-u1 test.u
+  expect_yes "launchd: and then not the janitor's own home" ld_removable wt-h4
+  expect_yes "launchd: a longer name that starts with a worktree's does not keep it" ld_removable wt-q9
+  expect_yes "launchd: an unreferenced worktree under the user's home stays REMOVABLE" ld_removable wt-u2
 else
   printf 'ok - launchd: skipped, plutil is not available on this host\n'
 fi
