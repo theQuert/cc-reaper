@@ -16,11 +16,26 @@ all of the following hold:
 - its size is at most `CC_WJ_ARCHIVE_MAX_BYTES`, which defaults to 1048576.
 
 A matching file that fails any of these SHALL keep the worktree, and the report SHALL name the
-condition that failed. An ignored directory that a plain declaration would discount whole SHALL
-keep the worktree when the text of some `archive:` pattern before its first wildcard is empty,
-is a prefix of the directory's path followed by `/`, or begins with that path followed by `/`,
-or when that cannot be determined, and the report SHALL say so. A value of `CC_WJ_ARCHIVE_MAX_BYTES` that is not a decimal integer SHALL
-make no file archivable.
+condition that failed. An `archive:` pattern MAY reach an ignored directory that git lists
+collapsed: the text of the pattern before its first wildcard is empty, is a prefix of the
+directory's path followed by `/`, or begins with that path followed by `/`. The janitor SHALL
+then walk that directory instead of discounting or pinning it whole, and judge each file in it
+as it judges an ignored file listed by name, with these additions:
+- a subdirectory SHALL be discounted whole, after the credential scan a declared directory
+  receives, only when every `archive:` pattern that may reach it has no wildcard and is a
+  strict ancestor of it, and a plain declaration names it below the deepest of them: the
+  declaration's text before its first wildcard begins with that ancestor followed by `/`, and
+  what follows the ancestor spells two consecutive characters outside its wildcards. A plain
+  declaration naming the ancestor itself, one of its ancestors, or `<ancestor>/*` SHALL NOT
+  discount it; its files SHALL then be judged one by one, `archive:` first;
+- the walk SHALL keep the worktree when any name in the directory holds a newline;
+- the walk SHALL stop at the first file that keeps the worktree, and the report SHALL name it;
+- a walk that fails, or counts more than 1000 files outside
+  discounted subdirectories SHALL keep the worktree, and the report SHALL say which.
+
+When whether a pattern may reach the directory cannot be determined, a directory a plain
+declaration would discount whole SHALL keep the worktree, and the report SHALL say so. A value
+of `CC_WJ_ARCHIVE_MAX_BYTES` that is not a decimal integer SHALL make no file archivable.
 
 With `--apply`, after every recheck and immediately before removing a worktree, the janitor
 SHALL copy each such file into a directory it creates for this removal:
@@ -49,9 +64,17 @@ For a REMOVABLE worktree holding such files, the report SHALL print
 - **WHEN** a plain pattern (`*.log`) and an `archive:` pattern (`keep.log`) both name an archivable ignored file
 - **THEN** the file is copied before the removal, and a file only the plain pattern names is discounted without a copy
 
-#### Scenario: A declared directory an archive: pattern may reach into
-- **WHEN** a plain declaration names an ignored directory (`logs`) and an `archive:` pattern may name a path inside it (`logs/notes.md`, `*.md`)
-- **THEN** the directory keeps the worktree, and the report says an `archive:` pattern may name a path inside it
+#### Scenario: A directory an archive: pattern may reach into
+- **WHEN** git lists an ignored directory collapsed (`logs/`, `.codex/evidence/`) and an `archive:` pattern may name a path inside it (`logs/notes.md`, `*.md`, `.codex/evidence`)
+- **THEN** the directory is walked: its archivable files are listed on the `archive on removal:` line and copied by `--apply`, and its files that only a plain declaration names are discounted without a copy
+
+#### Scenario: A declared subdirectory inside a walked directory
+- **WHEN** `.codex/evidence` is declared `archive:` and `.codex/evidence/*/venv` plain, and a walked directory holds `.codex/evidence/2303/venv/`
+- **THEN** that subdirectory is discounted whole, unless it holds a credential-shaped file or another `archive:` pattern names a path inside it (`archive:.codex/evidence/9/venv/notes.md`), in which case its files are judged one by one
+
+#### Scenario: A walked directory that keeps its worktree
+- **WHEN** a walked directory holds a file over the size limit, a credential-shaped name, a symlink, or an undeclared file, or the walk fails or counts more than 1000 files
+- **THEN** the worktree is kept, and the report names the file or the reason
 
 #### Scenario: An unusable size limit
 - **WHEN** `CC_WJ_ARCHIVE_MAX_BYTES` is not a decimal integer

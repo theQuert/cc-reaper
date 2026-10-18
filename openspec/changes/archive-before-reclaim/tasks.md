@@ -33,3 +33,8 @@
   review of the exact head.
 - [ ] 3.2 Deploy by rename. stima-api declares `archive:.canary-window-plan`, and a dry run on
   the host shows the plan-only worktrees REMOVABLE with their archive line.
+
+## 4. Walk a directory an archive: pattern reaches (stima-api #5284)
+
+- [x] 4.1 Test first: a collapsed `.codex/evidence/` of records is REMOVABLE and its records copied byte for byte; a plain-declared subdirectory is discounted whole; a file over the limit, a credential-shaped name, a symlink, a walk that fails or passes 1000 files keeps the worktree.
+- [x] 4.2 `_cc_wj_archive_walk`, called from `_cc_wj_pins` for a collapsed directory an `archive:` pattern may reach.

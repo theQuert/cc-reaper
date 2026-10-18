@@ -2123,6 +2123,119 @@ _cc_wj_archive_may_reach() {
     } END { exit !f }' 2>/dev/null
 }
 
+# Whether a plain declaration names directory $2 itself, below archive: ancestor $1: its
+# text before the first wildcard starts with `$1/`, and what follows spells two consecutive
+# characters outside its wildcards. `$1/*` and a line naming $1 or one of its ancestors are
+# as broad as the archive: line, and would discard the records it keeps.
+_cc_wj_declared_below() {
+  local anc="$1" p="$2" pat lit
+  [ -n "${ZSH_VERSION:-}" ] && setopt local_options glob_subst
+  while IFS= read -r pat; do
+    [ -n "$pat" ] || continue
+    case "$pat" in "$anc/"*) ;; *) continue ;; esac
+    lit="${pat#"$anc/"}"
+    case "$lit" in *[!*?][!*?]*) ;; *) continue ;; esac
+    lit="${pat%%[*?]*}"
+    case "$lit" in "$anc/"*) ;; *) continue ;; esac
+    # shellcheck disable=SC2254
+    case "$p" in $pat) return 0 ;; esac
+  done <<DECL
+$_CC_WJ_DECLARED
+DECL
+  return 1
+}
+
+# Judge every file inside collapsed ignored directory $2 of worktree $1 that an archive:
+# pattern may reach, as `_cc_wj_pins` judges an ignored file: an archivable one is appended
+# to $3 for the copy, one only a plain line declares is discounted, and anything else
+# prints one pin and stops. stima-api's `.codex/evidence/` - records merged docs cite - kept
+# 25 landed worktrees (20.3G) on 2026-10-18 for 1.33G of them, because the directory was
+# pinned rather than walked (#5284). Never past 1000 files: a directory holding more is not
+# a record directory, and the walk is repeated on every recheck.
+#
+# A subdirectory a plain line declares - a virtualenv beside the records - is discounted
+# whole after the credential scan, when every archive: pattern that reaches it is a
+# wildcard-free strict ancestor of it, and a plain line names it below the deepest of them,
+# such as `.codex/evidence/*/venv` below `.codex/evidence`: the plain line is the more
+# specific statement. Otherwise its files are judged one by one, archive: first.
+_cc_wj_archive_walk() {
+  local wt="$1" d="$2" archive_to="${3:-}" list dirs f rel n=0 arc pruned="" p skip anc nl
+  # A walk that fails is not a walk that found nothing.
+  nl="$(find "$wt/$d" -name "*"$'\n'"*" -print -quit 2>/dev/null)" &&
+    dirs="$(find "$wt/$d" -mindepth 1 -type d -print 2>/dev/null)" &&
+    list="$(find "$wt/$d" ! -type d -print 2>/dev/null)" || {
+    _cc_wj_pin '!!' "$d/ (declared archive:, but it could not be walked)"; return 0; }
+  # A name holding a newline arrives as fragments, which can spell another path.
+  [ -z "$nl" ] || {
+    _cc_wj_pin '!!' "$d/ (declared archive:, but a name in it holds a newline)"; return 0; }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in "$wt/$d/"*) ;; *)
+      _cc_wj_pin '!!' "$d/ (declared archive:, but a name in it holds a newline)"; return 0 ;; esac
+    rel="${f#"$wt/"}"
+    skip=0
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      case "$rel/" in "$p/"*) skip=1; break ;; esac
+    done <<PRUNED
+$pruned
+PRUNED
+    [ "$skip" -eq 0 ] || continue
+    # The deepest wildcard-free ancestor among the archive: patterns reaching it; any other
+    # pattern reaching it answers no prune.
+    anc="$(printf '%s\n' "$_CC_WJ_ARCHIVED" | D="$rel" awk 'NF {
+        p = $0; i = match(p, /[*?]/)
+        if (i) { p = substr(p, 1, i - 1); if (p == "" || index(ENVIRON["D"] "/", p) == 1 || index(p, ENVIRON["D"] "/") == 1) bad = 1 }
+        else if (p == ENVIRON["D"] || index(p, ENVIRON["D"] "/") == 1) bad = 1
+        else if (index(ENVIRON["D"], p "/") == 1 && length(p) > length(a)) a = p
+      } END { if (bad) exit 1; print a }' 2>/dev/null)" || continue
+    if [ -n "$anc" ]; then _cc_wj_declared_below "$anc" "$rel" || continue
+    else _cc_wj_declared "$rel" || continue
+    fi
+    if _cc_wj_find_credential "$f"; then
+      _cc_wj_pin '!!' "$rel/ (declared, but holds a credential-shaped file)"; return 0
+    fi
+    pruned="$pruned$rel"$'\n'
+  done <<DIRS
+$dirs
+DIRS
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    # A name containing a newline arrives as fragments; a fragment proves nothing.
+    case "$f" in "$wt/$d/"*) ;; *)
+      _cc_wj_pin '!!' "$d/ (declared archive:, but a name in it holds a newline)"; return 0 ;; esac
+    rel="${f#"$wt/"}"
+    skip=0
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      case "$rel" in "$p/"*) skip=1; break ;; esac
+    done <<PRUNED
+$pruned
+PRUNED
+    [ "$skip" -eq 0 ] || continue
+    n=$((n + 1))
+    [ "$n" -le 1000 ] || {
+      _cc_wj_pin '!!' "$d/ (declared archive:, but it holds more than 1000 files)"; return 0; }
+    rel="${f#"$wt/"}"
+    arc=0
+    _cc_wj_archivable "$wt" "$rel" || arc=$?
+    case "$arc" in
+      0)
+        [ -z "$archive_to" ] || { printf '%s\n' "$rel" >> "$archive_to"; } 2>/dev/null || {
+          _cc_wj_pin '!!' "$rel (declared archive:, but it could not be listed for the copy)"
+          return 0; }
+        continue ;;
+      2) _cc_wj_pin '!!' "$rel (declared archive:, but $_CC_WJ_ARCHIVE_WHY)"; return 0 ;;
+    esac
+    _cc_wj_declared "$rel" && ! _cc_wj_sensitive_name "${rel##*/}" && continue
+    _cc_wj_pin '!!' "$rel"
+    return 0
+  done <<LIST
+$list
+LIST
+  return 0
+}
+
 # git collapses a wholly ignored directory to one `!! dir/` entry, so a declaration naming
 # files inside it - `logs/*.log` inside `logs/` - never meets a name it can match. Such a
 # directory is disposable when every non-directory in it is declared and none is
@@ -2187,7 +2300,7 @@ _cc_wj_pin() {
 # With $2, each archivable file this read discounts is appended to that file, one path per
 # line, so a removal copies out exactly what the read that cleared it saw.
 _cc_wj_pins() {
-  local wt="$1" archive_to="${2:-}" sf rec code rest base skip_next=0 drc arc status_timeout status_rc=0
+  local wt="$1" archive_to="${2:-}" sf rec code rest base skip_next=0 drc reach arc status_timeout status_rc=0
   status_timeout="$(_cc_wj_git_status_timeout_seconds)" || {
     _cc_wj_pin '??' "(invalid git status timeout)"; return 1; }
   sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-status.XXXXXX")" || {
@@ -2232,10 +2345,13 @@ _cc_wj_pins() {
         esac
         drc=0
         _cc_wj_declared_dir "$wt" "$rest" || drc=$?
-        case "$drc" in
-          0) ;;
-          2) _cc_wj_pin '!!' "$rest/ (declared, but holds a credential-shaped file)" ;;
-          3) _cc_wj_pin '!!' "$rest/ (declared, but an archive: pattern may name a path inside it)" ;;
+        reach=1
+        case "$drc" in 0|2) ;; *) _cc_wj_archive_may_reach "$rest"; reach=$? ;; esac
+        case "$drc:$reach" in
+          0:*) ;;
+          2:*) _cc_wj_pin '!!' "$rest/ (declared, but holds a credential-shaped file)" ;;
+          *:0) _cc_wj_archive_walk "$wt" "$rest" "$archive_to" ;;
+          3:*) _cc_wj_pin '!!' "$rest/ (declared, but an archive: pattern may name a path inside it)" ;;
           *) _cc_wj_pin '!!' "$rest/" ;;
         esac
         ;;

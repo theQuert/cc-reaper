@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- **`worktree-janitor` walks a directory an `archive:` pattern reaches, instead of pinning it.**
+  git lists stima-api's ignored `.codex/evidence/` as one collapsed entry, so
+  `archive:.codex/evidence` could not copy the records inside it and kept 25 landed worktrees
+  (20.3G) for 1.33G of records on 2026-10-18 (stima-api #5284). Each file in such a directory is
+  now judged as a named ignored file is: archivable records are copied before the removal, and a
+  subdirectory a plain line declares is discounted whole when the only `archive:` patterns
+  reaching it are wildcard-free ancestors. A file over the limit, a credential-shaped name, a
+  symlink, an undeclared file, a failed walk or one past 1000 files keeps the worktree, named.
 - **`worktree-janitor` keeps a worktree a launchd job runs from (`CC_WJ_LAUNCHAGENTS_DIRS`).**
   `tech.stima.event-gateway-feed` ran `mac_feed.py` from a worktree the new pushed-work reclaim
   removed; between its runs it has no process, so no holder scan saw it, and it exited 2 every

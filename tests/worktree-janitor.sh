@@ -2197,15 +2197,18 @@ expect_yes "a record a plain line also names is copied, not deleted" \
   d_says "$OUT_O" wt-ofile "archive on removal: keep.log"
 expect_yes "and what only the plain line names is still discounted without a copy" \
   d_judged "$OUT_O" wt-ofile REMOVABLE no
-expect_yes "a declared directory an archive: pattern reaches into keeps the worktree" \
-  d_says "$OUT_O" wt-odir "logs/ (declared, but an archive: pattern may name a path inside it)"
+expect_yes "a declared directory an archive: pattern reaches into is walked for its records" \
+  d_says "$OUT_O" wt-odir "archive on removal: logs/notes.md"
 OUT_OA="$TMPDIR_ROOT/out-archive-overlap-apply.txt"
 _wj_over --apply > "$OUT_OA"
 O_DEST="$(find "$O_ROOT/store/primary" -mindepth 1 -maxdepth 1 -type d -name 'wt-ofile-*' 2>/dev/null)"
 expect_yes "--apply copies the overlapping record and nothing the plain line owns" \
   bash -c '[ "$(cat "$1/keep.log")" = keep ] && [ ! -e "$1/other.log" ] && [ ! -e "$2" ]' \
   _ "$O_DEST" "$O_FILE"
-expect_yes "and keeps the directory an archive: pattern reaches into" test -f "$O_DIR/logs/notes.md"
+O_DDEST="$(find "$O_ROOT/store/primary" -mindepth 1 -maxdepth 1 -type d -name 'wt-odir-*' 2>/dev/null)"
+expect_yes "and copies the walked directory's record, not what the plain line owns, then removes it" \
+  bash -c '[ "$(cat "$1/logs/notes.md")" = n ] && [ ! -e "$1/logs/api.log" ] && [ ! -e "$2" ]' \
+  _ "$O_DDEST" "$O_DIR"
 
 # The reach check fails closed. A declared directory whose name awk cannot take (a newline)
 # and one discounted file by file rather than whole are both kept while an archive: pattern
@@ -2226,10 +2229,10 @@ RCH_EACH=$(rch_wt wt-each); mkdir -p "$RCH_EACH/notes"; echo a > "$RCH_EACH/note
 OUT_RCH="$TMPDIR_ROOT/out-archive-reach.txt"
 CC_WJ_ARCHIVE_DIR="$RCH_ROOT/store" PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$RCH_PRIMARY" > "$OUT_RCH" 2>&1
 expect_yes "a declared directory whose name awk cannot take is kept, not discounted" \
-  d_says "$OUT_RCH" wt-newline "nl?x/ (declared, but an archive: pattern may name a path inside it)"
+  d_says "$OUT_RCH" wt-newline "nl?x/ (declared archive:, but a name in it holds a newline)"
 expect_no "and the check writes nothing to stderr" file_has "$OUT_RCH" "newline in string"
-expect_yes "a directory discounted file by file is kept while an archive: pattern may reach in" \
-  d_says "$OUT_RCH" wt-each "notes/ (declared, but an archive: pattern may name a path inside it)"
+expect_yes "a directory discounted file by file is walked when an archive: pattern may reach in" \
+  d_says "$OUT_RCH" wt-each "archive on removal: notes/a.md"
 # And a reach check that fails, for whatever reason, answers nothing: the directory stays.
 RCH_STUBS="$RCH_ROOT/stubs-awk"
 mkdir -p "$RCH_STUBS"
@@ -2244,6 +2247,108 @@ CC_WJ_ARCHIVE_DIR="$RCH_ROOT/store" PATH="$RCH_STUBS:$STUBS_IDLE:$PATH" \
   bash "$WJ" --repo "$RCH_PRIMARY" > "$OUT_RCH_FAIL" 2>&1
 expect_yes "a reach check that fails keeps the directory" \
   d_says "$OUT_RCH_FAIL" wt-each "notes/ (declared, but an archive: pattern may name a path inside it)"
+
+# A directory nothing declares but an archive: pattern reaches into is walked, not pinned.
+# stima-api's `.codex/evidence/` holds records merged docs cite; pinned whole, it kept 25
+# landed worktrees on 2026-10-18 (#5284). Every file inside is judged as an ignored file is:
+# archivable records are copied, what a plain line declares is discounted, and anything
+# else - a file over the limit, a credential-shaped name, a symlink, an undeclared file, a
+# walk that fails or runs past its bound - keeps the worktree, named.
+EV_ROOT="$TMPDIR_ROOT/archive-walk"
+EV_PRIMARY="$EV_ROOT/primary"
+mkdir -p "$EV_ROOT"
+git init -q --bare "$EV_ROOT/origin.git" -b main
+git clone -q "$EV_ROOT/origin.git" "$EV_PRIMARY" 2>/dev/null
+evgit() { git -C "$EV_PRIMARY" -c user.email=t@t -c user.name=t "$@"; }
+mkdir -p "$EV_PRIMARY/.codex"; echo r > "$EV_PRIMARY/.codex/README"
+printf '.codex/*\n!.codex/README\n' > "$EV_PRIMARY/.gitignore"
+printf 'archive:.codex/evidence\narchive:.codex/evidence/9/venv/notes.md\n.codex/evidence/*/venv\n' \
+  > "$EV_PRIMARY/.worktree-regenerable"
+evgit add -A; evgit commit -qm base; evgit push -q origin main
+ev_wt() {
+  evgit worktree add -q -b "$1" "$EV_ROOT/$1" origin/main 2>/dev/null
+  mkdir -p "$EV_ROOT/$1/.codex/evidence/2303"; echo "proof $1" > "$EV_ROOT/$1/.codex/evidence/2303/a.json"
+  echo "$EV_ROOT/$1"
+}
+EV_OK=$(ev_wt wt-ev)
+echo notes > "$EV_OK/.codex/evidence/b.md"
+mkdir -p "$EV_OK/.codex/evidence/2303/venv/bin"; head -c 4096 /dev/zero > "$EV_OK/.codex/evidence/2303/venv/bin/py"
+# A declared subdirectory an archive: pattern names a path inside is judged file by file.
+EV_NAMED=$(ev_wt wt-evnamed); mkdir -p "$EV_NAMED/.codex/evidence/9/venv"; echo n > "$EV_NAMED/.codex/evidence/9/venv/notes.md"
+EV_BIG=$(ev_wt wt-evbig);   head -c 2048 /dev/zero > "$EV_BIG/.codex/evidence/2303/run.log"
+EV_KEY=$(ev_wt wt-evkey);   echo k > "$EV_KEY/.codex/evidence/id_rsa"
+EV_VKEY=$(ev_wt wt-evvkey); mkdir -p "$EV_VKEY/.codex/evidence/2303/venv"; echo k > "$EV_VKEY/.codex/evidence/2303/venv/.env"
+EV_LINK=$(ev_wt wt-evlink); ln -s "$EV_OK/.codex/evidence/b.md" "$EV_LINK/.codex/evidence/l.md"
+EV_MANY=$(ev_wt wt-evmany)
+mkdir -p "$EV_MANY/.codex/evidence/many"
+( cd "$EV_MANY/.codex/evidence/many" && i=0 && while [ $i -lt 1000 ]; do : > "f$i"; i=$((i + 1)); done )
+EV_DENY=$(ev_wt wt-evdeny); mkdir -p "$EV_DENY/.codex/evidence/locked"; chmod 000 "$EV_DENY/.codex/evidence/locked"
+_wj_ev() {
+  CC_WJ_ARCHIVE_DIR="$EV_ROOT/store" CC_WJ_ARCHIVE_MAX_BYTES=1024 PATH="$STUBS_IDLE:$PATH" \
+    bash "$WJ" --repo "$EV_PRIMARY" "$@" 2>&1
+}
+OUT_EV="$TMPDIR_ROOT/out-archive-walk.txt"
+_wj_ev > "$OUT_EV"
+expect_yes "a collapsed directory of records an archive: pattern names is REMOVABLE" \
+  d_says "$OUT_EV" wt-ev "classification: REMOVABLE"
+ev_lists() { d_block "$OUT_EV" wt-ev | grep -F "archive on removal:" | grep -qF -- "$1"; }
+ev_lists_both() { ev_lists .codex/evidence/2303/a.json && ev_lists .codex/evidence/b.md; }
+expect_yes "and the report names each record inside it" ev_lists_both
+expect_no "but not what a plain line declares inside it" ev_lists venv
+expect_yes "a record over the limit inside it keeps the worktree, named" \
+  d_says "$OUT_EV" wt-evbig ".codex/evidence/2303/run.log (declared archive:, but larger than 1024 bytes)"
+expect_yes "a credential-shaped name inside it keeps the worktree" \
+  d_says "$OUT_EV" wt-evkey ".codex/evidence/ (declared, but holds a credential-shaped file)"
+expect_yes "so does one inside a declared subdirectory" \
+  d_says "$OUT_EV" wt-evvkey "!! .codex/evidence/2303/venv/ (declared, but holds a credential-shaped file)"
+expect_yes "a declared subdirectory an archive: pattern names a path inside is walked, not discounted" \
+  bash -c 'grep -F "archive on removal:" | grep -qF .codex/evidence/9/venv/notes.md' < <(d_block "$OUT_EV" wt-evnamed)
+expect_yes "a symlink inside it keeps the worktree" \
+  d_says "$OUT_EV" wt-evlink ".codex/evidence/l.md (declared archive:, but not a regular file)"
+expect_yes "a directory past the walk's bound keeps the worktree" \
+  d_says "$OUT_EV" wt-evmany ".codex/evidence/ (declared archive:, but it holds more than 1000 files)"
+if [ -r "$EV_DENY/.codex/evidence/locked" ]; then
+  printf 'ok - archive walk: unreadable directory skipped, running as a user who can read it\n'
+else
+  expect_yes "a walk that fails keeps the worktree" \
+    d_says "$OUT_EV" wt-evdeny ".codex/evidence/ (declared archive:, but it could not be walked)"
+fi
+expect_yes "a report copies nothing from a walked directory" test ! -e "$EV_ROOT/store"
+OUT_EVA="$TMPDIR_ROOT/out-archive-walk-apply.txt"
+_wj_ev --apply > "$OUT_EVA"
+EV_DEST="$(find "$EV_ROOT/store/primary" -mindepth 1 -maxdepth 1 -type d -name 'wt-ev-*' 2>/dev/null)"
+expect_yes "--apply copies every record from the walked directory, byte for byte" \
+  bash -c '[ "$(cat "$1/.codex/evidence/2303/a.json")" = "proof wt-ev" ] && [ "$(cat "$1/.codex/evidence/b.md")" = notes ]' \
+  _ "$EV_DEST"
+expect_yes "and nothing a plain line declares" test ! -e "$EV_DEST/.codex/evidence/2303/venv"
+expect_yes "then removes the worktree" test ! -e "$EV_OK"
+expect_yes "and keeps every worktree the walk refused" \
+  bash -c 'for d; do [ -d "$d/.codex/evidence" ] || exit 1; done' _ \
+  "$EV_BIG" "$EV_KEY" "$EV_VKEY" "$EV_LINK" "$EV_MANY" "$EV_DENY"
+chmod 755 "$EV_DENY/.codex/evidence/locked"
+
+# A plain line as broad as the archive: line - an ancestor of it, the same path, or `<A>/*` -
+# never discounts a subdirectory whole: the records inside it would leave uncopied.
+BR_ROOT="$TMPDIR_ROOT/archive-broad"
+BR_PRIMARY="$BR_ROOT/primary"
+mkdir -p "$BR_ROOT"
+git init -q --bare "$BR_ROOT/origin.git" -b main
+git clone -q "$BR_ROOT/origin.git" "$BR_PRIMARY" 2>/dev/null
+brgit() { git -C "$BR_PRIMARY" -c user.email=t@t -c user.name=t "$@"; }
+printf 'logs/\nev/\nwide/\n' > "$BR_PRIMARY/.gitignore"
+printf 'logs\narchive:logs/keep\nev\narchive:ev\nwide/*\narchive:wide\n' > "$BR_PRIMARY/.worktree-regenerable"
+brgit add -A; brgit commit -qm base; brgit push -q origin main
+BR_WT="$BR_ROOT/wt-broad"
+brgit worktree add -q -b wt-broad "$BR_WT" origin/main 2>/dev/null
+mkdir -p "$BR_WT/logs/keep/run1" "$BR_WT/ev/run1" "$BR_WT/wide/run1"
+echo r > "$BR_WT/logs/keep/run1/report.md"; echo r > "$BR_WT/ev/run1/report.md"; echo r > "$BR_WT/wide/run1/report.md"
+OUT_BR="$TMPDIR_ROOT/out-archive-broad.txt"
+CC_WJ_ARCHIVE_DIR="$BR_ROOT/store" PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$BR_PRIMARY" > "$OUT_BR" 2>&1
+br_lists() { d_block "$OUT_BR" wt-broad | grep -F "archive on removal:" | grep -qF -- "$1"; }
+expect_yes "a plain line naming an ancestor of the archive: line leaves its records on the copy list" \
+  br_lists logs/keep/run1/report.md
+expect_yes "so does a plain line naming the same path" br_lists ev/run1/report.md
+expect_yes "and a plain <archive>/* line" br_lists wide/run1/report.md
 
 # ─── Pull requests found by SHA search and by branch ─────────────────────────
 # The stub serves one JSON file per endpoint and applies the caller's --jq with real jq,
