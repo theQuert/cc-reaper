@@ -2327,6 +2327,29 @@ expect_yes "and keeps every worktree the walk refused" \
   "$EV_BIG" "$EV_KEY" "$EV_VKEY" "$EV_LINK" "$EV_MANY" "$EV_DENY"
 chmod 755 "$EV_DENY/.codex/evidence/locked"
 
+# A plain line as broad as the archive: line - an ancestor of it, the same path, or `<A>/*` -
+# never discounts a subdirectory whole: the records inside it would leave uncopied.
+BR_ROOT="$TMPDIR_ROOT/archive-broad"
+BR_PRIMARY="$BR_ROOT/primary"
+mkdir -p "$BR_ROOT"
+git init -q --bare "$BR_ROOT/origin.git" -b main
+git clone -q "$BR_ROOT/origin.git" "$BR_PRIMARY" 2>/dev/null
+brgit() { git -C "$BR_PRIMARY" -c user.email=t@t -c user.name=t "$@"; }
+printf 'logs/\nev/\nwide/\n' > "$BR_PRIMARY/.gitignore"
+printf 'logs\narchive:logs/keep\nev\narchive:ev\nwide/*\narchive:wide\n' > "$BR_PRIMARY/.worktree-regenerable"
+brgit add -A; brgit commit -qm base; brgit push -q origin main
+BR_WT="$BR_ROOT/wt-broad"
+brgit worktree add -q -b wt-broad "$BR_WT" origin/main 2>/dev/null
+mkdir -p "$BR_WT/logs/keep/run1" "$BR_WT/ev/run1" "$BR_WT/wide/run1"
+echo r > "$BR_WT/logs/keep/run1/report.md"; echo r > "$BR_WT/ev/run1/report.md"; echo r > "$BR_WT/wide/run1/report.md"
+OUT_BR="$TMPDIR_ROOT/out-archive-broad.txt"
+CC_WJ_ARCHIVE_DIR="$BR_ROOT/store" PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$BR_PRIMARY" > "$OUT_BR" 2>&1
+br_lists() { d_block "$OUT_BR" wt-broad | grep -F "archive on removal:" | grep -qF -- "$1"; }
+expect_yes "a plain line naming an ancestor of the archive: line leaves its records on the copy list" \
+  br_lists logs/keep/run1/report.md
+expect_yes "so does a plain line naming the same path" br_lists ev/run1/report.md
+expect_yes "and a plain <archive>/* line" br_lists wide/run1/report.md
+
 # ─── Pull requests found by SHA search and by branch ─────────────────────────
 # The stub serves one JSON file per endpoint and applies the caller's --jq with real jq,
 # so a filter that stops comparing the head, base or close time stops matching here too.

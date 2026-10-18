@@ -21,11 +21,16 @@ collapsed: the text of the pattern before its first wildcard is empty, is a pref
 directory's path followed by `/`, or begins with that path followed by `/`. The janitor SHALL
 then walk that directory instead of discounting or pinning it whole, and judge each file in it
 as it judges an ignored file listed by name, with these additions:
-- a subdirectory a plain declaration names SHALL be discounted whole, after the credential scan
-  a declared directory receives, only when every `archive:` pattern that may reach it has no
-  wildcard and is a strict ancestor of it; otherwise its files SHALL be judged one by one;
+- a subdirectory SHALL be discounted whole, after the credential scan a declared directory
+  receives, only when every `archive:` pattern that may reach it has no wildcard and is a
+  strict ancestor of it, and a plain declaration names it below the deepest of them: the
+  declaration's text before its first wildcard begins with that ancestor followed by `/`, and
+  what follows the ancestor spells two consecutive characters outside its wildcards. A plain
+  declaration naming the ancestor itself, one of its ancestors, or `<ancestor>/*` SHALL NOT
+  discount it; its files SHALL then be judged one by one, `archive:` first;
+- the walk SHALL keep the worktree when any name in the directory holds a newline;
 - the walk SHALL stop at the first file that keeps the worktree, and the report SHALL name it;
-- a walk that fails, meets a name holding a newline, or counts more than 1000 files outside
+- a walk that fails, or counts more than 1000 files outside
   discounted subdirectories SHALL keep the worktree, and the report SHALL say which.
 
 When whether a pattern may reach the directory cannot be determined, a directory a plain

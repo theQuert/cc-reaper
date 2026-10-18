@@ -2123,6 +2123,28 @@ _cc_wj_archive_may_reach() {
     } END { exit !f }' 2>/dev/null
 }
 
+# Whether a plain declaration names directory $2 itself, below archive: ancestor $1: its
+# text before the first wildcard starts with `$1/`, and what follows spells two consecutive
+# characters outside its wildcards. `$1/*` and a line naming $1 or one of its ancestors are
+# as broad as the archive: line, and would discard the records it keeps.
+_cc_wj_declared_below() {
+  local anc="$1" p="$2" pat lit
+  [ -n "${ZSH_VERSION:-}" ] && setopt local_options glob_subst
+  while IFS= read -r pat; do
+    [ -n "$pat" ] || continue
+    case "$pat" in "$anc/"*) ;; *) continue ;; esac
+    lit="${pat#"$anc/"}"
+    case "$lit" in *[!*?][!*?]*) ;; *) continue ;; esac
+    lit="${pat%%[*?]*}"
+    case "$lit" in "$anc/"*) ;; *) continue ;; esac
+    # shellcheck disable=SC2254
+    case "$p" in $pat) return 0 ;; esac
+  done <<DECL
+$_CC_WJ_DECLARED
+DECL
+  return 1
+}
+
 # Judge every file inside collapsed ignored directory $2 of worktree $1 that an archive:
 # pattern may reach, as `_cc_wj_pins` judges an ignored file: an archivable one is appended
 # to $3 for the copy, one only a plain line declares is discounted, and anything else
@@ -2133,16 +2155,19 @@ _cc_wj_archive_may_reach() {
 #
 # A subdirectory a plain line declares - a virtualenv beside the records - is discounted
 # whole after the credential scan, when every archive: pattern that reaches it is a
-# wildcard-free strict ancestor of it, such as `.codex/evidence` above
-# `.codex/evidence/*/venv`: the plain line is the more specific statement. Any other pattern
-# that reaches it may name a record inside, so its files are judged one by one, archive:
-# first.
+# wildcard-free strict ancestor of it, and a plain line names it below the deepest of them,
+# such as `.codex/evidence/*/venv` below `.codex/evidence`: the plain line is the more
+# specific statement. Otherwise its files are judged one by one, archive: first.
 _cc_wj_archive_walk() {
-  local wt="$1" d="$2" archive_to="${3:-}" list dirs f rel n=0 arc pruned="" p skip
+  local wt="$1" d="$2" archive_to="${3:-}" list dirs f rel n=0 arc pruned="" p skip anc nl
   # A walk that fails is not a walk that found nothing.
-  dirs="$(find "$wt/$d" -mindepth 1 -type d -print 2>/dev/null)" &&
+  nl="$(find "$wt/$d" -name "*"$'\n'"*" -print -quit 2>/dev/null)" &&
+    dirs="$(find "$wt/$d" -mindepth 1 -type d -print 2>/dev/null)" &&
     list="$(find "$wt/$d" ! -type d -print 2>/dev/null)" || {
     _cc_wj_pin '!!' "$d/ (declared archive:, but it could not be walked)"; return 0; }
+  # A name holding a newline arrives as fragments, which can spell another path.
+  [ -z "$nl" ] || {
+    _cc_wj_pin '!!' "$d/ (declared archive:, but a name in it holds a newline)"; return 0; }
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     case "$f" in "$wt/$d/"*) ;; *)
@@ -2156,12 +2181,17 @@ _cc_wj_archive_walk() {
 $pruned
 PRUNED
     [ "$skip" -eq 0 ] || continue
-    _cc_wj_declared "$rel" || continue
-    printf '%s\n' "$_CC_WJ_ARCHIVED" | D="$rel" awk 'NF {
+    # The deepest wildcard-free ancestor among the archive: patterns reaching it; any other
+    # pattern reaching it answers no prune.
+    anc="$(printf '%s\n' "$_CC_WJ_ARCHIVED" | D="$rel" awk 'NF {
         p = $0; i = match(p, /[*?]/)
         if (i) { p = substr(p, 1, i - 1); if (p == "" || index(ENVIRON["D"] "/", p) == 1 || index(p, ENVIRON["D"] "/") == 1) bad = 1 }
         else if (p == ENVIRON["D"] || index(p, ENVIRON["D"] "/") == 1) bad = 1
-      } END { exit bad }' 2>/dev/null || continue
+        else if (index(ENVIRON["D"], p "/") == 1 && length(p) > length(a)) a = p
+      } END { if (bad) exit 1; print a }' 2>/dev/null)" || continue
+    if [ -n "$anc" ]; then _cc_wj_declared_below "$anc" "$rel" || continue
+    else _cc_wj_declared "$rel" || continue
+    fi
     if _cc_wj_find_credential "$f"; then
       _cc_wj_pin '!!' "$rel/ (declared, but holds a credential-shaped file)"; return 0
     fi
