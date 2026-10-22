@@ -543,7 +543,8 @@ def write_record(s, cfg, now, status):
            "claims": [f"{r}#{n}" for r, n in s["claims"]],
            "worktrees": [{"path": str(w["path"]), "branch": w.get("branch", "")} for w in s["owned"]],
            "last_text": s["last_text"][-2000:], "at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
-           "status": status,
+           "status": status, "pid": s.get("pid"), "start": s.get("start", ""),
+           "pane": s.get("pane", ""), "session_id": s.get("session_id", ""),
            "resume": f"tmux new-session -d -s {s['tmux']} -c {s['cwd']} 'claude --resume {s['sid']}'"}
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=1) + "\n")
@@ -558,6 +559,72 @@ def mark_record(path, outcome):
         path.write_text(json.dumps(rec, ensure_ascii=False, indent=1) + "\n")
     except (OSError, ValueError):
         pass
+
+
+def has_marker(issue_ref, sid):
+    """True/False when the issue has (no) comment carrying our marker; None when gh could not say."""
+    repo, num = issue_ref
+    rc, out = run(["gh", "issue", "view", num, "-R", repo, "--json", "comments"], 60)
+    if rc != 0:
+        return None
+    try:
+        return any(f"session-reaper:{sid}" in (c.get("body") or "") for c in json.loads(out).get("comments", []))
+    except (ValueError, AttributeError):
+        return None
+
+
+def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg, now):
+    """The steps after claude has exited, safe to repeat: each checks for its own earlier effect.
+    Returns False when a step could not be confirmed (the record then stays "exiting")."""
+    log = Path(os.path.expanduser(cfg["CLOSED_LOG"]))
+    log.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        done = sid in log.read_text()
+    except OSError:
+        done = False
+    if not done:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        issues = " ".join(f"{r}#{n}" for r, n in claims) or "-"
+        with log.open("a") as fh:
+            fh.write(f"\n## {stamp} session-reaper (resume: claude --resume <sid>)\n"
+                     f"- {rec_tmux} {sid} cwd={cwd} issues={issues} — {summ}\n")
+    ok = True
+    for ref in claims:
+        if has_marker(ref, sid) is False:
+            ok = comment(ref, f"Session `{rec_tmux}` (`{sid}`) finished and was reaped by session-reaper. "
+                              f"Resume it with `cd {cwd} && claude --resume {sid}`.\n\n<!-- session-reaper:{sid} -->") and ok
+        elif has_marker(ref, sid) is None:
+            ok = False
+    return ok
+
+
+def recover_exiting(cfg, now):
+    """A crash after /exit leaves reaped/<tmux>.json at "exiting": finish those whose claude is gone."""
+    d = Path(os.path.expanduser(cfg["REAPED_DIR"]))
+    table = ps_table()
+    for path in sorted(d.glob("*.json")):
+        try:
+            rec = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        pid = rec.get("pid")
+        if rec.get("status") != "exiting" or not pid:
+            continue
+        if pid in table and table[pid][1] == rec.get("start"):
+            continue  # still running: a live reap or an earlier abort, not ours to finish
+        claims = [tuple(c.rsplit("#", 1)) for c in rec.get("claims", []) if "#" in c]
+        if not finish_close(rec["tmux"], rec["sid"], rec["cwd"], claims, (rec.get("last_text") or "").strip()[:120],
+                            rec.get("pane"), rec.get("session_id"), True, cfg, now):
+            continue
+        pane = rec.get("pane")
+        if pane and pane_exists(pane):
+            st = pane_state(pane)
+            if st and st["session"] == rec["tmux"] and st["session_id"] == rec.get("session_id"):
+                if st["alone"]:
+                    tmux("kill-session", "-t", st["session_id"])
+                else:
+                    tmux("kill-pane", "-t", pane)
+        mark_record(path, "reaped")
 
 
 def reap(s, cfg, now):
@@ -606,16 +673,9 @@ def reap(s, cfg, now):
             return "skipped:background-tasks", []
     else:
         return "skipped:exit-timeout", [f"claude pid {s['pid']} did not exit within {EXIT_WAIT_SECONDS}s"]
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
-    issues = " ".join(f"{r}#{n}" for r, n in s["claims"]) or "-"
-    log = Path(os.path.expanduser(cfg["CLOSED_LOG"]))
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a") as fh:
-        fh.write(f"\n## {stamp} session-reaper (resume: claude --resume <sid>)\n"
-                 f"- {s['tmux']} {s['sid']} cwd={s['cwd']} issues={issues} — {summary(s)}\n")
-    for ref in s["claims"]:
-        comment(ref, f"Session `{s['tmux']}` (`{s['sid']}`) finished and was reaped by session-reaper. "
-                     f"Resume it with `cd {s['cwd']} && claude --resume {s['sid']}`.")
+    if not finish_close(s["tmux"], s["sid"], s["cwd"], s["claims"], summary(s), s["pane"],
+                        s["session_id"], alone, cfg, now):
+        return "skipped:close-unconfirmed", [f"{s['tmux']}: log or issue comment not confirmed; record stays exiting"]
     # Kill only what this session owned: the whole tmux session if it was its only pane.
     # Recount just before the kill: a window opened during the exit wait must survive. A pane
     # that closed with claude leaves nothing of this session's to kill.
@@ -672,6 +732,11 @@ def main(argv=None):
     now = time.time()
     rows, failures, reaped, seen = [], [], 0, []
     try:
+        if apply and not args.only:
+            recover_exiting(cfg, now)
+    except Exception as e:
+        failures.append(f"recover exiting: {type(e).__name__}: {e}")
+    try:
         for s in gather(cfg, now):
             if args.only and s["tmux"] != args.only:
                 continue
@@ -681,7 +746,7 @@ def main(argv=None):
                 outcome = "keep" if keep else ("reap" if apply else "would-reap")
                 if not keep and apply:
                     outcome, fails = reap(s, cfg, now)
-                    if s.get("record"):
+                    if s.get("record") and outcome != "skipped:close-unconfirmed":  # stays "exiting" for recovery
                         mark_record(s["record"], outcome)
                     reaped += outcome == "reaped"
                     failures += [f"{s['tmux']} ({s['sid']}): {f}" for f in fails]

@@ -196,6 +196,54 @@ class ReapRecheck(unittest.TestCase):
             tmux.assert_not_called()
 
 
+class RecoverExiting(unittest.TestCase):
+    """A crash after /exit leaves reaped/<tmux>.json at "exiting"; the next run finishes it once."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d)
+        self.cfg = dict(CFG, REAPED_DIR=str(self.d / "reaped"), CLOSED_LOG=str(self.d / "closed.md"))
+        s = {"tmux": "work", "name": "work", "sid": "sid-1", "cwd": "/w", "claims": [("o/r", "7")],
+             "owned": [], "last_text": "SESSION-DONE: x", "pid": 4242, "start": "t0", "pane": "%9",
+             "session_id": "$3"}
+        self.rec = reaper.write_record(s, self.cfg, 0, "exiting")
+        self.comments = []
+
+    def recover(self, comments_existing=()):
+        with mock.patch.object(reaper, "ps_table", return_value={}), \
+             mock.patch.object(reaper, "has_marker", side_effect=lambda ref, sid: sid in comments_existing), \
+             mock.patch.object(reaper, "comment", side_effect=lambda ref, body: self.comments.append(body) or True), \
+             mock.patch.object(reaper, "pane_exists", return_value=True), \
+             mock.patch.object(reaper, "pane_state", return_value={"session": "work", "session_id": "$3", "alone": True}), \
+             mock.patch.object(reaper, "tmux") as tmux:
+            reaper.recover_exiting(self.cfg, 0)
+            return tmux
+
+    def test_one_run_completes_a_dead_exiting_record_and_a_second_does_nothing(self):
+        tmux = self.recover()
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "reaped")
+        self.assertEqual((self.d / "closed.md").read_text().count("sid-1"), 1)
+        self.assertEqual(len(self.comments), 1)
+        self.assertIn("session-reaper:sid-1", self.comments[0])
+        tmux.assert_called_once_with("kill-session", "-t", "$3")
+        tmux = self.recover()
+        self.assertEqual((self.d / "closed.md").read_text().count("sid-1"), 1)
+        self.assertEqual(len(self.comments), 1)
+        tmux.assert_not_called()
+
+    def test_an_existing_marker_comment_is_not_posted_again(self):
+        self.recover(comments_existing=("sid-1",))
+        self.assertEqual(self.comments, [])
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "reaped")
+
+    def test_a_still_running_pid_is_left_alone(self):
+        with mock.patch.object(reaper, "ps_table", return_value={4242: (1, "t0", "claude")}), \
+             mock.patch.object(reaper, "tmux") as tmux:
+            reaper.recover_exiting(self.cfg, 0)
+        tmux.assert_not_called()
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "exiting")
+
+
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
 class Verify(unittest.TestCase):
     """The verifier must report each failure it exists to catch, then pass once they are gone."""
