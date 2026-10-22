@@ -113,7 +113,7 @@ snapshot_tree() {
     printf '%s\0' "$f" >> "$kept"
   done < "$list"
   if [ -s "$kept" ]; then
-    GIT_INDEX_FILE="$idx" git -C "$wt" --literal-pathspecs add -A \
+    GIT_INDEX_FILE="$idx" git -C "$wt" --literal-pathspecs add -f -A \
       --pathspec-from-file="$kept" --pathspec-file-nul 2>"$TMP/add.err" || {
       log "add failed in $wt: $(tr '\n' ' ' < "$TMP/add.err" | cut -c1-200)" >&2; return 1; }
   fi
