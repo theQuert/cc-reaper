@@ -590,10 +590,11 @@ def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg,
                      f"- {rec_tmux} {sid} cwd={cwd} issues={issues} — {summ}\n")
     ok = True
     for ref in claims:
-        if has_marker(ref, sid) is False:
+        seen = has_marker(ref, sid)
+        if seen is False:
             ok = comment(ref, f"Session `{rec_tmux}` (`{sid}`) finished and was reaped by session-reaper. "
                               f"Resume it with `cd {cwd} && claude --resume {sid}`.\n\n<!-- session-reaper:{sid} -->") and ok
-        elif has_marker(ref, sid) is None:
+        elif seen is None:
             ok = False
     return ok
 
