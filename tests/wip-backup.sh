@@ -82,6 +82,25 @@ echo again > "$WORK/w1/a.txt"
 run
 check "a change is pushed as a new snapshot" '[ "$(rref $REF)" != "$S" ] && [ "$(git --git-dir="$R" show "$(rref $REF):a.txt")" = again ]'
 
+# A tracked file under a gitignored directory, modified: ls-files lists it, and add must not
+# re-judge it against .gitignore ("paths are ignored ... Use -f"), which skipped the whole backup.
+wt wign feat/2-tracked-under-ignored
+mkdir -p "$WORK/wign/managed"; echo v1 > "$WORK/wign/managed/x"
+git -C "$WORK/wign" add -f managed/x
+git "${F[@]}" -C "$WORK/wign" commit -qm "track managed/x"
+printf 'managed/\n' >> "$WORK/wign/.gitignore"
+git "${F[@]}" -C "$WORK/wign" commit -qam "ignore managed/"
+echo v2 > "$WORK/wign/managed/x"                 # tracked, modified, under an ignored dir
+echo secret > "$WORK/wign/managed/untracked"     # untracked, ignored: must stay out
+run
+SI="$(rref refs/wip/macmini/feat/2-tracked-under-ignored)"
+check "a modified tracked file under an ignored dir is backed up" \
+  '[ -n "$SI" ] && [ "$(git --git-dir="$R" show "$SI:managed/x" 2>/dev/null)" = v2 ]'
+check "an untracked ignored file beside it stays out of the snapshot" \
+  '! git --git-dir="$R" show "$SI:managed/untracked" >/dev/null 2>&1'
+check "the ignored-path add error is not logged" '! grep -q "add failed" "$WORK/out"'
+age "$WORK/wign"                                 # idle from here on, so later counts hold
+
 # ---------------------------------------------------------------- what counts as active
 wt w2 feat/2-idle
 echo idle-work > "$WORK/w2/a.txt"; age "$WORK/w2"
