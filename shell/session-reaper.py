@@ -599,10 +599,28 @@ def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg,
     return ok
 
 
+CLAUDE_CMD = re.compile(r"(^|/)claude$")
+STALE_EXITING_SECONDS = 24 * 3600
+
+
+def claude_under(table, root):
+    """True when root or any process below it is a claude."""
+    pids = [root] + [p for p, _ in descendants(table, root)]
+    for p in pids:
+        cmd = table.get(p, (0, "", ""))[2].split()
+        if any(CLAUDE_CMD.search(w) for w in cmd[:2]):
+            return True
+    return False
+
+
 def recover_exiting(cfg, now):
-    """A crash after /exit leaves reaped/<tmux>.json at "exiting": finish those whose claude is gone."""
+    """A crash after /exit leaves reaped/<tmux>.json at "exiting": finish those whose claude is gone.
+    Never comments on or kills a session that is alive; returns report lines for stale records."""
+    notes = []
     d = Path(os.path.expanduser(cfg["REAPED_DIR"]))
     table = ps_table()
+    if not table:
+        return notes  # ps failed: nothing can be proven dead, leave every record for the next run
     for path in sorted(d.glob("*.json")):
         try:
             rec = json.loads(path.read_text())
@@ -613,11 +631,23 @@ def recover_exiting(cfg, now):
             continue
         if pid in table and table[pid][1] == rec.get("start"):
             continue  # still running: a live reap or an earlier abort, not ours to finish
+        pane = rec.get("pane")
+        if pane and pane_exists(pane):
+            st = pane_state(pane)
+            if not st:
+                continue  # cannot see the pane: not proof of anything
+            if claude_under(table, st["pane_pid"]):
+                mark_record(path, "alive")  # the user kept or restarted claude here: not ours
+                continue
         claims = [tuple(c.rsplit("#", 1)) for c in rec.get("claims", []) if "#" in c]
         if not finish_close(rec["tmux"], rec["sid"], rec["cwd"], claims, (rec.get("last_text") or "").strip()[:120],
-                            rec.get("pane"), rec.get("session_id"), True, cfg, now):
+                            pane, rec.get("session_id"), True, cfg, now):
+            try:
+                if now - path.stat().st_mtime > STALE_EXITING_SECONDS:
+                    notes.append(f"{rec['tmux']} ({rec['sid']}): record exiting over 24h, issue comment unconfirmed")
+            except OSError:
+                pass
             continue
-        pane = rec.get("pane")
         if pane and pane_exists(pane):
             st = pane_state(pane)
             if st and st["session"] == rec["tmux"] and st["session_id"] == rec.get("session_id"):
@@ -626,6 +656,7 @@ def recover_exiting(cfg, now):
                 else:
                     tmux("kill-pane", "-t", pane)
         mark_record(path, "reaped")
+    return notes
 
 
 def reap(s, cfg, now):
@@ -651,29 +682,33 @@ def reap(s, cfg, now):
     alone = state["alone"]
     snapshot = descendants(table, s["pid"])
     s["record"] = write_record(s, cfg, now, "exiting")
-    tmux("send-keys", "-t", s["pane"], "-l", "/exit")
-    time.sleep(0.5)
-    typed = pane_state(s["pane"])
-    if not typed or cursor_line(typed) != "❯ /exit":
-        # The input was not empty after all (cursor moved into a draft): take our text back out.
-        tmux("send-keys", "-t", s["pane"], *["BSpace"] * len("/exit"))
-        return "skipped:input-not-empty", []
-    tmux("send-keys", "-t", s["pane"], "Enter")
-    deadline = time.time() + EXIT_WAIT_SECONDS
-    while time.time() < deadline:
-        time.sleep(1)
-        if s["pid"] not in ps_table():
-            break
-        state = pane_state(s["pane"])
-        if state and MENU_TEXT in state["screen"]:
-            tmux("send-keys", "-t", s["pane"], "Escape")  # Esc is Stay: background tasks keep running
-            time.sleep(1.5)
+    try:  # until claude is confirmed gone, a crash must not leave "exiting" for recovery to act on
+        tmux("send-keys", "-t", s["pane"], "-l", "/exit")
+        time.sleep(0.5)
+        typed = pane_state(s["pane"])
+        if not typed or cursor_line(typed) != "❯ /exit":
+            # The input was not empty after all (cursor moved into a draft): take our text back out.
+            tmux("send-keys", "-t", s["pane"], *["BSpace"] * len("/exit"))
+            return "skipped:input-not-empty", []
+        tmux("send-keys", "-t", s["pane"], "Enter")
+        deadline = time.time() + EXIT_WAIT_SECONDS
+        while time.time() < deadline:
+            time.sleep(1)
+            if s["pid"] not in ps_table():
+                break
             state = pane_state(s["pane"])
             if state and MENU_TEXT in state["screen"]:
-                return "skipped:menu-stuck", [f"exit menu still open in {s['tmux']} after Esc"]
-            return "skipped:background-tasks", []
-    else:
-        return "skipped:exit-timeout", [f"claude pid {s['pid']} did not exit within {EXIT_WAIT_SECONDS}s"]
+                tmux("send-keys", "-t", s["pane"], "Escape")  # Esc is Stay: background tasks keep running
+                time.sleep(1.5)
+                state = pane_state(s["pane"])
+                if state and MENU_TEXT in state["screen"]:
+                    return "skipped:menu-stuck", [f"exit menu still open in {s['tmux']} after Esc"]
+                return "skipped:background-tasks", []
+        else:
+            return "skipped:exit-timeout", [f"claude pid {s['pid']} did not exit within {EXIT_WAIT_SECONDS}s"]
+    except Exception:
+        mark_record(s["record"], "exception")
+        raise
     if not finish_close(s["tmux"], s["sid"], s["cwd"], s["claims"], summary(s), s["pane"],
                         s["session_id"], alone, cfg, now):
         return "skipped:close-unconfirmed", [f"{s['tmux']}: log or issue comment not confirmed; record stays exiting"]
@@ -731,10 +766,10 @@ def main(argv=None):
         print("session-reaper: another run holds the lock")
         return 0
     now = time.time()
-    rows, failures, reaped, seen = [], [], 0, []
+    rows, failures, reaped, seen, stale = [], [], 0, [], []
     try:
         if apply and not args.only:
-            recover_exiting(cfg, now)
+            stale = recover_exiting(cfg, now)
     except Exception as e:
         failures.append(f"recover exiting: {type(e).__name__}: {e}")
     try:
@@ -771,6 +806,8 @@ def main(argv=None):
               "| tmux | session | status idle | issues | outcome | keeps it | held only by background shells "
               "| kept only by new gates | verification target |",
               "|---|---|---|---|---|---|---|---|---|", *rows]
+    if stale:
+        report += ["", "## Stale exiting records", *[f"- {f}" for f in stale]]
     if failures:
         report += ["", "## Verification failures", *[f"- {f}" for f in failures]]
     out = Path(os.path.expanduser(cfg["REPORT"]))
