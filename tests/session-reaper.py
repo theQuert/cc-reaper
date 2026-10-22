@@ -196,6 +196,169 @@ class ReapRecheck(unittest.TestCase):
             tmux.assert_not_called()
 
 
+class RecoverExiting(unittest.TestCase):
+    """A crash after /exit leaves reaped/<tmux>.json at "exiting"; the next run finishes it once."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d)
+        self.cfg = dict(CFG, REAPED_DIR=str(self.d / "reaped"), CLOSED_LOG=str(self.d / "closed.md"))
+        s = {"tmux": "work", "name": "work", "sid": "sid-1", "cwd": "/w", "claims": [("o/r", "7")],
+             "owned": [], "last_text": "SESSION-DONE: x", "pid": 4242, "start": "t0", "pane": "%9",
+             "session_id": "$3"}
+        self.rec = reaper.write_record(s, self.cfg, 0, "exiting")
+        self.comments = []
+
+    OTHER = {1: (0, "x", "launchd"), 500: (1, "x", "-zsh")}
+
+    def recover(self, comments_existing=(), table=None):
+        with mock.patch.object(reaper, "ps_table", return_value=self.OTHER if table is None else table), \
+             mock.patch.object(reaper, "has_marker", side_effect=lambda ref, sid: sid in comments_existing), \
+             mock.patch.object(reaper, "comment", side_effect=lambda ref, body: self.comments.append(body) or True), \
+             mock.patch.object(reaper, "pane_exists", return_value=True), \
+             mock.patch.object(reaper, "pane_state", return_value={"session": "work", "session_id": "$3", "alone": True, "pane_pid": 500}), \
+             mock.patch.object(reaper, "tmux") as tmux:
+            reaper.recover_exiting(self.cfg, 0)
+            return tmux
+
+    def test_one_run_completes_a_dead_exiting_record_and_a_second_does_nothing(self):
+        tmux = self.recover()
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "reaped")
+        self.assertEqual((self.d / "closed.md").read_text().count("sid-1"), 1)
+        self.assertEqual(len(self.comments), 1)
+        self.assertIn("session-reaper:sid-1", self.comments[0])
+        tmux.assert_called_once_with("kill-session", "-t", "$3")
+        tmux = self.recover()
+        self.assertEqual((self.d / "closed.md").read_text().count("sid-1"), 1)
+        self.assertEqual(len(self.comments), 1)
+        tmux.assert_not_called()
+
+    def test_an_existing_marker_comment_is_not_posted_again(self):
+        self.recover(comments_existing=("sid-1",))
+        self.assertEqual(self.comments, [])
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "reaped")
+
+    def test_a_still_running_pid_is_left_alone(self):
+        with mock.patch.object(reaper, "ps_table", return_value={4242: (1, "t0", "claude")}), \
+             mock.patch.object(reaper, "tmux") as tmux:
+            reaper.recover_exiting(self.cfg, 0)
+        tmux.assert_not_called()
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "exiting")
+
+    def test_empty_ps_table_skips_recovery_and_leaves_the_record(self):
+        tmux = self.recover(table={})
+        tmux.assert_not_called()
+        self.assertEqual(self.comments, [])
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "exiting")
+
+    def test_a_new_claude_under_the_pane_blocks_recovery_and_aborts_the_record(self):
+        table = dict(self.OTHER)
+        table[600] = (500, "t9", "/usr/local/bin/claude --resume x")
+        tmux = self.recover(table=table)
+        tmux.assert_not_called()
+        self.assertEqual(self.comments, [])
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "aborted:alive")
+
+    def test_a_resumed_versioned_claude_binary_also_blocks_recovery(self):
+        table = dict(self.OTHER)
+        table[600] = (500, "t9", "/Users/x/.local/share/claude/versions/2.1.293 --resume")
+        tmux = self.recover(table=table)
+        tmux.assert_not_called()
+        self.assertEqual(self.comments, [])
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "aborted:alive")
+
+    def test_unconfirmed_marker_keeps_the_record_and_notes_it_after_24h(self):
+        with mock.patch.object(reaper, "ps_table", return_value=self.OTHER), \
+             mock.patch.object(reaper, "has_marker", return_value=None), \
+             mock.patch.object(reaper, "comment") as comment, \
+             mock.patch.object(reaper, "pane_exists", return_value=False), \
+             mock.patch.object(reaper, "tmux") as tmux:
+            st = self.rec.stat().st_mtime
+            self.assertEqual(reaper.recover_exiting(self.cfg, st + 60), [])
+            notes = reaper.recover_exiting(self.cfg, st + 25 * 3600)
+        comment.assert_not_called()
+        tmux.assert_not_called()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("sid-1", notes[0])
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "exiting")
+
+
+class HasMarker(unittest.TestCase):
+    def check(self, rc, out):
+        with mock.patch.object(reaper, "run", return_value=(rc, out)):
+            return reaper.has_marker(("o/r", "7"), "sid-1")
+
+    def test_tri_state(self):
+        found = json.dumps({"comments": [{"body": "x <!-- session-reaper:sid-1 -->"}]})
+        self.assertIs(self.check(0, found), True)
+        self.assertIs(self.check(0, json.dumps({"comments": [{"body": "other"}]})), False)
+        self.assertIsNone(self.check(1, ""))
+        self.assertIsNone(self.check(0, "not json"))
+
+
+class FinishAndReap(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d)
+        self.cfg = dict(CFG, REAPED_DIR=str(self.d / "reaped"), CLOSED_LOG=str(self.d / "closed.md"))
+
+    def test_finish_close_is_false_when_gh_cannot_say_and_posts_nothing(self):
+        with mock.patch.object(reaper, "has_marker", return_value=None), \
+             mock.patch.object(reaper, "comment") as comment:
+            ok = reaper.finish_close("work", "sid-1", "/w", [("o/r", "7")], "x", "%9", "$3", True, self.cfg, 0)
+        self.assertFalse(ok)
+        comment.assert_not_called()
+
+    def sess(self):
+        f = self.d / "1.json"
+        f.write_text(json.dumps({"status": "idle", "statusUpdatedAt": 1}))
+        return {"file": str(f), "status_at": 1, "pid": 4242, "start": "t0", "pane": "%9", "tmux": "work",
+                "name": "work", "sid": "sid-1", "cwd": "/w", "claims": [("o/r", "7")], "owned": [],
+                "last_text": "x"}
+
+    def patches(self):
+        st = {"session": "work", "session_id": "$3", "alone": True, "pane_pid": 500, "screen": ""}
+        table = {4242: (500, "t0", "claude"), 500: (1, "x", "-zsh")}
+        return [mock.patch.object(reaper, "ps_table", return_value=table),
+                mock.patch.object(reaper, "foreground", return_value=True),
+                mock.patch.object(reaper, "pane_state", return_value=st),
+                mock.patch.object(reaper, "empty_prompt", return_value=True),
+                mock.patch.object(reaper, "protected", return_value=False),
+                mock.patch.object(reaper, "tmux"),
+                mock.patch.object(reaper.time, "sleep")]
+
+    def run_reap(self, s, extra=()):
+        from contextlib import ExitStack
+        with ExitStack() as es:
+            for m in [*self.patches(), *extra]:
+                es.enter_context(m)
+            return reaper.reap(s, self.cfg, 0)
+
+    def test_close_unconfirmed_keeps_the_record_exiting(self):
+        s = self.sess()
+        gone = mock.patch.object(reaper, "cursor_line", return_value="❯ /exit")
+        # claude vanishes from ps after Enter: first call (reap start) has it, the wait loop does not
+        calls = iter([{4242: (500, "t0", "claude"), 500: (1, "x", "-zsh")}])
+        def ps():
+            return next(calls, {500: (1, "x", "-zsh")})
+        extra = [gone, mock.patch.object(reaper, "finish_close", return_value=False)]
+        from contextlib import ExitStack
+        with ExitStack() as es:
+            for m in self.patches()[1:] + extra:
+                es.enter_context(m)
+            es.enter_context(mock.patch.object(reaper, "ps_table", side_effect=ps))
+            out = reaper.reap(s, self.cfg, 0)
+        self.assertEqual(out[0], "skipped:close-unconfirmed")
+        self.assertEqual(json.loads(s["record"].read_text())["status"], "exiting")
+
+    def test_an_exception_in_reap_before_claude_exits_marks_the_record_aborted(self):
+        s = self.sess()
+        boom = mock.patch.object(reaper, "cursor_line", side_effect=RuntimeError("boom"))
+        with self.assertRaises(RuntimeError):
+            self.run_reap(s, [boom])
+        self.assertEqual(json.loads(s["record"].read_text())["status"], "aborted:exception")
+
+
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
 class Verify(unittest.TestCase):
     """The verifier must report each failure it exists to catch, then pass once they are gone."""
