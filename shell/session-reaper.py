@@ -599,7 +599,8 @@ def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg,
     return ok
 
 
-CLAUDE_CMD = re.compile(r"(^|/)claude$")
+# `claude …` from a shell, or the versioned binary itself (`~/.local/share/claude/versions/2.1.293 --resume`).
+CLAUDE_CMD = re.compile(r"(^|/)claude$|/claude/versions/[^/]+$")
 STALE_EXITING_SECONDS = 24 * 3600
 
 

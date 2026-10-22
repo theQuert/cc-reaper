@@ -259,6 +259,14 @@ class RecoverExiting(unittest.TestCase):
         self.assertEqual(self.comments, [])
         self.assertEqual(json.loads(self.rec.read_text())["status"], "aborted:alive")
 
+    def test_a_resumed_versioned_claude_binary_also_blocks_recovery(self):
+        table = dict(self.OTHER)
+        table[600] = (500, "t9", "/Users/x/.local/share/claude/versions/2.1.293 --resume")
+        tmux = self.recover(table=table)
+        tmux.assert_not_called()
+        self.assertEqual(self.comments, [])
+        self.assertEqual(json.loads(self.rec.read_text())["status"], "aborted:alive")
+
     def test_unconfirmed_marker_keeps_the_record_and_notes_it_after_24h(self):
         with mock.patch.object(reaper, "ps_table", return_value=self.OTHER), \
              mock.patch.object(reaper, "has_marker", return_value=None), \
