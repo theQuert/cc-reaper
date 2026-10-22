@@ -556,7 +556,9 @@ def mark_record(path, outcome):
     try:
         rec = json.loads(path.read_text())
         rec["status"] = "reaped" if outcome == "reaped" else f"aborted:{outcome}"
-        path.write_text(json.dumps(rec, ensure_ascii=False, indent=1) + "\n")
+        tmp = path.with_suffix(".tmp")  # whole or not at all, as write_record: a torn record would be unreadable
+        tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=1) + "\n")
+        tmp.replace(path)
     except (OSError, ValueError):
         pass
 
