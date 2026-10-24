@@ -137,6 +137,9 @@ chmod +x "$FAKE_BIN/docker"
 # go stub. `go env GOCACHE` answers FAKE_GOCACHE, so the age trim runs against a sandbox
 # cache; an unset FAKE_GOCACHE is a go that reports no cache.
 export FAKE_GOCACHE="$SANDBOX/gocache"
+# The act's go-build-age step reads these; a value from the caller's shell must not point it at
+# the real cache or switch it to auto.
+unset CC_DJ_GO_BUILD_DIR CC_DJ_GO_BUILD_MAX_AGE_MIN CC_DJ_NEW_STEPS_MODE
 mkdir -p "$FAKE_GOCACHE"
 cat > "$FAKE_BIN/go" <<STUB
 #!/usr/bin/env bash
@@ -187,9 +190,21 @@ STUB
 chmod +x "$FAKE_BIN/ps"
 
 # lsof stub: the real lsof unless FAKE_LSOF_FAIL=1, an lsof that can report nothing.
+# FAKE_LSOF_HOLD=<path>: a `+D <path>` walk of exactly that path reports one open file, any
+# other `+D` walk reports nothing (the real lsof exits 1 for that too).
 cat > "$FAKE_BIN/lsof" <<'STUB'
 #!/usr/bin/env bash
 [ "${FAKE_LSOF_FAIL:-0}" = 1 ] && exit 1
+if [ -n "${FAKE_LSOF_HOLD:-}" ]; then
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "+D" ]; then
+      if [ "$a" = "$FAKE_LSOF_HOLD" ]; then printf 'p4242\nn%s/node_modules/held-file\n' "$a"; exit 0; fi
+      exit 1
+    fi
+    prev="$a"
+  done
+fi
 exec /usr/sbin/lsof "$@"
 STUB
 chmod +x "$FAKE_BIN/lsof"
@@ -274,6 +289,10 @@ _run_dj() {
     # The df stub reports kilobytes of free space, far under the act floor; only group 3d
     # turns the low-disk action on.
     export CC_DJ_ACT_FREE_GB="${CC_DJ_ACT_FREE_GB:-off}"
+    # The new act steps read these; a stray value from the caller's shell must not point
+    # them at the real template store or the real sessions directory.
+    unset NODE_MODULES_TEMPLATE_STORE
+    export CC_DJ_SPOTCHECK_LOG="${CC_DJ_SPOTCHECK_LOG-$SANDBOX/spotcheck.log}"
     # Never the machine's real /private/tmp. These runs exercise the cache targets,
     # and letting them enumerate the host's temp directory made the result depend on
     # whatever else was running - besides being slow and pointing a deletion path at
@@ -405,7 +424,7 @@ printf "\n# Test group 3d: --check acts below the free-GB floor\n"
 # The owner tools are stubs that record their arguments; gh records the comment it would
 # post. The act runs once per cooldown and never twice at a time.
 ACT_CAPTURE="$SANDBOX/act_calls"; : > "$ACT_CAPTURE"
-for t in go-hook janitor; do
+for t in go-hook janitor template; do
   printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\n' "$t" "$ACT_CAPTURE" > "$SANDBOX/act-$t"
   chmod +x "$SANDBOX/act-$t"
 done
@@ -413,7 +432,8 @@ printf '#!/usr/bin/env bash\necho "gh $*" >> "%s"\ncat >> "%s"\n' "$ACT_CAPTURE"
 chmod +x "$FAKE_BIN/gh"
 _run_act() {
   CC_DJ_ACT_FREE_GB="${CC_DJ_ACT_FREE_GB:-30}" \
-  CC_DJ_ACT_GO_CACHE_HOOK="$SANDBOX/act-go-hook" CC_DJ_ACT_WORKTREE_JANITOR="$SANDBOX/act-janitor" \
+  CC_DJ_ACT_GO_CACHE_HOOK="${ACT_HOOK-$SANDBOX/act-go-hook}" CC_DJ_ACT_WORKTREE_JANITOR="$SANDBOX/act-janitor" \
+    CC_DJ_ACT_TEMPLATE_SCRIPT="${ACT_TEMPLATE_SCRIPT-$SANDBOX/act-template}" \
     CC_DJ_ALERT_ISSUE="${ACT_ISSUE-acme/demo#3337}" CC_DJ_GROWTH_TARGETS="$SANDBOX/no-targets.tsv" \
     FAKE_DF_AVAIL_KB="$1" _run_dj --check 80 "${2:-0}"
 }
@@ -486,6 +506,262 @@ mkdir -p "$SANDBOX/state/low-disk-act.lock"; touch -t 202601010000 "$SANDBOX/sta
 : > "$ACT_CAPTURE"; CC_DJ_ACT_TRIM_SECONDS=1 _run_act $((25 * 1048576))
 expect_yes "act: a stale lock is removed and the act runs" grep -q 'go-hook' "$ACT_CAPTURE"
 rm -f "$SANDBOX/state/cooldown-act" "$FAKE_BIN/gh"
+
+printf "\n# Test group 3e: act hook path, 1h cooldown under 20 GB, template prune and go-build-age (spot-check by default)\n"
+# Everything runs in the sandbox: HOME is FAKE_HOME, the template store, the sessions directory
+# and the spot-check log are sandbox paths, and lsof is the stub (FAKE_LSOF_HOLD names the one
+# path it reports as held).
+rm -f "$FAKE_BIN/gh"
+printf '#!/usr/bin/env bash\necho "gh $*" >> "%s"\ncat >> "%s"\n' "$ACT_CAPTURE" "$ACT_CAPTURE" > "$FAKE_BIN/gh"
+chmod +x "$FAKE_BIN/gh"
+printf '#!/usr/bin/env bash\necho "janitor $*" >> "%s"\n' "$ACT_CAPTURE" > "$SANDBOX/act-janitor"
+_act_reset() {
+  rm -f "$SANDBOX/state/cooldown-act"; rmdir "$SANDBOX/state/low-disk-act.lock" 2>/dev/null || true
+  : > "$ACT_CAPTURE"; : > "$SANDBOX/dj.log"; : > "$SANDBOX/spotcheck.log"
+}
+
+# -- the go cache hook: the installed cc-reaper copy, and a missing one is an error -----
+mkdir -p "$FAKE_HOME/.cc-reaper" "$FAKE_HOME/.claude/hooks"
+rm -f "$FAKE_HOME/.cc-reaper/reclaim-byproducts.sh" "$FAKE_HOME/.claude/hooks/reclaim-byproducts.sh"
+_act_reset; ACT_HOOK="" _run_act $((25 * 1048576))
+expect_yes "act: a missing go cache hook is an ERROR line in the log" \
+  grep -q 'ERROR act: go cache hook .*reclaim-byproducts.sh not found' "$SANDBOX/dj.log"
+expect_yes "act: and the ERROR reaches the alert comment, not only the log" \
+  grep -q 'ERROR: go cache pressure trim not run' "$ACT_CAPTURE"
+expect_no "act: and it is no longer a quiet 'skipped'" grep -q 'go cache pressure trim: skipped' "$SANDBOX/dj.log"
+expect_yes "act: the missing hook does not stop the worktree trim after it" \
+  grep -qx 'janitor --trim-regenerable --apply' "$ACT_CAPTURE"
+# The old default, ~/.claude/hooks, is where the file never was; a copy only there is not run.
+printf '#!/usr/bin/env bash\necho "legacy-hook $*" >> "%s"\n' "$ACT_CAPTURE" > "$FAKE_HOME/.claude/hooks/reclaim-byproducts.sh"
+chmod +x "$FAKE_HOME/.claude/hooks/reclaim-byproducts.sh"
+_act_reset; ACT_HOOK="" _run_act $((25 * 1048576))
+expect_no "act: the default is no longer ~/.claude/hooks/reclaim-byproducts.sh" grep -q 'legacy-hook' "$ACT_CAPTURE"
+printf '#!/usr/bin/env bash\necho "installed-hook $*" >> "%s"\n' "$ACT_CAPTURE" > "$FAKE_HOME/.cc-reaper/reclaim-byproducts.sh"
+chmod +x "$FAKE_HOME/.cc-reaper/reclaim-byproducts.sh"
+_act_reset; ACT_HOOK="" _run_act $((25 * 1048576))
+expect_yes "act: the default is the installed ~/.cc-reaper/reclaim-byproducts.sh, run with --go-cache" \
+  test "$(grep -cx 'installed-hook --go-cache' "$ACT_CAPTURE")" -eq 1
+expect_no "act: and nothing is an ERROR then" grep -q 'ERROR' "$SANDBOX/dj.log"
+_act_reset; ACT_HOOK="$SANDBOX/act-go-hook" _run_act $((25 * 1048576))
+expect_yes "act: CC_DJ_ACT_GO_CACHE_HOOK still overrides the default" grep -qx 'go-hook --go-cache' "$ACT_CAPTURE"
+expect_no "act: and the installed copy is then not run" grep -q 'installed-hook' "$ACT_CAPTURE"
+rm -f "$FAKE_HOME/.cc-reaper/reclaim-byproducts.sh" "$FAKE_HOME/.claude/hooks/reclaim-byproducts.sh"
+
+# -- cooldown: 1 h under 20 GB free, 3 h above ---------------------------------------
+_cd_run() {  # <free GB> <seconds since the last act>
+  _act_reset; touch "$SANDBOX/state/cooldown-act"
+  _run_act $(( $1 * 1048576 )) "$(( $(date +%s) - $2 ))"
+}
+_cd_run 15 4000
+expect_yes "cooldown: under 20 GB free an act 4000s ago does not block the next one" grep -q 'go-hook' "$ACT_CAPTURE"
+_cd_run 15 2000
+expect_no "cooldown: under 20 GB free an act 2000s ago still does" grep -q 'go-hook' "$ACT_CAPTURE"
+expect_yes "cooldown: and the log names the one-hour bound it applied" grep -q 'acted within 3300s' "$SANDBOX/dj.log"
+_cd_run 15 3400
+expect_yes "cooldown: hourly checks are not skipped by the minutes a check spends before it acts" grep -q 'go-hook' "$ACT_CAPTURE"
+_cd_run 25 4000
+expect_no "cooldown: between 20 and 30 GB free the 3 h cooldown holds" grep -q 'go-hook' "$ACT_CAPTURE"
+expect_yes "cooldown: and the log names the 3 h bound" grep -q 'acted within 10800s' "$SANDBOX/dj.log"
+_cd_run 25 11000
+expect_yes "cooldown: and acts once the 3 h has passed" grep -q 'go-hook' "$ACT_CAPTURE"
+_act_reset; touch "$SANDBOX/state/cooldown-act"
+CC_DJ_ACT_LOW_COOLDOWN_SECS=600 _run_act $((15 * 1048576)) "$(( $(date +%s) - 700 ))"
+expect_yes "cooldown: the low-disk cooldown is configurable" grep -q 'go-hook' "$ACT_CAPTURE"
+_act_reset; touch "$SANDBOX/state/cooldown-act"
+CC_DJ_ACT_LOW_FREE_GB=10 _run_act $((15 * 1048576)) "$(( $(date +%s) - 4000 ))"
+expect_no "cooldown: and so is the free-space line it applies under" grep -q 'go-hook' "$ACT_CAPTURE"
+_act_reset; touch "$SANDBOX/state/cooldown-act"
+CC_DJ_ACT_COOLDOWN_SECS=1200 _run_act $((15 * 1048576)) "$(( $(date +%s) - 1300 ))"
+expect_yes "cooldown: a shorter ordinary cooldown is never lengthened by the low one" grep -q 'go-hook' "$ACT_CAPTURE"
+_act_reset; CC_DJ_ACT_LOW_COOLDOWN_SECS=1h _run_act $((15 * 1048576))
+expect_yes "cooldown: a non-numeric low cooldown logs and does not act" \
+  grep -q 'act: CC_DJ_ACT_LOW_COOLDOWN_SECS=1h is not a number' "$SANDBOX/dj.log"
+expect_no "cooldown: and runs nothing" grep -q 'go-hook' "$ACT_CAPTURE"
+
+# -- the template prune: spot-check by default, per-path lsof before any deletion ------
+TPL="$SANDBOX/tpl/store"
+_mk_store() {
+  rm -rf "$SANDBOX/tpl" "$SANDBOX/sessions"; mkdir -p "$SANDBOX/sessions"
+  mkdir -p "$TPL/Darwin-arm64-aaaa/node_modules" "$TPL/Darwin-arm64-bbbb/node_modules" "$TPL/Darwin-arm64-cccc/node_modules"
+  echo x > "$TPL/Darwin-arm64-aaaa/node_modules/f"; echo x > "$TPL/Darwin-arm64-bbbb/node_modules/f"
+  touch -t 202601010000 "$TPL/Darwin-arm64-aaaa" "$TPL/Darwin-arm64-bbbb"   # unused for months
+}
+_tp_run() { _act_reset; CC_DJ_TEMPLATE_STORE="$TPL" CC_DJ_SESSIONS_DIR="$SANDBOX/sessions" _run_act $((25 * 1048576)); }
+SPOT="$SANDBOX/spotcheck.log"
+
+_mk_store; FAKE_LSOF_HOLD="$TPL/Darwin-arm64-bbbb" _tp_run
+expect_yes "spotcheck(default): an unused template is left in place" test -d "$TPL/Darwin-arm64-aaaa"
+expect_yes "spotcheck(default): and so is the one a process holds" test -d "$TPL/Darwin-arm64-bbbb"
+expect_yes "spotcheck(default): and the fresh one" test -d "$TPL/Darwin-arm64-cccc"
+expect_yes "spotcheck(default): the log names a run id and the mode" grep -Eq 'run=[0-9TZ]+-[0-9]+ step=template-prune mode=spotcheck' "$SPOT"
+expect_yes "spotcheck(default): it says it would remove the unheld stale template, with its size and holder result" \
+  grep -Eq "path=$TPL/Darwin-arm64-aaaa size_bytes=[0-9]+ holder=none verdict=would-remove" "$SPOT"
+expect_yes "spotcheck(default): it says it would keep the held one, and why" \
+  grep -Eq "path=$TPL/Darwin-arm64-bbbb size_bytes=[0-9]+ holder=held verdict=keep reason=held" "$SPOT"
+expect_no "spotcheck(default): a template used within the window is not a candidate" grep -q 'Darwin-arm64-cccc' "$SPOT"
+expect_yes "spotcheck(default): the alert comment says it was a spot-check" \
+  grep -q 'node-modules template prune (spotcheck)' "$ACT_CAPTURE"
+expect_no "spotcheck(default): the owner script is not asked to prune" grep -q '^template ' "$ACT_CAPTURE"
+# The log lives where the contract says when nothing overrides it.
+_mk_store; _act_reset; rm -f "$FAKE_HOME/.cc-reaper/logs/spotcheck-disk-janitor.log"
+CC_DJ_SPOTCHECK_LOG= CC_DJ_TEMPLATE_STORE="$TPL" CC_DJ_SESSIONS_DIR="$SANDBOX/sessions" _run_act $((25 * 1048576))
+expect_yes "spotcheck: the default log is ~/.cc-reaper/logs/spotcheck-disk-janitor.log" \
+  grep -q 'step=template-prune' "$FAKE_HOME/.cc-reaper/logs/spotcheck-disk-janitor.log"
+# An unknown mode is the safe mode, not auto.
+_mk_store; CC_DJ_NEW_STEPS_MODE=yolo _tp_run
+expect_yes "spotcheck: an unrecognised CC_DJ_NEW_STEPS_MODE deletes nothing" test -d "$TPL/Darwin-arm64-aaaa"
+expect_yes "spotcheck: and says so" grep -q 'CC_DJ_NEW_STEPS_MODE=yolo is not spotcheck or auto' "$SANDBOX/dj.log"
+
+# auto: only after a fresh per-path lsof check shows no holder
+_mk_store; CC_DJ_NEW_STEPS_MODE=auto FAKE_LSOF_HOLD="$TPL/Darwin-arm64-bbbb" _tp_run
+expect_no "auto: the unheld stale template is removed" test -d "$TPL/Darwin-arm64-aaaa"
+expect_yes "auto: the held one is kept" test -d "$TPL/Darwin-arm64-bbbb"
+expect_yes "auto: and the fresh one" test -d "$TPL/Darwin-arm64-cccc"
+expect_yes "auto: the log records the removal and the keep" \
+  bash -c 'grep -Eq "mode=auto path=.*aaaa .*verdict=removed" "$1" && grep -Eq "mode=auto path=.*bbbb .*verdict=keep reason=held" "$1"' _ "$SPOT"
+expect_yes "auto: the alert comment counts them" grep -q 'node-modules template prune (auto): removed 1, kept 1' "$ACT_CAPTURE"
+_mk_store; CC_DJ_NEW_STEPS_MODE=auto FAKE_LSOF_FAIL=1 _tp_run
+expect_yes "auto: an lsof that cannot report is not 'nothing is held'" test -d "$TPL/Darwin-arm64-aaaa"
+expect_yes "auto: and the other stale template too" test -d "$TPL/Darwin-arm64-bbbb"
+# Protected sessions: never removed, whatever lsof says.
+_mk_store
+printf '{"pid":1,"sessionId":"s1","name":"uiux","cwd":"%s"}\n' "$TPL/Darwin-arm64-aaaa/node_modules" > "$SANDBOX/sessions/1.json"
+CC_DJ_NEW_STEPS_MODE=auto _tp_run
+expect_yes "protected: a tree holding the cwd of the uiux session is kept" test -d "$TPL/Darwin-arm64-aaaa"
+expect_no "protected: the other stale template is still removed" test -d "$TPL/Darwin-arm64-bbbb"
+expect_yes "protected: and the log says why" grep -Eq "path=.*aaaa .*verdict=keep reason=protected-session" "$SPOT"
+for name in homepage verify-signin-redesign; do
+  _mk_store; printf '{"pid":1,"sessionId":"s1","name":"%s","cwd":"%s"}\n' "$name" "$TPL/Darwin-arm64-bbbb/node_modules" > "$SANDBOX/sessions/1.json"
+  CC_DJ_NEW_STEPS_MODE=auto _tp_run
+  expect_yes "protected: a tree holding the cwd of the $name session is kept" test -d "$TPL/Darwin-arm64-bbbb"
+done
+_mk_store; printf '{"pid":1,"sessionId":"s1","name":"docs","cwd":"%s"}\n' "$TPL/Darwin-arm64-bbbb/node_modules" > "$SANDBOX/sessions/1.json"
+CC_DJ_NEW_STEPS_MODE=auto _tp_run
+expect_no "protected: only those three names protect: another session's cwd is just a holder check" test -d "$TPL/Darwin-arm64-bbbb"
+for name in homepage uiux verify-signin-redesign; do
+  _mk_store; TPL_SAVE="$TPL"; TPL="$SANDBOX/tpl/$name/store"; mkdir -p "$TPL/Darwin-arm64-zzzz"; touch -t 202601010000 "$TPL/Darwin-arm64-zzzz"
+  CC_DJ_NEW_STEPS_MODE=auto _tp_run
+  expect_yes "protected: a path under a '$name' tree is never removed" test -d "$TPL/Darwin-arm64-zzzz"
+  expect_yes "protected: and the log says the path is protected" grep -Eq "zzzz .*verdict=keep reason=protected-path" "$SPOT"
+  TPL="$TPL_SAVE"
+done
+# Anything that is not a plain directory directly under the store is left alone.
+_mk_store; ln -s "$SANDBOX/tpl" "$TPL/Darwin-arm64-link"; touch -h -t 202601010000 "$TPL/Darwin-arm64-link"
+mkdir -p "$TPL/.adopting.99" "$TPL/has space"; touch -t 202601010000 "$TPL/.adopting.99" "$TPL/has space"
+CC_DJ_NEW_STEPS_MODE=auto _tp_run
+expect_yes "auto: a symlink in the store is not followed or removed" test -L "$TPL/Darwin-arm64-link"
+expect_yes "auto: the target of that symlink is intact" test -d "$SANDBOX/tpl/store/Darwin-arm64-cccc"
+expect_yes "auto: an in-progress .adopting.* directory is left alone" test -d "$TPL/.adopting.99"
+expect_yes "auto: a name outside the template key shape is left alone" test -d "$TPL/has space"
+# The owner script missing, or the store absent.
+_mk_store; ACT_TEMPLATE_SCRIPT="$SANDBOX/no-such-template-script" CC_DJ_NEW_STEPS_MODE=auto _tp_run
+expect_yes "template: a missing owner script is an ERROR line in the log" \
+  grep -q 'ERROR act: node-modules template script .*no-such-template-script not found' "$SANDBOX/dj.log"
+expect_yes "template: and in the alert comment" grep -q 'ERROR: node-modules template prune not run' "$ACT_CAPTURE"
+expect_yes "template: and nothing is deleted on a stale contract, even in auto" test -d "$TPL/Darwin-arm64-aaaa"
+_mk_store; rm -rf "$TPL"; CC_DJ_NEW_STEPS_MODE=auto _tp_run
+expect_yes "template: an absent store is reported, not an error" grep -q 'node-modules template prune: no store' "$ACT_CAPTURE"
+_mk_store; CC_DJ_ACT_TEMPLATES_PRUNE_DAYS=off _tp_run
+expect_no "template: CC_DJ_ACT_TEMPLATES_PRUNE_DAYS=off turns the step off" grep -q 'template prune' "$ACT_CAPTURE"
+_mk_store; CC_DJ_ACT_TEMPLATES_PRUNE_DAYS=7d _tp_run
+expect_yes "template: a non-numeric day count logs and skips the step" \
+  grep -q 'CC_DJ_ACT_TEMPLATES_PRUNE_DAYS=7d is not a number' "$SANDBOX/dj.log"
+# The step runs only under the act; --check above the floor never reaches it.
+_mk_store; : > "$SPOT"; _act_reset; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_TEMPLATE_STORE="$TPL" _run_act $((40 * 1048576))
+expect_yes "template: at 40 GB free nothing is judged or removed" test -d "$TPL/Darwin-arm64-aaaa"
+expect_no "template: and no spot-check line is written" grep -q 'template-prune' "$SPOT"
+# -- go build cache age trim (rule go-build-age): only under 20 GB, spot-check by default ---
+# A sandbox cache: entries 3 h old and fresh ones in hex subdirectories, the top-level files Go
+# keeps, a README in a hex directory, non-hex and nested directories, and two symlinks that point
+# outside the cache at old files. The df stub sets free space; HOME is FAKE_HOME.
+GB="$SANDBOX/gb/go-build"; GB_OUT="$SANDBOX/gb/outside"
+_mk_gocache() {
+  rm -rf "$SANDBOX/gb"; mkdir -p "$GB/0a/sub" "$GB/ff" "$GB/fuzz" "$GB/zz" "$GB_OUT/dir"
+  local old mid; old="$(date -v-3H +%Y%m%d%H%M)"; mid="$(date -v-90M +%Y%m%d%H%M)"
+  printf 'aaaaa' > "$GB/0a/1111-a"; printf 'ddddddd' > "$GB/0a/1111-d"
+  for f in 0a/README README trim.txt testexpire.txt fuzz/4444-d zz/5555-d 0a/sub/6666-d; do printf x > "$GB/$f"; done
+  printf x > "$GB/0a/7777-d"                                  # used 90 minutes ago
+  printf x > "$GB/ff/8888-d"                                  # used just now
+  printf x > "$GB_OUT/target-d"; printf x > "$GB_OUT/dir/9999-d"
+  ln -s "$GB_OUT/target-d" "$GB/0a/link-d"                     # an old symlink entry
+  ln -s "$GB_OUT/dir" "$GB/0b"                                 # a symlinked hex directory
+  touch -t "$old" "$GB/0a/1111-a" "$GB/0a/1111-d" "$GB/0a/README" "$GB/README" "$GB/trim.txt" \
+    "$GB/testexpire.txt" "$GB/fuzz/4444-d" "$GB/zz/5555-d" "$GB/0a/sub/6666-d" "$GB_OUT/target-d" "$GB_OUT/dir/9999-d"
+  touch -h -t "$old" "$GB/0a/link-d" "$GB/0b"
+  touch -t "$mid" "$GB/0a/7777-d"
+}
+_gb_kept_all_but_old() {  # every file except the two old entries is still there
+  local f
+  for f in 0a/README README trim.txt testexpire.txt fuzz/4444-d zz/5555-d 0a/sub/6666-d 0a/7777-d ff/8888-d; do
+    [ -f "$GB/$f" ] || return 1
+  done
+  [ -L "$GB/0a/link-d" ] && [ -L "$GB/0b" ] && [ -f "$GB_OUT/target-d" ] && [ -f "$GB_OUT/dir/9999-d" ] \
+    && [ -d "$GB/0a" ] && [ -d "$GB/ff" ]
+}
+_gb_run() {  # <free GB>
+  _act_reset; CC_DJ_GO_BUILD_DIR="${GB_DIR-$GB}" CC_DJ_TEMPLATE_STORE="$SANDBOX/no-store" _run_act $(( $1 * 1048576 ))
+}
+
+_mk_gocache; _gb_run 15
+expect_yes "go-build-age spotcheck(default): under 20 GB nothing is deleted" \
+  bash -c 'test -f "$1/0a/1111-a" && test -f "$1/0a/1111-d"' _ "$GB"
+expect_yes "go-build-age spotcheck(default): and every other file stays" _gb_kept_all_but_old
+expect_yes "go-build-age spotcheck(default): the log names a run id, the rule, the mode and the cache" \
+  grep -Eq "run=[0-9TZ]+-[0-9]+ step=go-build-age start mode=spotcheck rule=go-build-age dir=$GB max_age_min=120" "$SPOT"
+expect_yes "go-build-age spotcheck(default): it counts the two old entries and sums their bytes" \
+  grep -Eq 'step=go-build-age end mode=spotcheck rule=go-build-age count=2 bytes=12 verdict=would-remove' "$SPOT"
+expect_yes "go-build-age spotcheck(default): the alert comment says it was a spot-check" \
+  grep -q 'go build cache age trim (spotcheck, rule go-build-age): would remove 2 entries (12 bytes)' "$ACT_CAPTURE"
+_mk_gocache; _act_reset; rm -f "$FAKE_HOME/.cc-reaper/logs/spotcheck-disk-janitor.log"
+CC_DJ_SPOTCHECK_LOG= CC_DJ_GO_BUILD_DIR="$GB" CC_DJ_TEMPLATE_STORE="$SANDBOX/no-store" _run_act $((15 * 1048576))
+expect_yes "go-build-age spotcheck: with no override it writes ~/.cc-reaper/logs/spotcheck-disk-janitor.log" \
+  grep -q 'step=go-build-age end mode=spotcheck rule=go-build-age count=2' "$FAKE_HOME/.cc-reaper/logs/spotcheck-disk-janitor.log"
+_mk_gocache; CC_DJ_NEW_STEPS_MODE=yolo _gb_run 15
+expect_yes "go-build-age: an unrecognised CC_DJ_NEW_STEPS_MODE deletes nothing" test -f "$GB/0a/1111-a"
+
+_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto _gb_run 15
+expect_no "go-build-age auto: an entry unused for 3 h is deleted" test -e "$GB/0a/1111-a"
+expect_no "go-build-age auto: and its data file" test -e "$GB/0a/1111-d"
+expect_yes "go-build-age auto: README, trim.txt, fresh and 90-minute entries, other dirs and symlinks stay" _gb_kept_all_but_old
+expect_yes "go-build-age auto: the log records the removal" \
+  grep -Eq 'step=go-build-age end mode=auto rule=go-build-age count=2 bytes=12 rc=0 verdict=removed' "$SPOT"
+expect_yes "go-build-age auto: the alert comment counts it" \
+  grep -q 'go build cache age trim (auto, rule go-build-age): removed 2 entries (12 bytes listed)' "$ACT_CAPTURE"
+_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_MAX_AGE_MIN=60 _gb_run 15
+expect_no "go-build-age auto: CC_DJ_GO_BUILD_MAX_AGE_MIN=60 takes the 90-minute entry too" test -e "$GB/0a/7777-d"
+expect_yes "go-build-age auto: but never the fresh one" test -f "$GB/ff/8888-d"
+
+# The default cache is `go env GOCACHE` (the go stub answers FAKE_GOCACHE).
+_mk_gocache; _act_reset
+FAKE_GOCACHE="$GB" CC_DJ_NEW_STEPS_MODE=auto CC_DJ_TEMPLATE_STORE="$SANDBOX/no-store" _run_act $((15 * 1048576))
+expect_no "go-build-age: with no CC_DJ_GO_BUILD_DIR it trims go env GOCACHE" test -e "$GB/0a/1111-a"
+expect_yes "go-build-age: and logs that directory" grep -q "step=go-build-age start mode=auto rule=go-build-age dir=$GB " "$SPOT"
+
+# Above the floor, nothing; and the guards.
+_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto _gb_run 25
+expect_yes "go-build-age: at 25 GB free (over the 20 GB floor) nothing is deleted" test -f "$GB/0a/1111-a"
+expect_no "go-build-age: and no spot-check line is written" grep -q 'step=go-build-age' "$SPOT"
+expect_yes "go-build-age: the alert says why it did not run" grep -q 'go build cache age trim: not run, free .* is not under 20 GB' "$ACT_CAPTURE"
+_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_ACT_LOW_FREE_GB=10 _gb_run 15
+expect_yes "go-build-age: the floor is CC_DJ_ACT_LOW_FREE_GB" test -f "$GB/0a/1111-a"
+_mk_gocache; ln -s "$GB" "$SANDBOX/gb/link-cache"; CC_DJ_NEW_STEPS_MODE=auto GB_DIR="$SANDBOX/gb/link-cache" _gb_run 15
+expect_yes "go-build-age: a symlinked cache root is refused" test -f "$GB/0a/1111-a"
+expect_yes "go-build-age: and the alert says so" grep -q 'go build cache age trim: not run (.*is a symlink)' "$ACT_CAPTURE"
+_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_MAX_AGE_MIN=30 _gb_run 15
+expect_yes "go-build-age: an age under 60 minutes is refused" test -f "$GB/0a/1111-a"
+expect_yes "go-build-age: as an ERROR line" grep -q 'ERROR act: CC_DJ_GO_BUILD_MAX_AGE_MIN=30 is under 60' "$SANDBOX/dj.log"
+_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_MAX_AGE_MIN=2h _gb_run 15
+expect_yes "go-build-age: a non-numeric age is an ERROR and deletes nothing" \
+  bash -c 'test -f "$1/0a/1111-a" && grep -q "CC_DJ_GO_BUILD_MAX_AGE_MIN=2h is not a number" "$2"' _ "$GB" "$SANDBOX/dj.log"
+_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_MAX_AGE_MIN=off _gb_run 15
+expect_yes "go-build-age: off turns the step off" test -f "$GB/0a/1111-a"
+expect_no "go-build-age: and leaves no line" grep -q 'go build cache age trim' "$ACT_CAPTURE"
+mkdir -p "$SANDBOX/gb-uiux/uiux"; _mk_gocache; mv "$GB" "$SANDBOX/gb-uiux/uiux/go-build"
+CC_DJ_NEW_STEPS_MODE=auto GB_DIR="$SANDBOX/gb-uiux/uiux/go-build" _gb_run 15
+expect_yes "go-build-age: a cache under a protected tree is never trimmed" test -f "$SANDBOX/gb-uiux/uiux/go-build/0a/1111-a"
+rm -rf "$SANDBOX/gb" "$SANDBOX/gb-uiux"
+rm -rf "$SANDBOX/tpl" "$SANDBOX/sessions" "$FAKE_BIN/gh"
+rm -f "$SANDBOX/state/cooldown-act"
 
 printf "\n# Test group 3c: --check host temp reclaim, clone age, daily builder prune\n"
 # The reclaimer's own safety rules are tests/host-temp-reaper.py. Here only the contract with
