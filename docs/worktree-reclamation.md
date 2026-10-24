@@ -303,6 +303,19 @@ say.
   worktree before the budget ran out, so a large
   first repository cannot starve the rest; report runs neither read nor write either. The
   lock is refreshed at every worktree boundary.
+- **Largest first** (`CC_WJ_ORDER=largest`, the default; stima-api #5886). Within a
+  repository the worktrees are examined by their last known size, largest first, so a sweep
+  the budget cuts short has spent it where the bytes are. Nothing is measured for the order:
+  the sizes are growth-watch's samples (`growth-samples.tsv`, keyed under the glob rows of
+  `growth-targets.tsv`) and the janitor's own `du` of a worktree (a report's estimate, a
+  spot-check, a removal), kept as `path<TAB>bytes<TAB>measured_at` in
+  `worktree-sizes.tsv` under `CC_WJ_STATE_DIR`; the newest measurement wins, a removal
+  forgets the row, a trim subtracts what it freed, and rows 30 days old drop. In this mode the
+  worktree cursor holds the worktrees examined in the current cycle: those go after the rest,
+  and once all are in it a new cycle starts. Trees of unknown size go after the known ones,
+  in path order, since an unmeasured tree is almost always a new one still in use. The order
+  never decides anything: every gate applies to every tree. `CC_WJ_ORDER=path` restores the
+  path order and its resume-after-the-last cursor, and reads and writes no sizes.
 - **Rechecking a trim without rescanning for every cache.** The scheduled trim under disk
   pressure runs after the removal phase, with its own budget: trimming first would bump the
   worktree's mtime and make the same run keep a landed tree as recently active. Before a

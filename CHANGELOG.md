@@ -9,7 +9,10 @@
   decision stays as before, and what these rules would trim is appended to
   `~/.cc-reaper/logs/spotcheck-worktree-janitor.log`; `auto` lets them decide. `CC_WJ_DENY_NAMES`
   (default `homepage uiux verify-signin-redesign`) names trees nothing may trim or remove. A run
-  with nothing to trim answers that first.
+  with nothing to trim answers that first. A budgeted sweep now examines each repository's
+  worktrees largest first (`CC_WJ_ORDER=largest`, the default; `path` is the old order), by the
+  sizes growth-watch and the janitor already measured, cached in `worktree-sizes.tsv`; no new
+  `du` pass, and every gate still applies to every tree.
 - **`worktree-janitor` walks a directory an `archive:` pattern reaches, instead of pinning it.**
   git lists stima-api's ignored `.codex/evidence/` as one collapsed entry, so
   `archive:.codex/evidence` could not copy the records inside it and kept 25 landed worktrees
