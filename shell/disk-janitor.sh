@@ -45,6 +45,26 @@ Environment:
   CC_DJ_DEV_SERVER_MIN_HOURS  Never judge a dev server younger than this (default: 6)
   CC_DJ_ACT_FREE_GB     --check acts below this many free GB, or `off` (default: 30)
   CC_DJ_ACT_COOLDOWN_SECS  Seconds between two low-disk actions (default: 10800)
+  CC_DJ_ACT_LOW_FREE_GB    Under this many free GB the shorter cooldown below applies (default: 20,
+                           the CI heavy-slot floor)
+  CC_DJ_ACT_LOW_COOLDOWN_SECS  Cooldown under that floor, never longer than the one above
+                           (default: 3300: an hour less the minutes an hourly check spends before it
+                           acts, so every hourly check can act; drops of 29 GB/hour were seen)
+  CC_DJ_ACT_GO_CACHE_HOOK  Go cache pressure trim the act runs with --go-cache (default:
+                           ~/.cc-reaper/reclaim-byproducts.sh); missing is an ERROR line, not a skip
+  CC_DJ_ACT_TEMPLATES_PRUNE_DAYS  The act drops node_modules templates unused this many days, or `off`
+                           (default: 7); see CC_DJ_NEW_STEPS_MODE
+  CC_DJ_ACT_TEMPLATE_SCRIPT  node-modules-template.sh, the templates' owner; the step needs it present
+                           (default: ~/.claude/hooks/node-modules-template.sh)
+  CC_DJ_TEMPLATE_STORE  The template store (default: $NODE_MODULES_TEMPLATE_STORE or
+                           ~/.claude/node-modules-templates)
+  CC_DJ_NEW_STEPS_MODE  spotcheck or auto (default: spotcheck) for deletion steps added to the act
+                           after 2026-10-24: spotcheck logs what it would remove, with size and a
+                           per-path lsof result, to CC_DJ_SPOTCHECK_LOG and deletes nothing; auto
+                           deletes only paths a fresh lsof shows unheld. Never under the trees of the
+                           homepage, uiux or verify-signin-redesign sessions.
+  CC_DJ_SPOTCHECK_LOG   Spot-check log (default: ~/.cc-reaper/logs/spotcheck-disk-janitor.log)
+  CC_DJ_SESSIONS_DIR    Where live session JSON is read to find protected trees (default: ~/.claude/sessions)
   CC_DJ_ACT_TRIM_SECONDS   Bound on the worktree regenerable trim it runs (default: 900); the
                            janitor gets half of it as CC_WJ_SWEEP_BUDGET_SECONDS
   CC_DJ_ALERT_ISSUE     owner/repo#N to comment on after acting; unset = log only
@@ -78,6 +98,15 @@ CC_DJ_CHROME_CLONE_MIN_AGE_DAYS="${CC_DJ_CHROME_CLONE_MIN_AGE_DAYS:-1}"
 CC_DJ_BUILDER_PRUNE_UNTIL="${CC_DJ_BUILDER_PRUNE_UNTIL:-24h}"
 CC_DJ_ACT_FREE_GB="${CC_DJ_ACT_FREE_GB:-30}"
 CC_DJ_ACT_COOLDOWN_SECS="${CC_DJ_ACT_COOLDOWN_SECS:-10800}"
+# Below the CI heavy-slot floor a 3h cooldown is too slow: a 29 GB/hour drop was measured
+# (stima-api#5886). 3300, not 3600: --check runs every 3600s and stamps the cooldown part-way
+# through, so a 3600 cooldown would skip every second hourly check.
+CC_DJ_ACT_LOW_FREE_GB="${CC_DJ_ACT_LOW_FREE_GB:-20}"
+CC_DJ_ACT_LOW_COOLDOWN_SECS="${CC_DJ_ACT_LOW_COOLDOWN_SECS:-3300}"
+CC_DJ_ACT_TEMPLATES_PRUNE_DAYS="${CC_DJ_ACT_TEMPLATES_PRUNE_DAYS:-7}"
+# Deletion steps added to the act run in spot-check mode (log, delete nothing) until an
+# operator switches them to auto. Existing, already-automatic steps are not gated by this.
+CC_DJ_NEW_STEPS_MODE="${CC_DJ_NEW_STEPS_MODE:-spotcheck}"
 CC_DJ_ACT_TRIM_SECONDS="${CC_DJ_ACT_TRIM_SECONDS:-900}"
 CC_DJ_ALERT_ISSUE="${CC_DJ_ALERT_ISSUE:-}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
@@ -304,6 +333,145 @@ _cc_dj_run_bounded() {
   wait "$pid" 2>/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# Deletion steps of the act that run in spot-check mode first
+# ---------------------------------------------------------------------------
+
+# A path no new deletion step may touch: anything with a homepage, uiux or
+# verify-signin-redesign component, and any tree that holds, or sits under, the working
+# directory of a live session with one of those names (read from the sessions' JSON).
+# Prints the reason and returns 0 when protected; returns 1 when it is not. Fails closed:
+# session files present but no python3 to read them protects everything.
+_cc_dj_protected_tree() {
+  local path="$1" lc dir="${CC_DJ_SESSIONS_DIR:-$HOME/.claude/sessions}"
+  lc="/$(printf '%s' "$path" | tr 'A-Z' 'a-z')/"
+  case "$lc" in
+    */homepage/*|*/uiux/*|*/verify-signin-redesign*/*) echo protected-path; return 0 ;;
+  esac
+  [ -d "$dir" ] || return 1
+  ls "$dir"/*.json >/dev/null 2>&1 || return 1
+  command -v python3 >/dev/null 2>&1 || { echo protected-session; return 0; }
+  python3 -I - "$dir" "$path" <<'PY' && { echo protected-session; return 0; }
+import glob, json, os, sys
+d, cand = sys.argv[1], os.path.realpath(sys.argv[2])
+names = {"homepage", "uiux", "verify-signin-redesign"}
+for f in glob.glob(os.path.join(d, "*.json")):
+    try:
+        s = json.load(open(f))
+        name, cwd = str(s.get("name", "")).strip().lower(), s.get("cwd") or ""
+    except Exception:
+        continue
+    if name not in names or not cwd:
+        continue
+    cwd = os.path.realpath(cwd)
+    if cwd == cand or cwd.startswith(cand + "/") or cand.startswith(cwd + "/"):
+        sys.exit(0)
+sys.exit(1)
+PY
+  return 1
+}
+
+# Fresh holder check for one path. Sets _CC_DJ_HOLDER to none, held or unknown and
+# _CC_DJ_HOLDER_SAMPLE to the first open file. Unknown (lsof cannot report, or the walk
+# timed out) is never "nothing is held".
+_cc_dj_path_holder() {
+  local path="$1" raw rc=0 t="${CC_DJ_HOLDER_TIMEOUT_SECONDS:-120}"
+  _CC_DJ_HOLDER=unknown; _CC_DJ_HOLDER_SAMPLE=""
+  case "$t" in ''|*[!0-9]*|0) t=120 ;; esac
+  if ! _cc_dj_lsof_usable; then _CC_DJ_HOLDER_SAMPLE="lsof cannot report open files"; return 0; fi
+  raw="$(_cc_dj_run_bounded "$t" lsof -Fn +D "$path" 2>/dev/null)" || rc=$?
+  if [ "$rc" -eq 124 ]; then _CC_DJ_HOLDER_SAMPLE="lsof walk timed out after ${t}s"; return 0; fi
+  _CC_DJ_HOLDER_SAMPLE="$(printf '%s\n' "$raw" | sed -n 's/^n//p' | head -1)"
+  if [ -n "$_CC_DJ_HOLDER_SAMPLE" ]; then _CC_DJ_HOLDER=held; else _CC_DJ_HOLDER=none; fi
+}
+
+# Node-modules template prune, a step added to the act after 2026-10-24 (stima-api#5886):
+# ~/.claude/node-modules-templates held 16 GB, no schedule ran `node-modules-template.sh
+# prune`, and no growth target watched it. A template is a store entry no worktree needs
+# to build (apply clones it; a clone is independent), and `apply` refreshes its mtime, so
+# "unused N days" is the owner's own predicate and is reproduced here exactly
+# (`find -mtime -N`). The owner script has no per-path mode, so this step cannot hand it
+# the paths a fresh lsof cleared; it deletes those itself and requires the script to be
+# present, so a renamed or removed owner is a loud ERROR and not a deletion on a stale contract.
+#
+# Spot-check (default) logs each candidate - path, size, lsof result, verdict - to
+# CC_DJ_SPOTCHECK_LOG under one run id and deletes nothing. Auto deletes a candidate only
+# after an lsof taken immediately before shows no holder. Sets _CC_DJ_STEP_LINES for the
+# act's report; returns 0 always.
+_cc_dj_act_template_prune() {
+  local step_before="$1" days="$CC_DJ_ACT_TEMPLATES_PRUNE_DAYS" mode="$CC_DJ_NEW_STEPS_MODE"
+  local script store slog runid d name bytes verdict reason why
+  local cand=0 removed=0 kept=0 would=0 would_bytes=0 removed_bytes=0
+  _CC_DJ_STEP_LINES=""
+  [ "$days" = off ] && return 0
+  case "$days" in ''|*[!0-9]*|0|00*)
+    _cc_dj_log "ERROR act: CC_DJ_ACT_TEMPLATES_PRUNE_DAYS=$days is not a number of days (1 or more) or off; template prune not run"
+    _CC_DJ_STEP_LINES="- ERROR: node-modules template prune not run (CC_DJ_ACT_TEMPLATES_PRUNE_DAYS=$days is not a number)"
+    return 0 ;;
+  esac
+  days=$((10#$days))
+  case "$mode" in
+    spotcheck|auto) ;;
+    *) _cc_dj_log "act: CC_DJ_NEW_STEPS_MODE=$mode is not spotcheck or auto; using spotcheck"; mode=spotcheck ;;
+  esac
+  script="${CC_DJ_ACT_TEMPLATE_SCRIPT:-$HOME/.claude/hooks/node-modules-template.sh}"
+  if [ ! -x "$script" ]; then
+    _cc_dj_log "ERROR act: node-modules template script $script not found or not executable; template prune not run (CC_DJ_ACT_TEMPLATE_SCRIPT overrides the path)"
+    _CC_DJ_STEP_LINES="- ERROR: node-modules template prune not run (script $script not found or not executable)"
+    return 0
+  fi
+  store="${CC_DJ_TEMPLATE_STORE:-${NODE_MODULES_TEMPLATE_STORE:-$HOME/.claude/node-modules-templates}}"
+  if [ ! -d "$store" ]; then
+    _CC_DJ_STEP_LINES="- node-modules template prune: no store at $store"
+    return 0
+  fi
+  slog="${CC_DJ_SPOTCHECK_LOG:-$HOME/.cc-reaper/logs/spotcheck-disk-janitor.log}"
+  mkdir -p "$(dirname "$slog")" 2>/dev/null || true
+  runid="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  _cc_dj_spot() { printf '[%s] run=%s step=template-prune %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$runid" "$*" >> "$slog" 2>/dev/null || true; }
+  _cc_dj_spot "start mode=$mode store=$store unused_days=$days"
+  # Direct children only, plain directories (a symlink is not -type d), not dot-prefixed
+  # (.adopting.* is an adopt in progress).
+  while IFS= read -r -d '' d; do
+    name="$(basename "$d")"
+    cand=$((cand + 1))
+    bytes="$(_cc_dj_du_bytes "$d")"
+    verdict=""; reason=""
+    case "$name" in
+      *[!A-Za-z0-9._-]*) verdict=keep; reason=not-a-template-key; _CC_DJ_HOLDER=skipped; _CC_DJ_HOLDER_SAMPLE="" ;;
+      *) _cc_dj_path_holder "$d" ;;
+    esac
+    if [ -z "$verdict" ]; then
+      if why="$(_cc_dj_protected_tree "$d")"; then verdict=keep; reason="$why"
+      elif [ "$_CC_DJ_HOLDER" = held ]; then verdict=keep; reason=held
+      elif [ "$_CC_DJ_HOLDER" = unknown ]; then verdict=keep; reason=holder-unknown
+      elif [ "$mode" = spotcheck ]; then verdict=would-remove
+      elif [ -d "$d" ] && [ ! -L "$d" ]; then
+        rm -rf -- "$d" 2>/dev/null
+        if [ -e "$d" ]; then verdict=keep; reason=remove-failed; else verdict=removed; fi
+      else
+        verdict=keep; reason=changed-underfoot
+      fi
+    fi
+    case "$verdict" in
+      would-remove) would=$((would + 1)); would_bytes=$((would_bytes + ${bytes:-0})) ;;
+      removed) removed=$((removed + 1)); removed_bytes=$((removed_bytes + ${bytes:-0})) ;;
+      *) kept=$((kept + 1)) ;;
+    esac
+    _cc_dj_spot "mode=$mode path=$d size_bytes=${bytes:-?} holder=$_CC_DJ_HOLDER verdict=$verdict${reason:+ reason=$reason}${_CC_DJ_HOLDER_SAMPLE:+ sample=$_CC_DJ_HOLDER_SAMPLE}"
+  done < <(find "$store" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -mtime -"$days" -print0 2>/dev/null | sort -z)
+  _cc_dj_spot "end mode=$mode candidates=$cand would_remove=$would removed=$removed kept=$kept"
+  unset -f _cc_dj_spot
+  if [ "$cand" -eq 0 ]; then
+    _CC_DJ_STEP_LINES="- node-modules template prune ($mode): no template unused for ${days}+ days"
+  elif [ "$mode" = spotcheck ]; then
+    _CC_DJ_STEP_LINES="- node-modules template prune (spotcheck): would remove $would ($(_cc_dj_fmt_kb_delta $((would_bytes / 1024)))), kept $kept; nothing deleted; run=$runid in $slog"
+  else
+    _CC_DJ_STEP_LINES="- node-modules template prune (auto): removed $removed, kept $kept ($(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before )))); run=$runid in $slog"
+  fi
+  return 0
+}
+
 # Below CC_DJ_ACT_FREE_GB free, act instead of only notifying. On 2026-10-04 --check logged
 # BELOW threshold every hour from 10% free, sent one desktop notification nobody saw and
 # reclaimed nothing; at 20 GB the CI slots declined jobs and merge-gate queued for 90
@@ -317,16 +485,20 @@ _cc_dj_run_bounded() {
 # to CC_DJ_ALERT_ISSUE, where a person reads it; the desktop notification stays as well.
 _cc_dj_low_disk_act() {
   local free_kb="$1" lock="$CC_DJ_STATE_DIR/low-disk-act.lock" before after step_before rc body hook janitor
-  local v floor_gb trim_s cool_s budget
+  local v floor_gb trim_s cool_s budget low_gb low_cool_s
   [ "$CC_DJ_ACT_FREE_GB" = off ] && return 0
   # A bad value logs and skips the action; it never aborts the rest of the hourly check.
-  for v in CC_DJ_ACT_FREE_GB CC_DJ_ACT_TRIM_SECONDS CC_DJ_ACT_COOLDOWN_SECS; do
+  for v in CC_DJ_ACT_FREE_GB CC_DJ_ACT_TRIM_SECONDS CC_DJ_ACT_COOLDOWN_SECS CC_DJ_ACT_LOW_FREE_GB CC_DJ_ACT_LOW_COOLDOWN_SECS; do
     case "${!v}" in ''|*[!0-9]*) _cc_dj_log "act: $v=${!v} is not a number; not acting"; return 0 ;; esac
   done
   case "$free_kb" in ''|*[!0-9]*) _cc_dj_log "act: free space unreadable; not acting"; return 0 ;; esac
   # 10# so 08 is eight, not an octal error.
   floor_gb=$((10#$CC_DJ_ACT_FREE_GB)); trim_s=$((10#$CC_DJ_ACT_TRIM_SECONDS)); cool_s=$((10#$CC_DJ_ACT_COOLDOWN_SECS))
   [ "$free_kb" -lt $(( floor_gb * 1048576 )) ] || return 0
+  # Under the CI heavy-slot floor the shorter cooldown applies; it never lengthens an
+  # ordinary one an operator already set shorter.
+  low_gb=$((10#$CC_DJ_ACT_LOW_FREE_GB)); low_cool_s=$((10#$CC_DJ_ACT_LOW_COOLDOWN_SECS))
+  if [ "$free_kb" -lt $(( low_gb * 1048576 )) ] && [ "$low_cool_s" -lt "$cool_s" ]; then cool_s=$low_cool_s; fi
   if ! CC_DJ_COOLDOWN_SECS="$cool_s" _cc_dj_cooldown_ok act; then
     _cc_dj_log "act: free $(_cc_dj_fmt_kb_delta "$free_kb") < ${floor_gb}GB, but acted within ${cool_s}s; not again"
     return 0
@@ -343,14 +515,24 @@ _cc_dj_low_disk_act() {
   before="$free_kb"
   body="cc-reaper disk-janitor acted: free $(_cc_dj_fmt_kb_delta "$before") < ${floor_gb} GB on $(hostname -s) at $(date '+%Y-%m-%dT%H:%M:%S%z')."
 
-  hook="${CC_DJ_ACT_GO_CACHE_HOOK:-$HOME/.claude/hooks/reclaim-byproducts.sh}"
+  # The installed copy: install.sh deploys the scripts to ~/.cc-reaper, as resource-watch.sh
+  # expects. This default pointed at ~/.claude/hooks/, where the file never was, so on
+  # 2026-10-18 and 2026-10-24 the go cache trim was "skipped" every time (stima-api#5886).
+  hook="${CC_DJ_ACT_GO_CACHE_HOOK:-$HOME/.cc-reaper/reclaim-byproducts.sh}"
   step_before="$(_cc_dj_free_kb)"
   if [ -x "$hook" ]; then
     rc=0; "$hook" --go-cache >/dev/null 2>&1 || rc=$?
     body="$body"$'\n'"- go cache pressure trim (rc=$rc): $(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before )))"
   else
-    body="$body"$'\n'"- go cache pressure trim: skipped ($hook not found)"
+    # An ERROR, not a quiet skip: the body goes to the alert comment, which is what an
+    # operator reads, and the line is greppable in the log.
+    _cc_dj_log "ERROR act: go cache hook $hook not found or not executable; the go build cache was not trimmed (CC_DJ_ACT_GO_CACHE_HOOK overrides the path)"
+    body="$body"$'\n'"- ERROR: go cache pressure trim not run (hook $hook not found or not executable)"
   fi
+
+  step_before="$(_cc_dj_free_kb)"
+  _cc_dj_act_template_prune "$step_before"
+  [ -z "$_CC_DJ_STEP_LINES" ] || body="$body"$'\n'"$_CC_DJ_STEP_LINES"
 
   janitor="${CC_DJ_ACT_WORKTREE_JANITOR:-$HOME/.cc-reaper/worktree-janitor.sh}"
   step_before="$(_cc_dj_free_kb)"
