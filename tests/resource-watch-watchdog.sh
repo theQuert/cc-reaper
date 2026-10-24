@@ -117,6 +117,8 @@ STUB
 cat > "$stub_dir/osascript" <<'STUB'
 #!/usr/bin/env bash
 echo "$@" >> "${CC_RW_OSASCRIPT_LOG:-/dev/null}"
+[ -n "${CC_RW_TEST_OSASCRIPT_HANG:-}" ] && sleep "$CC_RW_TEST_OSASCRIPT_HANG"
+exit 0
 STUB
 chmod +x "$stub_dir"/*
 
@@ -310,6 +312,13 @@ expect_yes "W4: the overrun notification is sent even though the job's group die
   grep -q 'round-overrun' "$w4/osascript"
 expect_yes "W4: and the ERROR is logged" grep -q 'ERROR resource-watch round ran over' "$w4/resource-watch.log"
 expect_no  "W4: the TERM-proof step is gone (the group kill)" kill -0 "$(cat "$w4/top.pid" 2>/dev/null || echo 0)"
+# W4b: a notification that hangs (osascript stuck) must not hold the deadline: the TERM still goes out.
+w4b=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+w4b_t0=$(date +%s)
+launchd_round "$w4b" 100 CC_RW_TEST_HANG_TOP="$w4b/top.pid" CC_RW_TEST_TOP_IGNORES_TERM=1 CC_RW_ROUND_MAX_SECONDS=2 CC_RW_TEST_OSASCRIPT_HANG=25
+w4b_dt=$(( $(date +%s) - w4b_t0 ))
+expect_yes "W4b: a hung notification is cut off and the round still ends (took ${w4b_dt}s, bound 15s)" test "$w4b_dt" -lt 15
+expect_yes "W4b: the overrun was still logged" grep -q 'ERROR resource-watch round ran over' "$w4b/resource-watch.log"
 
 # ---------------------------------------------------------------------------
 # W5: the watchdog acts only on its own parent, and only when that parent is resource-watch

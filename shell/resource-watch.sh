@@ -647,7 +647,9 @@ _cc_rw_round_watchdog() {
   done
   held=${held# }
   _cc_rw_log_line "ERROR resource-watch round ran over CC_RW_ROUND_MAX_SECONDS=${secs}s; ending the round's own tree: ${tree}${held:+ (stopped pid(s) ${held} are ended too: a held round holds every later round)} ALERT:round-overrun"
-  _cc_rw_maybe_notify "round-overrun" "a resource-watch round ran over ${secs}s and is being ended; see resource-watch.log" "$(date +%s)"
+  # Bounded: a stuck osascript must not hold the TERM back, or the deadline means nothing.
+  _cc_rw_run_bounded 5 _cc_rw_maybe_notify "round-overrun" "a resource-watch round ran over ${secs}s and is being ended; see resource-watch.log" "$(date +%s)"
+  [ "$(ps -o ppid= -p "$me" 2>/dev/null | tr -d ' ')" = "$round" ] || exit 0   # the round ended meanwhile
   # shellcheck disable=SC2086
   killed=$(_cc_rw_end_pids 5 $tree)
   _cc_rw_log_line "ERROR resource-watch round ended (TERM: ${tree}; KILL: ${killed:-none})"
