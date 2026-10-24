@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Fixed
+- **A stuck or stopped reclaim can no longer silence the disk guard (stima-api #5886).**
+  `resource-watch.sh` writes `<state>/resource-watch.heartbeat` first in every round, ends a round
+  past `CC_RW_ROUND_MAX_SECONDS` (240) by its own tree (never the detached act, `ALERT:round-overrun`),
+  and treats a stopped (`T`) act or act child as an operator hold: ERROR and `ALERT:disk-act-held`
+  every round, never signalled. `reclaim-byproducts.sh` runs the go cache before the scratchpad
+  phase, bounds that phase to `CC_RB_SCRATCH_BUDGET_SECONDS` (900) with a cursor (what it does not
+  reach is kept), alerts (`ALERT:byproducts-lock-held` / `-old`, exit 1) instead of exiting 0 when
+  the lock holder is stopped or older than `CC_RB_LOCK_MAX_AGE_SECONDS` (10800), and gives
+  `--go-cache` / `--go-cache-cap` their own lock. See `docs/disk-guard-watchdog.md`.
 - **`resource-watch.sh` runs its low-disk act detached, so a long reclaim no longer stops the
   watch (stima-api #5886, EL-DISK-ROOTFIX-1356 D1).** The act ran in the foreground of the launchd
   job; on 2026-10-24 one (pid 55146) ran 3h34m and launchd started no round in that time: no

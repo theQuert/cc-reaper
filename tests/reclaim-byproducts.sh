@@ -1962,7 +1962,8 @@ check "a live holder: exit status is 0" "$OUT" "rc=0"
 OUT="$(run_stale "$LK" "$SCRIPT"; echo "rc=$?")"
 check "a live holder blocks --if-stale too" "$OUT" "another sweep, pid $HOLDER" "sweep started"
 OUT="$(_run "$LK" "$SCRIPT" --go-cache; echo "rc=$?")"
-check "a live holder blocks --go-cache too" "$OUT" "another sweep, pid $HOLDER" "go cache only"
+# --go-cache has its own lock (stima-api #5886): a long or stopped sweep must not hold it off.
+check "a live sweep holder does not block --go-cache" "$OUT" "go cache only" "another sweep"
 OUT="$(run "$LK" "$SCRIPT")"
 check "a dry run needs no lock and runs beside a live holder" "$OUT" "sweep started" "another sweep"
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null

@@ -44,11 +44,15 @@ Environment:
   CC_RW_RATE_FLAG_GBH      Falling faster than this many GB/h also writes <state>/disk-rate-high,
                        removed once a measured rate is at or below it (default: 20); 0 disables
   CC_RW_GO_CAP_MAX_SECONDS The go cache cap is ended, by pid, past this many seconds (default: 120); 0 = no bound
+  CC_RW_ROUND_MAX_SECONDS  A whole round past this many seconds ends its own process tree (never a detached
+                       act), with ERROR and ALERT:round-overrun, so launchd can start the next (default: 240); 0 = no bound
   CC_RW_RECLAIM_SCRIPT     reclaim-byproducts.sh to run (default: ~/.cc-reaper/reclaim-byproducts.sh)
   CC_RW_JANITOR_SCRIPT     worktree-janitor.sh to run (default: ~/.cc-reaper/worktree-janitor.sh)
   CC_RW_GO_CAP         Set to 0 to stop the every-run `reclaim-byproducts.sh --go-cache-cap` (default: 1)
 Reclaim output goes to resource-watch-act.log beside CC_RW_LOG. Each round appends
-`<epoch>\t<free KB>` to <state>/disk-free-samples.tsv (last 48 hours kept).
+`<epoch>\t<free KB>` to <state>/disk-free-samples.tsv (last 48 hours kept), and first of all
+writes its start epoch to <state>/resource-watch.heartbeat. A detached reclaim that is stopped
+(SIGSTOP, `T` in ps) is an operator hold: ERROR and ALERT:disk-act-held every round, never signalled.
 EOF
 }
 
@@ -399,6 +403,15 @@ _cc_rw_pid_alive() {
   return 0
 }
 
+# The pids of $1's tree whose `ps -o stat=` holds `T` (stopped), space-separated; empty when none.
+_cc_rw_stopped_pids() {
+  local pid out=""
+  for pid in $(_cc_rw_tree_pids "$1"); do
+    case "$(ps -o stat= -p "$pid" 2>/dev/null)" in *T*) out="$out $pid" ;; esac
+  done
+  echo "${out# }"
+}
+
 # TERM the listed pids, wait up to <grace> seconds for them, KILL the ones still alive. Prints
 # the pids that needed KILL. Args: <grace secs> <pid>...
 _cc_rw_end_pids() {
@@ -430,10 +443,11 @@ _cc_rw_act_unlock() {
 # Read the lock and act on it. Sets _CC_RW_ACT_STATE to one of
 #   idle      no act (a stale lock found here has been removed)
 #   running   an act is running inside its cap
+#   held      the act, or a pid in its tree, is stopped (`T`): an operator hold, never signalled
 #   overrun   an act ran past CC_RW_ACT_MAX_SECONDS and has just been ended
 # and _CC_RW_ACT_PID to the act's pid when there is one. Args: <now epoch>
 _cc_rw_act_supervise() {
-  local now=$1 lock pid started age max grace tree killed
+  local now=$1 lock pid started age max grace tree killed held what
   lock=$(_cc_rw_act_lock)
   _CC_RW_ACT_STATE=idle
   _CC_RW_ACT_PID=""
@@ -455,6 +469,16 @@ _cc_rw_act_supervise() {
   _CC_RW_ACT_PID=$pid
   max=$(_cc_rw_num CC_RW_ACT_MAX_SECONDS 5400)
   max=${max%.*}
+  # A stopped pid anywhere in the act's tree is an operator's hold (SIGSTOP), not a hang: it is
+  # never signalled, whatever its age, and the act keeps the lock. Every round says so.
+  held=$(_cc_rw_stopped_pids "$pid")
+  if [ -n "$held" ]; then
+    what="is stopped"
+    [ "$held" = "$pid" ] || what="has stopped pid(s) ${held} in its tree"
+    _cc_rw_log_line "ERROR disk act pid ${pid} ${what} (an operator hold, claimed ${age}s ago); not signalled, not ended, no new act while it holds the lock"
+    _CC_RW_ACT_STATE=held
+    return 0
+  fi
   if [ "$max" -eq 0 ] || [ "$age" -le "$max" ]; then
     _CC_RW_ACT_STATE=running
     return 0
@@ -553,6 +577,101 @@ _cc_rw_run_bounded() {
   done
   wait "$pid" || rc=$?
   return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Round watchdog: the heartbeat and the whole-round deadline (stima-api #5886)
+# ---------------------------------------------------------------------------
+#
+# launchd starts no new round while one runs, and has no maximum run time (ExitTimeOut only
+# spaces TERM and KILL when a job is being stopped). On 2026-10-24 one round never returned and
+# sampling, alerts and the go cache cap were gone for 5+ hours with nothing saying so. So:
+#   - <state>/resource-watch.heartbeat holds the epoch of the newest round's start, written
+#     before any step that can block, for a reader in another job to tell a dead guard;
+#   - a watchdog subshell ends the round past CC_RW_ROUND_MAX_SECONDS (240), its own tree by
+#     pid: the round, its command substitutions and children. A detached act is not in it (it
+#     is reparented and leads its own group) and is skipped by command line in any case.
+
+_cc_rw_heartbeat() {
+  local dir
+  dir=$(_cc_rw_state_dir)
+  mkdir -p "$dir" 2>/dev/null || true
+  { printf '%s\n' "$(date +%s)" > "$dir/resource-watch.heartbeat.tmp" \
+      && mv -f "$dir/resource-watch.heartbeat.tmp" "$dir/resource-watch.heartbeat"; } 2>/dev/null
+  return 0
+}
+
+# Like _cc_rw_tree_pids, but never lists or descends into pid <skip> (the watchdog) or a
+# resource-watch act. Args: <root pid> <skip pid>
+_cc_rw_round_tree() {
+  local queue=$1 skip=$2 next pid kid
+  while [ -n "$queue" ]; do
+    next=""
+    for pid in $queue; do
+      [ "$pid" = "$skip" ] && continue
+      _cc_rw_is_act_pid "$pid" && continue
+      echo "$pid"
+      for kid in $(pgrep -P "$pid" 2>/dev/null); do next="$next $kid"; done
+    done
+    queue=${next# }
+  done
+}
+
+# The watchdog body, run as `( _cc_rw_round_watchdog <round pid> <secs> ) &`. TERM from the round
+# (it finished in time) ends it and its sleep at once. Args: <round pid> <secs>
+#
+# It acts only on its own parent, and only while that parent runs resource-watch.sh: a
+# watchdog orphaned (a hand-run ended with Ctrl-C) or facing a reused pid exits without a signal.
+# The alert and the notification go out BEFORE the tree is ended: the watchdog is in the round's
+# process group, and launchd ends that group once the round exits, so anything after the TERM may
+# never run. A stopped pid in the round's own tree is ended with it, unlike a stopped act: a round
+# that is held holds every later round (launchd starts none while it runs), which is the very
+# failure this deadline exists for. The ERROR names such pids.
+_cc_rw_round_watchdog() {
+  local round=$1 secs=$2 me sp="" tree killed pid held=""
+  trap '[ -n "$sp" ] && kill "$sp" 2>/dev/null; exit 0' TERM
+  sleep "$secs" &
+  sp=$!
+  wait "$sp" 2>/dev/null || exit 0
+  sp=""
+  kill -0 "$round" 2>/dev/null || exit 0
+  # bash 3.2 (/bin/bash, launchd's) has no BASHPID: a child sh reports this subshell as its parent.
+  me=${BASHPID:-$(exec sh -c 'echo $PPID')}
+  [ "$(ps -o ppid= -p "$me" 2>/dev/null | tr -d ' ')" = "$round" ] || exit 0
+  # The script itself, by name: a path that merely contains the words (a directory) is not it.
+  case " $(ps -o command= -p "$round" 2>/dev/null) " in *"/resource-watch.sh "*|*" resource-watch.sh "*) ;; *) exit 0 ;; esac
+  tree=$(_cc_rw_round_tree "$round" "$me" | tr '\n' ' ')
+  tree=${tree% }
+  for pid in $tree; do
+    case "$(ps -o stat= -p "$pid" 2>/dev/null)" in *T*) held="$held $pid" ;; esac
+  done
+  held=${held# }
+  _cc_rw_log_line "ERROR resource-watch round ran over CC_RW_ROUND_MAX_SECONDS=${secs}s; ending the round's own tree: ${tree}${held:+ (stopped pid(s) ${held} are ended too: a held round holds every later round)} ALERT:round-overrun"
+  # Bounded: a stuck osascript must not hold the TERM back, or the deadline means nothing.
+  _cc_rw_run_bounded 5 _cc_rw_maybe_notify "round-overrun" "a resource-watch round ran over ${secs}s and is being ended; see resource-watch.log" "$(date +%s)"
+  [ "$(ps -o ppid= -p "$me" 2>/dev/null | tr -d ' ')" = "$round" ] || exit 0   # the round ended meanwhile
+  # shellcheck disable=SC2086
+  killed=$(_cc_rw_end_pids 5 $tree)
+  _cc_rw_log_line "ERROR resource-watch round ended (TERM: ${tree}; KILL: ${killed:-none})"
+  exit 0
+}
+
+# One launchd round: heartbeat first, then the snapshot under the deadline.
+_cc_rw_round() {
+  local max wd=""
+  _cc_rw_heartbeat
+  max=$(_cc_rw_num CC_RW_ROUND_MAX_SECONDS 240)
+  max=${max%.*}
+  if [ "$max" -gt 0 ]; then
+    ( _cc_rw_round_watchdog "$$" "$max" ) &
+    wd=$!
+  fi
+  _cc_rw_snapshot
+  if [ -n "$wd" ]; then
+    kill -TERM "$wd" 2>/dev/null
+    wait "$wd" 2>/dev/null
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -659,6 +778,7 @@ _cc_rw_snapshot() {
   [ "$disk_emerg" = "true" ]  && markers="${markers} ALERT:disk-emergency"
   [ "$rate_alert" = "true" ]  && markers="${markers} ALERT:disk-rate"
   [ "$_CC_RW_ACT_STATE" = "overrun" ] && markers="${markers} ALERT:disk-act-overrun"
+  [ "$_CC_RW_ACT_STATE" = "held" ]    && markers="${markers} ALERT:disk-act-held ACT:held:${_CC_RW_ACT_PID}"
   [ "$mem_breach"  = "true" ] && markers="${markers} ALERT:mem"
   [ "$act_started" = "true" ] && markers="${markers} ACT:started:${_CC_RW_ACT_PID}"
   [ "$_CC_RW_ACT_STATE" = "running" ] && markers="${markers} ACT:running:${_CC_RW_ACT_PID:-spawning}"
@@ -697,6 +817,9 @@ _cc_rw_snapshot() {
   [ "$_CC_RW_ACT_STATE" = "overrun" ] && _cc_rw_maybe_notify "disk-act-overrun" \
     "disk reclaim ran past its cap and was ended; see resource-watch.log" "$now"
 
+  [ "$_CC_RW_ACT_STATE" = "held" ] && _cc_rw_maybe_notify "disk-act-held" \
+    "disk reclaim pid ${_CC_RW_ACT_PID} is stopped (operator hold); no reclaim runs until it is continued or ended" "$now"
+
   [ "$mem_breach"  = "true" ] && _cc_rw_maybe_notify "mem" \
     "mem free ${mem_free_pct}% below ${mem_min_pct}% and compressor ${compressor_gb}GB above ${comp_threshold_gb}GB" "$now"
 
@@ -724,7 +847,7 @@ if [ -n "${BASH_VERSION:-}" ]; then
         exit 0
         ;;
       "")
-        _cc_rw_snapshot
+        _cc_rw_round
         ;;
       --act)
         # internal: the detached reclaim a round starts (see _cc_rw_disk_act)

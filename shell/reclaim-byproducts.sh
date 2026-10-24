@@ -151,6 +151,14 @@ TMUX_BIN="${BYPRODUCT_TMUX_BIN:-tmux}"
 CLOSED_SESSIONS_FILE="${BYPRODUCT_CLOSED_SESSIONS:-$HOME/handoffs/closed-sessions.md}"
 RESUME_DAYS="${BYPRODUCT_RESUME_DAYS:-2}"
 PROJECTS_DIR="${BYPRODUCT_PROJECTS_DIR:-$HOME/.claude/projects}"
+# The scratchpad phase's time budget (stima-api #5886). On 2026-10-24 it took ~2 minutes a
+# directory under load and 4 hours reached 114 of them, while every step behind it waited. Past
+# this many seconds the phase stops before its next directory (always after at least one), writes
+# where it stopped to the cursor file, and the next run starts after that entry, wrapping round.
+# A directory not reached this run is simply not judged: it is kept, never deleted. 0 = no budget.
+RB_STATE_DIR="${CC_RB_STATE_DIR:-$HOME/.cc-reaper/state}"
+SCRATCH_BUDGET_SECONDS="${CC_RB_SCRATCH_BUDGET_SECONDS:-900}"
+SCRATCH_CURSOR="${CC_RB_SCRATCH_CURSOR:-$RB_STATE_DIR/reclaim-byproducts.scratch-cursor}"
 CODEX_SESSIONS_DIR="${BYPRODUCT_CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
 
 # The minimum age of an ANONYMOUS VOLUME, which was the line above until 2026-09-13 and is
@@ -368,6 +376,11 @@ esac
 case "$RESUME_DAYS" in
   ''|*[!0-9]*|??????*) echo "byproducts: BYPRODUCT_RESUME_DAYS=$RESUME_DAYS is not a whole number of days below 100000; reaping nothing" >&2; exit 2 ;;
   *) RESUME_DAYS=$((10#$RESUME_DAYS)) ;;
+esac
+# Defaulted, not refused: it decides how long the phase runs, and what it does not reach is kept.
+case "$SCRATCH_BUDGET_SECONDS" in
+  ''|*[!0-9]*|????????*) echo "byproducts: CC_RB_SCRATCH_BUDGET_SECONDS=$SCRATCH_BUDGET_SECONDS is not a whole number of seconds; using 900" >&2; SCRATCH_BUDGET_SECONDS=900 ;;
+  *) SCRATCH_BUDGET_SECONDS=$((10#$SCRATCH_BUDGET_SECONDS)) ;;
 esac
 case "$NEW_RULES_MODE" in
   auto|spotcheck) ;;
@@ -643,6 +656,29 @@ removal_precheck() {  # <dir> <class: old|new>
   [ "$2" = old ]
 }
 
+# Every entry under the scratch root, two levels down, NUL-terminated, in byte order, starting
+# after the entry the cursor names and wrapping round to it, so a pass cut short by the time budget
+# is finished by the next run rather than restarted. An entry the cursor names that is gone
+# (reaped) still orders correctly; an unreadable or empty cursor starts at the top.
+#
+# Built from the glob and compared inside bash, never split on lines: a name with a newline split
+# into lines gives a fragment that is a RELATIVE path, resolved against the cwd, and an idle
+# session-id directory there would be judged and removed (review of 5d2024b). Run in a subshell
+# (process substitution), so the C locale it sets for the glob order and `[[ > ]]` stays here.
+scratch_order() {
+  local LC_ALL=C cur="" d rel
+  [ -f "$SCRATCH_CURSOR" ] && cur="$(head -n 1 "$SCRATCH_CURSOR" 2>/dev/null)"
+  for d in "$SCRATCH_ROOT"/*/*; do
+    rel="${d#"$SCRATCH_ROOT"/}"
+    if [ -z "$cur" ] || [[ "$rel" > "$cur" ]]; then printf '%s\0' "$d"; fi
+  done
+  [ -n "$cur" ] || return 0
+  for d in "$SCRATCH_ROOT"/*/*; do
+    rel="${d#"$SCRATCH_ROOT"/}"
+    [[ "$rel" > "$cur" ]] || printf '%s\0' "$d"
+  done
+}
+
 reap_scratchpads() {
   [ -d "$SCRATCH_ROOT" ] || { log "scratchpads: $SCRATCH_ROOT does not exist, nothing to reap"; return 0; }
   # /tmp is shared and the root is named by uid, so another account could have made it.
@@ -671,7 +707,25 @@ reap_scratchpads() {
   midx="$(mktemp "${TMPDIR:-/tmp}/byproducts-mention.XXXXXX")" || midx=""
   if [ -n "$midx" ] && build_mention_index "$midx"; then midx_ok=1; fi
   [ "$midx_ok" -eq 1 ] || log "scratchpads: transcripts could not be searched; path-in-use.sh judges every directory"
-  for d in "$SCRATCH_ROOT"/*/*; do
+  # In cursor order (scratch_order), against the time budget. The check is at the top of the loop,
+  # before anything about the directory is judged, so a directory is either judged whole or not
+  # reached, and one not reached is left exactly as it was.
+  local entries=() phase_start=$SECONDS judged=0 last="" stopped_after=""
+  while IFS= read -r -d '' d; do entries+=("$d"); done < <(scratch_order)
+  for d in ${entries[@]+"${entries[@]}"}; do
+    # Inside the root, two levels down, and one line: anything else is never judged, never removed.
+    case "$d" in
+      *"
+"*) log "scratchpad skipped: a name under $SCRATCH_ROOT holds a newline; kept, never judged: $(printf '%s' "$d" | tr '\n' '?')"
+          kept=$((kept + 1)); continue ;;
+      "$SCRATCH_ROOT"/*/*) ;;
+      *) log "scratchpad skipped: $d is not under $SCRATCH_ROOT; never judged"; continue ;;
+    esac
+    if [ "$SCRATCH_BUDGET_SECONDS" -gt 0 ] && [ "$judged" -gt 0 ] \
+       && [ $((SECONDS - phase_start)) -ge "$SCRATCH_BUDGET_SECONDS" ]; then
+      stopped_after=$last; break
+    fi
+    judged=$((judged + 1)); last="${d#"$SCRATCH_ROOT"/}"
     # A link at either level points anywhere; it is never a scratchpad.
     [ -d "$d" ] && [ ! -L "$d" ] && [ ! -L "${d%/*}" ] || continue
     sid="$(basename "$d")"
@@ -800,6 +854,16 @@ reap_scratchpads() {
   done
   rm -f "$midx" "$LSOF_SNAP" 2>/dev/null
   log "scratchpads: $reaped reaped, $kept kept, $(freed_mb "$bytes")"
+  if [ -n "$stopped_after" ]; then
+    log "scratchpads: time budget ${SCRATCH_BUDGET_SECONDS}s reached after ${judged} entr(ies) in $((SECONDS - phase_start))s; $(( ${#entries[@]} - judged )) not reached and kept; the next run continues after $stopped_after"
+    if [ "$DRY" -eq 0 ]; then
+      mkdir -p "$(dirname "$SCRATCH_CURSOR")" 2>/dev/null
+      printf '%s\n' "$stopped_after" > "$SCRATCH_CURSOR" 2>/dev/null \
+        || log "scratchpads: could not write the cursor $SCRATCH_CURSOR; the next run starts from the top" >&2
+    fi
+  elif [ "$DRY" -eq 0 ]; then
+    rm -f "$SCRATCH_CURSOR" 2>/dev/null
+  fi
   [ "$spot" -eq 0 ] || log "scratchpads: $spot more removable under the liveness rule, logged to $SPOTCHECK_LOG and not removed (CC_RB_NEW_RULES_MODE=$NEW_RULES_MODE)"
 }
 
@@ -1482,9 +1546,51 @@ PLIST
 # A live holder means this run exits 0 (launchd must not count it a failure). A holder
 # whose pid is gone is stale and is taken over; a lock whose pid is alive is never
 # touched, whatever its command line says, because a wrong "stale" here is two sweeps again.
-LOCK_DIR="${CC_RB_LOCK_DIR:-$HOME/.cc-reaper/state/reclaim-byproducts.lock}"
+#
+# Except that a live holder is not always a running one. On 2026-10-24 a sweep was stopped
+# (SIGSTOP) for hours and every run after it exited 0 here without a word. So a holder that is
+# stopped (`T` in ps), or has held the lock longer than CC_RB_LOCK_MAX_AGE_SECONDS (10800; 0 =
+# off), is an ERROR with ALERT:byproducts-lock-held / -old in the log, a notification at most once
+# per CC_RB_ALERT_COOLDOWN_SECS (3600), and exit 1. It is still never taken over or signalled:
+# a stop is an operator's hold. The age is the lock's `started` epoch, or its pid file's mtime
+# for a lock written before `started` existed.
+#
+# --go-cache and --go-cache-cap take a lock of their own (CC_RB_GO_LOCK_DIR), so a long or
+# stopped sweep cannot block the cap resource-watch runs every 10 minutes. The sweep's own go
+# cache step does not take it: every go cache deletion is an entry Go treats as a miss, so the
+# two overlapping is harmless, and a stopped sweep must not hold the cap off either.
+LOCK_DIR="${CC_RB_LOCK_DIR:-$RB_STATE_DIR/reclaim-byproducts.lock}"
+GO_LOCK_DIR="${CC_RB_GO_LOCK_DIR:-$RB_STATE_DIR/reclaim-byproducts-go.lock}"
+LOCK_WHAT=sweep
+LOCK_MAX_AGE_SECONDS="${CC_RB_LOCK_MAX_AGE_SECONDS:-10800}"
+case "$LOCK_MAX_AGE_SECONDS" in ''|*[!0-9]*|??????????*) LOCK_MAX_AGE_SECONDS=10800 ;; *) LOCK_MAX_AGE_SECONDS=$((10#$LOCK_MAX_AGE_SECONDS)) ;; esac
+ALERT_COOLDOWN_SECS="${CC_RB_ALERT_COOLDOWN_SECS:-3600}"
+case "$ALERT_COOLDOWN_SECS" in ''|*[!0-9]*|??????????*) ALERT_COOLDOWN_SECS=3600 ;; esac
+OSASCRIPT="${BYPRODUCT_OSASCRIPT_BIN:-osascript}"
 LOCK_OWNED=0
 lock_pid() { cat "$LOCK_DIR/pid" 2>/dev/null; }
+mtime_of() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+lock_started() {
+  local s
+  s="$(cat "$LOCK_DIR/started" 2>/dev/null)"
+  case "$s" in ''|*[!0-9]*) s="$(mtime_of "$LOCK_DIR/pid")" ;; esac
+  printf '%s' "$s"
+}
+# An ERROR line carrying ALERT:byproducts-lock-<kind>, and a notification unless one for the same
+# lock and kind went out within ALERT_COOLDOWN_SECS. Args: <kind> <message>
+lock_alert() {
+  local kind="$1" msg="$2" stamp now mt
+  log "byproducts: ERROR $msg ALERT:byproducts-lock-$kind"
+  # One cooldown per lock and kind: a held sweep must not silence a held go cache cap.
+  stamp="$RB_STATE_DIR/cooldown-${LOCK_DIR##*/}-$kind"
+  now="$(date +%s)"
+  mt="$(mtime_of "$stamp")"
+  case "$mt" in ''|*[!0-9]*) ;; *) [ $((now - mt)) -lt "$ALERT_COOLDOWN_SECS" ] && return 0 ;; esac
+  mkdir -p "$RB_STATE_DIR" 2>/dev/null; touch "$stamp" 2>/dev/null
+  msg="${msg//\\/\\\\}"; msg="${msg//\"/\\\"}"
+  "$OSASCRIPT" -e "display notification \"${msg}\" with title \"cc-reaper: reclaim-byproducts\" subtitle \"byproducts-lock-${kind}\"" >/dev/null 2>&1 || true
+  return 0
+}
 release_lock() {
   [ "$LOCK_OWNED" -eq 1 ] || return 0
   LOCK_OWNED=0
@@ -1494,11 +1600,12 @@ release_lock() {
   return 0
 }
 acquire_lock() {
-  local attempt=0 holder waited cmd
+  local attempt=0 holder waited cmd st started age
   mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
   while [ "$attempt" -lt 4 ]; do
     attempt=$((attempt + 1))
     if mkdir "$LOCK_DIR" 2>/dev/null; then
+      date +%s > "$LOCK_DIR/started"
       printf '%s\n' "$$" > "$LOCK_DIR/pid"
       LOCK_OWNED=1
       trap 'release_lock' EXIT
@@ -1514,7 +1621,18 @@ acquire_lock() {
     done
     case "$holder" in *[!0-9]*) holder="" ;; esac
     if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-      log "byproducts: another sweep, pid $holder, is running; this one exits"
+      st="$(ps -o stat= -p "$holder" 2>/dev/null | tr -d ' ')"
+      started="$(lock_started)"; age=""
+      case "$started" in ''|*[!0-9]*) ;; *) age=$(( $(date +%s) - started )) ;; esac
+      case "$st" in
+        *T*) lock_alert held "the $LOCK_WHAT lock $LOCK_DIR is held by pid $holder, which is stopped (stat $st, held ${age:-?}s): an operator hold; not taken over, not signalled, this run does nothing"
+             exit 1 ;;
+      esac
+      if [ "$LOCK_MAX_AGE_SECONDS" -gt 0 ] && [ -n "$age" ] && [ "$age" -gt "$LOCK_MAX_AGE_SECONDS" ]; then
+        lock_alert old "the $LOCK_WHAT lock $LOCK_DIR is held by pid $holder for ${age}s, over CC_RB_LOCK_MAX_AGE_SECONDS=${LOCK_MAX_AGE_SECONDS}; not taken over, not signalled, this run does nothing"
+        exit 1
+      fi
+      log "byproducts: another $LOCK_WHAT, pid $holder, is running; this one exits"
       exit 0
     fi
     cmd=""; [ -z "$holder" ] || cmd="$(ps -o command= -p "$holder" 2>/dev/null)"
@@ -1533,9 +1651,10 @@ case "${1:-}" in
   # The go cache alone, for a caller that just watched the disk run low (the CI runner
   # loop, when it starts declining jobs). No scratchpad liveness gate - that is the slow
   # part, minutes - and no stamp, so the scheduled full sweep is not pushed back.
-  --go-cache) acquire_lock; rotate_log; log "== go cache only $(now_iso) (pid $$) =="; reap_go_cache; exit 0 ;;
+  # Both under the go cache lock, not the sweep's (see "single instance").
+  --go-cache) LOCK_DIR="$GO_LOCK_DIR"; LOCK_WHAT="go cache run"; acquire_lock; rotate_log; log "== go cache only $(now_iso) (pid $$) =="; reap_go_cache; exit 0 ;;
   # The size cap alone, for resource-watch's 10-minute cadence: silent unless over the cap.
-  --go-cache-cap) acquire_lock; go_lru_cap; exit 0 ;;
+  --go-cache-cap) LOCK_DIR="$GO_LOCK_DIR"; LOCK_WHAT="go cache run"; acquire_lock; go_lru_cap; exit 0 ;;
   --if-stale) CHECK_STALE=1 ;;
   --install-launchd) trap restore_legacy_agent EXIT; install_launchd "${2:-04:00}"; exit 0 ;;
   --self-test) exec bash "$REPO_HERE/../tests/reclaim-byproducts.sh" ;;
@@ -1573,9 +1692,11 @@ if [ "$CHECK_STALE" -eq 1 ] && ran_recently; then
   exit 0
 fi
 
+# The go cache first (stima-api #5886): it is cheap and certain to free space, while the
+# scratchpad liveness phase is the slow one; on 2026-10-24 it ran 4 hours and nothing behind it ran.
+log "-- go cache";   reap_go_cache
 log "-- scratchpads"; reap_scratchpads
 log "-- session temp"; reap_session_temp
-log "-- go cache";   reap_go_cache
 log "-- docker";      reap_docker
 log "-- archives";    reap_archives
 log "-- caches";      reap_caches

@@ -34,6 +34,8 @@ jobs:
         run: bash tests/worktree-janitor-reclaim.sh
       - name: reclaim-byproducts
         run: bash tests/reclaim-byproducts.sh
+      - name: reclaim-byproducts-watchdog
+        run: bash tests/reclaim-byproducts-watchdog.sh
       - name: worktree-janitor-newrules
         run: bash tests/worktree-janitor-newrules.sh
       - name: worktree-janitor-order
@@ -44,3 +46,5 @@ jobs:
         run: bash tests/worktree-active-sessions.sh
       - name: resource-watch
         run: bash tests/resource-watch.sh
+      - name: resource-watch-watchdog
+        run: bash tests/resource-watch-watchdog.sh
