@@ -116,6 +116,7 @@ bash tests/guard-runaway.sh            # claude-guard runaway phase run whole un
 bash tests/install-rc-source.sh        # install.sh rc lines source the deployed copies; a stale one is repaired only when nothing else names the script
 bash tests/disk-guard.sh             # go cache LRU cap, session-temp reaper (task outputs, finished job tmp/)
 bash tests/worktree-janitor.sh         # Validate worktree gates, landing proofs, declarations, session mode, lock
+bash tests/worktree-janitor-newrules.sh # Pins on probation (spot-check vs auto), deny-list, nothing-to-trim first
 bash -n shell/claude-cleanup.sh        # Syntax check
 bash -n shell/cc-monitor.sh            # Syntax check
 bash -n hooks/stop-cleanup-orphans.sh  # Syntax check

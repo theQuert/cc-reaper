@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- **`worktree-janitor` puts two trivial pins on probation, and honours a deny-list.** A top-level
+  `*.log` file and a `.claude/skills` or `.claude/commands` symlink into the primary checkout kept
+  landed worktrees (stima-api #5886). With `CC_WJ_NEW_RULES_MODE=spotcheck`, the default, every
+  decision stays as before, and what these rules would trim is appended to
+  `~/.cc-reaper/logs/spotcheck-worktree-janitor.log`; `auto` lets them decide. `CC_WJ_DENY_NAMES`
+  (default `homepage uiux verify-signin-redesign`) names trees nothing may trim or remove. A run
+  with nothing to trim answers that first.
 - **`worktree-janitor` walks a directory an `archive:` pattern reaches, instead of pinning it.**
   git lists stima-api's ignored `.codex/evidence/` as one collapsed entry, so
   `archive:.codex/evidence` could not copy the records inside it and kept 25 landed worktrees
