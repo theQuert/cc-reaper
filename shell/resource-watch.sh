@@ -620,7 +620,7 @@ _cc_rw_round_tree() {
 # The watchdog body, run as `( _cc_rw_round_watchdog <round pid> <secs> ) &`. TERM from the round
 # (it finished in time) ends it and its sleep at once. Args: <round pid> <secs>
 #
-# It acts only on its own parent, and only while that parent's command line is resource-watch: a
+# It acts only on its own parent, and only while that parent runs resource-watch.sh: a
 # watchdog orphaned (a hand-run ended with Ctrl-C) or facing a reused pid exits without a signal.
 # The alert and the notification go out BEFORE the tree is ended: the watchdog is in the round's
 # process group, and launchd ends that group once the round exits, so anything after the TERM may
@@ -638,7 +638,8 @@ _cc_rw_round_watchdog() {
   # bash 3.2 (/bin/bash, launchd's) has no BASHPID: a child sh reports this subshell as its parent.
   me=${BASHPID:-$(exec sh -c 'echo $PPID')}
   [ "$(ps -o ppid= -p "$me" 2>/dev/null | tr -d ' ')" = "$round" ] || exit 0
-  case "$(ps -o command= -p "$round" 2>/dev/null)" in *resource-watch*) ;; *) exit 0 ;; esac
+  # The script itself, by name: a path that merely contains the words (a directory) is not it.
+  case " $(ps -o command= -p "$round" 2>/dev/null) " in *"/resource-watch.sh "*|*" resource-watch.sh "*) ;; *) exit 0 ;; esac
   tree=$(_cc_rw_round_tree "$round" "$me" | tr '\n' ' ')
   tree=${tree% }
   for pid in $tree; do

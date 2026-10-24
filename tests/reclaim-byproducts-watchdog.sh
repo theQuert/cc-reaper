@@ -25,12 +25,30 @@ check() {  # <label> <output> <present pattern> [absent pattern]
 yes_() { local label="$1"; shift; if "$@"; then pass "$label"; else fail "$label"; fi; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/test-byproducts-wd.XXXXXX")" || exit 1
+case "$WORK" in ''|/) echo "mktemp gave '$WORK'; refusing to run" >&2; exit 1 ;; esac
 FIXTURE_PIDS="$WORK/fixture-pids"; : > "$FIXTURE_PIDS"
-# Only pids this suite started are signalled, continued first so a stopped one can die.
+# The only rm in this suite (EL-5886-RM-1752). Every path must be under <root>, which is the suite's
+# own mktemp -d directory or a directory under it: not empty, not the root itself, no `..`
+# component. The whole call is refused if any path fails, before anything is removed.
+safe_rm() {
+  local root="$1" p
+  shift
+  case "$root" in ''|/) echo "safe_rm: refusing: root '$root' is empty or /" >&2; return 1 ;; esac
+  for p in "$@"; do
+    case "$p" in
+      */../*|*/..) echo "safe_rm: refusing $p (a .. component)" >&2; return 1 ;;
+      "$root"/?*) ;;
+      *) echo "safe_rm: refusing $p (not under $root)" >&2; return 1 ;;
+    esac
+  done
+  rm -rf -- "$@"
+}
+# Only pids this suite started are signalled, continued first so a stopped one can die. The root
+# goes only when it is still the directory mktemp made.
 cleanup() {
   local p
   for p in $(cat "$FIXTURE_PIDS" 2>/dev/null); do kill -CONT "$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; done
-  rm -rf "$WORK"
+  [ -n "$WORK" ] && [ -d "$WORK" ] && case "$WORK" in "${TMPDIR:-/tmp}"/test-byproducts-wd.?*) rm -rf -- "$WORK" ;; esac
 }
 trap cleanup EXIT
 OLD_TS="$(date -v-40d +%Y%m%d%H%M 2>/dev/null || date -d '40 days ago' +%Y%m%d%H%M)"
@@ -39,9 +57,23 @@ S2=22222222-2222-2222-2222-222222222222
 S3=33333333-3333-3333-3333-333333333333
 S4=44444444-4444-4444-4444-444444444444
 
+# ---------------------------------------------------------------- S0: safe_rm, the only rm here
+SR="$WORK/safe-rm-selftest"; mkdir -p "$SR/a" "$SR/b"; touch "$SR/b/keep" "$SR/a/drop"
+sr_refuses() { local err rc=0; err="$(safe_rm "$@" 2>&1 >/dev/null)" || rc=$?; [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'safe_rm: refusing'; }
+yes_ "S0a: safe_rm refuses a path outside its root" sr_refuses "$SR/a" "$SR/b/keep"
+yes_ "S0a: and that path survives" test -e "$SR/b/keep"
+yes_ "S0b: it refuses an empty path" sr_refuses "$WORK" ""
+yes_ "S0c: it refuses the root itself" sr_refuses "$WORK" "$WORK"
+yes_ "S0d: it refuses a .. escape" sr_refuses "$SR/a" "$SR/a/../b/keep"
+yes_ "S0e: it refuses an empty root" sr_refuses "" "$SR/b/keep"
+yes_ "S0f: one bad path refuses the whole call" sr_refuses "$SR/a" "$SR/a/drop" "$SR/b/keep"
+yes_ "S0f: so nothing was removed" test -e "$SR/a/drop" -a -e "$SR/b/keep"
+yes_ "S0g: it removes a path under its root" safe_rm "$SR/a" "$SR/a/drop"
+yes_ "S0g: which is gone" test ! -e "$SR/a/drop"
+
 fx() {
   local root="$1" s
-  rm -rf "$root"; mkdir -p "$root/bin" "$root/scratch/proj" "$root/archive" "$root/home/.claude/logs"
+  safe_rm "$WORK" "$root" || exit 1; mkdir -p "$root/bin" "$root/scratch/proj" "$root/archive" "$root/home/.claude/logs"
   for s in $S1 $S2 $S3; do mkdir -p "$root/scratch/proj/$s"; touch "$root/scratch/proj/$s/f"; touch -t "$OLD_TS" "$root/scratch/proj/$s/f" "$root/scratch/proj/$s"; done
   mkdir -p "$root/scratch/proj/$S4"; touch "$root/scratch/proj/$S4/just-written"
   # The liveness gate: every directory is free, after RB_TEST_GATE_SLEEP seconds. Each call is recorded.
@@ -180,7 +212,7 @@ check "R3b: non-zero" "$OUT" "rc=1" "sweep started"
 yes_ "R3b: not taken over" test "$(cat "$LKDIR/pid")" = "$H"
 yes_ "R3b: and not signalled" kill -0 "$H"
 # A lock written before `started` existed: its pid file's mtime is the age.
-rm -f "$LKDIR/started"; touch -t "$OLD_TS" "$LKDIR/pid"
+safe_rm "$WORK" "$LKDIR/started"; touch -t "$OLD_TS" "$LKDIR/pid"
 OUT="$(_run "$LK" "$SCRIPT"; echo "rc=$?")"
 check "R3b: a lock with no started file is aged by its pid file" "$OUT" "ALERT:byproducts-lock-old"
 OUT="$(CC_RB_LOCK_MAX_AGE_SECONDS=0 _run "$LK" "$SCRIPT"; echo "rc=$?")"
@@ -238,7 +270,7 @@ yes_ "R4c: the ordinary scratchpads beside it are still reaped" gone "$F" $S1
 # ---------------------------------------------------------------- R5: one alert cooldown per lock
 fx "$LK"; holder; H=$HP; stop_pid "$H"; holder; G=$HP; stop_pid "$G"
 mkdir -p "$LKDIR" "$GOLK"; echo "$H" > "$LKDIR/pid"; echo "$G" > "$GOLK/pid"; date +%s > "$LKDIR/started"; date +%s > "$GOLK/started"
-rm -f "$(STATE "$LK")"/cooldown-* 2>/dev/null
+safe_rm "$WORK" "$(STATE "$LK")"/cooldown-*
 OUT="$(_run "$LK" "$SCRIPT")"
 OUT="$(_run "$LK" "$SCRIPT" --go-cache-cap)"
 yes_ "R5: a stopped sweep holder and a stopped go-cache holder each notify once" \

@@ -30,7 +30,24 @@ expect_no() {
   else printf "not ok - %s\n" "$name"; failures=$((failures + 1)); fi
 }
 
-TMPDIR_ROOT=$(mktemp -d)
+TMPDIR_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/test-resource-watch-wd.XXXXXX")
+case "$TMPDIR_ROOT" in ''|/) echo "mktemp gave '$TMPDIR_ROOT'; refusing to run" >&2; exit 1 ;; esac
+# The only rm in this suite (EL-5886-RM-1752). Every path must be under <root>, which is the suite's
+# own mktemp -d directory or a directory under it: not empty, not the root itself, no `..`
+# component. The whole call is refused if any path fails, before anything is removed.
+safe_rm() {
+  local root="$1" p
+  shift
+  case "$root" in ''|/) echo "safe_rm: refusing: root '$root' is empty or /" >&2; return 1 ;; esac
+  for p in "$@"; do
+    case "$p" in
+      */../*|*/..) echo "safe_rm: refusing $p (a .. component)" >&2; return 1 ;;
+      "$root"/?*) ;;
+      *) echo "safe_rm: refusing $p (not under $root)" >&2; return 1 ;;
+    esac
+  done
+  rm -rf -- "$@"
+}
 stub_dir="$TMPDIR_ROOT/stubs"
 guard_dir="$TMPDIR_ROOT/guard"
 mkdir -p "$stub_dir" "$guard_dir"
@@ -57,7 +74,10 @@ cleanup() {
     done
     if [ "$ours" -eq 1 ]; then kill -CONT -- "-$g" 2>/dev/null; kill -KILL -- "-$g" 2>/dev/null; fi
   done
-  rm -rf "$TMPDIR_ROOT"
+  # The root goes only when it is still the directory mktemp made.
+  [ -n "$TMPDIR_ROOT" ] && [ -d "$TMPDIR_ROOT" ] \
+    && case "$TMPDIR_ROOT" in "${TMPDIR:-/tmp}"/test-resource-watch-wd.?*) rm -rf -- "$TMPDIR_ROOT" ;; esac
+  return 0
 }
 trap cleanup EXIT
 
@@ -118,6 +138,22 @@ echo "$!" >> "$CC_RW_TEST_FIXTURE_PIDS"
 wait
 STUB
 chmod +x "$guard_dir"/*.sh
+
+# ---------------------------------------------------------------------------
+# S0: safe_rm, the only rm here
+# ---------------------------------------------------------------------------
+SR="$TMPDIR_ROOT/safe-rm-selftest"; mkdir -p "$SR/a" "$SR/b"; touch "$SR/b/keep" "$SR/a/drop"
+sr_refuses() { local err rc=0; err="$(safe_rm "$@" 2>&1 >/dev/null)" || rc=$?; [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'safe_rm: refusing'; }
+expect_yes "S0a: safe_rm refuses a path outside its root" sr_refuses "$SR/a" "$SR/b/keep"
+expect_yes "S0a: and that path survives" test -e "$SR/b/keep"
+expect_yes "S0b: it refuses an empty path" sr_refuses "$TMPDIR_ROOT" ""
+expect_yes "S0c: it refuses the root itself" sr_refuses "$TMPDIR_ROOT" "$TMPDIR_ROOT"
+expect_yes "S0d: it refuses a .. escape" sr_refuses "$SR/a" "$SR/a/../b/keep"
+expect_yes "S0e: it refuses an empty root" sr_refuses "" "$SR/b/keep"
+expect_yes "S0f: one bad path refuses the whole call" sr_refuses "$SR/a" "$SR/a/drop" "$SR/b/keep"
+expect_yes "S0f: so nothing was removed" test -e "$SR/a/drop" -a -e "$SR/b/keep"
+expect_yes "S0g: it removes a path under its root" safe_rm "$SR/a" "$SR/a/drop"
+expect_yes "S0g: which is gone" test ! -e "$SR/a/drop"
 
 GB=1048576
 # One round in <dir> at <free GB>, extra VAR=value pairs after. Foreground; never fails the suite.
@@ -201,7 +237,7 @@ echo "$w3_act" >> "$FIXTURE_PIDS"; echo "$w3_act" >> "$ACT_GROUPS"
 wait_for_lines "$w3/pids" 2
 kill -STOP "$w3_act"
 echo "$(( $(date +%s) - 6000 ))" > "$w3/state/disk-act.lock/started"   # past the 5400s cap
-rm -f "$w3/state/cooldown-disk-act"
+safe_rm "$TMPDIR_ROOT" "$w3/state/cooldown-disk-act"
 round "$w3" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh" CC_RW_ACT_KILL_GRACE_SECS=1
 expect_yes "W3a: a stopped act past the cap is never ended" kill -0 "$w3_act"
 expect_yes "W3a: and is still stopped (not continued, not signalled)" is_stopped "$w3_act"
@@ -278,7 +314,11 @@ expect_no  "W4: the TERM-proof step is gone (the group kill)" kill -0 "$(cat "$w
 # ---------------------------------------------------------------------------
 # W5: the watchdog acts only on its own parent, and only when that parent is resource-watch
 # ---------------------------------------------------------------------------
-sleep 300 > /dev/null 2>&1 &
+# An unrelated process whose command line does say resource-watch, so only the parent check stands
+# between it and the watchdog (a reused pid can look like anything).
+mkdir -p "$TMPDIR_ROOT/w5"
+printf '#!/usr/bin/env bash\nsleep 300 &\necho "$!" >> "$1"\nwait\n' > "$TMPDIR_ROOT/w5/resource-watch.sh"
+/bin/bash "$TMPDIR_ROOT/w5/resource-watch.sh" "$FIXTURE_PIDS" > /dev/null 2>&1 &
 w5_other=$!
 echo "$w5_other" >> "$FIXTURE_PIDS"
 w5=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkdir -p "$w5/state"
