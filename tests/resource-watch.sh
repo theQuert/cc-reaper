@@ -672,6 +672,20 @@ echo "$(( $(date +%s) - 200 ))" > "$t16c/state/disk-act.lock/started"
 guard_case "$t16c" 30
 expect_yes "T16c: the same lock 200s old is stale and taken over" grep -q '^janitor' "$t16c/calls"
 
+# Two rounds racing past the supervisor: the mkdir claim alone must keep the second out.
+t16d=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkdir -p "$t16d/state/disk-act.lock"
+t16d_rc=0
+(
+  export CC_RW_LOG="$t16d/resource-watch.log" CC_RW_STATE_DIR="$t16d/state" CC_RW_TEST_CALLS="$t16d/calls"
+  export CC_RW_JANITOR_SCRIPT="$guard_dir/janitor.sh" CC_RW_RECLAIM_SCRIPT="$guard_dir/reclaim.sh"
+  source "$ROOT_DIR/shell/resource-watch.sh"
+  _cc_rw_disk_act 30 "$(date +%s)"
+) || t16d_rc=$?
+sleep 1
+expect_yes "T16d: a claim against an existing lock directory fails" test "$t16d_rc" -ne 0
+expect_no  "T16d: and starts no act" test -s "$t16d/calls"
+expect_no  "T16d: nor touches the cooldown stamp" test -e "$t16d/state/cooldown-disk-act"
+
 # ---------------------------------------------------------------------------
 # T17: D7 write rate over the last ~60 minutes; >10GB/h alerts, >20GB/h flags, cleared below
 # ---------------------------------------------------------------------------
