@@ -476,8 +476,8 @@ expect_yes "T11g: a first run starts the sample file with one sample" \
 
 
 # ---------------------------------------------------------------------------
-# T12: disk guard. Alert below 40GB free; below 25GB run worktree-janitor --scheduled and
-# reclaim-byproducts, at most once per 30 minutes; the go cache cap runs on every snapshot.
+# T12: disk guard. Alert below 60GB free; below 40GB start worktree-janitor --scheduled and
+# reclaim-byproducts, detached, at most once per 30 minutes; the go cache cap runs every round.
 # ---------------------------------------------------------------------------
 GB=1048576
 guard_dir=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
@@ -487,6 +487,21 @@ for name in janitor reclaim; do
 echo "$name \$*" >> "\$CC_RW_TEST_CALLS"
 STUB
 done
+# A janitor that hangs: records its own pid and its child's, then waits on the child.
+cat > "$guard_dir/janitor-slow.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "janitor $*" >> "$CC_RW_TEST_CALLS"
+echo "$$" >> "$CC_RW_TEST_PIDS"
+sleep 300 &
+echo "$!" >> "$CC_RW_TEST_PIDS"
+wait
+STUB
+
+# Wait (at most 10s) for a detached act to release its lock.
+wait_unlocked() {
+  local i=0
+  while [ -d "$1/state/disk-act.lock" ] && [ "$i" -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+}
 
 guard_case() {
   local dir=$1 free_gb=$2
@@ -495,50 +510,258 @@ guard_case() {
   (
     export PATH="$stub_dir:$PATH"
     export CC_RW_LOG="$dir/resource-watch.log" CC_RW_STATE_DIR="$dir/state"
-    export CC_RW_OSASCRIPT_LOG="$dir/osascript" CC_RW_TEST_CALLS="$dir/calls"
+    export CC_RW_OSASCRIPT_LOG="$dir/osascript" CC_RW_TEST_CALLS="$dir/calls" CC_RW_TEST_PIDS="$dir/pids"
     export CC_RW_TEST_DF_KB=$(( free_gb * GB ))
     export CC_RW_JANITOR_SCRIPT="$guard_dir/janitor.sh" CC_RW_RECLAIM_SCRIPT="$guard_dir/reclaim.sh"
     for pair in "$@"; do export "$pair"; done
-    bash "$ROOT_DIR/shell/resource-watch.sh"
+    /bin/bash "$ROOT_DIR/shell/resource-watch.sh"
   ) || true
+  [ "${GUARD_NOWAIT:-0}" = "1" ] || wait_unlocked "$dir"
   touch "$dir/osascript" "$dir/calls"
 }
 
 g1=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
-guard_case "$g1" 60
-expect_no  "T12a: 60GB free raises no disk-low" grep -q 'ALERT:disk-low' "$g1/resource-watch.log"
+guard_case "$g1" 70
+expect_no  "T12a: 70GB free raises no disk-low" grep -q 'ALERT:disk-low' "$g1/resource-watch.log"
 expect_yes "T12a: but the go cache cap still runs" grep -qx 'reclaim --go-cache-cap' "$g1/calls"
 expect_no  "T12a: and nothing else does" grep -qE 'janitor|^reclaim $' "$g1/calls"
 
 g2=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
-guard_case "$g2" 30
-expect_yes "T12b: 30GB free logs ALERT:disk-low" grep -q 'ALERT:disk-low' "$g2/resource-watch.log"
+guard_case "$g2" 50
+expect_yes "T12b: 50GB free logs ALERT:disk-low" grep -q 'ALERT:disk-low' "$g2/resource-watch.log"
 expect_yes "T12b: and notifies once" test "$(grep -c 'disk-low' "$g2/osascript")" -eq 1
 expect_no  "T12b: without running the reclaim" test -f "$g2/state/cooldown-disk-act"
 
 g3=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
-guard_case "$g3" 20
-expect_yes "T12c: 20GB free runs the janitor --scheduled, then reclaim-byproducts (apply, no flag)" \
+guard_case "$g3" 30
+expect_yes "T12c: 30GB free runs the janitor --scheduled, then reclaim-byproducts (apply, no flag)" \
   test "$(grep -v -- --go-cache-cap "$g3/calls" | tr '\n' '|')" = "janitor --scheduled|reclaim |"
 expect_yes "T12c: and still alerts" grep -q 'ALERT:disk-low' "$g3/resource-watch.log"
-guard_case "$g3" 20
+expect_yes "T12c: the act releases its lock when it is done" test ! -e "$g3/state/disk-act.lock"
+expect_yes "T12c: and writes its run to resource-watch-act.log" grep -q '== disk act done' "$g3/resource-watch-act.log"
+guard_case "$g3" 30
 expect_yes "T12d: a second run inside 30 minutes does not reclaim again" \
   test "$(grep -c '^janitor' "$g3/calls")" -eq 1
 expect_yes "T12d: but caps the go cache again" test "$(grep -c -- --go-cache-cap "$g3/calls")" -eq 2
 touch -t "$(date -v-31M +%Y%m%d%H%M 2>/dev/null || date -d '31 minutes ago' +%Y%m%d%H%M)" "$g3/state/cooldown-disk-act"
-guard_case "$g3" 20
+guard_case "$g3" 30
 expect_yes "T12d: after the cooldown it reclaims again" test "$(grep -c '^janitor' "$g3/calls")" -eq 2
 
 g4=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
-guard_case "$g4" 20 CC_RW_DISK_ACT_GB=0
+guard_case "$g4" 30 CC_RW_DISK_ACT_GB=0
 expect_no "T12e: CC_RW_DISK_ACT_GB=0 turns the reclaim off" grep -q '^janitor' "$g4/calls"
 g5=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
-guard_case "$g5" 30 CC_RW_DISK_ACT_GB=35
+guard_case "$g5" 45 CC_RW_DISK_ACT_GB=50
 expect_yes "T12e: the act threshold is a knob" grep -q '^janitor' "$g5/calls"
 g6=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
-guard_case "$g6" 30 CC_RW_DISK_ALERT_GB=20 CC_RW_GO_CAP=0
+guard_case "$g6" 50 CC_RW_DISK_ALERT_GB=45 CC_RW_GO_CAP=0
 expect_no "T12e: the alert threshold is a knob" grep -q 'ALERT:disk-low' "$g6/resource-watch.log"
 expect_no "T12e: CC_RW_GO_CAP=0 stops the cap" grep -q -- --go-cache-cap "$g6/calls"
+
+# ---------------------------------------------------------------------------
+# T13: tiers fire at the right free values (60 alert / 40 act / 20 emergency)
+# ---------------------------------------------------------------------------
+t13=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); guard_case "$t13" 61
+expect_no  "T13a: 61GB: no disk-low" grep -q 'ALERT:disk-low' "$t13/resource-watch.log"
+t13=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); guard_case "$t13" 59
+expect_yes "T13b: 59GB: disk-low" grep -q 'ALERT:disk-low' "$t13/resource-watch.log"
+expect_no  "T13b: 59GB: no act" grep -q '^janitor' "$t13/calls"
+t13=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); guard_case "$t13" 41
+expect_no  "T13c: 41GB: no act" grep -q '^janitor' "$t13/calls"
+t13=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); guard_case "$t13" 39
+expect_yes "T13d: 39GB: the act runs" grep -q '^janitor' "$t13/calls"
+expect_no  "T13d: 39GB: no emergency" grep -q 'ALERT:disk-emergency' "$t13/resource-watch.log"
+t13=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); guard_case "$t13" 21
+expect_no  "T13e: 21GB: no emergency flag" test -e "$t13/state/disk-emergency"
+t13=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); guard_case "$t13" 19
+expect_yes "T13f: 19GB: ALERT:disk-emergency" grep -q 'ALERT:disk-emergency' "$t13/resource-watch.log"
+expect_yes "T13f: 19GB: the emergency flag exists" test -f "$t13/state/disk-emergency"
+expect_yes "T13f: the flag holds the epoch and the free GB" \
+  awk 'NR==1 { exit !($1 ~ /^[0-9]+$/ && $2 == "19.0") }' "$t13/state/disk-emergency"
+expect_yes "T13f: and notifies" grep -q 'EMERGENCY' "$t13/osascript"
+expect_yes "T13f: the act still runs, with disk-low too" \
+  sh -c "grep -q '^janitor' '$t13/calls' && grep -q 'ALERT:disk-low' '$t13/resource-watch.log'"
+guard_case "$t13" 25
+expect_no  "T13g: back at 25GB the emergency flag is removed" test -e "$t13/state/disk-emergency"
+t13=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); guard_case "$t13" 19 CC_RW_DISK_EMERGENCY_GB=0
+expect_no  "T13h: CC_RW_DISK_EMERGENCY_GB=0 disables the flag" test -e "$t13/state/disk-emergency"
+
+# ---------------------------------------------------------------------------
+# T14: the act is detached and the round returns at once; a second round does not start another
+# ---------------------------------------------------------------------------
+t14=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+t14_start=$(date +%s)
+GUARD_NOWAIT=1 guard_case "$t14" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh"
+t14_secs=$(( $(date +%s) - t14_start ))
+t14_pid=$(cat "$t14/state/disk-act.lock/pid" 2>/dev/null || true)
+expect_yes "T14a: the round returns within 5s while the act hangs (${t14_secs}s)" test "$t14_secs" -le 5
+expect_yes "T14a: the lock names the act's pid" test -n "$t14_pid"
+expect_yes "T14a: the act is alive after the round exited" kill -0 "${t14_pid:-0}"
+expect_yes "T14a: and leads its own process group, off the launchd job's" \
+  test "$(ps -o pgid= -p "${t14_pid:-0}" | tr -d ' ')" = "$t14_pid"
+expect_yes "T14a: its command line is resource-watch --act" \
+  sh -c "ps -o command= -p '${t14_pid:-0}' | grep -q 'resource-watch.sh --act'"
+expect_yes "T14a: the round logged ACT:started with that pid" grep -q "ACT:started:${t14_pid}" "$t14/resource-watch.log"
+i=0; while [ "$(wc -l < "$t14/pids" 2>/dev/null || echo 0)" -lt 2 ] && [ "$i" -lt 50 ]; do sleep 0.2; i=$((i+1)); done
+rm -f "$t14/state/cooldown-disk-act"   # past the cooldown: only the lock may stop a second act
+GUARD_NOWAIT=1 guard_case "$t14" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh"
+expect_yes "T14b: a second round while the act runs starts no other" test "$(grep -c '^janitor' "$t14/calls")" -eq 1
+expect_yes "T14b: and logs ACT:running with the same pid" grep -q "ACT:running:${t14_pid}" "$t14/resource-watch.log"
+expect_yes "T14b: it still samples (two snapshot lines)" test "$(grep -c 'disk_free=' "$t14/resource-watch.log")" -eq 2
+
+# ---------------------------------------------------------------------------
+# T15: past CC_RW_ACT_MAX_SECONDS the next round ends exactly the act's recorded tree
+# ---------------------------------------------------------------------------
+sleep 300 &
+t15_decoy=$!
+echo "$(( $(date +%s) - 6000 ))" > "$t14/state/disk-act.lock/started"
+t15_tree="$t14_pid $(tr '\n' ' ' < "$t14/pids")"
+GUARD_NOWAIT=1 guard_case "$t14" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh" CC_RW_ACT_KILL_GRACE_SECS=2
+t15_alive=""
+for p in $t15_tree; do kill -0 "$p" 2>/dev/null && t15_alive="$t15_alive $p"; done
+expect_yes "T15a: every pid of the act's tree is gone (${t15_tree})" test -z "$t15_alive"
+expect_yes "T15a: an unrelated sleep of the same name lives" kill -0 "$t15_decoy"
+expect_yes "T15a: ERROR names the act and its tree" grep -q "ERROR disk act pid ${t14_pid} has run" "$t14/resource-watch.log"
+expect_yes "T15a: the snapshot line carries ALERT:disk-act-overrun" grep -q 'ALERT:disk-act-overrun' "$t14/resource-watch.log"
+expect_yes "T15a: and it notifies" grep -q 'disk-act-overrun' "$t14/osascript"
+expect_yes "T15a: the lock is released" test ! -e "$t14/state/disk-act.lock"
+expect_yes "T15a: no new act starts in the same round" test "$(grep -c '^janitor' "$t14/calls")" -eq 1
+kill "$t15_decoy" 2>/dev/null; wait "$t15_decoy" 2>/dev/null || true
+for p in $t15_alive; do kill -KILL "$p" 2>/dev/null || true; done
+
+t15b=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+GUARD_NOWAIT=1 guard_case "$t15b" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh"
+t15b_pid=$(cat "$t15b/state/disk-act.lock/pid" 2>/dev/null || true)
+echo "$(( $(date +%s) - 6000 ))" > "$t15b/state/disk-act.lock/started"
+GUARD_NOWAIT=1 guard_case "$t15b" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh" CC_RW_ACT_MAX_SECONDS=0
+expect_yes "T15b: CC_RW_ACT_MAX_SECONDS=0 leaves a long act running" kill -0 "${t15b_pid:-0}"
+i=0; while [ "$(wc -l < "$t15b/pids" 2>/dev/null || echo 0)" -lt 2 ] && [ "$i" -lt 50 ]; do sleep 0.2; i=$((i+1)); done
+GUARD_NOWAIT=1 guard_case "$t15b" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh" CC_RW_ACT_KILL_GRACE_SECS=1
+for p in ${t15b_pid:-} $(cat "$t15b/pids" 2>/dev/null); do kill -KILL "$p" 2>/dev/null || true; done
+
+# ---------------------------------------------------------------------------
+# T16: a stale lock is taken over; a pid that is not an act is never signalled
+# ---------------------------------------------------------------------------
+bash -c 'exit 0' &
+t16_dead=$!
+wait "$t16_dead" || true
+t16=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkdir -p "$t16/state/disk-act.lock"
+echo "$t16_dead" > "$t16/state/disk-act.lock/pid"; echo "$(( $(date +%s) - 100 ))" > "$t16/state/disk-act.lock/started"
+guard_case "$t16" 30
+expect_yes "T16a: a dead pid's lock is logged stale" grep -q "WARN disk act lock stale (pid ${t16_dead}" "$t16/resource-watch.log"
+expect_yes "T16a: and the round starts a new act" grep -q '^janitor' "$t16/calls"
+expect_yes "T16a: which releases the lock when done" test ! -e "$t16/state/disk-act.lock"
+
+sleep 300 &
+t16_other=$!
+t16b=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkdir -p "$t16b/state/disk-act.lock"
+echo "$t16_other" > "$t16b/state/disk-act.lock/pid"; echo "$(( $(date +%s) - 9000 ))" > "$t16b/state/disk-act.lock/started"
+guard_case "$t16b" 30 CC_RW_ACT_KILL_GRACE_SECS=1
+expect_yes "T16b: a live pid that is not an act is stale, not an overrun" grep -q 'WARN disk act lock stale' "$t16b/resource-watch.log"
+expect_no  "T16b: no overrun is raised for it" grep -q 'ALERT:disk-act-overrun' "$t16b/resource-watch.log"
+expect_yes "T16b: and it is never signalled" kill -0 "$t16_other"
+expect_yes "T16b: the new act runs" grep -q '^janitor' "$t16b/calls"
+kill "$t16_other" 2>/dev/null; wait "$t16_other" 2>/dev/null || true
+
+t16c=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkdir -p "$t16c/state/disk-act.lock"
+echo "$(date +%s)" > "$t16c/state/disk-act.lock/started"
+GUARD_NOWAIT=1 guard_case "$t16c" 30
+expect_no  "T16c: a lock claimed just now with no pid yet is a spawn in flight" grep -q '^janitor' "$t16c/calls"
+expect_yes "T16c: logged as running" grep -q 'ACT:running:spawning' "$t16c/resource-watch.log"
+echo "$(( $(date +%s) - 200 ))" > "$t16c/state/disk-act.lock/started"
+guard_case "$t16c" 30
+expect_yes "T16c: the same lock 200s old is stale and taken over" grep -q '^janitor' "$t16c/calls"
+
+# Two rounds racing past the supervisor: the mkdir claim alone must keep the second out.
+t16d=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkdir -p "$t16d/state/disk-act.lock"
+t16d_rc=0
+(
+  export CC_RW_LOG="$t16d/resource-watch.log" CC_RW_STATE_DIR="$t16d/state" CC_RW_TEST_CALLS="$t16d/calls"
+  export CC_RW_JANITOR_SCRIPT="$guard_dir/janitor.sh" CC_RW_RECLAIM_SCRIPT="$guard_dir/reclaim.sh"
+  source "$ROOT_DIR/shell/resource-watch.sh"
+  _cc_rw_disk_act 30 "$(date +%s)"
+) || t16d_rc=$?
+sleep 1
+expect_yes "T16d: a claim against an existing lock directory fails" test "$t16d_rc" -ne 0
+expect_no  "T16d: and starts no act" test -s "$t16d/calls"
+expect_no  "T16d: nor touches the cooldown stamp" test -e "$t16d/state/cooldown-disk-act"
+
+# ---------------------------------------------------------------------------
+# T17: D7 write rate over the last ~60 minutes; >10GB/h alerts, >20GB/h flags, cleared below
+# ---------------------------------------------------------------------------
+rate_seed() {
+  local dir
+  dir=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+  mkdir -p "$dir/state"
+  printf '%s\n' "$@" | tr ' ' '\t' > "$dir/state/disk-free-samples.tsv"
+  echo "$dir"
+}
+t17_now=$(date +%s)
+t17a=$(rate_seed "$((t17_now - 3600)) $((130 * GB))")
+guard_case "$t17a" 100
+expect_yes "T17a: 30GB in an hour logs ALERT:disk-rate" grep -q 'ALERT:disk-rate' "$t17a/resource-watch.log"
+expect_yes "T17a: with the rate on the line" grep -qE 'disk_rate=(29\.9|30\.0)GB/h' "$t17a/resource-watch.log"
+expect_yes "T17a: and writes the disk-rate-high flag" test -f "$t17a/state/disk-rate-high"
+expect_yes "T17a: and notifies" grep -q 'GB/h' "$t17a/osascript"
+expect_yes "T17a: the sample is appended as epoch<TAB>free KB" \
+  awk -F'\t' 'END { exit !(NF == 2 && $2 == 100 * 1048576) }' "$t17a/state/disk-free-samples.tsv"
+printf '%s\t%s\n' "$((t17_now - 3500))" "$((105 * GB))" > "$t17a/state/disk-free-samples.tsv"
+guard_case "$t17a" 100
+expect_no  "T17b: a 5GB/h rate clears the flag" test -e "$t17a/state/disk-rate-high"
+expect_no  "T17b: and raises no new ALERT:disk-rate" test "$(grep -c 'ALERT:disk-rate' "$t17a/resource-watch.log")" -gt 1
+
+t17c=$(rate_seed "$((t17_now - 3600)) $((115 * GB))")
+guard_case "$t17c" 100
+expect_yes "T17c: 15GB/h alerts" grep -q 'ALERT:disk-rate' "$t17c/resource-watch.log"
+expect_no  "T17c: but sets no flag" test -e "$t17c/state/disk-rate-high"
+
+t17d=$(rate_seed "$((t17_now - 3500)) $((120 * GB))" "$((t17_now - 1800)) $((100 * GB))")
+guard_case "$t17d" 100
+expect_yes "T17d: the oldest sample in the window is the one compared (20GB in 3500s > 20GB/h)" \
+  test -f "$t17d/state/disk-rate-high"
+
+t17e=$(rate_seed "$((t17_now - 7200)) $((200 * GB))" "$((t17_now - 600)) $((110 * GB))")
+touch "$t17e/state/disk-rate-high"
+guard_case "$t17e" 100
+expect_no  "T17e: no sample 20-65 minutes old means no rate" grep -qE 'disk_rate=|ALERT:disk-rate' "$t17e/resource-watch.log"
+expect_yes "T17e: and an unmeasured round leaves the flag as it was" test -f "$t17e/state/disk-rate-high"
+
+t17f=$(rate_seed "$((t17_now - 3600)) $((80 * GB))")
+touch "$t17f/state/disk-rate-high"
+guard_case "$t17f" 100
+expect_no  "T17f: free space growing is no alert" grep -q 'ALERT:disk-rate' "$t17f/resource-watch.log"
+expect_no  "T17f: and clears the flag" test -e "$t17f/state/disk-rate-high"
+
+t17g=$(rate_seed "$((t17_now - 200000)) $((100 * GB))" "$((t17_now - 180000)) $((100 * GB))" "$((t17_now - 1000)) $((100 * GB))")
+guard_case "$t17g" 100
+expect_yes "T17g: samples older than 48h are dropped (2 lines kept)" \
+  test "$(wc -l < "$t17g/state/disk-free-samples.tsv")" -eq 2
+
+t17h=$(rate_seed "$((t17_now - 3600)) $((130 * GB))")
+guard_case "$t17h" 100 CC_RW_RATE_ALERT_GBH=0 CC_RW_RATE_FLAG_GBH=0
+expect_no  "T17h: CC_RW_RATE_*_GBH=0 disable alert and flag" \
+  sh -c "grep -q 'ALERT:disk-rate' '$t17h/resource-watch.log' || test -e '$t17h/state/disk-rate-high'"
+
+# ---------------------------------------------------------------------------
+# T18: the go cache cap is bounded, so a hung cap cannot hold the round
+# ---------------------------------------------------------------------------
+cat > "$guard_dir/reclaim-hang.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "$$" >> "$CC_RW_TEST_PIDS"
+sleep 300 &
+echo "$!" >> "$CC_RW_TEST_PIDS"
+wait
+STUB
+t18=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+t18_start=$(date +%s)
+guard_case "$t18" 100 CC_RW_RECLAIM_SCRIPT="$guard_dir/reclaim-hang.sh" CC_RW_GO_CAP_MAX_SECONDS=1
+t18_secs=$(( $(date +%s) - t18_start ))
+t18_alive=""
+for p in $(cat "$t18/pids" 2>/dev/null); do kill -0 "$p" 2>/dev/null && t18_alive="$t18_alive $p"; done
+expect_yes "T18: a hung go cache cap is ended and the round returns within 10s (${t18_secs}s)" test "$t18_secs" -le 10
+expect_yes "T18: its pids are gone" test -z "$t18_alive"
+expect_yes "T18: and an ERROR says so" grep -q 'ERROR bash .*--go-cache-cap ran over 1s' "$t18/resource-watch.log"
+for p in $t18_alive; do kill -KILL "$p" 2>/dev/null || true; done
 
 if [ "$failures" -gt 0 ]; then
   printf "%s test failure(s)\n" "$failures"
