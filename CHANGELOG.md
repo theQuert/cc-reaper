@@ -3,6 +3,16 @@
 ## [Unreleased]
 
 ### Added
+- **`worktree-janitor` puts two trivial pins on probation, and honours a deny-list.** A top-level
+  `*.log` file and a `.claude/skills` or `.claude/commands` symlink into the primary checkout kept
+  landed worktrees (stima-api #5886). With `CC_WJ_NEW_RULES_MODE=spotcheck`, the default, every
+  decision stays as before, and what these rules would trim is appended to
+  `~/.cc-reaper/logs/spotcheck-worktree-janitor.log`; `auto` lets them decide. `CC_WJ_DENY_NAMES`
+  (default `homepage uiux verify-signin-redesign`) names trees nothing may trim or remove. A run
+  with nothing to trim answers that first. A budgeted sweep now examines each repository's
+  worktrees largest first (`CC_WJ_ORDER=largest`, the default; `path` is the old order), by the
+  sizes growth-watch and the janitor already measured, cached in `worktree-sizes.tsv`; no new
+  `du` pass, and every gate still applies to every tree.
 - **`disk-janitor`'s low-disk act reaches its tools, and prunes node-modules templates in spot-check mode.**
   The go cache hook defaulted to `~/.claude/hooks/reclaim-byproducts.sh`, which never existed, so
   the act logged "skipped" (stima-api #5886). It now defaults to the installed

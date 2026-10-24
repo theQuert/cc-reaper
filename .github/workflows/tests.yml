@@ -32,3 +32,7 @@ jobs:
         run: bash tests/worktree-janitor.sh
       - name: worktree-janitor-reclaim
         run: bash tests/worktree-janitor-reclaim.sh
+      - name: worktree-janitor-newrules
+        run: bash tests/worktree-janitor-newrules.sh
+      - name: worktree-janitor-order
+        run: bash tests/worktree-janitor-order.sh
