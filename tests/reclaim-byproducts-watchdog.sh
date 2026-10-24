@@ -214,6 +214,39 @@ OUT="$(_run "$LK" "$SCRIPT"; echo "rc=$?")"
 check "R3e: the full sweep does not take the go-cache lock" "$OUT" "sweep ended" "ALERT:byproducts-lock"
 kill -CONT "$G"; kill "$G" 2>/dev/null; wait "$G" 2>/dev/null
 
+# ---------------------------------------------------------------- R4: a newline in a name never leaves the root
+# A name with a newline, split into lines, gave a relative path that resolved against the cwd. Each
+# decoy below is an idle directory with a session id, in the cwd, exactly where such a fragment points.
+F="$WORK/r4"; fx "$F"
+mkdir -p "$F/cwd/$S1" "$F/cwd/$S2/$S3"
+touch -t "$OLD_TS" "$F/cwd/$S1" "$F/cwd/$S2/$S3" "$F/cwd/$S2"
+NL2="$F/scratch/proj/a
+$S1"                                   # newline at the second level -> "<uuid>"
+NL1="$F/scratch/b
+$S2"                                   # newline at the first level  -> "<uuid>/<uuid>"
+mkdir -p "$NL2" "$NL1/$S3"
+touch -t "$OLD_TS" "$NL2" "$NL1/$S3" "$NL1"
+OUT="$(cd "$F/cwd" && _run "$F" "$SCRIPT")"
+yes_ "R4a: a session-id directory in the cwd is never removed ($S1)" test -d "$F/cwd/$S1"
+yes_ "R4a: nor one two levels down ($S2/$S3)" test -d "$F/cwd/$S2/$S3"
+yes_ "R4a: the gate is never asked about a path outside the root" \
+  sh -c "! grep -v '^$F/scratch/' '$F/gate-calls'"
+check "R4b: a name with a newline is skipped and logged" "$OUT" "scratchpad skipped: .*newline"
+yes_ "R4b: and kept" test -d "$NL2"
+yes_ "R4c: the ordinary scratchpads beside it are still reaped" gone "$F" $S1
+
+# ---------------------------------------------------------------- R5: one alert cooldown per lock
+fx "$LK"; holder; H=$HP; stop_pid "$H"; holder; G=$HP; stop_pid "$G"
+mkdir -p "$LKDIR" "$GOLK"; echo "$H" > "$LKDIR/pid"; echo "$G" > "$GOLK/pid"; date +%s > "$LKDIR/started"; date +%s > "$GOLK/started"
+rm -f "$(STATE "$LK")"/cooldown-* 2>/dev/null
+OUT="$(_run "$LK" "$SCRIPT")"
+OUT="$(_run "$LK" "$SCRIPT" --go-cache-cap)"
+yes_ "R5: a stopped sweep holder and a stopped go-cache holder each notify once" \
+  test "$(cat "$LK/osascript-calls" 2>/dev/null | wc -l | tr -d ' ')" -eq 2
+OUT="$(_run "$LK" "$SCRIPT" --go-cache-cap)"
+yes_ "R5: and each keeps its own cooldown" test "$(cat "$LK/osascript-calls" 2>/dev/null | wc -l | tr -d ' ')" -eq 2
+kill -CONT "$H" "$G"; kill "$H" "$G" 2>/dev/null; wait "$H" "$G" 2>/dev/null
+
 echo
 echo "passed: $PASSED, failed: $FAILURES"
 [ "$FAILURES" -eq 0 ]

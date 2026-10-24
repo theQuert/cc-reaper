@@ -656,18 +656,27 @@ removal_precheck() {  # <dir> <class: old|new>
   [ "$2" = old ]
 }
 
-# Every entry under the scratch root, two levels down, one per line in byte order, starting after
-# the entry the cursor names and wrapping round to it, so a pass cut short by the time budget is
-# finished by the next run rather than restarted. An entry the cursor names that is gone (reaped)
-# still orders correctly; an unreadable or empty cursor starts at the top.
+# Every entry under the scratch root, two levels down, NUL-terminated, in byte order, starting
+# after the entry the cursor names and wrapping round to it, so a pass cut short by the time budget
+# is finished by the next run rather than restarted. An entry the cursor names that is gone
+# (reaped) still orders correctly; an unreadable or empty cursor starts at the top.
+#
+# Built from the glob and compared inside bash, never split on lines: a name with a newline split
+# into lines gives a fragment that is a RELATIVE path, resolved against the cwd, and an idle
+# session-id directory there would be judged and removed (review of 5d2024b). Run in a subshell
+# (process substitution), so the C locale it sets for the glob order and `[[ > ]]` stays here.
 scratch_order() {
-  local cur=""
+  local LC_ALL=C cur="" d rel
   [ -f "$SCRATCH_CURSOR" ] && cur="$(head -n 1 "$SCRATCH_CURSOR" 2>/dev/null)"
-  printf '%s\n' "$SCRATCH_ROOT"/*/* | LC_ALL=C sort | LC_ALL=C awk -v root="$SCRATCH_ROOT/" -v cur="$cur" '
-    { rel = substr($0, length(root) + 1) }
-    cur == "" || (rel "") > (cur "") { print; next }
-    { rest[++n] = $0 }
-    END { for (i = 1; i <= n; i++) print rest[i] }'
+  for d in "$SCRATCH_ROOT"/*/*; do
+    rel="${d#"$SCRATCH_ROOT"/}"
+    if [ -z "$cur" ] || [[ "$rel" > "$cur" ]]; then printf '%s\0' "$d"; fi
+  done
+  [ -n "$cur" ] || return 0
+  for d in "$SCRATCH_ROOT"/*/*; do
+    rel="${d#"$SCRATCH_ROOT"/}"
+    [[ "$rel" > "$cur" ]] || printf '%s\0' "$d"
+  done
 }
 
 reap_scratchpads() {
@@ -702,8 +711,16 @@ reap_scratchpads() {
   # before anything about the directory is judged, so a directory is either judged whole or not
   # reached, and one not reached is left exactly as it was.
   local entries=() phase_start=$SECONDS judged=0 last="" stopped_after=""
-  while IFS= read -r d; do entries+=("$d"); done < <(scratch_order)
+  while IFS= read -r -d '' d; do entries+=("$d"); done < <(scratch_order)
   for d in ${entries[@]+"${entries[@]}"}; do
+    # Inside the root, two levels down, and one line: anything else is never judged, never removed.
+    case "$d" in
+      *"
+"*) log "scratchpad skipped: a name under $SCRATCH_ROOT holds a newline; kept, never judged: $(printf '%s' "$d" | tr '\n' '?')"
+          kept=$((kept + 1)); continue ;;
+      "$SCRATCH_ROOT"/*/*) ;;
+      *) log "scratchpad skipped: $d is not under $SCRATCH_ROOT; never judged"; continue ;;
+    esac
     if [ "$SCRATCH_BUDGET_SECONDS" -gt 0 ] && [ "$judged" -gt 0 ] \
        && [ $((SECONDS - phase_start)) -ge "$SCRATCH_BUDGET_SECONDS" ]; then
       stopped_after=$last; break
@@ -1560,11 +1577,12 @@ lock_started() {
   printf '%s' "$s"
 }
 # An ERROR line carrying ALERT:byproducts-lock-<kind>, and a notification unless one for the same
-# kind went out within ALERT_COOLDOWN_SECS. Args: <kind> <message>
+# lock and kind went out within ALERT_COOLDOWN_SECS. Args: <kind> <message>
 lock_alert() {
   local kind="$1" msg="$2" stamp now mt
   log "byproducts: ERROR $msg ALERT:byproducts-lock-$kind"
-  stamp="$RB_STATE_DIR/cooldown-byproducts-lock-$kind"
+  # One cooldown per lock and kind: a held sweep must not silence a held go cache cap.
+  stamp="$RB_STATE_DIR/cooldown-${LOCK_DIR##*/}-$kind"
   now="$(date +%s)"
   mt="$(mtime_of "$stamp")"
   case "$mt" in ''|*[!0-9]*) ;; *) [ $((now - mt)) -lt "$ALERT_COOLDOWN_SECS" ] && return 0 ;; esac
