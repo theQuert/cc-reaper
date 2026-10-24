@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- **`disk-janitor`'s low-disk act reaches its tools, and prunes node-modules templates in spot-check mode.**
+  The go cache hook defaulted to `~/.claude/hooks/reclaim-byproducts.sh`, which never existed, so
+  the act logged "skipped" (stima-api #5886). It now defaults to the installed
+  `~/.cc-reaper/reclaim-byproducts.sh`, and a missing hook is an ERROR line in the log and the
+  alert. A new step drops node-modules templates unused for 7 days; it starts as
+  `CC_DJ_NEW_STEPS_MODE=spotcheck`, logging path, size and per-path lsof to
+  `~/.cc-reaper/logs/spotcheck-disk-janitor.log` and deleting nothing. Under 20GB free the act
+  cooldown is 3300s. CI: `tests` runs the disk and worktree janitor suites on macos-latest.
 - **`worktree-janitor` walks a directory an `archive:` pattern reaches, instead of pinning it.**
   git lists stima-api's ignored `.codex/evidence/` as one collapsed entry, so
   `archive:.codex/evidence` could not copy the records inside it and kept 25 landed worktrees
