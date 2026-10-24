@@ -3,7 +3,6 @@
 ## [Unreleased]
 
 ### Added
-<<<<<<< HEAD
 - **`worktree-janitor` puts two trivial pins on probation, and honours a deny-list.** A top-level
   `*.log` file and a `.claude/skills` or `.claude/commands` symlink into the primary checkout kept
   landed worktrees (stima-api #5886). With `CC_WJ_NEW_RULES_MODE=spotcheck`, the default, every
@@ -14,7 +13,6 @@
   worktrees largest first (`CC_WJ_ORDER=largest`, the default; `path` is the old order), by the
   sizes growth-watch and the janitor already measured, cached in `worktree-sizes.tsv`; no new
   `du` pass, and every gate still applies to every tree.
-=======
 - **`disk-janitor`'s low-disk act reaches its tools, and prunes node-modules templates in spot-check mode.**
   The go cache hook defaulted to `~/.claude/hooks/reclaim-byproducts.sh`, which never existed, so
   the act logged "skipped" (stima-api #5886). It now defaults to the installed
@@ -28,7 +26,6 @@
   `README`, `trim.txt` or a symlink) unused for `CC_DJ_GO_BUILD_MAX_AGE_MIN` (120, minimum 60)
   minutes, by mtime, which Go refreshes hourly on use. Same `CC_DJ_NEW_STEPS_MODE` gate: spot-check
   logs count, bytes and run id and deletes nothing; auto deletes without a per-file lsof.
->>>>>>> origin/main
 - **`worktree-janitor` walks a directory an `archive:` pattern reaches, instead of pinning it.**
   git lists stima-api's ignored `.codex/evidence/` as one collapsed entry, so
   `archive:.codex/evidence` could not copy the records inside it and kept 25 landed worktrees
