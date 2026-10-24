@@ -118,6 +118,7 @@ bash tests/disk-guard.sh             # go cache LRU cap, session-temp reaper (ta
 bash tests/worktree-janitor.sh         # Validate worktree gates, landing proofs, declarations, session mode, lock
 bash tests/worktree-janitor-newrules.sh # Pins on probation (spot-check vs auto), deny-list, nothing-to-trim first
 bash tests/worktree-janitor-order.sh    # Largest first by cached sizes, the per-cycle cursor, CC_WJ_ORDER=path
+bash tests/worktree-janitor-unknown-session.sh  # An unreadable session record keeps only the trees it names, CC_WJ_UNKNOWN_SESSION_SCOPE
 bash -n shell/claude-cleanup.sh        # Syntax check
 bash -n shell/cc-monitor.sh            # Syntax check
 bash -n hooks/stop-cleanup-orphans.sh  # Syntax check

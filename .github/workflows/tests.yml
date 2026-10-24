@@ -36,3 +36,7 @@ jobs:
         run: bash tests/worktree-janitor-newrules.sh
       - name: worktree-janitor-order
         run: bash tests/worktree-janitor-order.sh
+      - name: worktree-janitor-unknown-session
+        run: bash tests/worktree-janitor-unknown-session.sh
+      - name: worktree-active-sessions
+        run: bash tests/worktree-active-sessions.sh
