@@ -13,6 +13,15 @@
   worktrees largest first (`CC_WJ_ORDER=largest`, the default; `path` is the old order), by the
   sizes growth-watch and the janitor already measured, cached in `worktree-sizes.tsv`; no new
   `du` pass, and every gate still applies to every tree.
+  A session record the janitor cannot read (a torn `<pid>.json`, a Codex claim with no task row,
+  an unreadable transcript) no longer keeps every worktree: on 2026-10-24 eight such records each
+  kept all ~120 trees, and the 10:35 sweep freed 0 B. With `CC_WJ_UNKNOWN_SESSION_SCOPE=tree`,
+  the default, it keeps the trees its readable remains name (a process cwd, a raw `cwd` string,
+  a Claude project directory) and every tree active within the session grace, as
+  `KEEP(session-unknown:<record>)`, logged once per record with the trees it kept; every other
+  gate is unchanged, and a tree bound for `refs/wip` stays kept. It is on probation too: under
+  `spotcheck` decisions stay as before and the trees it would free are logged as
+  `rule=session-unknown-per-tree`; `global` restores the old behaviour.
 - **`disk-janitor`'s low-disk act reaches its tools, and prunes node-modules templates in spot-check mode.**
   The go cache hook defaulted to `~/.claude/hooks/reclaim-byproducts.sh`, which never existed, so
   the act logged "skipped" (stima-api #5886). It now defaults to the installed

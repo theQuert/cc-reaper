@@ -18,7 +18,7 @@ A worktree may go only when **all** of these hold, and a check that cannot run k
 |---|---|---|
 | Contents | Does `git status --porcelain --ignored` show only things a command rebuilds? | Plain `--porcelain` hides ignored files, and removal deletes them: a `.env`, a local database, proof logs. |
 | Holders | Does any process have its cwd in the worktree, **or any file in it open**? | A session edits a task worktree through `git -C` and absolute paths while its own cwd is elsewhere. A cwd-only check sees nobody. And lsof escapes names: `\xNN` for a byte it will not print, `\\` for a backslash. No locale avoids it - under en_US.UTF-8 it still escapes a zero-width space - so scan with `LC_ALL=C`, decode the escapes back to bytes, and compare byte for byte. A path with a control character cannot be matched that way; count it as held. |
-| Harness claim | Does any verified-live Claude session or Codex writer lock claim it by cwd or a structured tool call in its current two human user turns? | The desktop host can keep its registry and rollout open while its process cwd is `/` or the primary checkout. An unbounded transcript search pins every historical worktree forever; the two-turn window preserves a follow-up before its first tool call without doing that. Transcript files can exceed 100 MB, so inspect them backwards from the tail and stop at the second user boundary instead of rereading their whole history for every candidate. A stale PID file or unopened lock is history, not a claim; an open claim that cannot be mapped is uncertainty and keeps every worktree. |
+| Harness claim | Does any verified-live Claude session or Codex writer lock claim it by cwd or a structured tool call in its current two human user turns? | The desktop host can keep its registry and rollout open while its process cwd is `/` or the primary checkout. An unbounded transcript search pins every historical worktree forever; the two-turn window preserves a follow-up before its first tool call without doing that. Transcript files can exceed 100 MB, so inspect them backwards from the tail and stop at the second user boundary instead of rereading their whole history for every candidate. A stale PID file or unopened lock is history, not a claim; an open claim that cannot be mapped is uncertainty and keeps the worktrees it could be about (below, "A record that cannot be read"). |
 | Landed | Has the work reached the **freshly fetched** base branch? | "Clean" says nothing about "finished". And in a squash-merging repository a landed branch is never an ancestor of its base. |
 | Idle | Was nothing in the worktree, **or its `HEAD`, `index` and `logs/`**, modified within the last N hours? | Clean, unheld and landed are all true one minute after a commit, and a `git switch` touches only the administrative files. Use `find -H`: BSD find does not follow a worktree path that is a symlink. Run your own `git status` with `--no-optional-locks`, or it rewrites the index you are judging. |
 | Git's own state | Is the worktree locked, or does it hold a populated submodule? | `git worktree lock` is an explicit request to keep, and Claude Code locks the worktrees it creates for agents. A submodule's dirty state is invisible to the outer status. |
@@ -256,6 +256,55 @@ removal sweep and the trim alike when its directory name or branch contains a na
 live Claude session registered under that name stands at or under it. A live session's tool
 calls already veto through the ordinary claim gate; this one holds whatever the claim windows
 say.
+
+### A record that cannot be read keeps the trees it could be about
+
+Until 2026-10-24 one session record the janitor could not read kept every worktree on the
+machine: a torn `53453.json`, a Codex claim whose task was not yet in `state_5.sqlite`, a
+transcript `find` that failed on a full disk. That day eight such records each blinded a sweep,
+and the 10:35 run kept all ~120 trees and freed 0 B.
+
+With `CC_WJ_UNKNOWN_SESSION_SCOPE=tree` (the default) such a record keeps only the worktrees it
+could be about. What can still be read of it attributes it:
+
+| Record | Attributed by |
+|---|---|
+| a live Claude registry record (`<pid>.json`) that will not parse, has a bad pid or session id, or a cwd that does not resolve | the cwd of that pid (`lsof -p <pid> -d cwd`) and any `"cwd"` string in its raw text |
+| a live Claude session whose transcript cannot be located, is not unique or is unreadable | its cwd (already a claim) and the project directories of its transcripts |
+| a recent Claude transcript that cannot be opened, has no activity time or no cwd | its project directory under `~/.claude/projects`, which encodes the cwd it started in (every byte but `[A-Za-z0-9]` becomes `-`); a prefix match, so a sibling whose name extends the tree's is kept too |
+| an active Codex writer lock with no single task row or rollout | every cwd its state rows name, the `cwd` in its rollout's first record, and the cwd of each process holding the lock |
+| a recent Codex row that cannot be used | its `cwd` column |
+| a transcript that fails to parse when a candidate asks it | its own session's cwd claims and, for Claude, its project directory; it is then dropped from the lists, so later candidates do not ask it again |
+
+Whatever could not be read may still name any path (a tool call can), so every such record
+also keeps each tree whose own recent signals - an entry at its top level, its git index,
+`HEAD` or `HEAD` reflog - changed within the session grace (at least one hour). An older tree
+nothing names is judged by its other gates as usual. Every other keep gate still applies to
+every tree: holders, the deny-list, launchd targets, landing, git state, dirty and unpushed
+work. A tree whose edits would first go to `refs/wip` stays kept while any record is unknown,
+since a snapshot taken while an unreadable session may be writing it proves nothing. A registry
+that cannot be listed at all, or a missing `jq` or `sqlite3`, still keeps every worktree: no
+record of it was read, so none can be attributed.
+
+A tree kept this way reads `KEEP(session-unknown:<record>)`, with records named like
+`claude-session:53453.json`, `claude-transcript:<session id>` or `codex-claim:<thread id>`. Each
+record is logged once per phase, to stderr and the janitor log, with what attributed it and the
+trees it kept:
+
+```
+worktree-janitor: KEEP(session-unknown:claude-transcript:b627c13d-...) scope=tree: recent Claude transcript b627c13d-....jsonl is unreadable (Permission denied); about: projdir=-Users-me-GitHub-repo--claude-worktrees-a, and trees active within the session grace; kept 2 worktree(s): /Users/me/GitHub/repo/.claude/worktrees/a /Users/me/GitHub/repo/.claude/worktrees/c
+```
+
+The run still exits 1 when a record could not be read. The same per-tree question is asked
+again against the fresh scans right before each removal and each trimmed directory.
+
+The rule changes which trees may be removed, so it is on probation like the two pins above:
+under `CC_WJ_NEW_RULES_MODE=spotcheck` (the default) every decision stays as `global` makes it,
+and each tree the per-tree rule would free is appended to `CC_WJ_SPOTCHECK_LOG` with
+`rule=session-unknown-per-tree`, with a `spotcheck:` line under its unchanged
+`KEEP(active-session)`. `auto` lets it decide. `CC_WJ_UNKNOWN_SESSION_SCOPE=global` (or any value
+but `tree`) is the old behaviour: the first record that cannot be read keeps every worktree,
+whatever `CC_WJ_NEW_RULES_MODE` says.
 
 ## Where to run it
 
