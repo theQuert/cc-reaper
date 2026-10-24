@@ -5,6 +5,7 @@ on:
     branches: [main]
 permissions:
   contents: read
+  pull-requests: read
 jobs:
   suites:
     # The scripts target macOS (BSD stat, launchd), so the suites run there. The repository is public:
@@ -25,6 +26,9 @@ jobs:
       - name: disk-janitor
         run: bash tests/disk-janitor.sh
       - name: worktree-janitor
+        # The no-pull-request probe calibrates against this repository's real pull requests via gh.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: bash tests/worktree-janitor.sh
       - name: worktree-janitor-reclaim
         run: bash tests/worktree-janitor-reclaim.sh
