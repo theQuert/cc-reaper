@@ -1954,7 +1954,6 @@ build_fixture "$LK"
 sleep 300 & HOLDER=$!
 mkdir -p "$LKDIR"; echo "$HOLDER" > "$LKDIR/pid"
 OUT="$(run_real "$LK" "$SCRIPT"; echo "rc=$?")"
-kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 check "a live holder: the second instance says so and exits 0" "$OUT" "another sweep, pid $HOLDER, is running; this one exits" "sweep started"
 check "a live holder: exit status is 0" "$OUT" "rc=0"
 [ -d "$LK/scratch/proj/11111111-1111-1111-1111-111111111111" ] && pass "a live holder: nothing was swept" || fail "swept while another sweep held the lock"
@@ -1966,6 +1965,7 @@ OUT="$(_run "$LK" "$SCRIPT" --go-cache; echo "rc=$?")"
 check "a live holder blocks --go-cache too" "$OUT" "another sweep, pid $HOLDER" "go cache only"
 OUT="$(run "$LK" "$SCRIPT")"
 check "a dry run needs no lock and runs beside a live holder" "$OUT" "sweep started" "another sweep"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 
 # Stale: the holder is dead now.
 build_fixture "$LK"

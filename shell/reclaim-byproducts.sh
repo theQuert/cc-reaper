@@ -348,6 +348,7 @@ sweep_ended() {
     *) delta="free on $DATA_VOLUME $(as_gb "$FREE_BEFORE") -> $(as_gb "$after") ($(awk -v a="$FREE_BEFORE" -v b="$after" 'BEGIN{d=(b-a)/1048576; if (d>-0.05 && d<0.05) d=0; printf "%+.1fGB", d}'))" ;;
   esac
   log "== byproducts sweep ended $(now_iso) after ${SECONDS}s; $delta =="
+  release_lock   # this trap replaced acquire_lock's EXIT trap, so it releases the lock itself
 }
 
 # A whole number of hours, refused rather than silently reinterpreted. `off` in
@@ -1554,7 +1555,7 @@ MODE=reap
 rotate_log
 FREE_BEFORE="$(free_kb)"
 log "== byproducts sweep started $(now_iso) (${MODE}, ${GATE} gate, pid $$) =="
-trap 'sweep_ended; release_lock' EXIT
+trap sweep_ended EXIT
 
 if [ ! -r "$PATH_IN_USE" ]; then
   # Without the liveness gate there is no safe scratchpad rule, and reaping the other
