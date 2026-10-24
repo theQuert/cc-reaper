@@ -30,14 +30,25 @@ Environment:
   CC_RW_DISK_MIN_PCT   Disk free % below which alert fires (default: 15)
   CC_RW_MEM_MIN_PCT    Memory free % below which alert fires when compressor also high (default: 5)
   CC_RW_DISK_DROP_GB   Disk free fall in GB, against a 25-45 minute old sample, that alerts; 0 disables (default: 10)
-  CC_RW_DISK_ALERT_GB  Disk free GB below which ALERT:disk-low fires (default: 40); 0 disables
-  CC_RW_DISK_ACT_GB    Disk free GB below which the reclaim runs by itself: worktree-janitor
-                       --scheduled, then reclaim-byproducts (default: 25); 0 disables
-  CC_RW_ACT_COOLDOWN_SECS  Seconds between two reclaim runs (default: 1800)
+  CC_RW_DISK_ALERT_GB  Disk free GB below which ALERT:disk-low fires (default: 60); 0 disables
+  CC_RW_DISK_ACT_GB    Disk free GB below which the reclaim starts by itself, detached: worktree-janitor
+                       --scheduled, then reclaim-byproducts (default: 40); 0 disables
+  CC_RW_DISK_EMERGENCY_GB  Disk free GB below which ALERT:disk-emergency fires and the flag file
+                       <state>/disk-emergency exists, for other tools to read (default: 20); 0 disables
+  CC_RW_ACT_COOLDOWN_SECS  Seconds between two reclaim starts (default: 1800)
+  CC_RW_ACT_MAX_SECONDS    A reclaim running longer is ended, its process tree by pid, by the next
+                       round, with ERROR and ALERT:disk-act-overrun (default: 5400); 0 disables the cap
+  CC_RW_ACT_KILL_GRACE_SECS  Seconds between TERM and KILL when ending an overrun (default: 10)
+  CC_RW_RATE_WINDOW_SECS   Span the disk write rate is measured over (default: 3600)
+  CC_RW_RATE_ALERT_GBH     Disk free falling faster than this many GB/h raises ALERT:disk-rate (default: 10); 0 disables
+  CC_RW_RATE_FLAG_GBH      Falling faster than this many GB/h also writes <state>/disk-rate-high,
+                       removed once a measured rate is at or below it (default: 20); 0 disables
+  CC_RW_GO_CAP_MAX_SECONDS The go cache cap is ended, by pid, past this many seconds (default: 120); 0 = no bound
   CC_RW_RECLAIM_SCRIPT     reclaim-byproducts.sh to run (default: ~/.cc-reaper/reclaim-byproducts.sh)
   CC_RW_JANITOR_SCRIPT     worktree-janitor.sh to run (default: ~/.cc-reaper/worktree-janitor.sh)
   CC_RW_GO_CAP         Set to 0 to stop the every-run `reclaim-byproducts.sh --go-cache-cap` (default: 1)
-Reclaim output goes to resource-watch-act.log beside CC_RW_LOG.
+Reclaim output goes to resource-watch-act.log beside CC_RW_LOG. Each round appends
+`<epoch>\t<free KB>` to <state>/disk-free-samples.tsv (last 48 hours kept).
 EOF
 }
 
@@ -188,7 +199,7 @@ _cc_rw_collect_memory() {
   }'
 }
 
-# Returns: disk_free_gb disk_free_pct
+# Returns: disk_free_gb disk_free_pct disk_free_kb
 _cc_rw_collect_disk() {
   df -k /System/Volumes/Data 2>/dev/null \
     | awk 'NR==2 {
@@ -198,7 +209,7 @@ _cc_rw_collect_disk() {
         used_pct = capacity + 0
         free_pct = 100 - used_pct
         free_gb  = avail / (1024*1024)
-        printf "%.1f %.1f\n", free_gb, free_pct
+        printf "%.1f %.1f %.0f\n", free_gb, free_pct, avail
       }'
 }
 
@@ -220,6 +231,37 @@ _cc_rw_disk_drop() {
   { [ -f "$file" ] && tail -n 11 "$file"; printf '%s %s\n' "$now" "$free"; } > "$file.tmp" 2>/dev/null \
     && mv -f "$file.tmp" "$file" 2>/dev/null
   return 0
+}
+
+# D7, the write rate (stima-api #5886). The drop alert above compares two samples; this one
+# answers "how fast is the disk filling", which is what decides whether a reclaim can still
+# finish in time. On 2026-10-24 free space went from 54.5 GB to 23.5 GB in 73 minutes, about
+# 25 GB/h, so at the 40 GB act line a run has roughly 80 minutes before 20 GB is gone.
+#
+# Every round appends `<epoch>\t<free KB>` to the samples file and keeps 48 hours (about 288
+# lines at the ten-minute cadence). The rate is taken against the OLDEST sample whose age is
+# between a third of the window and the window plus five minutes of launchd drift, so a
+# gap (sleep, a stalled round) yields no rate rather than one averaged over hours. Printed in
+# GB/h with consumption positive (a reclaim prints a negative rate); nothing when no sample
+# qualifies. Args: <samples file> <now epoch> <free KB> <window secs> <keep secs>
+_cc_rw_disk_rate() {
+  local file=$1 now=$2 kb=$3 win=$4 keep=$5
+  [[ "$kb" =~ ^[0-9]+$ ]] || return 0
+  [ -f "$file" ] && awk -v now="$now" -v kb="$kb" -v win="$win" '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      age = now - $1
+      if (age >= win / 3 && age <= win + 300 && age > 0 && (!found || $1 < best)) { best = $1; prev = $2; found = 1 }
+    }
+    END { if (found) printf "%.1f\n", (prev - kb) / 1048576 * 3600 / (now - best) }' "$file"
+  { [ -f "$file" ] && awk -v cut=$(( now - keep )) '$1 ~ /^[0-9]+$/ && $1 + 0 >= cut' "$file"
+    printf '%s\t%s\n' "$now" "$kb"; } > "$file.tmp" 2>/dev/null \
+    && mv -f "$file.tmp" "$file" 2>/dev/null
+  return 0
+}
+
+# 0 when number $1 is above limit $2 and the limit is on (> 0).
+_cc_rw_above() {
+  awk -v f="$1" -v l="$2" 'BEGIN { exit !(f ~ /^-?[0-9.]+$/ && l + 0 > 0 && f + 0 > l + 0) }'
 }
 
 # ---------------------------------------------------------------------------
@@ -279,40 +321,238 @@ _cc_rw_maybe_notify() {
 }
 
 # ---------------------------------------------------------------------------
-# Disk guard: below CC_RW_DISK_ACT_GB free, run the reclaim by itself
+# Disk guard: below CC_RW_DISK_ACT_GB free, start the reclaim by itself, detached
 # ---------------------------------------------------------------------------
+#
+# Tiers (stima-api #5886, EL-DISK-ROOTFIX-1356 D1). Measured on 2026-10-24: free space fell
+# about 25 GB/h at its peak (54.5 GB to 23.5 GB in 73 minutes). At the old 25 GB act line that
+# is an hour of headroom for a reclaim that ran 3h34m, so the lines move up:
+#   < CC_RW_DISK_ALERT_GB     (60) ALERT:disk-low: about 2h24m from empty at the peak rate
+#   < CC_RW_DISK_ACT_GB       (40) the reclaim starts, detached, once per CC_RW_ACT_COOLDOWN_SECS
+#   < CC_RW_DISK_EMERGENCY_GB (20) ALERT:disk-emergency and <state>/disk-emergency, a flag other
+#                                  tools read to stop starting heavy work; removed above the line
+#
+# Why detached (D1). The reclaim used to run in the foreground of this launchd job, so while it
+# ran launchd started no new round: on 2026-10-24 one act (pid 55146) ran 3h34m and there were
+# no samples, no go cache cap and no alerts from 10:35 on. Now the act is this script re-run as
+# `resource-watch.sh --act`, in its own process group (`set -m`), under nohup with stdin, stdout
+# and stderr off the job. launchd ends only the job's own process group when the job exits
+# (unless AbandonProcessGroup), so the act survives the round and the round returns at once.
+#
+# Single instance. <state>/disk-act.lock is a directory: mkdir is the atomic claim, made by the
+# round before it spawns; `started` holds the claim epoch and `pid` the act's own pid, written by
+# the act itself with noclobber. A later round reads it:
+#   - pid alive and its command line is a `resource-watch` `--act`: running; past
+#     CC_RW_ACT_MAX_SECONDS it is ended (ERROR line, ALERT:disk-act-overrun);
+#   - pid dead, or alive but not an act (a reused pid): stale, removed, the round may claim anew;
+#   - no pid yet: the spawn is in flight for 120 seconds, stale after that.
+# Ending an overrun walks the act's tree with `pgrep -P` from the recorded pid, sends TERM to
+# exactly those pids, waits CC_RW_ACT_KILL_GRACE_SECS and sends KILL to whichever of them is
+# still alive. Nothing is matched by name, so no other process can be hit.
 
 # 0 when $1 < $2 and $2 > 0 (a limit of 0 is "off"); also 1 for an unreadable $1.
 _cc_rw_below() {
   awk -v f="$1" -v l="$2" 'BEGIN { exit !(f ~ /^[0-9.]+$/ && l + 0 > 0 && f + 0 < l + 0) }'
 }
 
-# The reclaim, once per CC_RW_ACT_COOLDOWN_SECS. Foreground on purpose: launchd kills a job's
-# stray children when the job exits, so a backgrounded sweep would die with this run. The
-# stamp is touched BEFORE the work, so a sweep that overruns the cooldown is not started twice.
-# Order is the byproducts doc's: the worktree sweep first, because a reclaimed tree orphans
-# what reclaim-byproducts then collects.
+_cc_rw_act_lock() {
+  echo "$(_cc_rw_state_dir)/disk-act.lock"
+}
+
+_cc_rw_act_log() {
+  echo "$(dirname "$(_cc_rw_log_path)")/resource-watch-act.log"
+}
+
+# One line to the main log, so an ERROR is read where the snapshots are.
+_cc_rw_log_line() {
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$(_cc_rw_log_path)" 2>/dev/null || true
+}
+
+# 0 when pid $1 is alive and its command line is a resource-watch act, so a pid the system has
+# since handed to another process is never taken for one.
+_cc_rw_is_act_pid() {
+  local pid=$1 cmd
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd=$(ps -o command= -p "$pid" 2>/dev/null) || return 1
+  case "$cmd" in *resource-watch*" --act"*) return 0 ;; esac
+  return 1
+}
+
+# $1 and every descendant, parents first, one per line (`pgrep -P` breadth-first).
+_cc_rw_tree_pids() {
+  local queue=$1 next pid kid
+  while [ -n "$queue" ]; do
+    next=""
+    for pid in $queue; do
+      echo "$pid"
+      for kid in $(pgrep -P "$pid" 2>/dev/null); do next="$next $kid"; done
+    done
+    queue=${next# }
+  done
+}
+
+# 0 when pid $1 is alive; a zombie (exited, its parent not yet reaped it) counts as gone.
+_cc_rw_pid_alive() {
+  kill -0 "$1" 2>/dev/null || return 1
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in Z*) return 1 ;; esac
+  return 0
+}
+
+# TERM the listed pids, wait up to <grace> seconds for them, KILL the ones still alive. Prints
+# the pids that needed KILL. Args: <grace secs> <pid>...
+_cc_rw_end_pids() {
+  local grace=$1 pid alive waited=0
+  shift
+  [ "$#" -gt 0 ] || return 0
+  kill -TERM "$@" 2>/dev/null
+  while :; do
+    alive=""
+    for pid in "$@"; do _cc_rw_pid_alive "$pid" && alive="$alive $pid"; done
+    [ -z "$alive" ] && return 0
+    [ "$waited" -ge "$grace" ] && break
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  # shellcheck disable=SC2086
+  kill -KILL $alive 2>/dev/null
+  echo "${alive# }"
+}
+
+_cc_rw_act_unlock() {
+  local lock
+  lock=$(_cc_rw_act_lock)
+  rm -f "$lock/pid" "$lock/started" 2>/dev/null
+  rmdir "$lock" 2>/dev/null
+  return 0
+}
+
+# Read the lock and act on it. Sets _CC_RW_ACT_STATE to one of
+#   idle      no act (a stale lock found here has been removed)
+#   running   an act is running inside its cap
+#   overrun   an act ran past CC_RW_ACT_MAX_SECONDS and has just been ended
+# and _CC_RW_ACT_PID to the act's pid when there is one. Args: <now epoch>
+_cc_rw_act_supervise() {
+  local now=$1 lock pid started age max grace tree killed
+  lock=$(_cc_rw_act_lock)
+  _CC_RW_ACT_STATE=idle
+  _CC_RW_ACT_PID=""
+  [ -d "$lock" ] || return 0
+  pid=$(cat "$lock/pid" 2>/dev/null)
+  started=$(cat "$lock/started" 2>/dev/null)
+  [[ "$started" =~ ^[0-9]+$ ]] \
+    || started=$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)
+  age=$(( now - started ))
+  if [ -z "$pid" ] && [ "$age" -lt 120 ]; then
+    _CC_RW_ACT_STATE=running
+    return 0
+  fi
+  if [ -z "$pid" ] || ! _cc_rw_is_act_pid "$pid"; then
+    _cc_rw_log_line "WARN disk act lock stale (pid ${pid:-none} is not a running act, claimed ${age}s ago); taken over"
+    _cc_rw_act_unlock
+    return 0
+  fi
+  _CC_RW_ACT_PID=$pid
+  max=$(_cc_rw_num CC_RW_ACT_MAX_SECONDS 5400)
+  max=${max%.*}
+  if [ "$max" -eq 0 ] || [ "$age" -le "$max" ]; then
+    _CC_RW_ACT_STATE=running
+    return 0
+  fi
+  grace=$(_cc_rw_num CC_RW_ACT_KILL_GRACE_SECS 10)
+  tree=$(_cc_rw_tree_pids "$pid" | tr '\n' ' ')
+  tree=${tree% }
+  _cc_rw_log_line "ERROR disk act pid ${pid} has run ${age}s, over CC_RW_ACT_MAX_SECONDS=${max}; ending its process tree: ${tree}"
+  # shellcheck disable=SC2086
+  killed=$(_cc_rw_end_pids "${grace%.*}" $tree)
+  _cc_rw_log_line "ERROR disk act pid ${pid} ended (TERM: ${tree}; KILL: ${killed:-none})"
+  printf '== disk act pid %s ended by resource-watch after %ss (over %ss) ==\n' "$pid" "$age" "$max" \
+    >> "$(_cc_rw_act_log)" 2>/dev/null
+  _cc_rw_act_unlock
+  _CC_RW_ACT_STATE=overrun
+  return 0
+}
+
+# Claim the lock and start the act, at most once per CC_RW_ACT_COOLDOWN_SECS. The cooldown stamp
+# is touched when the act starts. Returns 1 when nothing was started. Sets _CC_RW_ACT_PID.
 # Args: <free GB> <now epoch>
 _cc_rw_disk_act() {
-  local free=$1 now=$2 stamp mtime cool actlog janitor reclaim
+  local free=$1 now=$2 stamp mtime cool actlog lock self
   stamp="$(_cc_rw_state_dir)/cooldown-disk-act"
   cool=$(_cc_rw_num CC_RW_ACT_COOLDOWN_SECS 1800)
   if [ -f "$stamp" ]; then
     mtime=$(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp" 2>/dev/null || echo 0)
     [ $(( now - mtime )) -lt "${cool%.*}" ] && return 1
   fi
-  touch "$stamp" 2>/dev/null || return 1
-  actlog="$(dirname "$(_cc_rw_log_path)")/resource-watch-act.log"
+  lock=$(_cc_rw_act_lock)
+  mkdir "$lock" 2>/dev/null || return 1
+  printf '%s\n' "$now" > "$lock/started" 2>/dev/null
+  touch "$stamp" 2>/dev/null
+  actlog=$(_cc_rw_act_log)
+  _cc_rw_bound_log "$actlog"
+  self="${BASH_SOURCE[0]}"
+  _CC_RW_ACT_PID=$(
+    set -m
+    nohup "${BASH:-bash}" "$self" --act "$free" >> "$actlog" 2>&1 < /dev/null &
+    echo "$!"
+  )
+  return 0
+}
+
+# The act itself (`resource-watch.sh --act <free GB>`). Order is the byproducts doc's: the
+# worktree sweep first, because a reclaimed tree orphans what reclaim-byproducts then collects.
+_cc_rw_act_main() {
+  local free=$1 lock janitor reclaim
+  lock=$(_cc_rw_act_lock)
+  # The claim is the round's; the pid is ours. No lock, or a pid already there, means this
+  # process does not own the claim, so it does nothing.
+  ( set -C; printf '%s\n' "$$" > "$lock/pid" ) 2>/dev/null || {
+    echo "== disk act pid $$ not started: $lock is missing or already names an act =="
+    return 1
+  }
+  trap '_cc_rw_act_release' EXIT
   janitor="${CC_RW_JANITOR_SCRIPT:-$HOME/.cc-reaper/worktree-janitor.sh}"
   reclaim="${CC_RW_RECLAIM_SCRIPT:-$HOME/.cc-reaper/reclaim-byproducts.sh}"
-  _cc_rw_bound_log "$actlog"
-  {
-    echo "== disk act $(date '+%Y-%m-%dT%H:%M:%S') free=${free}GB =="
-    if [ -f "$janitor" ]; then bash "$janitor" --scheduled; echo "worktree-janitor --scheduled rc=$?"; else echo "no $janitor"; fi
-    if [ -f "$reclaim" ]; then bash "$reclaim"; echo "reclaim-byproducts rc=$?"; else echo "no $reclaim"; fi
-    echo "== disk act done $(date '+%Y-%m-%dT%H:%M:%S') free=$(_cc_rw_collect_disk | awk '{print $1}')GB =="
-  } >> "$actlog" 2>&1
+  echo "== disk act $(date '+%Y-%m-%dT%H:%M:%S') pid $$ free=${free}GB =="
+  if [ -f "$janitor" ]; then bash "$janitor" --scheduled; echo "worktree-janitor --scheduled rc=$?"; else echo "no $janitor"; fi
+  if [ -f "$reclaim" ]; then bash "$reclaim"; echo "reclaim-byproducts rc=$?"; else echo "no $reclaim"; fi
+  echo "== disk act done $(date '+%Y-%m-%dT%H:%M:%S') pid $$ free=$(_cc_rw_collect_disk | awk '{print $1}')GB =="
   return 0
+}
+
+# Remove the lock only while it still names this act: a round that ended this act may already
+# have removed it, and a newer act may hold a new one.
+_cc_rw_act_release() {
+  local lock
+  lock=$(_cc_rw_act_lock)
+  [ "$(cat "$lock/pid" 2>/dev/null)" = "$$" ] && _cc_rw_act_unlock
+  return 0
+}
+
+# Run a command in the background and wait for it at most <secs> seconds (0 = no bound), then
+# end its tree by pid as an overrun act is ended. Keeps the round short however the go cache cap
+# behaves. Args: <secs> <command>...
+_cc_rw_run_bounded() {
+  local cap=$1 pid ticks=0 tree killed rc=0
+  shift
+  if [ "${cap%.*}" -eq 0 ]; then "$@"; return $?; fi
+  "$@" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$ticks" -ge $(( ${cap%.*} * 5 )) ]; then
+      tree=$(_cc_rw_tree_pids "$pid" | tr '\n' ' ')
+      tree=${tree% }
+      # shellcheck disable=SC2086
+      killed=$(_cc_rw_end_pids 5 $tree)
+      _cc_rw_log_line "ERROR $* ran over ${cap}s; ended pids ${tree} (KILL: ${killed:-none})"
+      wait "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 0.2
+    ticks=$(( ticks + 1 ))
+  done
+  wait "$pid" || rc=$?
+  return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -342,8 +582,8 @@ _cc_rw_snapshot() {
   local mem_free_pct compressor_gb phys_gb
   read -r mem_free_pct compressor_gb phys_gb <<< "$mem_out"
 
-  local disk_free_gb disk_free_pct
-  read -r disk_free_gb disk_free_pct <<< "$disk_out"
+  local disk_free_gb disk_free_pct disk_free_kb
+  read -r disk_free_gb disk_free_pct disk_free_kb <<< "$disk_out"
 
   # --- thresholds ---
   local ncpu load_factor load_threshold
@@ -376,17 +616,53 @@ _cc_rw_snapshot() {
   drop_gb=$(_cc_rw_disk_drop "${state_dir}/disk-free-samples" "$now" "$disk_free_gb" \
     "$(_cc_rw_disk_drop_gb)")
 
+  # --- D7 write rate: GB/h over the last ~60 minutes of samples ---
+  local rate_gbh rate_alert_gbh rate_flag_gbh rate_alert=false rate_flag=false
+  rate_gbh=$(_cc_rw_disk_rate "${state_dir}/disk-free-samples.tsv" "$now" "$disk_free_kb" \
+    "$(_cc_rw_num CC_RW_RATE_WINDOW_SECS 3600)" 172800)
+  rate_alert_gbh=$(_cc_rw_num CC_RW_RATE_ALERT_GBH 10)
+  rate_flag_gbh=$(_cc_rw_num CC_RW_RATE_FLAG_GBH 20)
+  _cc_rw_above "$rate_gbh" "$rate_alert_gbh" && rate_alert=true
+  _cc_rw_above "$rate_gbh" "$rate_flag_gbh" && rate_flag=true
+  if [ "$rate_flag" = "true" ]; then
+    printf '%s %s %s\n' "$now" "$rate_gbh" "$disk_free_gb" > "${state_dir}/disk-rate-high" 2>/dev/null
+  elif [ -n "$rate_gbh" ]; then
+    rm -f "${state_dir}/disk-rate-high" 2>/dev/null
+  fi
+
+  # --- the detached act: is one running, did one overrun? Every round, whatever free space is ---
+  _cc_rw_act_supervise "$now"
+
   # --- build markers (MED-2: remove dead alert_tag variable) ---
   local markers=""
   [ "$load_breach" = "true" ] && markers="${markers} ALERT:load"
   [ "$disk_breach" = "true" ] && markers="${markers} ALERT:disk"
   [ -n "$drop_gb" ]           && markers="${markers} ALERT:disk-drop"
-  local alert_gb act_gb disk_low=false disk_act=false
-  alert_gb=$(_cc_rw_num CC_RW_DISK_ALERT_GB 40); act_gb=$(_cc_rw_num CC_RW_DISK_ACT_GB 25)
+  local alert_gb act_gb emerg_gb disk_low=false disk_act=false disk_emerg=false
+  alert_gb=$(_cc_rw_num CC_RW_DISK_ALERT_GB 60); act_gb=$(_cc_rw_num CC_RW_DISK_ACT_GB 40)
+  emerg_gb=$(_cc_rw_num CC_RW_DISK_EMERGENCY_GB 20)
   _cc_rw_below "$disk_free_gb" "$alert_gb" && disk_low=true
   _cc_rw_below "$disk_free_gb" "$act_gb" && disk_act=true
+  _cc_rw_below "$disk_free_gb" "$emerg_gb" && disk_emerg=true
+  if [ "$disk_emerg" = "true" ]; then
+    printf '%s %s\n' "$now" "$disk_free_gb" > "${state_dir}/disk-emergency" 2>/dev/null
+  elif [[ "$disk_free_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    rm -f "${state_dir}/disk-emergency" 2>/dev/null
+  fi
+  # Started here rather than after the log line, so the line says what this round did.
+  local act_started=false
+  if [ "$disk_act" = "true" ] && [ "$_CC_RW_ACT_STATE" = "idle" ] \
+    && _cc_rw_disk_act "$disk_free_gb" "$now"; then
+    act_started=true
+  fi
   [ "$disk_low" = "true" ]    && markers="${markers} ALERT:disk-low"
+  [ "$disk_emerg" = "true" ]  && markers="${markers} ALERT:disk-emergency"
+  [ "$rate_alert" = "true" ]  && markers="${markers} ALERT:disk-rate"
+  [ "$_CC_RW_ACT_STATE" = "overrun" ] && markers="${markers} ALERT:disk-act-overrun"
   [ "$mem_breach"  = "true" ] && markers="${markers} ALERT:mem"
+  [ "$act_started" = "true" ] && markers="${markers} ACT:started:${_CC_RW_ACT_PID}"
+  [ "$_CC_RW_ACT_STATE" = "running" ] && markers="${markers} ACT:running:${_CC_RW_ACT_PID:-spawning}"
+  [ -n "$rate_gbh" ]          && markers="${markers} disk_rate=${rate_gbh}GB/h"
   markers="${markers# }"   # ltrim space
 
   # --- write log line ---
@@ -412,15 +688,24 @@ _cc_rw_snapshot() {
   [ "$disk_low" = "true" ] && _cc_rw_maybe_notify "disk-low" \
     "disk free ${disk_free_gb}GB below ${alert_gb}GB" "$now"
 
+  [ "$disk_emerg" = "true" ] && _cc_rw_maybe_notify "disk-emergency" \
+    "EMERGENCY: disk free ${disk_free_gb}GB below ${emerg_gb}GB" "$now"
+
+  [ "$rate_alert" = "true" ] && _cc_rw_maybe_notify "disk-rate" \
+    "disk filling at ${rate_gbh}GB/h, now ${disk_free_gb}GB free" "$now"
+
+  [ "$_CC_RW_ACT_STATE" = "overrun" ] && _cc_rw_maybe_notify "disk-act-overrun" \
+    "disk reclaim ran past its cap and was ended; see resource-watch.log" "$now"
+
   [ "$mem_breach"  = "true" ] && _cc_rw_maybe_notify "mem" \
     "mem free ${mem_free_pct}% below ${mem_min_pct}% and compressor ${compressor_gb}GB above ${comp_threshold_gb}GB" "$now"
 
-  # --- disk guard: the cap every run, the full reclaim only below the act line ---
+  # --- disk guard: the go cache cap every run, bounded so the round stays short ---
   local reclaim_script="${CC_RW_RECLAIM_SCRIPT:-$HOME/.cc-reaper/reclaim-byproducts.sh}"
   if [ "${CC_RW_GO_CAP:-1}" != "0" ] && [ -f "$reclaim_script" ]; then
-    bash "$reclaim_script" --go-cache-cap >> "$(dirname "$log_file")/resource-watch-act.log" 2>&1
+    _cc_rw_run_bounded "$(_cc_rw_num CC_RW_GO_CAP_MAX_SECONDS 120)" \
+      bash "$reclaim_script" --go-cache-cap >> "$(_cc_rw_act_log)" 2>&1
   fi
-  [ "$disk_act" = "true" ] && _cc_rw_disk_act "$disk_free_gb" "$now"
 
   # deterministic exit: a false tail-test (`[ ... ] && notify`) must not leak
   # rc=1 into launchd's last-exit-status on healthy runs
@@ -440,6 +725,11 @@ if [ -n "${BASH_VERSION:-}" ]; then
         ;;
       "")
         _cc_rw_snapshot
+        ;;
+      --act)
+        # internal: the detached reclaim a round starts (see _cc_rw_disk_act)
+        _cc_rw_act_main "${2:-}"
+        exit $?
         ;;
       *)
         echo "resource-watch: unknown option '$1'" >&2

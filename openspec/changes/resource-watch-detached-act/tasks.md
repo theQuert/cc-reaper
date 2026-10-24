@@ -1,0 +1,5 @@
+- [x] Detached act under a single-instance lock, stale-lock takeover, runtime cap ending the tree by pid
+- [x] Tiers 60 / 40 / 20 GB with the `disk-emergency` flag
+- [x] Write-rate samples, `ALERT:disk-rate`, `disk-rate-high` flag set and cleared
+- [x] Go cache cap bounded by `CC_RW_GO_CAP_MAX_SECONDS`
+- [x] Tests T12-T18 in `tests/resource-watch.sh`

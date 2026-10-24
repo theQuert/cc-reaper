@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Fixed
+- **`resource-watch.sh` runs its low-disk act detached, so a long reclaim no longer stops the
+  watch (stima-api #5886, EL-DISK-ROOTFIX-1356 D1).** The act ran in the foreground of the launchd
+  job; on 2026-10-24 one (pid 55146) ran 3h34m and launchd started no round in that time: no
+  samples, no go cache cap, no alerts from 10:35. The act is now `resource-watch.sh --act` in its
+  own process group under nohup, under the single-instance lock `<state>/disk-act.lock` (atomic
+  `mkdir`; a dead or non-act pid is a stale lock and is taken over without being signalled). Past
+  `CC_RW_ACT_MAX_SECONDS` (5400) the next round logs ERROR, raises `ALERT:disk-act-overrun` and
+  ends the act's process tree by pid (`pgrep -P` walk, TERM, KILL after
+  `CC_RW_ACT_KILL_GRACE_SECS`, 10). The every-round go cache cap is bounded by
+  `CC_RW_GO_CAP_MAX_SECONDS` (120) the same way. Snapshot lines carry `ACT:started:<pid>` and
+  `ACT:running:<pid>`.
+
+### Changed
+- **Disk tiers in `resource-watch.sh` move up for a measured 25 GB/h** (54.5 GB to 23.5 GB free in
+  73 minutes on 2026-10-24): `ALERT:disk-low` under 60 GB (was 40), the act under 40 GB (was 25),
+  and a new emergency tier under `CC_RW_DISK_EMERGENCY_GB` (20) that raises `ALERT:disk-emergency`
+  and writes `~/.cc-reaper/state/disk-emergency` for other tools to read, removed above the line.
+  `CC_RW_DISK_ALERT_GB` and `CC_RW_DISK_ACT_GB` keep their names.
+- **Disk write rate (D7).** Each round appends `<epoch>\t<free KB>` to
+  `~/.cc-reaper/state/disk-free-samples.tsv` (48 hours kept) and measures GB/h over the last hour
+  (`CC_RW_RATE_WINDOW_SECS`, 3600): above `CC_RW_RATE_ALERT_GBH` (10) `ALERT:disk-rate`, above
+  `CC_RW_RATE_FLAG_GBH` (20) also `~/.cc-reaper/state/disk-rate-high`, removed when a measured rate
+  is at or below it. The line carries `disk_rate=<GB/h>`.
+
 ### Added
 - **`worktree-janitor` walks a directory an `archive:` pattern reaches, instead of pinning it.**
   git lists stima-api's ignored `.codex/evidence/` as one collapsed entry, so
