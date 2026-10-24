@@ -3,14 +3,12 @@
 ## [Unreleased]
 
 ### Added
-<<<<<<< HEAD
 - **`reclaim-byproducts.sh` runs as a single instance (`CC_RB_LOCK_DIR`).** The launchd `--if-stale`
   run and resource-watch's low-disk run overlapped for hours on 2026-10-24 (stima-api #5886). Every
   mode that removes something now takes an atomic `mkdir` lock
   (`~/.cc-reaper/state/reclaim-byproducts.lock`, pid inside); a live holder makes the second run log
   one line and exit 0, a lock whose pid is dead is taken over and logged, and the lock is released
   on exit, INT and TERM only by its owner. `--dry-run` takes none.
-=======
 - **`disk-janitor`'s low-disk act reaches its tools, and prunes node-modules templates in spot-check mode.**
   The go cache hook defaulted to `~/.claude/hooks/reclaim-byproducts.sh`, which never existed, so
   the act logged "skipped" (stima-api #5886). It now defaults to the installed
@@ -24,7 +22,6 @@
   `README`, `trim.txt` or a symlink) unused for `CC_DJ_GO_BUILD_MAX_AGE_MIN` (120, minimum 60)
   minutes, by mtime, which Go refreshes hourly on use. Same `CC_DJ_NEW_STEPS_MODE` gate: spot-check
   logs count, bytes and run id and deletes nothing; auto deletes without a per-file lsof.
->>>>>>> origin/main
 - **`worktree-janitor` walks a directory an `archive:` pattern reaches, instead of pinning it.**
   git lists stima-api's ignored `.codex/evidence/` as one collapsed entry, so
   `archive:.codex/evidence` could not copy the records inside it and kept 25 landed worktrees
