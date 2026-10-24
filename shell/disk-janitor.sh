@@ -58,11 +58,18 @@ Environment:
                            (default: ~/.claude/hooks/node-modules-template.sh)
   CC_DJ_TEMPLATE_STORE  The template store (default: $NODE_MODULES_TEMPLATE_STORE or
                            ~/.claude/node-modules-templates)
+  CC_DJ_GO_BUILD_MAX_AGE_MIN  Under CC_DJ_ACT_LOW_FREE_GB free, the act deletes go build cache
+                           entries (regular files in the 00..ff subdirectories) unused this many
+                           minutes, rule go-build-age, or `off` (default: 120, minimum 60: Go
+                           refreshes a used entry's mtime at most hourly); see CC_DJ_NEW_STEPS_MODE
+  CC_DJ_GO_BUILD_DIR    The go build cache that step trims (default: `go env GOCACHE`)
   CC_DJ_NEW_STEPS_MODE  spotcheck or auto (default: spotcheck) for deletion steps added to the act
-                           after 2026-10-24: spotcheck logs what it would remove, with size and a
-                           per-path lsof result, to CC_DJ_SPOTCHECK_LOG and deletes nothing; auto
-                           deletes only paths a fresh lsof shows unheld. Never under the trees of the
-                           homepage, uiux or verify-signin-redesign sessions.
+                           after 2026-10-24: spotcheck logs what it would remove, with size (and,
+                           for templates, a per-path lsof result) to CC_DJ_SPOTCHECK_LOG and deletes
+                           nothing; auto deletes templates only when a fresh lsof shows them unheld,
+                           and go build cache entries by age alone (Go tolerates a deleted entry).
+                           Never under the trees of the homepage, uiux or verify-signin-redesign
+                           sessions.
   CC_DJ_SPOTCHECK_LOG   Spot-check log (default: ~/.cc-reaper/logs/spotcheck-disk-janitor.log)
   CC_DJ_SESSIONS_DIR    Where live session JSON is read to find protected trees (default: ~/.claude/sessions)
   CC_DJ_ACT_TRIM_SECONDS   Bound on the worktree regenerable trim it runs (default: 900); the
@@ -104,6 +111,9 @@ CC_DJ_ACT_COOLDOWN_SECS="${CC_DJ_ACT_COOLDOWN_SECS:-10800}"
 CC_DJ_ACT_LOW_FREE_GB="${CC_DJ_ACT_LOW_FREE_GB:-20}"
 CC_DJ_ACT_LOW_COOLDOWN_SECS="${CC_DJ_ACT_LOW_COOLDOWN_SECS:-3300}"
 CC_DJ_ACT_TEMPLATES_PRUNE_DAYS="${CC_DJ_ACT_TEMPLATES_PRUNE_DAYS:-7}"
+# Under CC_DJ_ACT_LOW_FREE_GB the act deletes go build cache entries unused this many minutes
+# (rule go-build-age; a new step, so CC_DJ_NEW_STEPS_MODE gates it).
+CC_DJ_GO_BUILD_MAX_AGE_MIN="${CC_DJ_GO_BUILD_MAX_AGE_MIN:-120}"
 # Deletion steps added to the act run in spot-check mode (log, delete nothing) until an
 # operator switches them to auto. Existing, already-automatic steps are not gated by this.
 CC_DJ_NEW_STEPS_MODE="${CC_DJ_NEW_STEPS_MODE:-spotcheck}"
@@ -472,14 +482,149 @@ _cc_dj_act_template_prune() {
   return 0
 }
 
+# Go build cache age trim (rule go-build-age), a step added to the act after 2026-10-24
+# (stima-api#5886). It runs only under CC_DJ_ACT_LOW_FREE_GB (the CI heavy-slot floor), where
+# the skills hook's pressure trim above has not freed enough, and deletes entries unused for
+# CC_DJ_GO_BUILD_MAX_AGE_MIN minutes.
+#
+# mtime is the LRU signal: Go refreshes an entry's mtime each time a build uses it, at most once
+# an hour (cmd/go/internal/cache, mtimeInterval), and its own trim deletes by the same mtime after
+# five days. So an entry used within the last hour is always younger than 120 minutes, and an
+# age under 60 minutes is refused: a hot entry could look unused.
+#
+# No per-file lsof, unlike the template prune: Go treats a missing, truncated or mismatched entry
+# as a cache miss and rebuilds it, a build that already opened a file keeps reading it after the
+# unlink, and an entry being written right now is minutes old, never a candidate. Per-file lsof
+# over ~100k entries would also cost more than the step frees time for. Only regular files one
+# level under the two-hex-digit subdirectories: never README, trim.txt or other top-level files
+# (an old testexpire.txt deleted would make expired test results valid again), never the
+# directories, never through a symlink (find does not follow them, and a symlinked cache root
+# is refused).
+#
+# One find pass lists the candidates, one stat pass sums their sizes; auto then removes exactly
+# that list. The step shares a bound of a third of CC_DJ_ACT_TRIM_SECONDS across the three, and a
+# listing the bound cut short deletes nothing. Spot-check (default) logs count, bytes, run id,
+# rule and a three-path sample to CC_DJ_SPOTCHECK_LOG and deletes nothing. Sets
+# _CC_DJ_STEP_LINES; returns 0 always.
+_cc_dj_act_go_build_age() {
+  local step_before="$1" age="$CC_DJ_GO_BUILD_MAX_AGE_MIN" mode="$CC_DJ_NEW_STEPS_MODE"
+  local low_gb dir why slog runid list sizes bound deadline left rc count bytes sample label
+  _CC_DJ_STEP_LINES=""
+  label="go build cache age trim"
+  [ "$age" = off ] && return 0
+  case "$age" in ''|*[!0-9]*)
+    _cc_dj_log "ERROR act: CC_DJ_GO_BUILD_MAX_AGE_MIN=$age is not a number of minutes (60 or more) or off; $label not run"
+    _CC_DJ_STEP_LINES="- ERROR: $label not run (CC_DJ_GO_BUILD_MAX_AGE_MIN=$age is not a number)"
+    return 0 ;;
+  esac
+  age=$((10#$age))
+  if [ "$age" -lt 60 ]; then
+    _cc_dj_log "ERROR act: CC_DJ_GO_BUILD_MAX_AGE_MIN=$age is under 60; Go refreshes a used entry's mtime only hourly; $label not run"
+    _CC_DJ_STEP_LINES="- ERROR: $label not run (CC_DJ_GO_BUILD_MAX_AGE_MIN=$age is under 60)"
+    return 0
+  fi
+  # The act validated CC_DJ_ACT_LOW_FREE_GB and CC_DJ_ACT_TRIM_SECONDS before calling.
+  low_gb=$((10#$CC_DJ_ACT_LOW_FREE_GB))
+  case "$step_before" in ''|*[!0-9]*) _CC_DJ_STEP_LINES="- $label: free space unreadable; not run"; return 0 ;; esac
+  if [ "$step_before" -ge $(( low_gb * 1048576 )) ]; then
+    _CC_DJ_STEP_LINES="- $label: not run, free $(_cc_dj_fmt_kb_delta "$step_before") is not under ${low_gb} GB"
+    return 0
+  fi
+  case "$mode" in
+    spotcheck|auto) ;;
+    *) _cc_dj_log "act: CC_DJ_NEW_STEPS_MODE=$mode is not spotcheck or auto; using spotcheck"; mode=spotcheck ;;
+  esac
+  dir="${CC_DJ_GO_BUILD_DIR:-}"
+  if [ -z "$dir" ]; then
+    if ! command -v go >/dev/null 2>&1; then
+      _CC_DJ_STEP_LINES="- $label: not run (go not found; CC_DJ_GO_BUILD_DIR names the cache)"
+      return 0
+    fi
+    dir="$(go env GOCACHE 2>/dev/null)"
+  fi
+  dir="${dir%/}"
+  # An absolute, plain directory, and no glob characters: the find below matches by -path.
+  case "$dir" in
+    /*) ;;
+    *) _CC_DJ_STEP_LINES="- $label: not run (cache '$dir' is not an absolute path)"; return 0 ;;
+  esac
+  case "$dir" in *[*?[\\]*)
+    _CC_DJ_STEP_LINES="- $label: not run (cache path $dir has glob characters)"; return 0 ;;
+  esac
+  if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+    _CC_DJ_STEP_LINES="- $label: not run ($dir is not a directory, or is a symlink)"
+    return 0
+  fi
+  if why="$(_cc_dj_protected_tree "$dir")"; then
+    _CC_DJ_STEP_LINES="- $label: not run ($dir is protected: $why)"
+    return 0
+  fi
+  slog="${CC_DJ_SPOTCHECK_LOG:-$HOME/.cc-reaper/logs/spotcheck-disk-janitor.log}"
+  mkdir -p "$(dirname "$slog")" 2>/dev/null || true
+  runid="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  _cc_dj_spot() { printf '[%s] run=%s step=go-build-age %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$runid" "$*" >> "$slog" 2>/dev/null || true; }
+  _cc_dj_spot "start mode=$mode rule=go-build-age dir=$dir max_age_min=$age"
+  list="$CC_DJ_STATE_DIR/go-build-age.$$.list"; sizes="$CC_DJ_STATE_DIR/go-build-age.$$.sizes"
+  bound=$(( 10#$CC_DJ_ACT_TRIM_SECONDS / 3 )); [ "$bound" -ge 1 ] || bound=1
+  deadline=$(( $(date +%s) + bound ))
+  # find does not follow symlinks (-P is its default): a symlinked hex directory is not
+  # descended, and a symlinked entry is not -type f.
+  rc=0
+  _cc_dj_run_bounded "$bound" find "$dir" -mindepth 2 -maxdepth 2 -path "$dir/[0-9a-f][0-9a-f]/*" \
+    -type f ! -name README ! -name trim.txt -mmin +"$age" -print0 > "$list" 2>/dev/null || rc=$?
+  count="$(tr -cd '\000' < "$list" 2>/dev/null | wc -c | tr -d ' ')"; count="${count:-0}"
+  if [ "$rc" -ne 0 ]; then
+    # 124 is the bound; anything else is find failing part-way. Either way the list may be
+    # cut mid-path, so nothing is deleted from it.
+    _cc_dj_spot "end mode=$mode rule=go-build-age listing=incomplete rc=$rc partial_count=$count verdict=nothing-deleted"
+    unset -f _cc_dj_spot; rm -f "$list" "$sizes"
+    _CC_DJ_STEP_LINES="- $label ($mode): listing $dir did not finish (rc=$rc, bound ${bound}s); nothing deleted; run=$runid in $slog"
+    return 0
+  fi
+  bytes=0; sample=""
+  if [ "$count" -gt 0 ]; then
+    left=$(( deadline - $(date +%s) )); [ "$left" -ge 1 ] || left=1
+    # stat by absolute path: a PATH stat is not guaranteed to be the BSD one. xargs reads the
+    # list through sh, because a background job's own stdin is /dev/null.
+    rc=0
+    _cc_dj_run_bounded "$left" /bin/sh -c 'exec xargs -0 /usr/bin/stat -f %z < "$1"' _ "$list" > "$sizes" 2>/dev/null || rc=$?
+    bytes="$(awk '{ s += $1 } END { printf "%d", s }' "$sizes" 2>/dev/null)"; bytes="${bytes:-0}"
+    [ "$rc" -eq 0 ] || bytes="${bytes}+"
+    sample="$(tr '\000' '\n' < "$list" | head -3 | tr '\n' ' ')"; sample="${sample% }"
+  fi
+  if [ "$count" -eq 0 ]; then
+    _cc_dj_spot "end mode=$mode rule=go-build-age count=0 bytes=0 verdict=none"
+    _CC_DJ_STEP_LINES="- $label ($mode): no entry in $dir unused for ${age}+ min"
+  elif [ "$mode" = spotcheck ]; then
+    _cc_dj_spot "end mode=spotcheck rule=go-build-age count=$count bytes=$bytes verdict=would-remove sample=$sample"
+    _CC_DJ_STEP_LINES="- $label (spotcheck, rule go-build-age): would remove $count entries ($bytes bytes) unused ${age}+ min in $dir; nothing deleted; run=$runid in $slog"
+  else
+    left=$(( deadline - $(date +%s) ))
+    if [ "$left" -lt 1 ]; then
+      _cc_dj_spot "end mode=auto rule=go-build-age count=$count bytes=$bytes verdict=nothing-deleted reason=budget-spent"
+      _CC_DJ_STEP_LINES="- $label (auto): the ${bound}s bound was spent listing $count entries; nothing deleted; run=$runid in $slog"
+    else
+      # rm -f without -r: a path that became a directory since the listing is left; a path
+      # that became a symlink loses the link, never its target.
+      rc=0
+      _cc_dj_run_bounded "$left" /bin/sh -c 'exec xargs -0 rm -f -- < "$1"' _ "$list" >/dev/null 2>&1 || rc=$?
+      _cc_dj_spot "end mode=auto rule=go-build-age count=$count bytes=$bytes rc=$rc verdict=removed sample=$sample"
+      _CC_DJ_STEP_LINES="- $label (auto, rule go-build-age): removed $count entries ($bytes bytes listed) unused ${age}+ min in $dir (rc=$rc; $(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before ))) freed); run=$runid in $slog"
+    fi
+  fi
+  unset -f _cc_dj_spot; rm -f "$list" "$sizes"
+  return 0
+}
+
 # Below CC_DJ_ACT_FREE_GB free, act instead of only notifying. On 2026-10-04 --check logged
 # BELOW threshold every hour from 10% free, sent one desktop notification nobody saw and
 # reclaimed nothing; at 20 GB the CI slots declined jobs and merge-gate queued for 90
 # minutes (stima-api#3337). GB, not %, because the floor that matters is the CI's 20 GB.
 #
 # Each step is the owner's own reclaimer, bounded and safe beside running work: the skills
-# hook's pressure trim of the go cache (idle entries first, never a clear for pressure), then the
-# worktree janitor's regenerable trim (unheld, unclaimed trees only; trees and branches
+# hook's pressure trim of the go cache (idle entries first, never a clear for pressure); under
+# CC_DJ_ACT_LOW_FREE_GB the go build cache age trim (go-build-age) and, always, the node-modules
+# template prune, both gated by CC_DJ_NEW_STEPS_MODE; then the worktree janitor's regenerable trim (unheld, unclaimed trees only; trees and branches
 # stay). Chrome clones and host temp already ran above. One run at a time (a lock), and
 # at most one per CC_DJ_ACT_COOLDOWN_SECS, so hourly checks do not stack. The record goes
 # to CC_DJ_ALERT_ISSUE, where a person reads it; the desktop notification stays as well.
@@ -529,6 +674,10 @@ _cc_dj_low_disk_act() {
     _cc_dj_log "ERROR act: go cache hook $hook not found or not executable; the go build cache was not trimmed (CC_DJ_ACT_GO_CACHE_HOOK overrides the path)"
     body="$body"$'\n'"- ERROR: go cache pressure trim not run (hook $hook not found or not executable)"
   fi
+
+  step_before="$(_cc_dj_free_kb)"
+  _cc_dj_act_go_build_age "$step_before"
+  [ -z "$_CC_DJ_STEP_LINES" ] || body="$body"$'\n'"$_CC_DJ_STEP_LINES"
 
   step_before="$(_cc_dj_free_kb)"
   _cc_dj_act_template_prune "$step_before"
