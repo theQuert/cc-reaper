@@ -1220,9 +1220,13 @@ _cc_wj_scan_claude_sessions() {
     }
     # A record that cannot be read keeps the worktrees it could be about: the cwd its live
     # process stands in, and any cwd string its raw text still carries.
+    # A live session can also work in any tree by absolute path from a cwd elsewhere, so the
+    # transcript of the session id its raw text carries is searched too; with no id or no
+    # readable transcript, the record keeps every tree.
     row="$(jq -er '[((.pid // "") | tostring), (.sessionId // ""), (.cwd // "")] | @tsv' "$f" 2>/dev/null)" || {
+      _cc_wj_tail_attrs_claude "$(_cc_wj_raw_session_id "" "$f" "$base")"
       _cc_wj_unknown_add "claude-session:${f##*/}" "live Claude session record ${f##*/} could not be parsed" \
-        cwd "$(_cc_wj_pid_cwd "$base")" cwd "$(_cc_wj_raw_cwd "$f")"
+        live yes cwd "$(_cc_wj_pid_cwd "$base")" cwd "$(_cc_wj_raw_cwd "$f")" "${_CC_WJ_TAIL_ATTRS[@]}"
       continue
     }
     IFS=$'\t' read -r pid sid cwd <<< "$row"
@@ -1230,33 +1234,38 @@ _cc_wj_scan_claude_sessions() {
     # missing or odd name can never fail the scan that every veto depends on.
     sname="$(jq -r '(.name // "") | tostring' "$f" 2>/dev/null | head -n 1)"
     case "$pid" in ''|*[!0-9]*)
+      _cc_wj_tail_attrs_claude "$(_cc_wj_raw_session_id "$sid" "$f" "$base")"
       _cc_wj_unknown_add "claude-session:${f##*/}" "live Claude session record ${f##*/} has no valid pid" \
-        cwd "$(_cc_wj_pid_cwd "$base")" cwd "$cwd"
+        live yes cwd "$(_cc_wj_pid_cwd "$base")" cwd "$cwd" "${_CC_WJ_TAIL_ATTRS[@]}"
       continue ;;
     esac
     [ "$pid" = "$base" ] || {
+      _cc_wj_tail_attrs_claude "$(_cc_wj_raw_session_id "$sid" "$f" "$base")"
       _cc_wj_unknown_add "claude-session:${f##*/}" "live Claude session record ${f##*/} disagrees with pid $pid" \
-        cwd "$(_cc_wj_pid_cwd "$base")" cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd"
+        live yes cwd "$(_cc_wj_pid_cwd "$base")" cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd" "${_CC_WJ_TAIL_ATTRS[@]}"
       continue
     }
     kill -0 "$pid" 2>/dev/null || continue
     cmd="$(ps -p "$pid" -o command= 2>/dev/null)" || {
       kill -0 "$pid" 2>/dev/null || continue
+      _cc_wj_tail_attrs_claude "$(_cc_wj_raw_session_id "$sid" "$f" "")"
       _cc_wj_unknown_add "claude-session:${f##*/}" "live Claude pid $pid could not be inspected" \
-        cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd"
+        live yes cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd" "${_CC_WJ_TAIL_ATTRS[@]}"
       continue
     }
     printf '%s\n' "$sid" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' || {
+      _cc_wj_tail_attrs_claude "$(_cc_wj_raw_session_id "" "$f" "$pid")"
       _cc_wj_unknown_add "claude-session:${f##*/}" "live Claude session record ${f##*/} has an invalid session id" \
-        cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd"
+        live yes cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd" "${_CC_WJ_TAIL_ATTRS[@]}"
       continue
     }
     # A live pid may have been reused.  The opaque session id in its command line binds
     # the registry record to this process.
     case "$cmd" in *"$sid"*) ;; *) continue ;; esac
     resolved="$(_cc_wj_claim_cwd "$cwd")" || {
+      _cc_wj_tail_attrs_claude "$sid"
       _cc_wj_unknown_add "claude-session:$sid" "live Claude session $sid could not map cwd ${cwd:-<empty>}" \
-        cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd"
+        live yes cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd" "${_CC_WJ_TAIL_ATTRS[@]}"
       continue
     }
     _cc_wj_active_add_claim Claude "$resolved" "$sid"
@@ -1273,12 +1282,13 @@ _cc_wj_scan_claude_sessions() {
     # attribute it.
     transcripts="$(find "$projects" -type f -name "$sid.jsonl" -print 2>/dev/null)" || {
       _cc_wj_unknown_add "claude-session:$sid" "the transcript for live Claude session $sid could not be located" \
-        cwd "$resolved" projdir "$(_cc_wj_project_dir_name "$resolved")"
+        live yes cwd "$resolved" projdir "$(_cc_wj_project_dir_name "$resolved")"
       continue
     }
     count="$(printf '%s\n' "$transcripts" | grep -c .)"
     [ "$count" -eq 1 ] || {
-      unknown_attrs=(cwd "$resolved" projdir "$(_cc_wj_project_dir_name "$resolved")")
+      _cc_wj_tail_attrs_claude "$sid"
+      unknown_attrs=(live yes cwd "$resolved" projdir "$(_cc_wj_project_dir_name "$resolved")" "${_CC_WJ_TAIL_ATTRS[@]}")
       while IFS= read -r t; do
         [ -n "$t" ] && unknown_attrs+=(projdir "$(_cc_wj_transcript_projdir "$t")")
       done <<SID_TRANSCRIPTS
@@ -1291,12 +1301,12 @@ SID_TRANSCRIPTS
     transcript="$transcripts"
     case "$transcript" in *$'\n'*|*$'\t'*)
       _cc_wj_unknown_add "claude-session:$sid" "live Claude session $sid has an unsafe transcript path" \
-        cwd "$resolved" projdir "$(_cc_wj_project_dir_name "$resolved")"
+        live yes cwd "$resolved" projdir "$(_cc_wj_project_dir_name "$resolved")"
       continue ;;
     esac
     [ -r "$transcript" ] || {
       _cc_wj_unknown_add "claude-session:$sid" "the transcript for live Claude session $sid is unreadable" \
-        cwd "$resolved" projdir "$(_cc_wj_transcript_projdir "$transcript")"
+        live yes cwd "$resolved" projdir "$(_cc_wj_transcript_projdir "$transcript")"
       continue
     }
     _cc_wj_active_add_transcript Claude "$sid" "$transcript"
@@ -1421,37 +1431,42 @@ _cc_wj_scan_codex_sessions() {
       attempt=$((attempt + 1))
     done
     if [ "$row_ok" -eq 0 ]; then
+      _cc_wj_tail_attrs_codex "$tid"
       _cc_wj_unknown_add "codex-claim:$tid" "active Codex claim $tid could not be mapped from local state" \
-        $(_cc_wj_codex_unknown_attrs "$tid" "$path")
+        live yes "${_CC_WJ_TAIL_ATTRS[@]}" $(_cc_wj_codex_unknown_attrs "$tid" "$path")
       continue
     fi
     if [ "$count" -eq 0 ]; then
       row="$(_cc_wj_codex_rollout_metadata "$tid")" || {
+        _cc_wj_tail_attrs_codex "$tid"
         _cc_wj_unknown_add "codex-claim:$tid" "active Codex claim $tid could not be mapped to exactly one task or active rollout" \
-          $(_cc_wj_codex_unknown_attrs "$tid" "$path")
+          live yes "${_CC_WJ_TAIL_ATTRS[@]}" $(_cc_wj_codex_unknown_attrs "$tid" "$path")
         continue
       }
       count=1
     fi
     [ "$count" -eq 1 ] || {
+      # shellcheck disable=SC2046
+      _cc_wj_tail_attrs_codex "$tid" $(printf '%s\n' "$row" | awk -F '\t' '{ print $2 }' | LC_ALL=C grep -E '^/[^ *?[]*$')
       _cc_wj_unknown_add "codex-claim:$tid" "active Codex claim $tid could not be mapped to exactly one task or active rollout" \
-        $(_cc_wj_codex_unknown_attrs "$tid" "$path" "$row")
+        live yes "${_CC_WJ_TAIL_ATTRS[@]}" $(_cc_wj_codex_unknown_attrs "$tid" "$path" "$row")
       continue
     }
     IFS=$'\t' read -r cwd rollout <<< "$row"
     resolved="$(_cc_wj_claim_cwd "$cwd")" || {
+      case "$rollout" in /*) _cc_wj_tail_attrs_codex "$tid" "$rollout" ;; *) _cc_wj_tail_attrs_codex "$tid" ;; esac
       _cc_wj_unknown_add "codex-claim:$tid" "active Codex claim $tid could not be mapped to cwd ${cwd:-<empty>}" \
-        cwd "$cwd" $(_cc_wj_codex_unknown_attrs "$tid" "$path")
+        live yes cwd "$cwd" "${_CC_WJ_TAIL_ATTRS[@]}" $(_cc_wj_codex_unknown_attrs "$tid" "$path")
       continue
     }
     case "$rollout" in ''|*$'\n'*|*$'\t'*)
       _cc_wj_active_add_claim Codex "$resolved" "$tid"
-      _cc_wj_unknown_add "codex-claim:$tid" "active Codex claim $tid has an unsafe transcript path" cwd "$resolved"
+      _cc_wj_unknown_add "codex-claim:$tid" "active Codex claim $tid has an unsafe transcript path" live yes cwd "$resolved"
       continue ;;
     esac
     [ -r "$rollout" ] || {
       _cc_wj_active_add_claim Codex "$resolved" "$tid"
-      _cc_wj_unknown_add "codex-claim:$tid" "the transcript for active Codex claim $tid is unreadable" cwd "$resolved"
+      _cc_wj_unknown_add "codex-claim:$tid" "the transcript for active Codex claim $tid is unreadable" live yes cwd "$resolved"
       continue
     }
     _cc_wj_active_add_claim Codex "$resolved" "$tid"
@@ -1509,7 +1524,7 @@ _cc_wj_scan_claude_recent() { # <grace hours> [relisted]
     activity="$(_cc_wj_mtime_epoch "$f")"
     case "$activity" in ''|*[!0-9]*)
       _cc_wj_unknown_add "claude-transcript:$sid" "recent Claude transcript $base has no readable activity time" \
-        projdir "$(_cc_wj_transcript_projdir "$f")"
+        projdir "$(_cc_wj_transcript_projdir "$f")" tail "Claude|$f"
       continue ;;
     esac
     [ $((now - activity)) -lt $((grace * 3600)) ] || continue
@@ -1523,12 +1538,12 @@ _cc_wj_scan_claude_recent() { # <grace hours> [relisted]
       grep -Eq '"message"[[:space:]]*:' "$f"
       [ $? -ne 1 ] || continue
       _cc_wj_unknown_add "claude-transcript:$sid" "recent Claude transcript $base has no mappable cwd" \
-        projdir "$(_cc_wj_transcript_projdir "$f")"
+        projdir "$(_cc_wj_transcript_projdir "$f")" tail "Claude|$f"
       continue
     fi
     case "$cwd" in /*) ;; *)
       _cc_wj_unknown_add "claude-transcript:$sid" "recent Claude session $sid has a non-absolute cwd" \
-        projdir "$(_cc_wj_transcript_projdir "$f")"
+        projdir "$(_cc_wj_transcript_projdir "$f")" tail "Claude|$f"
       continue ;;
     esac
     # Do not parse every recent transcript eagerly. Structured-path claims are only
@@ -1543,7 +1558,7 @@ _cc_wj_scan_claude_recent() { # <grace hours> [relisted]
     [ -e "$cwd" ] || continue
     resolved="$(_cc_wj_claim_cwd "$cwd")" || {
       _cc_wj_unknown_add "claude-transcript:$sid" "recent Claude session $sid could not map cwd $cwd" \
-        cwd "$cwd" projdir "$(_cc_wj_transcript_projdir "$f")"
+        cwd "$cwd" projdir "$(_cc_wj_transcript_projdir "$f")" tail "Claude|$f"
       continue
     }
     _cc_wj_recent_add_claim Claude "$resolved" "$sid" "$activity" transcript
@@ -1554,7 +1569,7 @@ CLAUDE_RECENT
 
 _cc_wj_scan_codex_recent() { # <grace hours>
   local grace="$1" state="${CC_WJ_CODEX_STATE_DB:-$HOME/.codex/state_5.sqlite}"
-  local sqlite now cutoff rows tid cwd rollout activity archived resolved claim_state
+  local sqlite now cutoff rows tid cwd rollout activity archived resolved claim_state rtail
   [ "$grace" -gt 0 ] || return 0
   [ -e "$state" ] || return 0
   sqlite="$(command -v sqlite3 2>/dev/null)" || {
@@ -1577,23 +1592,26 @@ _cc_wj_scan_codex_recent() { # <grace hours>
   }
   while IFS=$'\t' read -r tid cwd rollout activity archived; do
     [ -n "$tid" ] || continue
-    # A row that cannot be read keeps the trees its cwd column names, if it names one.
+    # A row that cannot be read keeps the trees its cwd column names, if it names one, and
+    # those its readable rollout's current turns name.
+    rtail=""
+    case "$rollout" in /*$'\n'*|/*$'\t'*) ;; /*) [ -r "$rollout" ] && rtail="Codex|$rollout" ;; esac
     printf '%s\n' "$tid" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' || {
-      _cc_wj_unknown_add "codex-task:invalid-id" "recent Codex local state contains an invalid task id" cwd "$cwd"
+      _cc_wj_unknown_add "codex-task:invalid-id" "recent Codex local state contains an invalid task id" cwd "$cwd" tail "$rtail"
       continue
     }
     _cc_wj_active_has_id Codex "$tid" && continue
     case "$activity" in ''|*[!0-9]*)
-      _cc_wj_unknown_add "codex-task:$tid" "recent Codex task $tid has no valid activity time" cwd "$cwd"; continue ;;
+      _cc_wj_unknown_add "codex-task:$tid" "recent Codex task $tid has no valid activity time" cwd "$cwd" tail "$rtail"; continue ;;
     esac
     case "$archived" in
       0) claim_state=recent ;;
       1) claim_state=archived ;;
-      *) _cc_wj_unknown_add "codex-task:$tid" "recent Codex task $tid has an invalid archived state" cwd "$cwd"; continue ;;
+      *) _cc_wj_unknown_add "codex-task:$tid" "recent Codex task $tid has an invalid archived state" cwd "$cwd" tail "$rtail"; continue ;;
     esac
     case "$cwd" in /*) ;; *)
       _cc_wj_unknown_add "codex-task:$tid" "recent Codex task $tid has a non-absolute cwd" \
-        $(_cc_wj_codex_unknown_attrs "$tid" /nonexistent)
+        tail "$rtail" $(_cc_wj_codex_unknown_attrs "$tid" /nonexistent)
       continue ;;
     esac
     case "$rollout" in ''|*$'\n'*|*$'\t'*)
@@ -1607,7 +1625,7 @@ _cc_wj_scan_codex_recent() { # <grace hours>
     # evidence in the rollout for a different, still-existing worktree.
     [ -e "$cwd" ] || continue
     resolved="$(_cc_wj_claim_cwd "$cwd")" || {
-      _cc_wj_unknown_add "codex-task:$tid" "recent Codex task $tid could not map cwd $cwd" cwd "$cwd"
+      _cc_wj_unknown_add "codex-task:$tid" "recent Codex task $tid could not map cwd $cwd" cwd "$cwd" tail "$rtail"
       continue
     }
     _cc_wj_recent_add_claim Codex "$resolved" "$tid" "$activity" "$claim_state"
@@ -1655,8 +1673,34 @@ _cc_wj_unknown_label() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._:-' '_'; 
 # Claude's project directory for cwd $1: every byte but [A-Za-z0-9] becomes `-`.
 _cc_wj_project_dir_name() { printf '%s' "$1" | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g'; }
 
-_cc_wj_unknown_add() { # <record> <message> [<cwd|projdir> <value>]...
-  local rec msg kind value attributed=0 row
+# The physical path of absolute path $1, as _cc_wj_claim_cwd resolves a readable record's cwd
+# (`cd -P`). A path that no longer exists resolves its deepest existing ancestor and keeps the
+# rest as written, so a cwd given through a symlink still names the tree it points into.
+_cc_wj_unknown_phys() { # <absolute path>
+  local p="$1" rest=""
+  case "$p" in /*) ;; *) return 1 ;; esac
+  while [ -n "$p" ] && [ ! -d "$p" ]; do
+    rest="/${p##*/}$rest"; p="${p%/*}"
+  done
+  [ -n "$p" ] || p=/
+  p="$(builtin cd -P -- "$p" >/dev/null 2>&1 && pwd -P)" || return 1
+  printf '%s%s\n' "${p%/}" "$rest"
+}
+
+# A record is added with attribution words: `cwd <path>` (stored as written and as resolved),
+# `projdir <name>`, `tail <Harness>|<transcript>` (the record's own transcript, searched per tree
+# by _cc_wj_unknown_tail_names), `global -` (it may be about any tree), and `live yes`: the record
+# is, or may be, a live session. A live session can work in any tree by absolute path from a cwd
+# elsewhere, so what its cwd and project directory say is not enough: a live record that adds
+# neither a transcript nor `global` keeps every tree.
+_cc_wj_unknown_row() { # <record> <kind> <value>
+  local row="$1"$'\t'"$2"$'\t'"$3"
+  _CC_WJ_UNKNOWN="${_CC_WJ_UNKNOWN}${row}"$'\n'
+  case $'\n'"$_CC_WJ_UNKNOWN_ATTR" in *$'\n'"$row"$'\n'*) ;; *) _CC_WJ_UNKNOWN_ATTR="${_CC_WJ_UNKNOWN_ATTR}${row}"$'\n' ;; esac
+}
+
+_cc_wj_unknown_add() { # <record> <message> [<cwd|projdir|tail|global|live> <value>]...
+  local rec msg kind value attributed=0 searched=0 live=0 phys
   rec="$(_cc_wj_unknown_label "$1")"; msg="$2"; shift 2
   [ -n "$_CC_WJ_ACTIVE_ERROR" ] || _CC_WJ_ACTIVE_ERROR="$msg"
   case $'\n'"$_CC_WJ_UNKNOWN_ERRORS" in
@@ -1667,16 +1711,29 @@ _cc_wj_unknown_add() { # <record> <message> [<cwd|projdir> <value>]...
     kind="$1"; value="$2"; shift 2
     case "$value" in ''|*$'\t'*|*$'\n'*) continue ;; esac
     case "$kind" in
-      cwd) case "$value" in /) continue ;; /*) value="${value%/}" ;; *) continue ;; esac ;;
-      projdir) case "$value" in -?*) ;; *) continue ;; esac
-               case "$value" in */*) continue ;; esac ;;
+      live) [ "$value" = yes ] && live=1; continue ;;
+      global) _cc_wj_unknown_row "$rec" global -; searched=1 ;;
+      tail)
+        case "$value" in Claude\|/*|Codex\|/*) ;; *) continue ;; esac
+        _cc_wj_unknown_row "$rec" tail "$value"; searched=1 ;;
+      cwd)
+        case "$value" in /) continue ;; /*) value="${value%/}" ;; *) continue ;; esac
+        _cc_wj_unknown_row "$rec" cwd "$value"
+        # Resolved as a readable record's cwd is, so a symlinked or /private-less spelling
+        # still names the tree.
+        phys="$(_cc_wj_unknown_phys "$value")" && [ -n "$phys" ] && [ "$phys" != "$value" ] &&
+          _cc_wj_unknown_row "$rec" cwd "$phys" ;;
+      projdir)
+        case "$value" in -?*) ;; *) continue ;; esac
+        case "$value" in */*) continue ;; esac
+        _cc_wj_unknown_row "$rec" projdir "$value" ;;
       *) continue ;;
     esac
-    row="${rec}"$'\t'"${kind}"$'\t'"${value}"
-    _CC_WJ_UNKNOWN="${_CC_WJ_UNKNOWN}${row}"$'\n'
-    case $'\n'"$_CC_WJ_UNKNOWN_ATTR" in *$'\n'"$row"$'\n'*) ;; *) _CC_WJ_UNKNOWN_ATTR="${_CC_WJ_UNKNOWN_ATTR}${row}"$'\n' ;; esac
     attributed=1
   done
+  if [ "$live" -eq 1 ] && [ "$searched" -eq 0 ]; then
+    _cc_wj_unknown_row "$rec" global -; attributed=1
+  fi
   [ "$attributed" -eq 1 ] || _CC_WJ_UNKNOWN="${_CC_WJ_UNKNOWN}${rec}"$'\t'none$'\t'-$'\n'
 }
 
@@ -1695,6 +1752,175 @@ _cc_wj_raw_cwd() { # <file>
     LC_ALL=C sed 's/^"cwd"[[:space:]]*:[[:space:]]*"//; s/"$//'
 }
 
+_CC_WJ_UUID_RE='[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
+
+# The session id of an unparsable live Claude record: $1 when it is one, else the one distinct
+# `"sessionId"` its raw text $2 carries, else the one id on live pid $3's command line. Nothing
+# when none or more than one is found.
+_cc_wj_raw_session_id() { # <parsed id> <record file> <pid>
+  local ids
+  printf '%s\n' "$1" | grep -Eqx "$_CC_WJ_UUID_RE" && { printf '%s\n' "$1"; return 0; }
+  ids="$(LC_ALL=C head -c 1048576 "$2" 2>/dev/null |
+    LC_ALL=C grep -Eo "\"sessionId\"[[:space:]]*:[[:space:]]*\"$_CC_WJ_UUID_RE\"" 2>/dev/null |
+    LC_ALL=C grep -Eo "$_CC_WJ_UUID_RE\"\$" | tr -d '"' | sort -u)"
+  if [ -z "$ids" ]; then
+    case "$3" in ''|*[!0-9]*) return 1 ;; esac
+    ids="$(ps -p "$3" -o command= 2>/dev/null | LC_ALL=C grep -Eo "$_CC_WJ_UUID_RE" | sort -u)"
+  fi
+  [ -n "$ids" ] && [ "$(printf '%s\n' "$ids" | grep -c .)" -eq 1 ] || return 1
+  printf '%s\n' "$ids"
+}
+
+# _CC_WJ_TAIL_ATTRS: attribution words for the transcripts of Claude session $1, `tail
+# Claude|<path>` for each, or `global -` when the id is missing or no transcript of it can be
+# found and read.
+_CC_WJ_TAIL_ATTRS=()
+_cc_wj_tail_attrs_claude() { # <session id>
+  local sid="$1" projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}" found t
+  _CC_WJ_TAIL_ATTRS=()
+  if printf '%s\n' "$sid" | grep -Eqx "$_CC_WJ_UUID_RE" &&
+     found="$(_cc_wj_with_timeout 15 find "$projects" -type f -name "$sid.jsonl" -print 2>/dev/null)"; then
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      [ -r "$t" ] || { _CC_WJ_TAIL_ATTRS=(global -); return 0; }
+      _CC_WJ_TAIL_ATTRS+=(tail "Claude|$t")
+    done <<CLAUDE_TAILS
+$found
+CLAUDE_TAILS
+  fi
+  [ "${#_CC_WJ_TAIL_ATTRS[@]}" -gt 0 ] || _CC_WJ_TAIL_ATTRS=(global -)
+}
+
+# The same for Codex thread $1: the rollouts $2... its rows name and every `*-<id>.jsonl` under
+# CC_WJ_CODEX_SESSIONS.
+_cc_wj_tail_attrs_codex() { # <thread id> [rollout]...
+  local tid="$1" sessions="${CC_WJ_CODEX_SESSIONS:-$HOME/.codex/sessions}" found="" t seen=$'\n'
+  shift
+  _CC_WJ_TAIL_ATTRS=()
+  printf '%s\n' "$tid" | grep -Eqx "$_CC_WJ_UUID_RE" || { _CC_WJ_TAIL_ATTRS=(global -); return 0; }
+  if [ -d "$sessions" ]; then
+    found="$(_cc_wj_with_timeout 15 find "$sessions" -type f -name "*-$tid.jsonl" -print 2>/dev/null)" ||
+      { _CC_WJ_TAIL_ATTRS=(global -); return 0; }
+  fi
+  while IFS= read -r t; do
+    case "$t" in '') continue ;; /*) ;; *) _CC_WJ_TAIL_ATTRS=(global -); return 0 ;; esac
+    case "$seen" in *$'\n'"$t"$'\n'*) continue ;; esac
+    seen="$seen$t"$'\n'
+    [ -r "$t" ] || { _CC_WJ_TAIL_ATTRS=(global -); return 0; }
+    _CC_WJ_TAIL_ATTRS+=(tail "Codex|$t")
+  done <<CODEX_TAILS
+$(printf '%s\n' "$@")
+$found
+CODEX_TAILS
+  [ "${#_CC_WJ_TAIL_ATTRS[@]}" -gt 0 ] || _CC_WJ_TAIL_ATTRS=(global -)
+}
+
+# The byte offset where the current two human user turns of transcript $2 begin, the window the
+# readable path searches for structured tool calls. A record that does not parse never ends the
+# window, so this window holds at least the readable one; with fewer than two turns it is the
+# whole file.
+_cc_wj_tail_window_start() { # <Claude|Codex> <transcript>
+  local python
+  python="$(command -v python3 2>/dev/null)" || return 2
+  "$python" - "$1" "$2" <<'PY'
+import json
+import mmap
+import os
+import sys
+
+harness, path = sys.argv[1:]
+
+
+def is_user(event):
+    if not isinstance(event, dict):
+        return False
+    if harness == "Codex":
+        payload = event.get("payload")
+        return (
+            event.get("type") == "response_item"
+            and isinstance(payload, dict)
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+        )
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return event.get("type") == "user" and (
+        isinstance(content, str)
+        or (
+            isinstance(content, list)
+            and any(isinstance(item, dict) and item.get("type") == "text" for item in content)
+        )
+    )
+
+
+try:
+    with open(path, "rb") as handle:
+        if os.fstat(handle.fileno()).st_size == 0:
+            print(0)
+            raise SystemExit(0)
+        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as contents:
+            turns, start, end = 0, 0, len(contents)
+            while end:
+                if contents[end - 1 : end] == b"\n":
+                    end -= 1
+                    continue
+                newline = contents.rfind(b"\n", 0, end)
+                begin = 0 if newline < 0 else newline + 1
+                if b'"user"' in contents[begin : min(end, begin + 8192)]:
+                    try:
+                        event = json.loads(contents[begin:end])
+                    except (UnicodeDecodeError, ValueError):
+                        event = None
+                    if is_user(event):
+                        turns += 1
+                        if turns >= 2:
+                            start = begin
+                            break
+                end = newline if newline >= 0 else 0
+            print(start)
+except (OSError, ValueError):
+    raise SystemExit(2)
+PY
+}
+
+# 0 when the current-turn window of transcript $2 holds any of paths $3..., as fixed strings
+# (also with JSON's escaped solidus); 1 when it holds none; 2 when it cannot tell (unreadable,
+# or a path JSON might spell otherwise). Raw text, not parsed records: the record could not be
+# parsed, so any mention keeps the tree. The window start is computed once per transcript.
+_CC_WJ_TAIL_OFFSETS=""  # transcript \t dev:inode \t window start
+_cc_wj_unknown_tail_names() { # <Claude|Codex> <transcript> <path>...
+  local harness="$1" f="$2" p id="" size off="" rp ri ro rc needles=()
+  shift 2
+  [ -r "$f" ] || return 2
+  for p in "$@"; do
+    [ -n "$p" ] || continue
+    printf '%s' "$p" | LC_ALL=C grep -q '[^A-Za-z0-9._/+@~,:= -]' && return 2
+    needles+=(-e "$p" -e "${p//\//\\/}")
+  done
+  [ "${#needles[@]}" -gt 0 ] || return 2
+  id="$(stat -f '%d:%i %z' "$f" 2>/dev/null)" || id="$(stat -c '%d:%i %s' "$f" 2>/dev/null)" || return 2
+  size="${id#* }"; id="${id%% *}"
+  case "$size" in ''|*[!0-9]*) return 2 ;; esac
+  # A file rewritten shorter than the cached start is measured again.
+  while IFS=$'\t' read -r rp ri ro; do
+    [ "$rp" = "$f" ] && [ "$ri" = "$id" ] && [ "$ro" -le "$size" ] && { off="$ro"; break; }
+  done <<TAIL_OFFSETS
+$_CC_WJ_TAIL_OFFSETS
+TAIL_OFFSETS
+  if [ -z "$off" ]; then
+    off="$(_cc_wj_tail_window_start "$harness" "$f")" || return 2
+    case "$off" in ''|*[!0-9]*) return 2 ;; esac
+    _CC_WJ_TAIL_OFFSETS="${_CC_WJ_TAIL_OFFSETS}${f}"$'\t'"${id}"$'\t'"${off}"$'\n'
+  fi
+  LC_ALL=C tail -c "+$((off + 1))" -- "$f" 2>/dev/null | LC_ALL=C grep -F -q "${needles[@]}"
+  rc=("${PIPESTATUS[@]}")
+  case "${rc[1]}" in
+    0) return 0 ;;
+    1) [ "${rc[0]}" -eq 0 ] && return 1; return 2 ;;
+  esac
+  return 2
+}
+
 # The project directory a Claude transcript under CC_WJ_CLAUDE_PROJECTS lives in.
 _cc_wj_transcript_projdir() { # <transcript>
   local projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}" rel
@@ -1704,10 +1930,14 @@ _cc_wj_transcript_projdir() { # <transcript>
 }
 
 # A transcript that could not be parsed when a candidate asked it: recorded as unknown with the
-# cwd its own session claims and, for Claude, its project directory, and dropped from both
-# transcript lists so later candidates do not ask it again.
-_cc_wj_unknown_from_transcript() { # <harness> <id> <transcript> <message>
+# cwd its own session claims, for Claude its project directory, and the transcript itself for a
+# raw search of its current turns, and dropped from both transcript lists so later candidates do
+# not ask it again. $5=active is a live session's: one whose transcript cannot be read keeps
+# every tree.
+_cc_wj_unknown_from_transcript() { # <harness> <id> <transcript> <message> <active|recent>
   local harness="$1" sid="$2" transcript="$3" msg="$4" h cwd x rest attrs=()
+  [ "${5:-active}" = recent ] || attrs+=(live yes)
+  case "$transcript" in /*) [ -r "$transcript" ] && attrs+=(tail "$harness|$transcript") ;; esac
   while IFS=$'\t' read -r h cwd x; do
     [ "$h" = "$harness" ] && [ "$x" = "$sid" ] && attrs+=(cwd "$cwd")
   done <<UNKNOWN_LIVE
@@ -1742,26 +1972,40 @@ _cc_wj_tree_recent() { # <worktree> <grace hours>
   [ -n "$out" ]
 }
 
+# Claude names a project directory after its cwd. Whether it shortens a long name (and how) is
+# not established here, so a name longer than this cannot be matched either way: a projdir
+# attribution keeps every tree when its own name, or the tree's, is longer.
+_CC_WJ_PROJDIR_MAX=200
+
 # 0, with _CC_WJ_UNKNOWN_REASON set, when an unreadable record of the current scan may be about
-# worktree $1: one of its attributions names it, or the tree is recent.
+# worktree $1: it may be about any tree (`global`), one of its attributions names it, its
+# transcript's current turns name it (or cannot be searched), or the tree is recent.
 _cc_wj_unknown_keeps() { # <worktree> <grace hours>
-  local wt="${1%/}" grace="$2" phys alt enc encp enca rec kind value unattributed="" first=""
+  local wt="${1%/}" grace="$2" phys alt walt enc encp enca encw long=0 e rec kind value rc
+  local unattributed="" first=""
   _CC_WJ_UNKNOWN_REASON=""; _CC_WJ_UNKNOWN_BY=attr
   [ -n "$_CC_WJ_UNKNOWN" ] || return 1
   phys="$(_cc_wj_realpath "$wt")"; phys="${phys%/}"
   case "$phys" in /private/*) alt="${phys#/private}" ;; *) alt="/private$phys" ;; esac
+  case "$wt" in /private/*) walt="${wt#/private}" ;; *) walt="/private$wt" ;; esac
   enc="$(_cc_wj_project_dir_name "$wt")"; encp="$(_cc_wj_project_dir_name "$phys")"
-  enca="$(_cc_wj_project_dir_name "$alt")"
+  enca="$(_cc_wj_project_dir_name "$alt")"; encw="$(_cc_wj_project_dir_name "$walt")"
+  for e in "$enc" "$encp" "$enca" "$encw"; do [ "${#e}" -le "$_CC_WJ_PROJDIR_MAX" ] || long=1; done
   while IFS=$'\t' read -r rec kind value; do
     [ -n "$rec" ] || continue
     case "$kind" in
+      global)
+        _CC_WJ_UNKNOWN_REASON="session-unknown:$rec"; return 0 ;;
       cwd)
-        case "$value/" in "$wt/"*|"$phys/"*|"$alt/"*)
+        case "$value/" in "$wt/"*|"$phys/"*|"$alt/"*|"$walt/"*)
           _CC_WJ_UNKNOWN_REASON="session-unknown:$rec"; return 0 ;;
         esac ;;
       projdir)
+        if [ "$long" -eq 1 ] || [ "${#value}" -gt "$_CC_WJ_PROJDIR_MAX" ]; then
+          _CC_WJ_UNKNOWN_REASON="session-unknown:$rec"; return 0
+        fi
         # A prefix also matches a sibling whose name extends this one: that keeps more, never less.
-        case "$value" in "$enc"|"$enc"-*|"$encp"|"$encp"-*|"$enca"|"$enca"-*)
+        case "$value" in "$enc"|"$enc"-*|"$encp"|"$encp"-*|"$enca"|"$enca"-*|"$encw"|"$encw"-*)
           _CC_WJ_UNKNOWN_REASON="session-unknown:$rec"; return 0 ;;
         esac ;;
       none) [ -n "$unattributed" ] || unattributed="$rec" ;;
@@ -1770,6 +2014,16 @@ _cc_wj_unknown_keeps() { # <worktree> <grace hours>
   done <<UNKNOWN_ROWS
 $_CC_WJ_UNKNOWN
 UNKNOWN_ROWS
+  # A live session can name the tree by absolute path from a cwd elsewhere. Its transcript's
+  # current turns are searched as raw text; one that cannot be searched keeps the tree.
+  while IFS=$'\t' read -r rec kind value; do
+    [ "$kind" = tail ] || continue
+    _cc_wj_unknown_tail_names "${value%%|*}" "${value#*|}" "$wt" "$walt" "$phys" "$alt"; rc=$?
+    [ "$rc" -eq 1 ] && continue
+    _CC_WJ_UNKNOWN_REASON="session-unknown:$rec"; return 0
+  done <<UNKNOWN_TAILS
+$_CC_WJ_UNKNOWN
+UNKNOWN_TAILS
   # What could not be read may also name trees nothing attributes (a tool call names any path),
   # so every record keeps a tree active within the session grace too.
   [ -n "$first" ] || return 1
@@ -1914,7 +2168,7 @@ RECENT_CLAIMS
       _CC_WJ_ACTIVE_ERROR="the transcript for recent $harness session $sid could not be parsed"
       # Per tree: the transcript becomes an unknown record, asked by the caller's gate.
       if [ "$(_cc_wj_unknown_scope)" != global ]; then
-        _cc_wj_unknown_from_transcript "$harness" "$sid" "$transcript" "$_CC_WJ_ACTIVE_ERROR"
+        _cc_wj_unknown_from_transcript "$harness" "$sid" "$transcript" "$_CC_WJ_ACTIVE_ERROR" recent
         continue
       fi
       return 2
@@ -2077,7 +2331,7 @@ ACTIVE_CLAIMS
             *)
               _CC_WJ_ACTIVE_ERROR="Codex session $sid ended while activity was being checked but its archived state could not be mapped"
               if [ "$(_cc_wj_unknown_scope)" != global ]; then
-                _cc_wj_unknown_from_transcript "$harness" "$sid" "$transcript" "$_CC_WJ_ACTIVE_ERROR"
+                _cc_wj_unknown_from_transcript "$harness" "$sid" "$transcript" "$_CC_WJ_ACTIVE_ERROR" active
                 continue
               fi
               return 2
@@ -2087,7 +2341,7 @@ ACTIVE_CLAIMS
       fi
       _CC_WJ_ACTIVE_ERROR="the transcript for active $harness session $sid could not be parsed"
       if [ "$(_cc_wj_unknown_scope)" != global ]; then
-        _cc_wj_unknown_from_transcript "$harness" "$sid" "$transcript" "$_CC_WJ_ACTIVE_ERROR"
+        _cc_wj_unknown_from_transcript "$harness" "$sid" "$transcript" "$_CC_WJ_ACTIVE_ERROR" active
         continue
       fi
       return 2

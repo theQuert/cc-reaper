@@ -269,12 +269,31 @@ could be about. What can still be read of it attributes it:
 
 | Record | Attributed by |
 |---|---|
-| a live Claude registry record (`<pid>.json`) that will not parse, has a bad pid or session id, or a cwd that does not resolve | the cwd of that pid (`lsof -p <pid> -d cwd`) and any `"cwd"` string in its raw text |
-| a live Claude session whose transcript cannot be located, is not unique or is unreadable | its cwd (already a claim) and the project directories of its transcripts |
-| a recent Claude transcript that cannot be opened, has no activity time or no cwd | its project directory under `~/.claude/projects`, which encodes the cwd it started in (every byte but `[A-Za-z0-9]` becomes `-`); a prefix match, so a sibling whose name extends the tree's is kept too |
-| an active Codex writer lock with no single task row or rollout | every cwd its state rows name, the `cwd` in its rollout's first record, and the cwd of each process holding the lock |
-| a recent Codex row that cannot be used | its `cwd` column |
-| a transcript that fails to parse when a candidate asks it | its own session's cwd claims and, for Claude, its project directory; it is then dropped from the lists, so later candidates do not ask it again |
+| a live Claude registry record (`<pid>.json`) that will not parse, has a bad pid or session id, or a cwd that does not resolve | the cwd of that pid (`lsof -p <pid> -d cwd`), any `"cwd"` string in its raw text, and the transcript of the session id its raw text (or else the pid's command line) carries |
+| a live Claude session whose transcript cannot be located, is not unique or is unreadable | its cwd (already a claim), the project directories of its transcripts, and each transcript that can be read |
+| a recent Claude transcript that cannot be opened, has no activity time or no cwd | its project directory under `~/.claude/projects`, which encodes the cwd it started in (every byte but `[A-Za-z0-9]` becomes `-`); a prefix match, so a sibling whose name extends the tree's is kept too; and the transcript, when it can be read |
+| an active Codex writer lock with no single task row or rollout | every cwd its state rows name, the `cwd` in its rollout's first record, the cwd of each process holding the lock, and each rollout its rows or `~/.codex/sessions` name |
+| a recent Codex row that cannot be used | its `cwd` column, and its rollout when it can be read |
+| a transcript that fails to parse when a candidate asks it | its own session's cwd claims, for Claude its project directory, and the transcript itself; it is then dropped from the lists, so later candidates do not ask it again |
+
+Every cwd is matched as written and as resolved (`cd -P` on its deepest existing ancestor, the
+rest appended), with and without `/private`, so a cwd given through a symlink names the tree it
+points into. A transcript is searched as raw text, since its records could not be parsed: every
+spelling of the tree's path (as given, physical, with and without `/private`, also with JSON's
+`\/`) as a fixed string in its current two human user turns, the same window the readable path
+reads for tool calls, widened by any record that does not parse. A mention keeps the tree; a
+transcript that cannot be read or a path JSON might spell otherwise keeps it too.
+
+A live record - a `<pid>.json` of a live pid, an active Codex claim, the transcript of a live
+session - may be a session working in any tree by absolute path from a cwd elsewhere, which no
+cwd, project directory or recency check sees (the session grace and the idle window are both
+48 hours). So a live record whose transcript cannot be found or read keeps every tree, as
+`global` would. Only a record no live session holds (a recent transcript or Codex row whose id no
+live registry entry carries) is attributed by its cwd, project directory and recency alone.
+
+Whether Claude shortens a long project directory name is not established here, so a project
+directory attribution keeps every tree when its name, or the name of the tree's path, is longer
+than 200 characters.
 
 Whatever could not be read may still name any path (a tool call can), so every such record
 also keeps each tree whose own recent signals - an entry at its top level, its git index,

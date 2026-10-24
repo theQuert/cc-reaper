@@ -3,13 +3,18 @@
 # about (stima-api#5886), instead of every worktree on the machine.
 #   A  old, landed, clean; an unreadable recent transcript's project directory names it  -> kept
 #   F  old, landed, clean; a torn live session record's raw cwd names it                 -> kept
+#      (its transcript, found by the session id in the raw text, is ten days old and readable)
 #   B  old, landed, clean; nothing names it                       -> freed per tree, kept by global
 #   C  recent, landed, clean; nothing names it                    -> kept by its own recency
 #   D  old, dirty (would go to refs/wip first)                    -> never freed while a record is unknown
 #   E  old, a commit origin does not have                         -> never freed
 # CC_WJ_UNKNOWN_SESSION_SCOPE=tree under CC_WJ_NEW_RULES_MODE=spotcheck (default), auto, and
-# CC_WJ_UNKNOWN_SESSION_SCOPE=global. Real git repositories and a local bare "origin"; lsof and gh
-# are stubs. TAP-style; set WJ_SCRIPT to test another copy of the janitor.
+# CC_WJ_UNKNOWN_SESSION_SCOPE=global. Then, with trees G and H, a live record that can work in any
+# tree by absolute path (stima-api#5886 review): its transcript names H from a cwd elsewhere; it
+# has no transcript at all (every tree kept); its cwd is a symlink into G; and a torn record that
+# appears only after the inventory, caught right before removal. Real git repositories and a
+# local bare "origin"; lsof and gh are stubs. TAP-style; set WJ_SCRIPT to test another copy of
+# the janitor.
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,6 +52,19 @@ mkwt() { G -C "$PRIMARY" worktree add -q -b "$1" "$T/wt-$1" main; }
 mkwt A; mkwt B; mkwt C; mkwt D; mkwt E; mkwt F
 echo notes > "$T/wt-D/notes.txt"
 echo work > "$T/wt-E/work.txt"; G -C "$T/wt-E" add work.txt; G -C "$T/wt-E" commit -qm "work on E"
+
+# Ten days old, so no recent-session scan reads it: a live session idle since then.
+old_file() { python3 -c 'import os, sys, time; t = time.time() - 10 * 86400; os.utime(sys.argv[1], (t, t))' "$1"; }
+# A readable transcript for session $1 in the project directory of cwd $2, whose current turn
+# has a tool call naming path $3.
+transcript() { # <session id> <cwd> <path named>
+  local dir="$PROJECTS/$(printf '%s' "$2" | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g')"
+  mkdir -p "$dir"
+  printf '{"type":"user","cwd":"%s","message":{"role":"user","content":"go"}}\n' "$2" > "$dir/$1.jsonl"
+  printf '{"type":"assistant","cwd":"%s","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls %s"}}]}}\n' \
+    "$2" "$3" >> "$dir/$1.jsonl"
+  old_file "$dir/$1.jsonl"
+}
 
 # Ten days old: every entry of the tree, the tree itself, and its git index, HEAD and HEAD reflog.
 age() { # <name>...
@@ -127,6 +145,7 @@ python3 -c 'import time; time.sleep(600)' </dev/null >/dev/null 2>&1 &
 live_pid=$!; disown "$live_pid" 2>/dev/null || true
 printf '{"pid":%s,"sessionId":"0000aaaa-0000-4000-8000-00000000000f","cwd":"%s","na' "$live_pid" "$T/wt-F" \
   > "$SESSIONS/$live_pid.json"
+transcript 0000aaaa-0000-4000-8000-00000000000f "$T/wt-F" "$T/wt-F/notes"
 REC_A="session-unknown:claude-transcript:$SID_A"
 REC_F="session-unknown:claude-session:$live_pid.json"
 
@@ -208,6 +227,71 @@ check "  with D's uncommitted file and E's commit in place" \
   bash -c '[ -f "$1/wt-D/notes.txt" ] && git -C "$1/wt-E" log -1 --format=%s | grep -q "work on E"' _ "$T"
 check "  and sends no refs/wip snapshot" test -z "$(git -C "$ORIGIN" for-each-ref refs/wip)"
 check "  and B's branch remains" git -C "$PRIMARY" show-ref -q --verify refs/heads/B
+
+# ─── A live record can be about any tree (stima-api#5886 review) ──────────────
+#
+# G and H are old, landed and clean. Each case leaves exactly one unreadable record: the torn
+# registry record of the live process, rewritten per case. A's transcript is made readable and
+# old, so it is no longer a record.
+
+chmod 600 "$PROJ_A/$SID_A.jsonl"; old_file "$PROJ_A/$SID_A.jsonl"
+mkwt G; mkwt H
+reage() { age A D E F G H; }
+REC_L="session-unknown:claude-session:$live_pid.json"
+torn() { # <session id> <cwd>
+  printf '{"pid":%s,"sessionId":"%s","cwd":"%s","na' "$live_pid" "$1" "$2" > "$SESSIONS/$live_pid.json"
+}
+
+# A transcript whose current turn names H, from a cwd in the primary checkout.
+SID_N="0000aaaa-0000-4000-8000-00000000001a"
+torn "$SID_N" "$PRIMARY"; transcript "$SID_N" "$PRIMARY" "$T/wt-H/src/main.go"
+CC_WJ_NEW_RULES_MODE=auto wj > "$T/named.txt"
+check "live, transcript names H by path: H is kept by the record" judged "$T/named.txt" H "KEEP($REC_L)"
+check "  and G, which nothing names, is removable" judged "$T/named.txt" G REMOVABLE
+
+# No transcript to search: the record may be about any tree.
+SID_X="0000aaaa-0000-4000-8000-00000000001b"
+torn "$SID_X" "$PRIMARY"
+CC_WJ_NEW_RULES_MODE=auto wj > "$T/notranscript.txt"
+for n in G H; do
+  check "live, no transcript: $n is kept by the record" judged "$T/notranscript.txt" "$n" "KEEP($REC_L)"
+done
+check "  and the log says it may be about any tree" \
+  bash -c 'grep -F "KEEP($1) scope=tree:" "$2" | grep -qF "global=-"' _ "$REC_L" "$T/notranscript.txt"
+
+# A cwd given through a symlink into G.
+SID_S="0000aaaa-0000-4000-8000-00000000001c"
+ln -s "$T/wt-G" "$T/link-to-G"
+torn "$SID_S" "$T/link-to-G/sub"; transcript "$SID_S" "$PRIMARY" "$PRIMARY/README.md"
+CC_WJ_NEW_RULES_MODE=auto wj > "$T/symlink.txt"
+check "cwd through a symlink into G: G is kept by the record" judged "$T/symlink.txt" G "KEEP($REC_L)"
+check "  and H is removable" judged "$T/symlink.txt" H REMOVABLE
+
+# A torn record that appears after the inventory. The lsof stub writes it on its first scan of
+# the Codex lock registry, which runs after the Claude registry in the same session scan, so the
+# inventory never sees it and the rescan right before the first removal does.
+rm -f "$SESSIONS/$live_pid.json"
+mkdir -p "$T/codex-locks"
+export TORN_AFTER_SCAN="$SESSIONS/$live_pid.json"
+export TORN_TEXT="{\"pid\":$live_pid,\"sessionId\":\"0000aaaa-0000-4000-8000-00000000001d\",\"cwd\":\"$PRIMARY\",\"na"
+cat > "$STUBS/lsof" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" -d cwd "*) cat "$LSOF_CWD_FILE" ;;
+  *" +D "*) [ -n "${TORN_AFTER_SCAN:-}" ] && [ ! -e "$TORN_AFTER_SCAN.done" ] &&
+      { printf '%s' "$TORN_TEXT" > "$TORN_AFTER_SCAN"; : > "$TORN_AFTER_SCAN.done"; }
+    cat "$LSOF_OPEN_FILE" ;;
+  *) cat "$LSOF_OPEN_FILE" ;;
+esac
+STUB
+chmod +x "$STUBS/lsof"
+CC_WJ_CODEX_LOCKS="$T/codex-locks" CC_WJ_NEW_RULES_MODE=auto wj --apply > "$T/late.txt"
+check "late record: the stub wrote it during the run" test -e "$TORN_AFTER_SCAN.done"
+for n in A G H; do
+  check "late record: auto --apply keeps landed clean $n" test -d "$T/wt-$n"
+done
+check "  the first removal candidate kept by the rescan right before removal" \
+  grep -qF -- "→ kept: $REC_L; an unreadable session record may be about it" "$T/late.txt"
 
 if [ "$failures" -eq 0 ]; then echo "# all passed"; else echo "# $failures failed"; fi
 [ "$failures" -eq 0 ]
