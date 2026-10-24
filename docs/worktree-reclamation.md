@@ -216,6 +216,47 @@ the worktree and names it, and a walk that fails or passes 1000 files keeps it. 
 deletes anything from the archive; that is yours to do. An older janitor drops the line as a
 pattern that names no path, so the file goes on keeping its worktree.
 
+### Two pins on probation, checked before they decide
+
+On 2026-10-24 the sweep kept 50 worktrees (30.9 GB) as `unrebuildable`, many of them for one
+of two entries that are not work:
+
+- **a top-level ignored `*.log` file** (`next-manual.log`, `routing-snapshot-redis.log`,
+  `.build-main.log`): output a dev server or build wrote. Only a regular file at the top
+  level counts; `sub/run.log`, a symlink or a credential-shaped name still keeps the tree.
+- **a `.claude/skills` or `.claude/commands` symlink into the repository's own primary
+  checkout**, absolute or relative, as an older `new-task-worktree.sh` made them. Removing a
+  link removes nothing it names. A link anywhere else still keeps the tree.
+
+Either may stop keeping a worktree, but only once someone has looked at what that would do.
+`CC_WJ_NEW_RULES_MODE` is `spotcheck` by default (and for any value but `auto`): every
+decision stays exactly as before, and each removal or trim the rules *would* have made is
+appended to `CC_WJ_SPOTCHECK_LOG` (`~/.cc-reaper/logs/spotcheck-worktree-janitor.log`), one
+line with the sweep's run id, phase, rule, path, bytes and the holder result from the
+sweep's snapshot:
+
+```
+[2026-10-24T13:00:00+0800] run=20261024T050000Z-4242 phase=trim action=would-trim rule=top-level-log path=<wt>/web/next/node_modules bytes=1610612736 holder=none(sweep-snapshot) worktree=<wt>
+```
+
+A tree is spot-checked only when those entries are *all* that keeps it; it is then judged
+through every other gate as the rule would judge it (holders, claims, landed, idle, git
+state), and the report adds a `spotcheck:` line under the unchanged classification. Set
+`auto` and the same trees go through the ordinary path, including every recheck right before
+the removal or the trim. Nothing about landing changes: an unlanded tree is still never
+removed, and the trim never asked for landing; what a log changed for the trim is that it
+made the tree dirty, and a dirty tree is trimmed only after `CC_WJ_TRIM_DIRTY_IDLE_HOURS`
+(168).
+
+### Names nothing may touch
+
+`CC_WJ_DENY_NAMES` (whitespace-separated; the installed config sets
+`homepage uiux verify-signin-redesign`) keeps a worktree as `KEEP(deny-listed:<name>)` in the
+removal sweep and the trim alike when its directory name or branch contains a name, or when a
+live Claude session registered under that name stands at or under it. A live session's tool
+calls already veto through the ordinary claim gate; this one holds whatever the claim windows
+say.
+
 ## Where to run it
 
 - **From cc-reaper's six-hour LaunchAgent** for repositories under the installed `~/GitHub`
@@ -268,6 +309,13 @@ pattern that names no path, so the file goes on keeping its worktree.
   later cache directory of the same worktree the trim reuses a holder and session snapshot younger than
   `CC_WJ_RECHECK_FRESH_SECONDS` (120) instead of rescanning the machine; every claim, holder
   and content check is still asked against it. Removal always rescans.
+- **Answering "nothing to trim" first.** The holder scan is machine-wide and taken once per
+  phase (two `lsof` calls, about 4 s on 2026-10-24), plus once more before each removal or
+  trimmed worktree; it does not grow with the number of worktrees. What does is the rest:
+  per tree, the recent-session lookup took 2-5 s, the git-state probe 1.5 s and the idle walk
+  up to 4 s, and on 2026-10-24 the trim phase spent them on all 132 trees it examined, every
+  one answering `count=0`, and ran 3240 s against its 1800 s budget. The trim now reads a
+  tree's regenerable directories first (one `git status`) and moves on when there are none.
 
 The common hook command is:
 
