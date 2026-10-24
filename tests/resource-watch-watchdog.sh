@@ -35,13 +35,27 @@ stub_dir="$TMPDIR_ROOT/stubs"
 guard_dir="$TMPDIR_ROOT/guard"
 mkdir -p "$stub_dir" "$guard_dir"
 FIXTURE_PIDS="$TMPDIR_ROOT/fixture-pids"
-: > "$FIXTURE_PIDS"
-# Only pids this suite started are ever signalled, continued first so a stopped one can die.
+ACT_GROUPS="$TMPDIR_ROOT/act-groups"
+: > "$FIXTURE_PIDS"; : > "$ACT_GROUPS"
+# Only pids this suite started are ever signalled, continued first so a stopped one can die. An
+# act leads its own process group, and a child of it can outlive both the act and the record of
+# its pid; the group is ended too, and only while every member is one of this suite's fixtures.
 cleanup() {
-  local p
+  local p g members m ours
   for p in $(cat "$FIXTURE_PIDS" 2>/dev/null); do
     kill -CONT "$p" 2>/dev/null || true
     kill -KILL "$p" 2>/dev/null || true
+  done
+  for g in $(cat "$ACT_GROUPS" 2>/dev/null); do
+    members=$(pgrep -g "$g" 2>/dev/null) || continue
+    ours=1
+    for m in $members; do
+      case "$(ps -o command= -p "$m" 2>/dev/null)" in
+        ''|"sleep 300"|*"$TMPDIR_ROOT"*) ;;
+        *) ours=0 ;;
+      esac
+    done
+    if [ "$ours" -eq 1 ]; then kill -CONT -- "-$g" 2>/dev/null; kill -KILL -- "-$g" 2>/dev/null; fi
   done
   rm -rf "$TMPDIR_ROOT"
 }
@@ -51,6 +65,7 @@ trap cleanup EXIT
 cat > "$stub_dir/top" <<'STUB'
 #!/usr/bin/env bash
 if [ -n "${CC_RW_TEST_HANG_TOP:-}" ]; then
+  [ -n "${CC_RW_TEST_TOP_IGNORES_TERM:-}" ] && trap '' TERM
   echo "$$" > "$CC_RW_TEST_HANG_TOP"
   echo "$$" >> "$CC_RW_TEST_FIXTURE_PIDS"
   exec sleep 40
@@ -157,7 +172,7 @@ w2=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
 # A detached act first, so the deadline is shown not to reach it.
 round "$w2" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh"
 w2_act=$(cat "$w2/state/disk-act.lock/pid" 2>/dev/null || echo 0)
-echo "$w2_act" >> "$FIXTURE_PIDS"
+echo "$w2_act" >> "$FIXTURE_PIDS"; echo "$w2_act" >> "$ACT_GROUPS"
 wait_for_lines "$w2/pids" 2
 w2_start=$(date +%s)
 round "$w2" 30 CC_RW_TEST_HANG_TOP="$w2/top.pid" CC_RW_ROUND_MAX_SECONDS=2 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh"
@@ -182,7 +197,7 @@ expect_no  "W2c: and logs no overrun" grep -q 'ALERT:round-overrun' "$w2c/resour
 w3=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
 round "$w3" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh"
 w3_act=$(cat "$w3/state/disk-act.lock/pid" 2>/dev/null || echo 0)
-echo "$w3_act" >> "$FIXTURE_PIDS"
+echo "$w3_act" >> "$FIXTURE_PIDS"; echo "$w3_act" >> "$ACT_GROUPS"
 wait_for_lines "$w3/pids" 2
 kill -STOP "$w3_act"
 echo "$(( $(date +%s) - 6000 ))" > "$w3/state/disk-act.lock/started"   # past the 5400s cap
@@ -208,7 +223,7 @@ kill -CONT "$w3_act" 2>/dev/null || true
 w3c=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
 round "$w3c" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh"
 w3c_act=$(cat "$w3c/state/disk-act.lock/pid" 2>/dev/null || echo 0)
-echo "$w3c_act" >> "$FIXTURE_PIDS"
+echo "$w3c_act" >> "$FIXTURE_PIDS"; echo "$w3c_act" >> "$ACT_GROUPS"
 wait_for_lines "$w3c/pids" 2
 w3c_child=$(head -1 "$w3c/pids")
 kill -STOP "$w3c_child"
@@ -223,11 +238,119 @@ kill -CONT "$w3c_child" 2>/dev/null || true
 w3d=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
 round "$w3d" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh"
 w3d_act=$(cat "$w3d/state/disk-act.lock/pid" 2>/dev/null || echo 0)
-echo "$w3d_act" >> "$FIXTURE_PIDS"
+echo "$w3d_act" >> "$FIXTURE_PIDS"; echo "$w3d_act" >> "$ACT_GROUPS"
 wait_for_lines "$w3d/pids" 2
 round "$w3d" 30 CC_RW_JANITOR_SCRIPT="$guard_dir/janitor-slow.sh"
 expect_yes "W3d: a running act is ACT:running" grep -q "ACT:running:${w3d_act}" "$w3d/resource-watch.log"
 expect_no  "W3d: not held" grep -q 'disk-act-held' "$w3d/resource-watch.log"
+
+# ---------------------------------------------------------------------------
+# W4: under launchd the job's process group dies with the round, the watchdog included, so the
+# alert and the notification go out before the round is ended. launchd_round stands in for it.
+# ---------------------------------------------------------------------------
+launchd_round() {
+  local dir=$1 free_gb=$2
+  shift 2
+  mkdir -p "$dir/state"
+  (
+    set -m
+    export PATH="$stub_dir:$PATH"
+    export CC_RW_LOG="$dir/resource-watch.log" CC_RW_STATE_DIR="$dir/state"
+    export CC_RW_OSASCRIPT_LOG="$dir/osascript" CC_RW_TEST_CALLS="$dir/calls" CC_RW_TEST_PIDS="$dir/pids"
+    export CC_RW_TEST_FIXTURE_PIDS="$FIXTURE_PIDS" CC_RW_TEST_DF_KB=$(( free_gb * GB ))
+    export CC_RW_JANITOR_SCRIPT="$guard_dir/janitor.sh" CC_RW_RECLAIM_SCRIPT="$guard_dir/reclaim.sh"
+    for pair in "$@"; do export "$pair"; done
+    /bin/bash "$RW" &
+    job=$!
+    wait "$job" || true
+    kill -KILL -- "-$job" 2>/dev/null   # what launchd does to the job's group once the job exits
+    exit 0
+  ) || true
+  touch "$dir/osascript" "$dir/calls"
+}
+w4=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+launchd_round "$w4" 100 CC_RW_TEST_HANG_TOP="$w4/top.pid" CC_RW_TEST_TOP_IGNORES_TERM=1 CC_RW_ROUND_MAX_SECONDS=2
+expect_yes "W4: the overrun notification is sent even though the job's group dies with the round" \
+  grep -q 'round-overrun' "$w4/osascript"
+expect_yes "W4: and the ERROR is logged" grep -q 'ERROR resource-watch round ran over' "$w4/resource-watch.log"
+expect_no  "W4: the TERM-proof step is gone (the group kill)" kill -0 "$(cat "$w4/top.pid" 2>/dev/null || echo 0)"
+
+# ---------------------------------------------------------------------------
+# W5: the watchdog acts only on its own parent, and only when that parent is resource-watch
+# ---------------------------------------------------------------------------
+sleep 300 > /dev/null 2>&1 &
+w5_other=$!
+echo "$w5_other" >> "$FIXTURE_PIDS"
+w5=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkdir -p "$w5/state"
+(
+  export CC_RW_LOG="$w5/resource-watch.log" CC_RW_STATE_DIR="$w5/state" CC_RW_OSASCRIPT_LOG="$w5/osascript"
+  export PATH="$stub_dir:$PATH"
+  # shellcheck source=/dev/null
+  source "$RW"
+  _cc_rw_round_watchdog "$w5_other" 1
+) || true
+expect_yes "W5a: a round pid that is not the watchdog's parent (orphaned, or reused) is never signalled" kill -0 "$w5_other"
+expect_no  "W5a: and nothing is logged as an overrun" grep -q 'round ran over' "$w5/resource-watch.log"
+cat > "$TMPDIR_ROOT/not-the-guard.sh" <<STUB
+#!/usr/bin/env bash
+export CC_RW_LOG="$w5/resource-watch.log" CC_RW_STATE_DIR="$w5/state" CC_RW_OSASCRIPT_LOG="$w5/osascript"
+source "$RW"
+( _cc_rw_round_watchdog \$\$ 1 ) &
+wait \$!
+echo survived > "\$1"
+STUB
+/bin/bash "$TMPDIR_ROOT/not-the-guard.sh" "$w5/flag" || true
+expect_yes "W5b: a parent whose command line is not resource-watch is never signalled" test -f "$w5/flag"
+kill "$w5_other" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# W6: the round tree skips a resource-watch act and everything under it
+# ---------------------------------------------------------------------------
+mkdir -p "$TMPDIR_ROOT/fake"
+cat > "$TMPDIR_ROOT/fake/resource-watch.sh" <<'STUB'
+#!/usr/bin/env bash
+sleep 300 &
+echo "$!" >> "$W6_PIDS"
+wait
+STUB
+cat > "$TMPDIR_ROOT/w6-root.sh" <<'STUB'
+#!/usr/bin/env bash
+/bin/bash "$W6_FAKE" --act 30 &
+echo "act $!" >> "$W6_PIDS"
+sleep 299 &
+echo "plain $!" >> "$W6_PIDS"
+wait
+STUB
+W6_PIDS="$TMPDIR_ROOT/w6-pids" W6_FAKE="$TMPDIR_ROOT/fake/resource-watch.sh" /bin/bash "$TMPDIR_ROOT/w6-root.sh" &
+w6_root=$!
+echo "$w6_root" >> "$FIXTURE_PIDS"
+wait_for_lines "$TMPDIR_ROOT/w6-pids" 3
+w6_act=$(awk '$1 == "act" {print $2}' "$TMPDIR_ROOT/w6-pids")
+w6_plain=$(awk '$1 == "plain" {print $2}' "$TMPDIR_ROOT/w6-pids")
+w6_actkid=$(awk 'NF == 1 {print $1}' "$TMPDIR_ROOT/w6-pids")
+for p in $w6_act $w6_plain $w6_actkid; do echo "$p" >> "$FIXTURE_PIDS"; done
+w6_tree=$( source "$RW"; _cc_rw_round_tree "$w6_root" 0 | tr '\n' ' ' )
+expect_yes "W6: the round tree holds the round and its plain child (${w6_tree})" \
+  sh -c "echo ' $w6_tree ' | grep -q ' $w6_root ' && echo ' $w6_tree ' | grep -q ' $w6_plain '"
+expect_no  "W6: but not a resource-watch act" sh -c "echo ' $w6_tree ' | grep -q ' ${w6_act:-x} '"
+expect_no  "W6: nor the act's child" sh -c "echo ' $w6_tree ' | grep -q ' ${w6_actkid:-x} '"
+for p in $w6_actkid $w6_plain $w6_act $w6_root; do kill "$p" 2>/dev/null || true; done
+
+# ---------------------------------------------------------------------------
+# W7: a stopped pid in the round's OWN tree is ended with it, and named. Unlike a detached act, a
+# held round holds every later round (launchd starts none while it runs): the 2026-10-24 failure.
+# ---------------------------------------------------------------------------
+w7=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+round "$w7" 100 CC_RW_TEST_HANG_TOP="$w7/top.pid" CC_RW_ROUND_MAX_SECONDS=3 &
+w7_round=$!
+wait_for_lines "$w7/top.pid" 1
+w7_top=$(cat "$w7/top.pid" 2>/dev/null || echo 0)
+i=0; while [ "$(ps -o comm= -p "$w7_top" 2>/dev/null)" != sleep ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+kill -STOP "$w7_top" 2>/dev/null || true
+wait "$w7_round" 2>/dev/null || true
+i=0; while kill -0 "$w7_top" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i + 1)); done   # the KILL follows a 5s grace
+expect_no  "W7: a stopped step of the round is ended with the round" kill -0 "$w7_top"
+expect_yes "W7: and the ERROR names it as stopped" grep -q "ERROR resource-watch round ran over.*stopped pid(s) ${w7_top}" "$w7/resource-watch.log"
 
 printf "passed: %s, failed: %s\n" "$passes" "$failures"
 [ "$failures" -eq 0 ]

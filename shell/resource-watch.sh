@@ -619,8 +619,16 @@ _cc_rw_round_tree() {
 
 # The watchdog body, run as `( _cc_rw_round_watchdog <round pid> <secs> ) &`. TERM from the round
 # (it finished in time) ends it and its sleep at once. Args: <round pid> <secs>
+#
+# It acts only on its own parent, and only while that parent's command line is resource-watch: a
+# watchdog orphaned (a hand-run ended with Ctrl-C) or facing a reused pid exits without a signal.
+# The alert and the notification go out BEFORE the tree is ended: the watchdog is in the round's
+# process group, and launchd ends that group once the round exits, so anything after the TERM may
+# never run. A stopped pid in the round's own tree is ended with it, unlike a stopped act: a round
+# that is held holds every later round (launchd starts none while it runs), which is the very
+# failure this deadline exists for. The ERROR names such pids.
 _cc_rw_round_watchdog() {
-  local round=$1 secs=$2 me sp="" tree killed
+  local round=$1 secs=$2 me sp="" tree killed pid held=""
   trap '[ -n "$sp" ] && kill "$sp" 2>/dev/null; exit 0' TERM
   sleep "$secs" &
   sp=$!
@@ -629,13 +637,19 @@ _cc_rw_round_watchdog() {
   kill -0 "$round" 2>/dev/null || exit 0
   # bash 3.2 (/bin/bash, launchd's) has no BASHPID: a child sh reports this subshell as its parent.
   me=${BASHPID:-$(exec sh -c 'echo $PPID')}
+  [ "$(ps -o ppid= -p "$me" 2>/dev/null | tr -d ' ')" = "$round" ] || exit 0
+  case "$(ps -o command= -p "$round" 2>/dev/null)" in *resource-watch*) ;; *) exit 0 ;; esac
   tree=$(_cc_rw_round_tree "$round" "$me" | tr '\n' ' ')
   tree=${tree% }
-  _cc_rw_log_line "ERROR resource-watch round ran over CC_RW_ROUND_MAX_SECONDS=${secs}s; ending the round's own tree: ${tree} ALERT:round-overrun"
+  for pid in $tree; do
+    case "$(ps -o stat= -p "$pid" 2>/dev/null)" in *T*) held="$held $pid" ;; esac
+  done
+  held=${held# }
+  _cc_rw_log_line "ERROR resource-watch round ran over CC_RW_ROUND_MAX_SECONDS=${secs}s; ending the round's own tree: ${tree}${held:+ (stopped pid(s) ${held} are ended too: a held round holds every later round)} ALERT:round-overrun"
+  _cc_rw_maybe_notify "round-overrun" "a resource-watch round ran over ${secs}s and is being ended; see resource-watch.log" "$(date +%s)"
   # shellcheck disable=SC2086
   killed=$(_cc_rw_end_pids 5 $tree)
   _cc_rw_log_line "ERROR resource-watch round ended (TERM: ${tree}; KILL: ${killed:-none})"
-  _cc_rw_maybe_notify "round-overrun" "a resource-watch round ran over ${secs}s and was ended; see resource-watch.log" "$(date +%s)"
   exit 0
 }
 
