@@ -1233,16 +1233,17 @@ _cc_wj_scan_claude_sessions() {
     # The session's name, for CC_WJ_DENY_NAMES only. Read apart from the row above so a
     # missing or odd name can never fail the scan that every veto depends on.
     sname="$(jq -r '(.name // "") | tostring' "$f" 2>/dev/null | head -n 1)"
+    # A record whose pid is missing or is not the live process its file is named for is not
+    # bound to that process, so its session id may be another session's and that transcript
+    # says nothing about what the live process does: it keeps every tree.
     case "$pid" in ''|*[!0-9]*)
-      _cc_wj_tail_attrs_claude "$(_cc_wj_raw_session_id "$sid" "$f" "$base")"
       _cc_wj_unknown_add "claude-session:${f##*/}" "live Claude session record ${f##*/} has no valid pid" \
-        live yes cwd "$(_cc_wj_pid_cwd "$base")" cwd "$cwd" "${_CC_WJ_TAIL_ATTRS[@]}"
+        live yes cwd "$(_cc_wj_pid_cwd "$base")" cwd "$cwd" global -
       continue ;;
     esac
     [ "$pid" = "$base" ] || {
-      _cc_wj_tail_attrs_claude "$(_cc_wj_raw_session_id "$sid" "$f" "$base")"
       _cc_wj_unknown_add "claude-session:${f##*/}" "live Claude session record ${f##*/} disagrees with pid $pid" \
-        live yes cwd "$(_cc_wj_pid_cwd "$base")" cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd" "${_CC_WJ_TAIL_ATTRS[@]}"
+        live yes cwd "$(_cc_wj_pid_cwd "$base")" cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd" global -
       continue
     }
     kill -0 "$pid" 2>/dev/null || continue
@@ -1448,6 +1449,10 @@ _cc_wj_scan_codex_sessions() {
     [ "$count" -eq 1 ] || {
       # shellcheck disable=SC2046
       _cc_wj_tail_attrs_codex "$tid" $(printf '%s\n' "$row" | awk -F '\t' '{ print $2 }' | LC_ALL=C grep -E '^/[^ *?[]*$')
+      # A rollout path that cannot be passed on as a word (a space, a glob character, not
+      # absolute) is a transcript left unsearched, so the claim keeps every tree.
+      printf '%s\n' "$row" | awk -F '\t' '$2 != "" { print $2 }' | LC_ALL=C grep -qvE '^/[^ *?[]*$' &&
+        _CC_WJ_TAIL_ATTRS+=(global -)
       _cc_wj_unknown_add "codex-claim:$tid" "active Codex claim $tid could not be mapped to exactly one task or active rollout" \
         live yes "${_CC_WJ_TAIL_ATTRS[@]}" $(_cc_wj_codex_unknown_attrs "$tid" "$path" "$row")
       continue

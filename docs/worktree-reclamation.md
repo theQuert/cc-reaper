@@ -269,10 +269,11 @@ could be about. What can still be read of it attributes it:
 
 | Record | Attributed by |
 |---|---|
-| a live Claude registry record (`<pid>.json`) that will not parse, has a bad pid or session id, or a cwd that does not resolve | the cwd of that pid (`lsof -p <pid> -d cwd`), any `"cwd"` string in its raw text, and the transcript of the session id its raw text (or else the pid's command line) carries |
+| a live Claude registry record (`<pid>.json`) that will not parse, has a bad session id, or a cwd that does not resolve | the cwd of that pid (`lsof -p <pid> -d cwd`), any `"cwd"` string in its raw text, and the transcript of the session id its raw text (or else the pid's command line) carries |
+| a live Claude registry record with no valid pid, or a pid other than the live one its file is named for | every tree: it is not bound to the live process, so its session id may be another session's |
 | a live Claude session whose transcript cannot be located, is not unique or is unreadable | its cwd (already a claim), the project directories of its transcripts, and each transcript that can be read |
 | a recent Claude transcript that cannot be opened, has no activity time or no cwd | its project directory under `~/.claude/projects`, which encodes the cwd it started in (every byte but `[A-Za-z0-9]` becomes `-`); a prefix match, so a sibling whose name extends the tree's is kept too; and the transcript, when it can be read |
-| an active Codex writer lock with no single task row or rollout | every cwd its state rows name, the `cwd` in its rollout's first record, the cwd of each process holding the lock, and each rollout its rows or `~/.codex/sessions` name |
+| an active Codex writer lock with no single task row or rollout | every cwd its state rows name, the `cwd` in its rollout's first record, the cwd of each process holding the lock, and each rollout its rows or `~/.codex/sessions` name; a rollout path with a space, a glob character or no leading `/` is left unsearched, so it keeps every tree |
 | a recent Codex row that cannot be used | its `cwd` column, and its rollout when it can be read |
 | a transcript that fails to parse when a candidate asks it | its own session's cwd claims, for Claude its project directory, and the transcript itself; it is then dropped from the lists, so later candidates do not ask it again |
 

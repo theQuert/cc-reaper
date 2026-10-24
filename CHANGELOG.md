@@ -23,7 +23,9 @@
   gate is unchanged, and a tree bound for `refs/wip` stays kept. A live record (a live pid's
   `<pid>.json`, an active Codex claim, a live session's transcript) whose transcript cannot be
   found or read keeps every tree, since a live session can work anywhere by absolute path; so
-  does a project directory name over 200 characters. It is on probation too: under
+  does a project directory name over 200 characters, a live `<pid>.json` whose pid is missing or
+  names another process (its session id may be another session's), and an active Codex claim
+  with a rollout path that holds a space or glob character. It is on probation too: under
   `spotcheck` decisions stay as before and the trees it would free are logged as
   `rule=session-unknown-per-tree`; `global` restores the old behaviour.
 - **`disk-janitor`'s low-disk act reaches its tools, and prunes node-modules templates in spot-check mode.**

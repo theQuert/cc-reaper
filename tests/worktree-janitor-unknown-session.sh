@@ -267,6 +267,24 @@ CC_WJ_NEW_RULES_MODE=auto wj > "$T/symlink.txt"
 check "cwd through a symlink into G: G is kept by the record" judged "$T/symlink.txt" G "KEEP($REC_L)"
 check "  and H is removable" judged "$T/symlink.txt" H REMOVABLE
 
+# A record that parses but whose pid is not the live process its file is named for (or that has
+# no pid at all): its session id may be another session's, so the transcript of that id says
+# nothing about what the live process does. That transcript is readable and names only the
+# primary checkout, yet G and H must stay kept by the record.
+SID_Y="0000aaaa-0000-4000-8000-00000000001e"
+transcript "$SID_Y" "$PRIMARY" "$PRIMARY/README.md"
+printf '{"pid":1,"sessionId":"%s","cwd":"%s"}\n' "$SID_Y" "$PRIMARY" > "$SESSIONS/$live_pid.json"
+CC_WJ_NEW_RULES_MODE=auto wj > "$T/disagree.txt"
+for n in G H; do
+  check "record disagreeing with its live pid, foreign session id: $n is kept by the record" \
+    judged "$T/disagree.txt" "$n" "KEEP($REC_L)"
+done
+printf '{"sessionId":"%s","cwd":"%s"}\n' "$SID_Y" "$PRIMARY" > "$SESSIONS/$live_pid.json"
+CC_WJ_NEW_RULES_MODE=auto wj > "$T/nopid.txt"
+for n in G H; do
+  check "record with no pid, foreign session id: $n is kept by the record" judged "$T/nopid.txt" "$n" "KEEP($REC_L)"
+done
+
 # A torn record that appears after the inventory. The lsof stub writes it on its first scan of
 # the Codex lock registry, which runs after the Claude registry in the same session scan, so the
 # inventory never sees it and the rescan right before the first removal does.
@@ -292,6 +310,38 @@ for n in A G H; do
 done
 check "  the first removal candidate kept by the rescan right before removal" \
   grep -qF -- "→ kept: $REC_L; an unreadable session record may be about it" "$T/late.txt"
+
+# An active Codex claim with two state rows: one rollout path holds a space, so it cannot be
+# passed on as a word. The other is readable and names only the primary checkout. The dropped
+# rollout may be the one naming G, so the claim must keep every tree.
+rm -f "$SESSIONS/$live_pid.json"
+TID_Q="0000bbbb-0000-4000-8000-00000000002a"
+LOCKS_Q="$T/codex-locks-q"; mkdir -p "$LOCKS_Q" "$T/codex rollouts"
+: > "$LOCKS_Q/$TID_Q.lock"; old_file "$LOCKS_Q/$TID_Q.lock"
+printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$TID_Q" "$PRIMARY" > "$T/codex rollouts/r1.jsonl"
+printf '{"type":"response_item","payload":{"type":"function_call","arguments":"ls %s"}}\n' "$T/wt-G" >> "$T/codex rollouts/r1.jsonl"
+printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$TID_Q" "$PRIMARY" > "$T/codex-r2.jsonl"
+STATE_Q="$T/codex-q.sqlite"
+sqlite3 "$STATE_Q" "create table threads(id text, cwd text, rollout_path text, updated_at integer,
+    archived_at integer, archived integer);
+  insert into threads values ('$TID_Q', '$PRIMARY', '$T/codex rollouts/r1.jsonl', 0, null, 0);
+  insert into threads values ('$TID_Q', '$PRIMARY', '$T/codex-r2.jsonl', 0, null, 0);"
+export LOCK_Q_LINE="n$LOCKS_Q/$TID_Q.lock"
+cat > "$STUBS/lsof" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" -d cwd "*) cat "$LSOF_CWD_FILE" ;;
+  *" +D "*) printf 'p1\n%s\n' "$LOCK_Q_LINE" ;;
+  *) cat "$LSOF_OPEN_FILE" ;;
+esac
+STUB
+chmod +x "$STUBS/lsof"
+REC_Q="session-unknown:codex-claim:$TID_Q"
+CC_WJ_CODEX_LOCKS="$LOCKS_Q" CC_WJ_CODEX_STATE_DB="$STATE_Q" CC_WJ_NEW_RULES_MODE=auto wj > "$T/codex-space.txt"
+for n in G H; do
+  check "Codex claim with a rollout path holding a space: $n is kept by the claim" \
+    judged "$T/codex-space.txt" "$n" "KEEP($REC_Q)"
+done
 
 if [ "$failures" -eq 0 ]; then echo "# all passed"; else echo "# $failures failed"; fi
 [ "$failures" -eq 0 ]
