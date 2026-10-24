@@ -1,0 +1,30 @@
+name: tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  suites:
+    # The scripts target macOS (BSD stat, launchd), so the suites run there. The repository is public:
+    # GitHub-hosted minutes are free. Add a suite here when a PR changes the script it covers.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: git identity for fixture repositories
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+          git config --global init.defaultBranch main
+      - name: syntax
+        run: |
+          for f in shell/*.sh hooks/*.sh; do bash -n "$f"; done
+          zsh -n shell/claude-cleanup.sh
+      - name: disk-janitor
+        run: bash tests/disk-janitor.sh
+      - name: worktree-janitor
+        run: bash tests/worktree-janitor.sh
+      - name: worktree-janitor-reclaim
+        run: bash tests/worktree-janitor-reclaim.sh
