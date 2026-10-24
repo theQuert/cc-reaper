@@ -1946,6 +1946,47 @@ rm -rf "$WORK/l/home/.claude/projects"
 OUT="$(CC_RB_NEW_RULES_MODE=auto run_real "$WORK/l" "$SCRIPT")"
 exists "$WORK/l" $SID7 && pass "a gate answer with a non-mention reason keeps the directory" || fail "deleted despite a non-mention reason"
 
+# ---------------------------------------------------------------- single instance (stima-api #5886)
+# Two sweeps overlapped for hours on 2026-10-24. The lock is a directory with a pid inside.
+LK="$WORK/lk"; LKDIR="$LK/home/.cc-reaper/state/reclaim-byproducts.lock"
+
+build_fixture "$LK"
+sleep 300 & HOLDER=$!
+mkdir -p "$LKDIR"; echo "$HOLDER" > "$LKDIR/pid"
+OUT="$(run_real "$LK" "$SCRIPT"; echo "rc=$?")"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+check "a live holder: the second instance says so and exits 0" "$OUT" "another sweep, pid $HOLDER, is running; this one exits" "sweep started"
+check "a live holder: exit status is 0" "$OUT" "rc=0"
+[ -d "$LK/scratch/proj/11111111-1111-1111-1111-111111111111" ] && pass "a live holder: nothing was swept" || fail "swept while another sweep held the lock"
+[ "$(cat "$LKDIR/pid" 2>/dev/null)" = "$HOLDER" ] && pass "a live holder: its lock is left alone" || fail "removed another live pid's lock"
+
+OUT="$(run_stale "$LK" "$SCRIPT"; echo "rc=$?")"
+check "a live holder blocks --if-stale too" "$OUT" "another sweep, pid $HOLDER" "sweep started"
+OUT="$(_run "$LK" "$SCRIPT" --go-cache; echo "rc=$?")"
+check "a live holder blocks --go-cache too" "$OUT" "another sweep, pid $HOLDER" "go cache only"
+OUT="$(run "$LK" "$SCRIPT")"
+check "a dry run needs no lock and runs beside a live holder" "$OUT" "sweep started" "another sweep"
+
+# Stale: the holder is dead now.
+build_fixture "$LK"
+sleep 300 & DEAD=$!; kill "$DEAD" 2>/dev/null; wait "$DEAD" 2>/dev/null
+mkdir -p "$LKDIR"; echo "$DEAD" > "$LKDIR/pid"
+OUT="$(run_real "$LK" "$SCRIPT"; echo "rc=$?")"
+check "a stale lock is taken over, and the log says so" "$OUT" "stale lock .*pid $DEAD, not running.*taking it over" "another sweep"
+check "a stale lock: the sweep then runs" "$OUT" "sweep ended"
+[ ! -e "$LKDIR" ] && pass "the lock is released after a normal run" || fail "lock left behind after a normal run"
+
+# A lock directory with no pid at all (an owner killed between mkdir and write) is stale too.
+build_fixture "$LK"; mkdir -p "$LKDIR"
+OUT="$(run_real "$LK" "$SCRIPT")"
+check "a lock with no pid is taken over" "$OUT" "stale lock .*pid none" "another sweep"
+[ ! -e "$LKDIR" ] && pass "and released after" || fail "lock left behind after taking over a pid-less lock"
+
+# Released on a failing run as well.
+build_fixture "$LK"
+OUT="$(run_fail "$LK" "$SCRIPT")"
+[ ! -e "$LKDIR" ] && pass "the lock is released after a failed run" || fail "lock left behind after a failed run"
+
 echo
 echo "passed: $PASSED, failed: $FAILURES"
 [ "$FAILURES" -eq 0 ]

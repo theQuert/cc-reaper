@@ -1471,6 +1471,60 @@ PLIST
   LEGACY_ASIDE=""
 }
 
+# ---------------------------------------------------------------- single instance
+
+# One sweep at a time (stima-api #5886). On 2026-10-24 the launchd --if-stale run and the
+# low-disk run resource-watch.sh starts overlapped for hours, each walking the same
+# directories and holding lsof snapshots over a 2 GB transcript scan. macOS ships no
+# flock(1), so the lock is a directory: mkdir is atomic, and the pid inside names the owner.
+# Every mode that removes something takes it; --dry-run changes nothing and does not.
+# A live holder means this run exits 0 (launchd must not count it a failure). A holder
+# whose pid is gone is stale and is taken over; a lock whose pid is alive is never
+# touched, whatever its command line says, because a wrong "stale" here is two sweeps again.
+LOCK_DIR="${CC_RB_LOCK_DIR:-$HOME/.cc-reaper/state/reclaim-byproducts.lock}"
+LOCK_OWNED=0
+lock_pid() { cat "$LOCK_DIR/pid" 2>/dev/null; }
+release_lock() {
+  [ "$LOCK_OWNED" -eq 1 ] || return 0
+  LOCK_OWNED=0
+  # Only a lock that still names this process: a takeover by another run must survive us.
+  [ "$(lock_pid)" = "$$" ] || return 0
+  rm -rf "$LOCK_DIR" 2>/dev/null
+  return 0
+}
+acquire_lock() {
+  local attempt=0 holder waited cmd
+  mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
+  while [ "$attempt" -lt 4 ]; do
+    attempt=$((attempt + 1))
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_DIR/pid"
+      LOCK_OWNED=1
+      trap 'release_lock' EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+      return 0
+    fi
+    # The owner writes its pid just after mkdir; give that a moment before calling it empty.
+    holder=""; waited=0
+    while [ "$waited" -lt 10 ]; do
+      holder="$(lock_pid)"; [ -n "$holder" ] && break
+      sleep 0.2; waited=$((waited + 1))
+    done
+    case "$holder" in *[!0-9]*) holder="" ;; esac
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+      log "byproducts: another sweep, pid $holder, is running; this one exits"
+      exit 0
+    fi
+    cmd=""; [ -z "$holder" ] || cmd="$(ps -o command= -p "$holder" 2>/dev/null)"
+    log "byproducts: stale lock $LOCK_DIR (pid ${holder:-none}, not running${cmd:+, now: $cmd}); taking it over"
+    # mv is atomic: of two runs taking over the same stale lock only one renames it.
+    mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null && rm -rf "$LOCK_DIR.stale.$$"
+  done
+  echo "byproducts: could not take $LOCK_DIR; this one exits" >&2
+  exit 0
+}
+
 # ---------------------------------------------------------------- main
 
 case "${1:-}" in
@@ -1478,9 +1532,9 @@ case "${1:-}" in
   # The go cache alone, for a caller that just watched the disk run low (the CI runner
   # loop, when it starts declining jobs). No scratchpad liveness gate - that is the slow
   # part, minutes - and no stamp, so the scheduled full sweep is not pushed back.
-  --go-cache) rotate_log; log "== go cache only $(now_iso) (pid $$) =="; reap_go_cache; exit 0 ;;
+  --go-cache) acquire_lock; rotate_log; log "== go cache only $(now_iso) (pid $$) =="; reap_go_cache; exit 0 ;;
   # The size cap alone, for resource-watch's 10-minute cadence: silent unless over the cap.
-  --go-cache-cap) go_lru_cap; exit 0 ;;
+  --go-cache-cap) acquire_lock; go_lru_cap; exit 0 ;;
   --if-stale) CHECK_STALE=1 ;;
   --install-launchd) trap restore_legacy_agent EXIT; install_launchd "${2:-04:00}"; exit 0 ;;
   --self-test) exec bash "$REPO_HERE/../tests/reclaim-byproducts.sh" ;;
@@ -1493,13 +1547,14 @@ esac
 # firing that skipped are both firings and the question this answers is how often the
 # timer fires. The header is the separator the log did not have either: two sweeps ran
 # into each other in it with nothing between them.
+[ "$DRY" -eq 1 ] || acquire_lock
 MODE=reap
 [ "$CHECK_STALE" -eq 1 ] && MODE=scheduled
 [ "$DRY" -eq 1 ] && MODE=dry-run
 rotate_log
 FREE_BEFORE="$(free_kb)"
 log "== byproducts sweep started $(now_iso) (${MODE}, ${GATE} gate, pid $$) =="
-trap sweep_ended EXIT
+trap 'sweep_ended; release_lock' EXIT
 
 if [ ! -r "$PATH_IN_USE" ]; then
   # Without the liveness gate there is no safe scratchpad rule, and reaping the other

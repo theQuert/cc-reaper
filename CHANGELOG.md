@@ -3,6 +3,12 @@
 ## [Unreleased]
 
 ### Added
+- **`reclaim-byproducts.sh` runs as a single instance (`CC_RB_LOCK_DIR`).** The launchd `--if-stale`
+  run and resource-watch's low-disk run overlapped for hours on 2026-10-24 (stima-api #5886). Every
+  mode that removes something now takes an atomic `mkdir` lock
+  (`~/.cc-reaper/state/reclaim-byproducts.lock`, pid inside); a live holder makes the second run log
+  one line and exit 0, a lock whose pid is dead is taken over and logged, and the lock is released
+  on exit, INT and TERM only by its owner. `--dry-run` takes none.
 - **`worktree-janitor` walks a directory an `archive:` pattern reaches, instead of pinning it.**
   git lists stima-api's ignored `.codex/evidence/` as one collapsed entry, so
   `archive:.codex/evidence` could not copy the records inside it and kept 25 landed worktrees
