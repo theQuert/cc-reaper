@@ -3,6 +3,12 @@
 ## [Unreleased]
 
 ### Added
+- **`reclaim-byproducts.sh` runs as a single instance (`CC_RB_LOCK_DIR`).** The launchd `--if-stale`
+  run and resource-watch's low-disk run overlapped for hours on 2026-10-24 (stima-api #5886). Every
+  mode that removes something now takes an atomic `mkdir` lock
+  (`~/.cc-reaper/state/reclaim-byproducts.lock`, pid inside); a live holder makes the second run log
+  one line and exit 0, a lock whose pid is dead is taken over and logged, and the lock is released
+  on exit, INT and TERM only by its owner. `--dry-run` takes none.
 - **`worktree-janitor` puts two trivial pins on probation, and honours a deny-list.** A top-level
   `*.log` file and a `.claude/skills` or `.claude/commands` symlink into the primary checkout kept
   landed worktrees (stima-api #5886). With `CC_WJ_NEW_RULES_MODE=spotcheck`, the default, every

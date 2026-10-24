@@ -72,6 +72,22 @@ echo "free      $1"; exit 0
 STUB
   chmod +x "$root/bin/path-in-use.sh"
 
+  # lsof stub: one `p<pid>`/`n<path>` pair per line of $root/lsof-held ("<pid> <path>"), after
+  # a base listing that makes it usable. Every call is recorded. With $root/lsof-hold-late a
+  # path in that file shows up only from the SECOND call on, i.e. at the pre-removal check.
+  cat > "$root/bin/lsof" <<STUB
+#!/usr/bin/env bash
+echo x >> "$root/lsof-calls"
+n=\$(wc -l < "$root/lsof-calls" | tr -d ' ')
+printf 'p1\nn/\n'
+if [ -f "$root/lsof-held" ] && { [ ! -f "$root/lsof-hold-late" ] || [ "\$n" -gt 1 ]; }; then
+  while read -r pid path; do printf 'p%s\nn%s\n' "\$pid" "\$path"; done < "$root/lsof-held"
+fi
+exit 0
+STUB
+  chmod +x "$root/bin/lsof"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$root/bin/tmux"; chmod +x "$root/bin/tmux"
+
   # Caches. `codex-runtimes` is supplied explicitly below as a fixture for a machine
   # owner that has proved it dead; the other four are the ones it refuses by name,
   # created as real directories under the fixture's HOME so that "it was refused"
@@ -173,6 +189,10 @@ _run() {
   BYPRODUCT_GO_BUSY="${GO_BUSY_OVERRIDE:-0}" \
   BYPRODUCT_FREE_GB="${FREE_GB_OVERRIDE:-9999}" \
   PATH_IN_USE_BIN="$root/bin/path-in-use.sh" \
+  BYPRODUCT_LSOF_BIN="$root/bin/lsof" \
+  BYPRODUCT_TMUX_BIN="$root/bin/tmux" \
+  BYPRODUCT_CLOSED_SESSIONS="$root/closed-sessions.md" \
+  BYPRODUCT_SPOTCHECK_LOG="$root/spotcheck.log" \
   BYPRODUCT_IDLE_HOURS=24 \
   BYPRODUCT_DOCKER_VOLUME_AGE_HOURS="${VOLUME_AGE_OVERRIDE:-24}" \
   BYPRODUCT_ARCHIVE_RETENTION_DAYS=30 \
@@ -1124,7 +1144,7 @@ mutate "anonymous-only volume names" \
   "volume WOULD be reaped: stima-ci-work-1"
 
 mutate "a non-zero liveness verdict keeps the scratchpad" \
-  's|^    if \[ "$rc" -ne 0 \]; then|    if false; then|' \
+  's|^      if \[ "$rc" -ne 0 \]; then|      if false; then|' \
   "scratchpad WOULD be reaped: .*22222222-"
 
 mutate "the idle window is checked before the gate" \
@@ -1770,6 +1790,202 @@ pressure_fixture "$WORK/p"
 OUT="$(FREE_GB_OVERRIDE=10 BYPRODUCT_SCRATCH_PRESSURE_IDLE_HOURS=0 run "$WORK/p" "$SCRIPT")"
 check "a zero pressure window reaps nothing" "$OUT" \
   "BYPRODUCT_SCRATCH_PRESSURE_IDLE_HOURS=0 is not a whole number" "WOULD be reaped"
+
+# ------------------------------------- liveness, not mention (stima-api#5886, 2026-10-24)
+#
+# 1ff8c396 (5.47 GB) was kept for days only because the ci session wrote its id while taking
+# an inventory; 12 GB of such directories were removed by hand. A transcript that NAMES a
+# scratchpad says nothing about whether the directory is in use. The stub gate answers the
+# way path-in-use.sh does for a named path - IN USE, with the "names it" reason - so the OLD
+# script keeps these directories and the new rule is what removes them.
+#   77777777 named, dead, idle           8888...  named, its session is alive
+#   99999999 named, a process holds it   aaaaaaaa named, touched just now
+#   bbbbbbbb named, protected by name    cccccccc named, closed (resumable) today
+#   dddddddd named, its session wrote a transcript just now
+#   eeeeeeee named, closed 10 days ago   11111111 not named: the old rule removes it
+#   ffffffff named, dead, in a project directory whose name starts with a dash (as every
+#            real one does: -Users-...); it must be found in the index, not parsed as a flag.
+#            The gate stub calls it FREE, so only the index can make it the new rule's.
+SID7=77777777-7777-7777-7777-777777777777
+SID8=88888888-8888-8888-8888-888888888888
+SID9=99999999-9999-9999-9999-999999999999
+SIDA=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+SIDB=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb
+SIDC=cccccccc-cccc-cccc-cccc-cccccccccccc
+SIDD=dddddddd-dddd-dddd-dddd-dddddddddddd
+SIDE=eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee
+SIDF=ffffffff-ffff-ffff-ffff-ffffffffffff
+SIDG=12121212-1212-1212-1212-121212121212
+live_fixture() {
+  local root="$1" sid
+  build_fixture "$root"
+  mkdir -p "$root/home/.claude/sessions" "$root/home/.claude/projects/proj"
+  for sid in $SID7 $SID8 $SID9 $SIDA $SIDB $SIDC $SIDD $SIDE; do
+    mkdir -p "$root/scratch/proj/$sid"; : > "$root/scratch/proj/$sid/out.txt"
+    touch -t "$OLD_TS" "$root/scratch/proj/$sid/out.txt" "$root/scratch/proj/$sid"
+    printf 'it listed %s/proj/%s earlier\n' "$root/scratch" "$sid" >> "$root/home/.claude/projects/proj/00000000-0000-0000-0000-000000000000.jsonl"
+  done
+  touch "$root/scratch/proj/$SIDA/just-written"
+  mkdir -p "$root/scratch/-dash-proj/$SIDF"; : > "$root/scratch/-dash-proj/$SIDF/out.txt"
+  touch -t "$OLD_TS" "$root/scratch/-dash-proj/$SIDF/out.txt" "$root/scratch/-dash-proj/$SIDF"
+  printf 'it listed %s/-dash-proj/%s earlier\n' "$root/scratch" "$SIDF" >> "$root/home/.claude/projects/proj/00000000-0000-0000-0000-000000000000.jsonl"
+  # The test shell is a live session with a record, and owns $SID8.
+  printf '{"pid":%s,"sessionId":"%s"}\n' "$$" "$SID8" > "$root/home/.claude/sessions/$$.json"
+  # A dead pid named uiux, as the operator's protected sessions are recorded.
+  printf '{"pid":99999,"sessionId":"%s","name":"uiux","tmux":"uiux:@1.%%1"}\n' "$SIDB" > "$root/home/.claude/sessions/99999.json"
+  : > "$root/home/.claude/projects/proj/$SIDD.jsonl"
+  # Not named by any transcript, but its own session wrote one just now: the old gate kept
+  # it by its session check, and with the index standing in for the gate's search so must we.
+  mkdir -p "$root/scratch/proj/$SIDG"; touch -t "$OLD_TS" "$root/scratch/proj/$SIDG"
+  : > "$root/home/.claude/projects/proj/$SIDG.jsonl"
+  printf '## %s Neo closed (claude --resume <sid>)\n- c %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$SIDC" > "$root/closed-sessions.md"
+  printf '\n## %s session-reaper\n- e %s cwd=/x\n' "$(date -v-10d '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d '10 days ago' '+%Y-%m-%d %H:%M:%S')" "$SIDE" >> "$root/closed-sessions.md"
+  printf '%s %s\n' 4242 "$root/scratch/proj/$SID9/out.txt" > "$root/lsof-held"
+  cat > "$root/bin/path-in-use.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s %s\n' "$1" "${PATH_IN_USE_WINDOW_HOURS:-unset}" >> "$(dirname "$0")/../piu-calls"
+case "$1" in
+  *11111111-*) echo "free      $1"; exit 0 ;;
+  *-7777-*|*-8888-*|*-9999-*|*-aaaa-*|*-bbbb-*|*-cccc-*|*-dddd-*|*-eeee-*)
+    echo "IN USE    $1"; echo "  a session active within 24h names it: 00000000-0000-0000-0000-000000000000.jsonl"; exit 1 ;;
+esac
+echo "free      $1"; exit 0
+STUB
+  chmod +x "$root/bin/path-in-use.sh"
+}
+exists() { [ -d "$1/scratch/proj/$2" ]; }
+
+live_fixture "$WORK/l"
+OUT="$(run_real "$WORK/l" "$SCRIPT")"
+check "default mode is spotcheck: the named, dead, idle scratchpad is logged and kept" "$OUT" \
+  "spot-check: .*$SID7.*logged only" "scratchpad reaped: .*$SID7"
+exists "$WORK/l" $SID7 && pass "spotcheck deletes nothing new" || fail "spotcheck removed $SID7"
+[ -d "$WORK/l/scratch/-dash-proj/$SIDF" ] && pass "a named scratchpad under a dash-led project directory is found in the index (kept in spotcheck although the gate says free)" || fail "the index missed a project directory that starts with a dash"
+check "spotcheck still removes what the old rules removed" "$OUT" "scratchpad reaped: .*11111111-"
+exists "$WORK/l" 11111111-1111-1111-1111-111111111111 && fail "the old rules' removal stopped in spotcheck" || pass "the old rules' removal continues in spotcheck"
+SPOT="$(cat "$WORK/l/spotcheck.log" 2>/dev/null)"
+check "the spot-check log records run id, path, size, decision and reason" "$SPOT" \
+  "run=[0-9T-]* .*decision=would-remove path=.*$SID7 size=[0-9.?]*GB holders=- reason=\"named by 00000000"
+check "the log names why a live session is kept" "$OUT" "scratchpad kept: .*$SID8 — its session is alive"
+check "a scratchpad a process holds is kept with the holder" "$OUT" "scratchpad kept: .*$SID9 — held by pid 4242"
+check "a scratchpad touched inside the window is kept" "$OUT" "scratchpad kept: .*$SIDA — touched within 24h"
+check "a protected session (by name) is kept" "$OUT" "scratchpad kept: .*$SIDB — belongs to a protected session"
+check "a session closed today is kept as resumable" "$OUT" "scratchpad kept: .*$SIDC — closed within 2d and resumable"
+check "a session that wrote a transcript inside the window is kept" "$OUT" "scratchpad kept: .*$SIDD — its session wrote a transcript"
+check "one closed ten days ago is no longer protected (spotcheck: logged removable)" "$OUT" "spot-check: .*$SIDE"
+check "an unmentioned scratchpad whose session wrote a transcript is kept (the gate no longer searches transcripts)" "$OUT" \
+  "scratchpad kept: .*$SIDG — its session wrote a transcript within 24h" "scratchpad reaped: .*$SIDG"
+grep -q '11111111-1111-1111-1111-111111111111 0$' "$WORK/l/piu-calls" && pass "with the index built the gate is asked with a window of 0, so it searches no transcript" || fail "the gate was asked with: $(cat "$WORK/l/piu-calls")"
+grep -q "$SID7" "$WORK/l/piu-calls" && fail "the gate was asked about a directory a transcript names" || pass "the gate is not asked about a directory the index names"
+n="$(wc -l < "$WORK/l/lsof-calls" | tr -d ' ')"; r="$(printf '%s\n' "$OUT" | grep -c '^scratchpad reaped:')"
+# One snapshot for the sweep, then one fresh check per removal - never one per scratchpad (10 here).
+[ "$n" = "$((r + 1))" ] && [ "$r" -ge 1 ] && pass "lsof runs once for the sweep plus once before each of the $r removals ($n calls, 10+ scratchpads)" || fail "lsof was called $n times for $r removals"
+
+live_fixture "$WORK/l"
+OUT="$(CC_RB_NEW_RULES_MODE=auto run_real "$WORK/l" "$SCRIPT")"
+exists "$WORK/l" $SID7 && fail "auto: the named, dead, idle scratchpad was kept" || pass "auto: a named but dead scratchpad is removed"
+for sid in $SID8 $SID9 $SIDA $SIDB $SIDC $SIDD; do
+  exists "$WORK/l" $sid && pass "auto: $sid stays" || fail "auto: $sid was removed"
+done
+[ -d "$WORK/l/scratch/-dash-proj/$SIDF" ] && fail "auto: a named scratchpad under a dash-led project directory was kept (grep read it as a flag?)" || pass "auto: a project directory that starts with a dash is matched, not parsed as an option"
+exists "$WORK/l" $SIDE && fail "auto: the session closed ten days ago stays" || pass "auto: a session closed ten days ago is removed"
+check "auto logs the removal to the spot-check log" "$(cat "$WORK/l/spotcheck.log")" "decision=removed path=.*$SID7"
+n="$(wc -l < "$WORK/l/lsof-calls" | tr -d ' ')"; r="$(printf '%s\n' "$OUT" | grep -c '^scratchpad reaped:')"
+[ "$n" = "$((r + 1))" ] && [ "$r" -ge 3 ] && pass "auto: one snapshot, one fresh check per removal ($n calls for $r removals)" || fail "auto: lsof was called $n times for $r removals"
+
+# The pre-removal check: free at the snapshot, held a moment later.
+live_fixture "$WORK/l"
+: > "$WORK/l/lsof-hold-late"
+printf '%s %s\n' 4343 "$WORK/l/scratch/proj/$SID7/out.txt" > "$WORK/l/lsof-held"
+OUT="$(CC_RB_NEW_RULES_MODE=auto run_real "$WORK/l" "$SCRIPT")"
+exists "$WORK/l" $SID7 && pass "a directory that became held after the snapshot is not removed" || fail "removed a directory held at the pre-removal check"
+check "the skip says who held it" "$OUT" "scratchpad kept: .*$SID7 — held by 4343 at removal"
+
+# An lsof that lists nothing is unusable, never "nothing is held".
+live_fixture "$WORK/l"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$WORK/l/bin/lsof"
+OUT="$(CC_RB_NEW_RULES_MODE=auto run_real "$WORK/l" "$SCRIPT")"
+exists "$WORK/l" $SID7 && pass "an unusable lsof keeps a directory only the new rule would remove" || fail "removed with lsof unusable"
+check "and says why" "$OUT" "$SID7 — lsof is unusable"
+
+# Session records that cannot be read: its session cannot be ruled alive.
+live_fixture "$WORK/l"
+rm -rf "$WORK/l/home/.claude/sessions"
+OUT="$(CC_RB_NEW_RULES_MODE=auto run_real "$WORK/l" "$SCRIPT")"
+exists "$WORK/l" $SID7 && pass "unreadable session records keep a named scratchpad" || fail "removed with session records unreadable"
+
+# A dry run prints and writes nothing, in either mode.
+live_fixture "$WORK/l"
+OUT="$(run "$WORK/l" "$SCRIPT")"
+[ ! -e "$WORK/l/spotcheck.log" ] && pass "a dry run writes no spot-check log" || fail "a dry run wrote the spot-check log"
+check "a dry run still reports the spot-check decision" "$OUT" "spotcheck: run=.*decision=would-remove path=.*$SID7"
+OUT="$(CC_RB_NEW_RULES_MODE=auto run "$WORK/l" "$SCRIPT")"
+check "a dry run in auto says WOULD be reaped and removes nothing" "$OUT" "scratchpad WOULD be reaped: .*$SID7"
+exists "$WORK/l" $SID7 && pass "dry-run auto removes nothing" || fail "dry run removed"
+
+# An unknown mode is spotcheck, not auto.
+live_fixture "$WORK/l"
+OUT="$(CC_RB_NEW_RULES_MODE=yes run_real "$WORK/l" "$SCRIPT")"
+exists "$WORK/l" $SID7 && pass "an unrecognised mode is read as spotcheck" || fail "an unrecognised mode deleted"
+
+# Transcripts that cannot be searched: path-in-use.sh judges, and its mention-only answer is
+# the same new-rule class.
+live_fixture "$WORK/l"
+rm -rf "$WORK/l/home/.claude/projects"
+OUT="$(run_real "$WORK/l" "$SCRIPT")"
+check "without a transcript index the gate's mention-only answer is the new rule's" "$OUT" "spot-check: .*$SID7"
+exists "$WORK/l" $SID7 && pass "and spotcheck still deletes nothing" || fail "deleted without an index"
+
+# A gate answer that is IN USE for a real reason stays kept, whoever names it.
+live_fixture "$WORK/l"
+cat > "$WORK/l/bin/path-in-use.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "IN USE    $1"; echo "  a process is working in it: pid 1"; echo "  a session active within 24h names it: x.jsonl"; exit 1
+STUB
+rm -rf "$WORK/l/home/.claude/projects"
+OUT="$(CC_RB_NEW_RULES_MODE=auto run_real "$WORK/l" "$SCRIPT")"
+exists "$WORK/l" $SID7 && pass "a gate answer with a non-mention reason keeps the directory" || fail "deleted despite a non-mention reason"
+
+# ---------------------------------------------------------------- single instance (stima-api #5886)
+# Two sweeps overlapped for hours on 2026-10-24. The lock is a directory with a pid inside.
+LK="$WORK/lk"; LKDIR="$LK/home/.cc-reaper/state/reclaim-byproducts.lock"
+
+build_fixture "$LK"
+sleep 300 & HOLDER=$!
+mkdir -p "$LKDIR"; echo "$HOLDER" > "$LKDIR/pid"
+OUT="$(run_real "$LK" "$SCRIPT"; echo "rc=$?")"
+check "a live holder: the second instance says so and exits 0" "$OUT" "another sweep, pid $HOLDER, is running; this one exits" "sweep started"
+check "a live holder: exit status is 0" "$OUT" "rc=0"
+[ -d "$LK/scratch/proj/11111111-1111-1111-1111-111111111111" ] && pass "a live holder: nothing was swept" || fail "swept while another sweep held the lock"
+[ "$(cat "$LKDIR/pid" 2>/dev/null)" = "$HOLDER" ] && pass "a live holder: its lock is left alone" || fail "removed another live pid's lock"
+
+OUT="$(run_stale "$LK" "$SCRIPT"; echo "rc=$?")"
+check "a live holder blocks --if-stale too" "$OUT" "another sweep, pid $HOLDER" "sweep started"
+OUT="$(_run "$LK" "$SCRIPT" --go-cache; echo "rc=$?")"
+check "a live holder blocks --go-cache too" "$OUT" "another sweep, pid $HOLDER" "go cache only"
+OUT="$(run "$LK" "$SCRIPT")"
+check "a dry run needs no lock and runs beside a live holder" "$OUT" "sweep started" "another sweep"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+
+# Stale: the holder is dead now.
+build_fixture "$LK"
+sleep 300 & DEAD=$!; kill "$DEAD" 2>/dev/null; wait "$DEAD" 2>/dev/null
+mkdir -p "$LKDIR"; echo "$DEAD" > "$LKDIR/pid"
+OUT="$(run_real "$LK" "$SCRIPT"; echo "rc=$?")"
+check "a stale lock is taken over, and the log says so" "$OUT" "stale lock .*pid $DEAD, not running.*taking it over" "another sweep"
+check "a stale lock: the sweep then runs" "$OUT" "sweep ended"
+[ ! -e "$LKDIR" ] && pass "the lock is released after a normal run" || fail "lock left behind after a normal run"
+
+# A lock directory with no pid at all (an owner killed between mkdir and write) is stale too.
+build_fixture "$LK"; mkdir -p "$LKDIR"
+OUT="$(run_real "$LK" "$SCRIPT")"
+check "a lock with no pid is taken over" "$OUT" "stale lock .*pid none" "another sweep"
+[ ! -e "$LKDIR" ] && pass "and released after" || fail "lock left behind after taking over a pid-less lock"
+
+# Released on a failing run as well.
+build_fixture "$LK"
+OUT="$(run_fail "$LK" "$SCRIPT")"
+[ ! -e "$LKDIR" ] && pass "the lock is released after a failed run" || fail "lock left behind after a failed run"
 
 echo
 echo "passed: $PASSED, failed: $FAILURES"
