@@ -12,9 +12,17 @@
 # Six reapers, one rule each, all fail-closed (the sixth, session temp, and the go cache's
 # size cap are described at their functions):
 #
-#   scratchpads  /tmp/claude-<uid>/<project>/<session-uuid>  — only when path-in-use.sh
-#                says free. UNKNOWN is treated as in use. Idle 24h, or 6h under disk
-#                pressure when no live Claude PID record names the session.
+#   scratchpads  /tmp/claude-<uid>/<project>/<session-uuid>  — idle 24h (6h under disk
+#                pressure when no live Claude PID record names the session), and then
+#                kept while the session is ALIVE, a process holds a file under it (one
+#                lsof per run), or it belongs to a protected session; a transcript that
+#                merely NAMES the path is not liveness (2026-10-24: 12 GB of scratchpads
+#                kept for days because the ci session printed their ids while taking an
+#                inventory, removed by hand). path-in-use.sh still judges every
+#                directory no transcript names. Directories the old mention rule kept are
+#                newly removable, and CC_RB_NEW_RULES_MODE=spotcheck (the default) only
+#                LOGS those to ~/.cc-reaper/logs/spotcheck-reclaim-byproducts.log;
+#                `auto` removes them. UNKNOWN is treated as in use.
 #   go cache     the entries Go itself would trim (`<hash>-a`/`-d` in the two-hex-digit
 #                subdirectories), sooner, and a size ceiling that takes the idlest entries
 #                first. This machine's one owner of that cache: cc-reaper's weekly trim
@@ -113,6 +121,37 @@ IDLE_HOURS="${BYPRODUCT_IDLE_HOURS:-24}"
 SCRATCH_PRESSURE_FREE_GB="${BYPRODUCT_SCRATCH_PRESSURE_FREE_GB:-100}"
 SCRATCH_PRESSURE_IDLE_HOURS="${BYPRODUCT_SCRATCH_PRESSURE_IDLE_HOURS:-6}"
 SESSIONS_DIR="${BYPRODUCT_SESSIONS_DIR:-$HOME/.claude/sessions}"
+
+# A scratchpad no live process holds and no live session owns used to be kept whenever ANY
+# other transcript written in the window named its path (path-in-use.sh's "mention" check).
+# That is a statement about what somebody TYPED, not about the directory: 1ff8c396 (5.47 GB)
+# was kept for days because the ci session wrote the id into its own inventory. The mention
+# check is also the slow half of the run - ~17s of grep over 2 GB of transcripts per spelling,
+# four spellings, per directory (64s measured 2026-10-24; 100+ directories is the 2h13m sweep).
+# The mention is now read ONCE per run, to tell the directories the old rule kept from the
+# ones it did not, and what decides a mentioned directory is liveness (live_session_ids, the
+# one lsof snapshot, a transcript written inside the window, the protected sessions below, and
+# a narrow resume window). Directories the old rule already removed are removed as before.
+#
+# What the new rule newly allows to go runs in SPOTCHECK mode until somebody promotes it:
+# the decision, size and holder check are written to the spot-check log and nothing is
+# deleted. `auto` deletes. Anything else is read as spotcheck.
+NEW_RULES_MODE="${CC_RB_NEW_RULES_MODE:-spotcheck}"
+SPOTCHECK_LOG="${BYPRODUCT_SPOTCHECK_LOG:-$HOME/.cc-reaper/logs/spotcheck-reclaim-byproducts.log}"
+# Sessions whose scratchpads are never reaped, by tmux session name or Claude session name,
+# resolved to ids through ~/.claude/sessions/<pid>.json (the `name` and `tmux` fields) and
+# `tmux list-panes`. Space-separated; a name that resolves to nothing protects nothing.
+PROTECT_SESSION_NAMES="${BYPRODUCT_PROTECT_SESSIONS:-homepage uiux verify-signin-redesign}"
+TMUX_BIN="${BYPRODUCT_TMUX_BIN:-tmux}"
+# The narrow stand-in for "a later `claude --resume` might want it": a session cc-reaper or
+# Neo closed (recorded in closed-sessions.md with its id) keeps its scratchpad for this many
+# days after the entry. A resumed session reads its own transcript, not the scratchpad; what
+# it can still want is a background task's output, which the 24h tree-idle window already
+# covers for the session's normal life, so two days is the margin for a resume the next day.
+CLOSED_SESSIONS_FILE="${BYPRODUCT_CLOSED_SESSIONS:-$HOME/handoffs/closed-sessions.md}"
+RESUME_DAYS="${BYPRODUCT_RESUME_DAYS:-2}"
+PROJECTS_DIR="${BYPRODUCT_PROJECTS_DIR:-$HOME/.claude/projects}"
+CODEX_SESSIONS_DIR="${BYPRODUCT_CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
 
 # The minimum age of an ANONYMOUS VOLUME, which was the line above until 2026-09-13 and is
 # not the same question. A volume an `--ephemeral` CI runner container left is dead the
@@ -309,6 +348,7 @@ sweep_ended() {
     *) delta="free on $DATA_VOLUME $(as_gb "$FREE_BEFORE") -> $(as_gb "$after") ($(awk -v a="$FREE_BEFORE" -v b="$after" 'BEGIN{d=(b-a)/1048576; if (d>-0.05 && d<0.05) d=0; printf "%+.1fGB", d}'))" ;;
   esac
   log "== byproducts sweep ended $(now_iso) after ${SECONDS}s; $delta =="
+  release_lock   # this trap replaced acquire_lock's EXIT trap, so it releases the lock itself
 }
 
 # A whole number of hours, refused rather than silently reinterpreted. `off` in
@@ -324,6 +364,14 @@ esac
 case "$SCRATCH_PRESSURE_IDLE_HOURS" in
   ''|0|*[!0-9]*|??????*) echo "byproducts: BYPRODUCT_SCRATCH_PRESSURE_IDLE_HOURS=$SCRATCH_PRESSURE_IDLE_HOURS is not a whole number of hours from 1 to 99999; reaping nothing" >&2; exit 2 ;;
   *) SCRATCH_PRESSURE_IDLE_HOURS=$((10#$SCRATCH_PRESSURE_IDLE_HOURS)) ;;
+esac
+case "$RESUME_DAYS" in
+  ''|*[!0-9]*|??????*) echo "byproducts: BYPRODUCT_RESUME_DAYS=$RESUME_DAYS is not a whole number of days below 100000; reaping nothing" >&2; exit 2 ;;
+  *) RESUME_DAYS=$((10#$RESUME_DAYS)) ;;
+esac
+case "$NEW_RULES_MODE" in
+  auto|spotcheck) ;;
+  *) echo "byproducts: CC_RB_NEW_RULES_MODE=$NEW_RULES_MODE is not auto or spotcheck; using spotcheck" >&2; NEW_RULES_MODE=spotcheck ;;
 esac
 # Never longer than the normal window: pressure only ever shortens it.
 [ "$SCRATCH_PRESSURE_IDLE_HOURS" -gt "$IDLE_HOURS" ] && SCRATCH_PRESSURE_IDLE_HOURS=$IDLE_HOURS
@@ -452,6 +500,149 @@ live_session_ids() {
   return 0
 }
 
+
+# ---- the liveness rule for a directory a transcript names (2026-10-24, stima-api#5886)
+
+# One lsof for the run: every open file and cwd of this user's processes, as `p<pid>` and
+# `n<name>` lines in $LSOF_SNAP. Taken lazily, at the first directory that needs it. Valid
+# only when it lists a process and a path; an lsof that cannot see anything is "unusable",
+# never "nothing is held".
+LSOF_SNAP=""
+LSOF_STATE=untaken   # untaken | ok | unusable
+lsof_take() {  # <outfile>: 0 when the listing is usable
+  command -v "$LSOF" >/dev/null 2>&1 || return 1
+  "$LSOF" -nP -Fpn > "$1" 2>/dev/null
+  grep -q '^p[0-9]' "$1" && grep -q '^n/' "$1"
+}
+lsof_snapshot() {
+  [ "$LSOF_STATE" = untaken ] || return 0
+  LSOF_SNAP="$(mktemp "${TMPDIR:-/tmp}/byproducts-lsof.XXXXXX")" || { LSOF_STATE=unusable; return 0; }
+  if lsof_take "$LSOF_SNAP"; then LSOF_STATE=ok; else LSOF_STATE=unusable; fi
+}
+# Pids in listing $1 with a file or cwd at or under directory $2 (given in both spellings of
+# /tmp), one per line.
+lsof_holders() {  # <listing> <dir>
+  local real; real="$(cd "$2" 2>/dev/null && pwd -P)" || real="$2"
+  awk -v a="$2" -v b="$real" '
+    function under(n, r) { return n == r || index(n, r "/") == 1 }
+    /^p/ { pid = substr($0, 2); next }
+    /^n/ { n = substr($0, 2); if (under(n, a) || under(n, b)) seen[pid] = 1 }
+    END { for (p in seen) print p }' "$1" | sort -n
+}
+
+# Session ids, one per line, of the sessions the PROTECT list names. A name matches a
+# session record's `name`, or the tmux session in its `tmux` field ("<session>:@w.%p"), or a
+# tmux session whose pane is the pid of a record.
+protected_session_ids() {
+  local f pid sid nm tm name pane
+  [ -n "$PROTECT_SESSION_NAMES" ] || return 0
+  if [ -d "$SESSIONS_DIR" ] && [ -r "$SESSIONS_DIR" ]; then
+    for f in "$SESSIONS_DIR"/*.json; do
+      [ -e "$f" ] || continue
+      case "${f##*/}" in *[!0-9]*.json|.json) continue ;; esac
+      nm="$(/usr/bin/plutil -extract name raw -o - "$f" 2>/dev/null)" || nm=""
+      tm="$(/usr/bin/plutil -extract tmux raw -o - "$f" 2>/dev/null)" || tm=""
+      tm="${tm%%:*}"
+      for name in $PROTECT_SESSION_NAMES; do
+        if [ "$nm" = "$name" ] || [ "$tm" = "$name" ]; then
+          sid="$(/usr/bin/plutil -extract sessionId raw -o - "$f" 2>/dev/null)" && printf '%s\n' "$sid"
+        fi
+      done
+    done
+  fi
+  if command -v "$TMUX_BIN" >/dev/null 2>&1; then
+    "$TMUX_BIN" list-panes -a -F '#{session_name} #{pane_pid}' 2>/dev/null | while read -r tm pane; do
+      for name in $PROTECT_SESSION_NAMES; do
+        [ "$tm" = "$name" ] || continue
+        f="$SESSIONS_DIR/$pane.json"
+        [ -f "$f" ] && sid="$(/usr/bin/plutil -extract sessionId raw -o - "$f" 2>/dev/null)" && printf '%s\n' "$sid"
+      done
+    done
+  fi
+}
+
+# Session ids, one per line, that closed-sessions.md records as closed (resumable) within
+# RESUME_DAYS days. A `## YYYY-MM-DD HH:MM:SS ...` header dates the `- <name> <uuid> ...`
+# entries under it.
+resumable_session_ids() {
+  [ -r "$CLOSED_SESSIONS_FILE" ] || return 0
+  local cutoff ts line when keep=0
+  cutoff=$(( $(date +%s) - RESUME_DAYS * 86400 ))
+  while IFS= read -r line; do
+    case "$line" in
+      "## "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]" "[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*)
+        ts="${line#\#\# }"; ts="${ts:0:19}"
+        when="$(date -j -f '%Y-%m-%d %H:%M:%S' "$ts" +%s 2>/dev/null || date -d "$ts" +%s 2>/dev/null)" || when=""
+        if [ -n "$when" ] && [ "$when" -ge "$cutoff" ]; then keep=1; else keep=0; fi ;;
+      "- "*)
+        [ "$keep" -eq 1 ] && printf '%s\n' "$line" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1 ;;
+    esac
+  done < "$CLOSED_SESSIONS_FILE"
+}
+
+# Which scratchpads do transcripts written in the window NAME - the old mention rule, read
+# once. Lines of `<project>/<session-id><TAB><transcript>` in $1. The caller's own
+# transcript is skipped, as path-in-use.sh skips it. 0 when the index could be built; a
+# project directory that cannot be searched is "unknown", and the caller then leaves every
+# directory to path-in-use.sh as before.
+build_mention_index() {  # <outfile>
+  local d any=0 root; root="${SCRATCH_ROOT##*/}"
+  for d in "$PROJECTS_DIR" "$CODEX_SESSIONS_DIR"; do
+    [ -d "$d" ] || continue
+    [ -r "$d" ] && [ -x "$d" ] || return 1
+    any=1
+  done
+  [ "$any" -eq 1 ] || return 1
+  {
+    for d in "$PROJECTS_DIR" "$CODEX_SESSIONS_DIR"; do
+      [ -d "$d" ] || continue
+      "$FIND" "$d" -name '*.jsonl' -mmin -"$((IDLE_HOURS * 60))" -type f -print0 2>/dev/null
+    done
+  } | xargs -0 grep -HoE "$root/[^/\" \\\\]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" 2>/dev/null \
+    | awk -F: -v self="${CLAUDE_CODE_SESSION_ID:-}" '{
+        n = split($1, a, "/"); f = a[n]
+        if (self != "" && f == self ".jsonl") next
+        m = $2; sub(/^[^\/]*\//, "", m); print m "\t" f }' \
+    | sort -u > "$1"
+  return 0
+}
+
+# A session transcript for $2 (in project $1) written inside $3 minutes. The session wrote
+# recently, whatever its processes look like.
+transcript_is_recent() {  # <project> <sid> <minutes>
+  local t
+  for t in "$PROJECTS_DIR/$1/$2.jsonl" "$PROJECTS_DIR"/*/"$2".jsonl; do
+    [ -f "$t" ] || continue
+    [ -n "$("$FIND" "$t" -mmin -"$3" -print -quit 2>/dev/null)" ] && return 0
+  done
+  return 1
+}
+
+# The spot-check log: what the new rule decided for a directory the mention rule used to
+# keep. Appended only by a run that can delete (a dry run prints, writes nothing).
+spotcheck_note() {  # <decision> <dir> <size-or-dash> <holders> <reason>
+  local line
+  line="run=$RUN_ID ts=$(now_iso) mode=$NEW_RULES_MODE decision=$1 path=$2 size=$3 holders=$4 reason=\"$5\""
+  if [ "$DRY" -eq 1 ]; then log "spotcheck: $line"; return 0; fi
+  mkdir -p "$(dirname "$SPOTCHECK_LOG")" 2>/dev/null && printf '%s\n' "$line" >> "$SPOTCHECK_LOG" 2>/dev/null \
+    || log "spotcheck: could not write $SPOTCHECK_LOG" >&2
+}
+
+# Immediately before a removal: a fresh lsof, and the directory is skipped if anything holds
+# it. 0 = free to remove. An lsof that cannot be read is "held" for a directory that only
+# the new rule allows ($2 = new), and defers to path-in-use.sh's own look for the others.
+RB_REMOVE_HOLDERS=""
+removal_precheck() {  # <dir> <class: old|new>
+  local fresh; fresh="$(mktemp "${TMPDIR:-/tmp}/byproducts-lsof.XXXXXX")" || { RB_REMOVE_HOLDERS="?"; [ "$2" = old ]; return; }
+  if lsof_take "$fresh"; then
+    RB_REMOVE_HOLDERS="$(lsof_holders "$fresh" "$1" | tr '\n' ' ')"
+    rm -f "$fresh"
+    [ -z "${RB_REMOVE_HOLDERS// /}" ]; return
+  fi
+  rm -f "$fresh"; RB_REMOVE_HOLDERS="lsof-unusable"
+  [ "$2" = old ]
+}
+
 reap_scratchpads() {
   [ -d "$SCRATCH_ROOT" ] || { log "scratchpads: $SCRATCH_ROOT does not exist, nothing to reap"; return 0; }
   # /tmp is shared and the root is named by uid, so another account could have made it.
@@ -459,8 +650,10 @@ reap_scratchpads() {
     log "scratchpads: $SCRATCH_ROOT is a link or not owned by $(id -un); nothing reaped" >&2
     FAILED=1; return 0
   fi
-  local reaped=0 kept=0 bytes=0 d sid verdict rc
+  local reaped=0 kept=0 spot=0 bytes=0 d sid proj verdict rc reasons first
   local pressure=0 live="" free window=$IDLE_HOURS
+  local midx="" midx_ok=0 live_ok=0 live_set="" prot="" resum="" class mention holders kb why
+  RUN_ID="$(date +%Y%m%dT%H%M%S)-$$"
   free="$(free_gb)"
   if [ "$SCRATCH_PRESSURE_FREE_GB" -gt 0 ] && [ -n "$free" ] && [ "$free" -lt "$SCRATCH_PRESSURE_FREE_GB" ]; then
     if live="$(live_session_ids)"; then
@@ -470,10 +663,19 @@ reap_scratchpads() {
       log "scratchpads: disk pressure (free ${free}GB), but session records under $SESSIONS_DIR could not be read; keeping the ${IDLE_HOURS}h window"
     fi
   fi
+  if [ "$pressure" -eq 1 ]; then live_ok=1; live_set="$live"; else
+    if live_set="$(live_session_ids)"; then live_ok=1; fi
+  fi
+  prot="$(protected_session_ids)"
+  resum="$(resumable_session_ids)"
+  midx="$(mktemp "${TMPDIR:-/tmp}/byproducts-mention.XXXXXX")" || midx=""
+  if [ -n "$midx" ] && build_mention_index "$midx"; then midx_ok=1; fi
+  [ "$midx_ok" -eq 1 ] || log "scratchpads: transcripts could not be searched; path-in-use.sh judges every directory"
   for d in "$SCRATCH_ROOT"/*/*; do
     # A link at either level points anywhere; it is never a scratchpad.
     [ -d "$d" ] && [ ! -L "$d" ] && [ ! -L "${d%/*}" ] || continue
     sid="$(basename "$d")"
+    proj="$(basename "${d%/*}")"
     # Only a session directory. /tmp/claude-501 also holds loose probe files and
     # directories nobody names a session, and those are not this reaper's business.
     if ! is_session_id "$sid"; then kept=$((kept + 1)); continue; fi
@@ -487,34 +689,118 @@ reap_scratchpads() {
       kept=$((kept + 1)); continue
     fi
 
-    # The user's rule, and the only test that matters: ask whether a live session is
-    # using it. Exit 0 free, 1 in use, 2 unknown. UNKNOWN keeps it - on 2026-09-11
-    # the mention rule correctly held a directory two sessions were still writing to
-    # while `lsof` reported no holder at all.
-    if [ "$window" -ne "$IDLE_HOURS" ]; then
-      verdict="$(PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" PATH_IN_USE_WINDOW_HOURS="$window" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
-    else
-      verdict="$(PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
-    fi
-    if [ "$rc" -ne 0 ]; then
-      log "scratchpad kept: $d — $(printf '%s' "$verdict" | sed -n '2p' | sed 's/^ *//')"
+    # A session the operator named is never reaped, whoever mentions it.
+    if [ -n "$prot" ] && printf '%s\n' "$prot" | grep -qxF "$sid"; then
+      log "scratchpad kept: $d — belongs to a protected session ($PROTECT_SESSION_NAMES)"
       kept=$((kept + 1)); continue
+    fi
+
+    # Who is using it NOW. A live session owns its scratchpad, and so does any process
+    # that holds a file or a cwd under it; one lsof for the whole run is joined by prefix.
+    lsof_snapshot
+    holders=""
+    if [ "$LSOF_STATE" = ok ]; then holders="$(lsof_holders "$LSOF_SNAP" "$d" | tr '\n' ' ')"; fi
+    if [ "$live_ok" -eq 1 ] && printf '%s\n' "$live_set" | grep -qxF "$sid"; then
+      log "scratchpad kept: $d — its session is alive"
+      kept=$((kept + 1)); continue
+    fi
+    if [ -n "${holders// /}" ]; then
+      log "scratchpad kept: $d — held by pid ${holders% }"
+      kept=$((kept + 1)); continue
+    fi
+
+    # The old rule's view of this directory, from the one index. A directory no transcript
+    # names goes through path-in-use.sh exactly as before; one that is named is the new
+    # rule's, and path-in-use.sh (whose answer would be "in use, mentioned") is not asked.
+    class=old; mention=""
+    if [ "$midx_ok" -eq 1 ]; then
+      # -e: a project directory is named for its path and starts with a dash.
+      mention="$(grep -F -m1 -e "$(printf '%s/%s\t' "$proj" "$sid")" "$midx" | cut -f2)"
+      [ -n "$mention" ] && class=new
+    fi
+    # Its session wrote a transcript inside the window: the session is active, whatever its
+    # processes look like. path-in-use.sh asks this too (check_session), and is told a window
+    # of 0 below when the index stands in for its transcript search, so it is asked here.
+    if [ "$midx_ok" -eq 1 ] && transcript_is_recent "$proj" "$sid" "$((window * 60))"; then
+      log "scratchpad kept: $d — its session wrote a transcript within ${window}h"
+      [ "$class" = new ] && spotcheck_note keep "$d" - "${holders:--}" "its session wrote a transcript within ${window}h; named by ${mention:-a transcript}"
+      kept=$((kept + 1)); continue
+    fi
+
+    if [ "$class" = old ]; then
+      # The user's rule: ask whether a live session is using it. Exit 0 free, 1 in use, 2
+      # unknown. UNKNOWN keeps it - on 2026-09-11 the mention rule correctly held a
+      # directory two sessions were still writing to while `lsof` reported no holder.
+      # With the index built, the transcript search is already done (once, for every
+      # directory) and the gate is asked with a window of 0: its own search then walks no
+      # file. That search was 4 x 17s per directory on 2 GB of transcripts, the slow half of
+      # a 2h13m sweep, and for a directory the index did not name it can only find nothing.
+      if [ "$midx_ok" -eq 1 ]; then
+        verdict="$(PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" PATH_IN_USE_WINDOW_HOURS=0 bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
+      elif [ "$window" -ne "$IDLE_HOURS" ]; then
+        verdict="$(PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" PATH_IN_USE_WINDOW_HOURS="$window" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
+      else
+        verdict="$(PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
+      fi
+      if [ "$rc" -ne 0 ]; then
+        # In use ONLY because a transcript names the path (a spelling the index missed): the
+        # same directory, the new rule's.
+        reasons="$(printf '%s\n' "$verdict" | sed '1d; s/^ *//; /^$/d')"
+        if [ "$rc" -eq 1 ] && [ -n "$reasons" ] && ! printf '%s\n' "$reasons" | grep -qv '^a session active within [0-9]*h names it: '; then
+          class=new; mention="$(printf '%s\n' "$reasons" | sed -n '1s/.*names it: //p')"
+        else
+          log "scratchpad kept: $d — $(printf '%s' "$verdict" | sed -n '2p' | sed 's/^ *//')"
+          kept=$((kept + 1)); continue
+        fi
+      fi
+    fi
+
+    if [ "$class" = new ]; then
+      # No process, no live session, not protected, not touched in the window; the only
+      # thing that kept it was a transcript naming it. What else is liveness?
+      why=""
+      if [ "$LSOF_STATE" != ok ]; then why="lsof is unusable, so holders cannot be ruled out"
+      elif [ "$live_ok" -ne 1 ]; then why="session records could not be read, so its session cannot be ruled alive"
+      elif [ -n "$resum" ] && printf '%s\n' "$resum" | grep -qxF "$sid"; then why="closed within ${RESUME_DAYS}d and resumable (closed-sessions.md)"
+      fi
+      if [ -n "$why" ]; then
+        log "scratchpad kept: $d — $why (named by ${mention:-a transcript})"
+        spotcheck_note keep "$d" - "${holders:--}" "$why; named by ${mention:-a transcript}"
+        kept=$((kept + 1)); continue
+      fi
     fi
 
     # Measured before the removal, because afterwards there is nothing to measure. It is
     # a second walk of a tree the `rm -rf` below is about to walk anyway; on the dry-run
     # path it is the only walk, and it is still small beside the liveness gate that just
     # decided this directory (358s of a 358s sweep, measured 2026-09-12).
-    bytes=$((bytes + $(kb_of "$d")))
+    kb="$(kb_of "$d")"
+
+    if [ "$class" = new ] && [ "$NEW_RULES_MODE" != auto ]; then
+      spotcheck_note would-remove "$d" "$(as_gb "$kb")" "${holders:--}" "named by ${mention:-a transcript}; its session is not alive, nothing holds it, idle ${window}h, not protected"
+      log "scratchpad spot-check: $d ($(as_gb "$kb")) is removable under the liveness rule, named by ${mention:-a transcript}; logged only, not removed"
+      spot=$((spot + 1)); kept=$((kept + 1)); continue
+    fi
+
+    bytes=$((bytes + kb))
     if [ "$DRY" -eq 1 ]; then
       log "scratchpad WOULD be reaped: $d"
     else
-      rm -rf "$d" 2>/dev/null || { log "scratchpad could not be removed: $d" >&2; FAILED=1; kept=$((kept + 1)); continue; }
+      # A fresh lsof, immediately before the removal: the one above may be an hour old.
+      if ! removal_precheck "$d" "$class"; then
+        log "scratchpad kept: $d — held by ${RB_REMOVE_HOLDERS% } at removal"
+        [ "$class" = new ] && spotcheck_note keep "$d" "$(as_gb "$kb")" "${RB_REMOVE_HOLDERS% }" "held at the pre-removal check"
+        bytes=$((bytes - kb)); kept=$((kept + 1)); continue
+      fi
+      rm -rf "$d" 2>/dev/null || { log "scratchpad could not be removed: $d" >&2; FAILED=1; kept=$((kept + 1)); bytes=$((bytes - kb)); continue; }
       log "scratchpad reaped: $d"
+      [ "$class" = new ] && spotcheck_note removed "$d" "$(as_gb "$kb")" - "named by ${mention:-a transcript}; liveness rule (auto)"
     fi
     reaped=$((reaped + 1))
   done
+  rm -f "$midx" "$LSOF_SNAP" 2>/dev/null
   log "scratchpads: $reaped reaped, $kept kept, $(freed_mb "$bytes")"
+  [ "$spot" -eq 0 ] || log "scratchpads: $spot more removable under the liveness rule, logged to $SPOTCHECK_LOG and not removed (CC_RB_NEW_RULES_MODE=$NEW_RULES_MODE)"
 }
 
 # ---------------------------------------------------------------- docker
@@ -1186,6 +1472,60 @@ PLIST
   LEGACY_ASIDE=""
 }
 
+# ---------------------------------------------------------------- single instance
+
+# One sweep at a time (stima-api #5886). On 2026-10-24 the launchd --if-stale run and the
+# low-disk run resource-watch.sh starts overlapped for hours, each walking the same
+# directories and holding lsof snapshots over a 2 GB transcript scan. macOS ships no
+# flock(1), so the lock is a directory: mkdir is atomic, and the pid inside names the owner.
+# Every mode that removes something takes it; --dry-run changes nothing and does not.
+# A live holder means this run exits 0 (launchd must not count it a failure). A holder
+# whose pid is gone is stale and is taken over; a lock whose pid is alive is never
+# touched, whatever its command line says, because a wrong "stale" here is two sweeps again.
+LOCK_DIR="${CC_RB_LOCK_DIR:-$HOME/.cc-reaper/state/reclaim-byproducts.lock}"
+LOCK_OWNED=0
+lock_pid() { cat "$LOCK_DIR/pid" 2>/dev/null; }
+release_lock() {
+  [ "$LOCK_OWNED" -eq 1 ] || return 0
+  LOCK_OWNED=0
+  # Only a lock that still names this process: a takeover by another run must survive us.
+  [ "$(lock_pid)" = "$$" ] || return 0
+  rm -rf "$LOCK_DIR" 2>/dev/null
+  return 0
+}
+acquire_lock() {
+  local attempt=0 holder waited cmd
+  mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
+  while [ "$attempt" -lt 4 ]; do
+    attempt=$((attempt + 1))
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_DIR/pid"
+      LOCK_OWNED=1
+      trap 'release_lock' EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+      return 0
+    fi
+    # The owner writes its pid just after mkdir; give that a moment before calling it empty.
+    holder=""; waited=0
+    while [ "$waited" -lt 10 ]; do
+      holder="$(lock_pid)"; [ -n "$holder" ] && break
+      sleep 0.2; waited=$((waited + 1))
+    done
+    case "$holder" in *[!0-9]*) holder="" ;; esac
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+      log "byproducts: another sweep, pid $holder, is running; this one exits"
+      exit 0
+    fi
+    cmd=""; [ -z "$holder" ] || cmd="$(ps -o command= -p "$holder" 2>/dev/null)"
+    log "byproducts: stale lock $LOCK_DIR (pid ${holder:-none}, not running${cmd:+, now: $cmd}); taking it over"
+    # mv is atomic: of two runs taking over the same stale lock only one renames it.
+    mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null && rm -rf "$LOCK_DIR.stale.$$"
+  done
+  echo "byproducts: could not take $LOCK_DIR; this one exits" >&2
+  exit 0
+}
+
 # ---------------------------------------------------------------- main
 
 case "${1:-}" in
@@ -1193,9 +1533,9 @@ case "${1:-}" in
   # The go cache alone, for a caller that just watched the disk run low (the CI runner
   # loop, when it starts declining jobs). No scratchpad liveness gate - that is the slow
   # part, minutes - and no stamp, so the scheduled full sweep is not pushed back.
-  --go-cache) rotate_log; log "== go cache only $(now_iso) (pid $$) =="; reap_go_cache; exit 0 ;;
+  --go-cache) acquire_lock; rotate_log; log "== go cache only $(now_iso) (pid $$) =="; reap_go_cache; exit 0 ;;
   # The size cap alone, for resource-watch's 10-minute cadence: silent unless over the cap.
-  --go-cache-cap) go_lru_cap; exit 0 ;;
+  --go-cache-cap) acquire_lock; go_lru_cap; exit 0 ;;
   --if-stale) CHECK_STALE=1 ;;
   --install-launchd) trap restore_legacy_agent EXIT; install_launchd "${2:-04:00}"; exit 0 ;;
   --self-test) exec bash "$REPO_HERE/../tests/reclaim-byproducts.sh" ;;
@@ -1208,6 +1548,7 @@ esac
 # firing that skipped are both firings and the question this answers is how often the
 # timer fires. The header is the separator the log did not have either: two sweeps ran
 # into each other in it with nothing between them.
+[ "$DRY" -eq 1 ] || acquire_lock
 MODE=reap
 [ "$CHECK_STALE" -eq 1 ] && MODE=scheduled
 [ "$DRY" -eq 1 ] && MODE=dry-run

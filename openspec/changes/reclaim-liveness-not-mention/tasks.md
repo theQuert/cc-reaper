@@ -1,0 +1,5 @@
+- [x] Index the mentions once per run; classify each directory as old-rule or new-rule
+- [x] Liveness predicate: live session, one lsof, transcript recency, protected sessions, resume window
+- [x] Fresh lsof before every removal
+- [x] Spot-check mode and log, `auto` switch
+- [ ] After a clean spot-check period, promote the host to `CC_RB_NEW_RULES_MODE=auto` (operator)
