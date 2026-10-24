@@ -159,6 +159,9 @@ chmod +x "$STUBS_IDLE/gh"
 export CC_WJ_ROOT="$TMPDIR_ROOT"
 export CC_WJ_LOG="$TMPDIR_ROOT/wj.log"
 export CC_WJ_STATE_DIR="$TMPDIR_ROOT/state"
+# The order and cursor cases here are path-order cases; largest first has its own suite
+# (tests/worktree-janitor-order.sh), and neither order changes what is kept.
+export CC_WJ_ORDER=path
 export CC_WJ_NOTIFY_MIN_GB=0
 export CC_WJ_COOLDOWN_SECS=0
 # Keep these holder/race fixtures isolated from the developer machine's live harness

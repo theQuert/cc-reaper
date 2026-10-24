@@ -8,6 +8,7 @@
 # The deployed config is the policy owner.  Preserve explicit environment values so a
 # one-shot diagnostic or test can override the installed cross-device policy.
 _CC_WJ_CONFIG_ERROR=""
+_CC_WJ_ORDER=""
 _CC_WJ_CONFIG_FILE="${CC_WJ_CONFIG:-$HOME/.cc-reaper/worktree-janitor.conf}"
 _CC_WJ_PRE_IDLE_SET="${CC_WJ_IDLE_HOURS+x}"; _CC_WJ_PRE_IDLE="${CC_WJ_IDLE_HOURS-}"
 _CC_WJ_PRE_GRACE_SET="${CC_WJ_SESSION_GRACE_HOURS+x}"; _CC_WJ_PRE_GRACE="${CC_WJ_SESSION_GRACE_HOURS-}"
@@ -78,6 +79,12 @@ Environment:
                           Seconds each phase of an apply run may examine worktrees before
                           it yields to the next sweep, which resumes where it stopped
                           (default: 1800; 0 is unbounded)
+  CC_WJ_ORDER             largest (default): each repository's worktrees are examined by their
+                          last known size, largest first, so a sweep the budget cuts short has
+                          spent it where the bytes are; path: in path order, as before
+  CC_WJ_GROWTH_SAMPLES, CC_WJ_GROWTH_TARGETS
+                          growth-watch's samples and targets, the sizes largest-first reads
+                          besides its own (default: those disk-janitor --check writes and reads)
   CC_WJ_LSOF_TIMEOUT_SECONDS, CC_WJ_LOCK_SCAN_TIMEOUT_SECONDS
                           Bounds on the machine-wide lsof scans and the Codex lock registry
                           scan, each retried once on a timeout (default: 120, 30)
@@ -97,6 +104,14 @@ Environment:
   CC_WJ_ARCHIVE_DIR      Where --apply copies archive:-declared files before a removal
                          (default: ~/.cc-reaper/archive)
   CC_WJ_ARCHIVE_MAX_BYTES Largest file an archive: declaration lets leave (default: 1048576)
+  CC_WJ_NEW_RULES_MODE   spotcheck (default; any other value too) or auto. Whether a top-level
+                         ignored *.log file and a .claude/skills or .claude/commands symlink into
+                         the primary checkout stop keeping a worktree (auto), or only have what
+                         they would trim or remove logged to CC_WJ_SPOTCHECK_LOG (spotcheck)
+  CC_WJ_SPOTCHECK_LOG    (default: ~/.cc-reaper/logs/spotcheck-worktree-janitor.log)
+  CC_WJ_DENY_NAMES       Whitespace-separated names; a worktree whose directory name or branch
+                         contains one, or that a live Claude session of that name stands in, is
+                         never trimmed or removed (default: none; the installed config sets it)
 
 A worktree is removable only when it holds nothing a command cannot rebuild - or that an
 archive: line in .worktree-regenerable lets --apply copy out first - no process
@@ -1178,7 +1193,7 @@ PY
 _cc_wj_scan_claude_sessions() {
   local registry="${CC_WJ_CLAUDE_SESSIONS:-$HOME/.claude/sessions}"
   local projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
-  local f files base row pid sid cwd cmd resolved transcripts count transcript
+  local f files base row pid sid cwd cmd resolved transcripts count transcript sname
   [ -e "$registry" ] || return 0
   if [ ! -d "$registry" ] || [ ! -r "$registry" ] || [ ! -x "$registry" ]; then
     _CC_WJ_ACTIVE_ERROR="the Claude session registry $registry is unreadable"
@@ -1202,6 +1217,9 @@ _cc_wj_scan_claude_sessions() {
       return 1
     }
     IFS=$'\t' read -r pid sid cwd <<< "$row"
+    # The session's name, for CC_WJ_DENY_NAMES only. Read apart from the row above so a
+    # missing or odd name can never fail the scan that every veto depends on.
+    sname="$(jq -r '(.name // "") | tostring' "$f" 2>/dev/null | head -n 1)"
     case "$pid" in ''|*[!0-9]*) _CC_WJ_ACTIVE_ERROR="live Claude session record ${f##*/} has no valid pid"; return 1 ;; esac
     [ "$pid" = "$base" ] || {
       _CC_WJ_ACTIVE_ERROR="live Claude session record ${f##*/} disagrees with pid $pid"
@@ -1225,6 +1243,10 @@ _cc_wj_scan_claude_sessions() {
       return 1
     }
     _cc_wj_active_add_claim Claude "$resolved" "$sid"
+    case "$sname" in
+      ''|*$'\t'*|*$'\n'*) ;;
+      *) _CC_WJ_ACTIVE_NAMES="${_CC_WJ_ACTIVE_NAMES}${sname}"$'\t'"${resolved}"$'\n' ;;
+    esac
     if [ ! -d "$projects" ] || [ ! -r "$projects" ] || [ ! -x "$projects" ]; then
       _CC_WJ_ACTIVE_ERROR="live Claude session $sid has no readable transcript registry at $projects"
       return 1
@@ -1509,7 +1531,7 @@ _cc_wj_scan_active_sessions() { # <recent-session grace hours>
       return 1
     }
   fi
-  _CC_WJ_ACTIVE_CLAIMS=""; _CC_WJ_ACTIVE_TRANSCRIPTS=""; _CC_WJ_ACTIVE_ERROR=""
+  _CC_WJ_ACTIVE_CLAIMS=""; _CC_WJ_ACTIVE_TRANSCRIPTS=""; _CC_WJ_ACTIVE_ERROR=""; _CC_WJ_ACTIVE_NAMES=""
   _CC_WJ_RECENT_CLAIMS=""; _CC_WJ_RECENT_TRANSCRIPTS=""; _CC_WJ_RECENT_REASON=""
   _cc_wj_scan_claude_sessions || return 1
   _cc_wj_scan_codex_sessions || return 1
@@ -2287,6 +2309,98 @@ _cc_wj_pin() {
   printf '%s\n' "${line//$'\n'/?}"
 }
 
+# ─── Rules on probation, and names nothing may touch (stima-api#5886) ─────────
+
+# On 2026-10-24 the last sweep kept 50 worktrees (30.9 GB) as unrebuildable, most of them for
+# one of two trivial entries: a top-level log a dev server or build wrote (`next-manual.log`,
+# `routing-snapshot-redis.log`, `.build-main.log`), and the `.claude/skills` link an older
+# new-task-worktree.sh made into the primary checkout. Neither is work: the log is output, and
+# removing a link removes nothing it names. Both rules start in spot-check mode, where they
+# change no decision and log what they would have trimmed or removed; `auto` lets them decide.
+_cc_wj_new_rules_mode() {
+  case "${CC_WJ_NEW_RULES_MODE:-spotcheck}" in
+    auto) echo auto ;;
+    *) echo spotcheck ;;
+  esac
+}
+
+# The rule that discounts ignored entry $2 (porcelain path, no trailing slash) of worktree $1,
+# printed, or status 1. Asked only after every existing discount has declined the entry.
+_cc_wj_new_rule() {
+  local wt="$1" rest="$2" target common primary resolved dir
+  case "$rest" in *$'\t'*|*$'\n'*|'') return 1 ;; esac
+  case "$rest" in
+    */*) ;;
+    *.log)
+      # A regular file at the top level, not a link and not credential-shaped.
+      [ -f "$wt/$rest" ] && [ ! -L "$wt/$rest" ] || return 1
+      _cc_wj_sensitive_name "$rest" && return 1
+      echo top-level-log; return 0 ;;
+    *) return 1 ;;
+  esac
+  case "$rest" in .claude/skills|.claude/commands) ;; *) return 1 ;; esac
+  [ -L "$wt/$rest" ] || return 1
+  target="$(readlink "$wt/$rest" 2>/dev/null)" || return 1
+  [ -n "$target" ] || return 1
+  case "$target" in /*) ;; *) target="$wt/.claude/$target" ;; esac
+  common="$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [ "$(basename "$common")" = .git ] || return 1
+  primary="$(dirname "$common")"
+  # Resolved when the target's directory exists, so `..` and a symlinked home compare by what
+  # they name; a dangling link is compared as written.
+  dir="$(dirname "$target")"
+  resolved="$target"
+  if [ -d "$dir" ]; then
+    resolved="$(_cc_wj_realpath "$dir")/$(basename "$target")"
+  fi
+  case "$resolved" in */../*|*/./*|*/..|*/.) return 1 ;; esac
+  for dir in "$primary" "$(_cc_wj_realpath "$primary")"; do
+    case "$resolved" in "${dir%/}"/*) echo primary-skills-link; return 0 ;; esac
+  done
+  return 1
+}
+
+_cc_wj_spotcheck_log() {
+  printf '%s\n' "${CC_WJ_SPOTCHECK_LOG:-$HOME/.cc-reaper/logs/spotcheck-worktree-janitor.log}"
+}
+
+# One spot-check record: what a new rule would have done, and nothing done.
+_cc_wj_spotcheck() { # <phase> <action> <rules> <path> <bytes> <holder> <worktree>
+  local log
+  log="$(_cc_wj_spotcheck_log)"
+  mkdir -p "$(dirname "$log")" 2>/dev/null || true
+  _cc_wj_bound_log "$log"
+  printf '[%s] run=%s phase=%s action=%s rule=%s path=%s bytes=%s holder=%s worktree=%s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${_CC_WJ_RUN_ID:-?}" "$1" "$2" "$3" "$4" "$5" "$6" "$7" \
+    >> "$log" 2>/dev/null || true
+}
+
+# Status 0, with _CC_WJ_DENY_REASON set, when CC_WJ_DENY_NAMES forbids touching worktree $1 on
+# branch $2: a name inside the worktree's directory name or branch, or a live Claude session
+# of that name standing at or under it. A live session's structured tool calls already veto
+# through the ordinary claim gate; this one holds whatever the claim windows say.
+_CC_WJ_DENY_REASON=""
+_cc_wj_denied() {
+  local wt="$1" branch="$2" name base phys sname scwd
+  _CC_WJ_DENY_REASON=""
+  [ -n "${CC_WJ_DENY_NAMES:-}" ] || return 1
+  base="$(basename "$wt")"
+  phys="$(_cc_wj_realpath "$wt")"
+  for name in $CC_WJ_DENY_NAMES; do
+    case "$base" in *"$name"*) _CC_WJ_DENY_REASON="deny-listed:$name"; return 0 ;; esac
+    case "$branch" in *"$name"*) _CC_WJ_DENY_REASON="deny-listed:$name"; return 0 ;; esac
+    while IFS=$'\t' read -r sname scwd; do
+      [ "$sname" = "$name" ] && [ -n "$scwd" ] || continue
+      case "$scwd/" in "${phys%/}/"*|"${wt%/}/"*)
+        _CC_WJ_DENY_REASON="deny-listed:session $name"; return 0 ;;
+      esac
+    done <<DENY_SESSIONS
+${_CC_WJ_ACTIVE_NAMES:-}
+DENY_SESSIONS
+  done
+  return 1
+}
+
 # Print every entry a removal would destroy that nothing is known to rebuild, one per
 # line as `<porcelain code> <path>`. When the status cannot be read, print one line
 # saying so and fail: an unreadable repository must not read as a clean one.
@@ -2300,7 +2414,7 @@ _cc_wj_pin() {
 # With $2, each archivable file this read discounts is appended to that file, one path per
 # line, so a removal copies out exactly what the read that cleared it saw.
 _cc_wj_pins() {
-  local wt="$1" archive_to="${2:-}" sf rec code rest base skip_next=0 drc reach arc status_timeout status_rc=0
+  local wt="$1" archive_to="${2:-}" sf rec code rest base skip_next=0 drc reach arc status_timeout status_rc=0 nr
   status_timeout="$(_cc_wj_git_status_timeout_seconds)" || {
     _cc_wj_pin '??' "(invalid git status timeout)"; return 1; }
   sf="$(mktemp "${TMPDIR:-/tmp}/cc-wj-status.XXXXXX")" || {
@@ -2378,6 +2492,12 @@ _cc_wj_pins() {
         esac
         if _cc_wj_declared "$rest" && ! _cc_wj_sensitive_name "$base"; then
           continue
+        fi
+        if nr="$(_cc_wj_new_rule "$wt" "$rest")"; then
+          [ "$(_cc_wj_new_rules_mode)" = auto ] && continue
+          # Spot check: still kept, and the inventory is told which rule would discount it.
+          [ -z "${_CC_WJ_NEWRULE_LOG:-}" ] ||
+            printf '%s\t%s\t%s\n' "$wt" "$nr" "$rest" >> "$_CC_WJ_NEWRULE_LOG" 2>/dev/null || true
         fi
         _cc_wj_pin '!!' "$rest"
         ;;
@@ -3386,6 +3506,105 @@ _cc_wj_cursor_write() { # <cursor file> <worktree>
   return 0
 }
 
+# ─── Largest first (stima-api#5886) ──────────────────────────────────────────
+#
+# A sweep the budget cuts short should have spent it where the bytes are, so with
+# CC_WJ_ORDER=largest (the default) each repository's worktrees are examined by their last
+# known size, largest first. Nothing is measured for the ordering: a full `du` of the
+# worktree roots took over ten minutes under load. The sizes are the ones already taken:
+#   - growth-watch's samples (disk-janitor --check, every few hours, budgeted), keyed
+#     `<label>/<name>` under a glob row of its targets file, mapped back to the path here;
+#   - this janitor's own `du` of a worktree (a report's estimate, a spot-check, a removal),
+#     kept in $(_cc_wj_state_dir)/worktree-sizes.tsv as path<TAB>bytes<TAB>measured_at.
+# The newest measurement of a path wins. The order only decides which worktree is asked
+# first: every one is still judged by every gate, wherever it sits. CC_WJ_ORDER=path is the
+# old path order and cursor, and reads and writes no size.
+_cc_wj_order() {
+  case "${CC_WJ_ORDER:-largest}" in
+    largest|path) printf '%s\n' "${CC_WJ_ORDER:-largest}" ;;
+    *) return 1 ;;
+  esac
+}
+
+_cc_wj_size_cache() { printf '%s\n' "$(_cc_wj_state_dir)/worktree-sizes.tsv"; }
+
+_cc_wj_tilde() { case "$1" in '~') printf '%s\n' "$HOME" ;; '~/'*) printf '%s\n' "$HOME/${1#\~/}" ;; *) printf '%s\n' "$1" ;; esac; }
+
+# Best effort, like the cursor: a size that cannot be written only costs the order. Rows not
+# measured for 30 days go, so trees removed some other way do not accumulate. `-` forgets the
+# path (it was removed). Two sweeps of different repositories may race here; the loser's row
+# is lost, which again only costs the order.
+_cc_wj_size_record() { # <path> <bytes | ->
+  [ "$_CC_WJ_ORDER" = largest ] || return 0
+  case "$2" in -) ;; ''|*[!0-9]*) return 0 ;; esac
+  local file tmp now
+  file="$(_cc_wj_size_cache)"; tmp="$file.tmp.${_CC_WJ_RUN_PID:-$$}"; now="$(date +%s)"
+  mkdir -p "$(dirname "$file")" 2>/dev/null
+  {
+    cat "$file" 2>/dev/null | CC_WJ_P="$1" LC_ALL=C awk -F'\t' -v cutoff=$((now - 2592000)) \
+      'NF == 3 && $1 != ENVIRON["CC_WJ_P"] && $2 ~ /^[0-9]+$/ && $3 + 0 >= cutoff'
+    [ "$2" = - ] || printf '%s\t%s\t%s\n' "$1" "$2" "$now"
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# The newest known size of each path, as path<TAB>bytes, into $1. Read once per run.
+_cc_wj_size_map() { # <out>
+  local targets samples
+  targets="$(_cc_wj_tilde "${CC_WJ_GROWTH_TARGETS:-${CC_DJ_GROWTH_TARGETS:-$HOME/.cc-reaper/growth-targets.tsv}}")"
+  samples="$(_cc_wj_tilde "${CC_WJ_GROWTH_SAMPLES:-${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state}/growth-samples.tsv}")"
+  # Copied first: an unreadable file is then an empty one, never an awk error.
+  cat "$targets" > "$1.targets" 2>/dev/null || : > "$1.targets"
+  cat "$samples" > "$1.samples" 2>/dev/null || : > "$1.samples"
+  cat "$(_cc_wj_size_cache)" > "$1.cache" 2>/dev/null || : > "$1.cache"
+  LC_ALL=C awk -F'\t' -v home="$HOME" -v uid="$(id -u)" '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    function note(p, epoch, bytes) { if (!(p in at) || epoch + 0 >= at[p] + 0) { at[p] = epoch; size[p] = bytes } }
+    FILENAME == ARGV[1] {
+      # growth-watch keys a glob row `label<TAB>path` as label/<path relative to the
+      # directory before the first wildcard>, with ~ and {uid} expanded.
+      if ($0 ~ /^[ \t]*#/ || NF < 3) next
+      label = trim($1); path = trim($2)
+      if (label == "" || path ~ /^docker:/) next
+      gsub(/\{uid\}/, uid, path)
+      if (path == "~") path = home; else if (substr(path, 1, 2) == "~/") path = home substr(path, 2)
+      cut = 0
+      for (i = 1; i <= length(path); i++) { c = substr(path, i, 1); if (c == "*" || c == "?" || c == "[") { cut = i; break } }
+      if (!cut) next
+      prefix = substr(path, 1, cut - 1); sub(/\/[^\/]*$/, "", prefix)
+      dir[label] = prefix
+      next
+    }
+    FILENAME == ARGV[2] {
+      # <epoch><TAB><key><TAB><KiB or a status>
+      if ($3 !~ /^[0-9]+$/ || (slash = index($2, "/")) == 0) next
+      label = substr($2, 1, slash - 1)
+      if (label in dir) note(dir[label] "/" substr($2, slash + 1), $1, $3 * 1024)
+      next
+    }
+    NF == 3 && $2 ~ /^[0-9]+$/ { note($1, $3, $2) }
+    END { for (p in at) printf "%s\t%.0f\n", p, size[p] }' "$1.targets" "$1.samples" "$1.cache" > "$1" 2>/dev/null ||
+    : > "$1"
+  rm -f "$1.targets" "$1.samples" "$1.cache"
+  return 0
+}
+
+# The inventory in examination order: worktrees not yet examined in this cycle before those
+# already examined, each part by known size, largest first, then those with no known size in
+# path order. Unknown sizes go last because a tree no measurement has reached yet is almost
+# always a new one, still in use and kept; the cycle reaches it all the same.
+_cc_wj_order_largest() { # <inventory> <sizes> <seen>
+  local tab
+  tab="$(printf '\t')"
+  LC_ALL=C sort -t "$tab" -k1,1 "$1" |
+    LC_ALL=C awk -F'\t' '
+      FILENAME == ARGV[1] { size[$1] = $2; next }
+      FILENAME == ARGV[2] { seen[$1] = 1; next }
+      { n++; known = ($1 in size)
+        printf "%d\t%d\t%.0f\t%d\t%s\n", ($1 in seen), !known, known ? size[$1] : 0, n, $0 }' "$2" "$3" - |
+    LC_ALL=C sort -t "$tab" -k1,1n -k2,2n -k3,3nr -k4,4n | cut -f5-
+}
+
 # Released only while it is still ours: after a takeover it belongs to somebody else.
 _cc_wj_unlock() {
   [ "$(cat "$1/pid" 2>/dev/null)" = "${_CC_WJ_RUN_PID:-$$}" ] && rm -f "$1/pid" "$1/cmd" && rmdir "$1" 2>/dev/null
@@ -3417,6 +3636,7 @@ _cc_wj_run_inner() {
 
   local apply=0 trim=0 scheduled=0 claims_only=0 claims_filter=""
   local explicit_repos=()
+  [ -n "${_CC_WJ_RUN_ID:-}" ] || _CC_WJ_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
   # Parse arguments
   while [ $# -gt 0 ]; do
@@ -3522,6 +3742,11 @@ _cc_wj_run_inner() {
       return 2
     fi
   done
+  if ! _CC_WJ_ORDER="$(_cc_wj_order)"; then
+    _CC_WJ_ORDER=""
+    echo "worktree-janitor: CC_WJ_ORDER=${CC_WJ_ORDER:-} is neither largest nor path; scanned and removed nothing" >&2
+    return 2
+  fi
 
   if [ "$claims_only" -eq 1 ]; then
     if ! _cc_wj_scan_active_sessions "$session_grace_hours"; then
@@ -3684,6 +3909,9 @@ KEEP
   # one it was fetching or listing, which would then be skipped again - so a large first
   # repository cannot keep the others from ever being examined. Same rules as the worktree
   # cursor; an unknown one keeps the order, and a phase that examined nothing writes none.
+  # Every size known before this run, read once; what this run measures orders the next one.
+  : > "$work/sizes"
+  [ "$_CC_WJ_ORDER" != largest ] || _cc_wj_size_map "$work/sizes"
   if [ "$apply" -eq 1 ]; then
     repo_cursor_file="$(_cc_wj_state_dir)/repo-cursor-$phase"
     cursor="$(head -n 1 "$repo_cursor_file" 2>/dev/null)"
@@ -3703,7 +3931,8 @@ KEEP
   # declared again.
   local reclaim pushed wip wip_dirty wip_ref wip_name total_pushed=0 total_wip=0 total_estimate=0
   reclaim="$(_cc_wj_reclaim_pushed)"
-  local active lease landed idle referenced classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes task_done wt_idle_hours
+  local trim_known active lease landed idle referenced classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes task_done wt_idle_hours
+  local nr_rules="" nr_dirty="" nr_count nr_line nr_note="" nr_holder nr_active_ok nr_blind
   # Said once, because the absence is otherwise silent: every squash-merged worktree just
   # reads KEEP(unlanded). That is how the scheduled sweep went without landed=pr for weeks.
   if [ "$trim" -eq 0 ] && ! command -v gh >/dev/null 2>&1; then
@@ -3775,7 +4004,10 @@ KEEP
     # Collected to completion before anything is judged. Read as it is produced, the
     # producer runs `git -C <next worktree> status` while the loop scans for holders, and
     # the janitor's own git then holds the next worktree it is about to judge.
-    if ! _cc_wj_list_worktrees "$repo" > "$work/inventory"; then
+    # In spot-check mode the listing also records, per worktree, each entry that kept it only
+    # because a rule on probation is not yet allowed to discount it.
+    : > "$work/newrule"
+    if ! _CC_WJ_NEWRULE_LOG="$work/newrule" _cc_wj_list_worktrees "$repo" > "$work/inventory"; then
       echo "worktree-janitor: could not list the worktrees of $repo (git 2.36 or newer is required); judged nothing in it"
       skipped=1
       [ -n "$lock" ] && _cc_wj_unlock "$lock"
@@ -3787,11 +4019,31 @@ KEEP
     # one it removed. A missing or unreadable cursor starts at the beginning; a report run
     # neither reads nor writes one.
     cursor=""
-    [ -n "$cursor_file" ] && cursor="$(head -n 1 "$cursor_file" 2>/dev/null)"
-    LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$work/inventory" |
-      CC_WJ_CURSOR="$cursor" LC_ALL=C awk -F'\t' '$1 > ENVIRON["CC_WJ_CURSOR"] { print; next }
-        { rest = rest $0 "\n" } END { printf "%s", rest }' > "$work/inventory.rotated" &&
-      mv -f "$work/inventory.rotated" "$work/inventory"
+    if [ "$_CC_WJ_ORDER" = largest ]; then
+      # Largest first, the order changing as sizes do, so "after the last examined" means
+      # nothing here. The cursor file instead holds the worktrees examined in this cycle, one
+      # per line: those go after the rest, and once every listed worktree is in it a new cycle
+      # starts. Paths no longer listed are dropped. A missing or unreadable file is an empty
+      # cycle; a report run neither reads nor writes it.
+      : > "$work/seen"
+      if [ -n "$cursor_file" ]; then
+        cat "$cursor_file" 2>/dev/null |
+          LC_ALL=C awk -F'\t' 'FILENAME == ARGV[1] { listed[$1] = 1; next }
+            ($0 in listed) && !($0 in kept) { kept[$0] = 1; print }' "$work/inventory" - > "$work/seen"
+        [ "$(wc -l < "$work/seen")" -lt "$(wc -l < "$work/inventory")" ] || : > "$work/seen"
+        { cp "$work/seen" "$cursor_file.tmp.${_CC_WJ_RUN_PID:-$$}" 2>/dev/null &&
+            mv -f "$cursor_file.tmp.${_CC_WJ_RUN_PID:-$$}" "$cursor_file" 2>/dev/null; } ||
+          rm -f "$cursor_file.tmp.${_CC_WJ_RUN_PID:-$$}" 2>/dev/null
+      fi
+      _cc_wj_order_largest "$work/inventory" "$work/sizes" "$work/seen" > "$work/inventory.rotated" &&
+        mv -f "$work/inventory.rotated" "$work/inventory"
+    else
+      [ -n "$cursor_file" ] && cursor="$(head -n 1 "$cursor_file" 2>/dev/null)"
+      LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$work/inventory" |
+        CC_WJ_CURSOR="$cursor" LC_ALL=C awk -F'\t' '$1 > ENVIRON["CC_WJ_CURSOR"] { print; next }
+          { rest = rest $0 "\n" } END { printf "%s", rest }' > "$work/inventory.rotated" &&
+        mv -f "$work/inventory.rotated" "$work/inventory"
+    fi
     wt_total="$(wc -l < "$work/inventory" | tr -d ' ')"
     wt_index=0
     while IFS=$'\t' read -r wt_path branch dirty ahead push_state pins; do
@@ -3806,7 +4058,11 @@ KEEP
         fi
         # The heartbeat: a sweep that is still deciding is not a dead holder.
         [ -n "$lock" ] && touch "$lock" 2>/dev/null
-        _cc_wj_cursor_write "$cursor_file" "$wt_path"
+        if [ "$_CC_WJ_ORDER" = largest ]; then
+          [ -z "$cursor_file" ] || printf '%s\n' "$wt_path" >> "$cursor_file" 2>/dev/null || :
+        else
+          _cc_wj_cursor_write "$cursor_file" "$wt_path"
+        fi
         examined=$((examined + 1))
         progress_common="$common"
       fi
@@ -3831,6 +4087,32 @@ KEEP
         total_kept=$((total_kept + 1))
         continue
       fi
+
+      # Named in CC_WJ_DENY_NAMES: nothing in it is trimmed or removed, in either phase.
+      if _cc_wj_denied "$wt_path" "$branch"; then
+        printf "  WORKTREE  %s\n" "$wt_path"
+        printf "    branch=%s  dirty=%s  active=n/a\n" "$branch" "$dirty"
+        printf "    classification: KEEP(%s)\n" "$_CC_WJ_DENY_REASON"
+        total_kept=$((total_kept + 1))
+        continue
+      fi
+
+      # Spot check: a worktree kept only by entries a rule on probation would discount is
+      # judged as the rule would judge it, and every decision that would act is logged instead
+      # and reverts to what the existing rules decide (KEEP(unrebuildable=<n>)).
+      nr_rules=""; nr_dirty=""
+      case "$dirty" in
+        ''|0|*[!0-9]*) ;;
+        *)
+          if [ -s "$work/newrule" ]; then
+            nr_count="$(W="$wt_path" LC_ALL=C awk -F'\t' '$1 == ENVIRON["W"]' "$work/newrule" | wc -l | tr -d ' ')"
+            if [ "$nr_count" = "$dirty" ]; then
+              nr_rules="$(W="$wt_path" LC_ALL=C awk -F'\t' '$1 == ENVIRON["W"] && !seen[$2]++ { printf "%s%s", (n++ ? "," : ""), $2 }' "$work/newrule")"
+              nr_dirty="$dirty"; dirty=0
+              nr_active_ok="$ACTIVE_OK"; nr_blind="$activity_blind"
+            fi
+          fi ;;
+      esac
 
       active="n/a"
       active_detail="-"
@@ -3905,7 +4187,22 @@ KEEP
       # not being used. The branch and worktree remain available for resume.
       if [ "$trim" -eq 1 ]; then
         printf "  WORKTREE  %s\n" "$wt_path"
-        printf "    branch=%s  dirty=%s  active=%s  recent=%s\n" "$branch" "$dirty" "$active" "$lease"
+        if [ -n "$nr_dirty" ]; then
+          printf "    branch=%s  dirty=%s  active=n/a  recent=n/a\n" "$branch" "$nr_dirty"
+        else
+          printf "    branch=%s  dirty=%s  active=%s  recent=%s\n" "$branch" "$dirty" "$active" "$lease"
+        fi
+        # Nothing to trim is the common answer, and the cheapest to reach: one status read,
+        # before the claim lookups, the idle walk and the git-state probe, which cost seconds
+        # a tree and on 2026-10-24 ran the trim phase to 3240 s against an 1800 s budget with
+        # every one of its 132 worktrees answering count=0. A failed read falls through to
+        # the full path, which keeps the worktree with its reason.
+        if _cc_wj_regenerable_dirs "$wt_path" > "$work/trim-precheck" 2>/dev/null &&
+           [ ! -s "$work/trim-precheck" ]; then
+          printf 'TRIM_RESULT count=0 trimmed=0 reclaimed=0\n'
+          [ -z "$nr_dirty" ] || { ACTIVE_OK="$nr_active_ok"; activity_blind="$nr_blind"; }
+          continue
+        fi
         # Uncommitted files are never listed, since only ignored regenerable directories
         # are, so a dirty tree loses nothing authored. It is still work in progress, so it
         # waits a long idle window first. Measured 2026-10-06: 55 of 90 trees were dirty,
@@ -3935,6 +4232,30 @@ KEEP
             continue
             ;;
         esac
+        if [ -n "$nr_dirty" ]; then
+          # Judged as the new rule would, with every gate, and trimmed by nothing: each
+          # directory it would remove is logged, and the tree stays as the existing rules keep it.
+          trim_result="$(_cc_wj_trim_regenerable "$wt_path" "$work" 0 "$session_grace_hours" "$trim_idle_window")"
+          nr_count=0
+          while IFS= read -r nr_line; do
+            case "$nr_line" in
+              '  TRIM_CANDIDATE  '*)
+                nr_line="${nr_line#  TRIM_CANDIDATE  }"
+                _cc_wj_spotcheck trim would-trim "$nr_rules" "${nr_line%  bytes=*}" "${nr_line##*  bytes=}" \
+                  "none(sweep-snapshot)" "$wt_path"
+                nr_count=$((nr_count + 1)) ;;
+            esac
+          done <<NR_TRIM
+$trim_result
+NR_TRIM
+          printf "    classification: KEEP(unrebuildable=%s)\n" "$nr_dirty"
+          [ "$nr_count" -eq 0 ] ||
+            printf "    spotcheck: %s would trim %s director%s here; logged to %s, nothing trimmed\n" \
+              "$nr_rules" "$nr_count" "$([ "$nr_count" -eq 1 ] && echo y || echo ies)" "$(_cc_wj_spotcheck_log)"
+          ACTIVE_OK="$nr_active_ok"; activity_blind="$nr_blind"
+          total_kept=$((total_kept + 1))
+          continue
+        fi
         trim_result="$(_cc_wj_trim_regenerable "$wt_path" "$work" "$apply" "$session_grace_hours" "$trim_idle_window")"
         printf "%s\n" "$trim_result"
         trim_count="$(printf '%s\n' "$trim_result" | awk -F'[ =]' '/^TRIM_RESULT / {print $3}')"
@@ -3947,6 +4268,15 @@ KEEP
         if [ "$apply" -eq 1 ]; then
           total_trimmed=$((total_trimmed + trim_count_done))
           total_trim_reclaimed=$((total_trim_reclaimed + trim_bytes))
+          # What it freed comes off its known size, so the next trim does not put a tree it
+          # just emptied first again. No known size, nothing to subtract from: none is written.
+          if [ "$trim_bytes" -gt 0 ] && [ "$_CC_WJ_ORDER" = largest ]; then
+            trim_known="$(CC_WJ_P="$wt_path" LC_ALL=C awk -F'\t' '$1 == ENVIRON["CC_WJ_P"] { print $2; exit }' "$work/sizes")"
+            case "$trim_known" in
+              ''|*[!0-9]*) ;;
+              *) _cc_wj_size_record "$wt_path" "$(awk -v k="$trim_known" -v t="$trim_bytes" 'BEGIN { printf "%.0f", (k > t ? k - t : 0) }')" ;;
+            esac
+          fi
         fi
         printf '%s\n' "$trim_result" | grep -q '^KEEP(' && total_kept=$((total_kept + 1))
         continue
@@ -4050,11 +4380,33 @@ KEEP
           ld_keep="$(_cc_wj_launchd_keep "$work" "$wt_path" "$LAUNCHD_OK")"
           [ -z "$ld_keep" ] || classification="$ld_keep" ;;
       esac
+      # Spot check: what the new rule would remove is logged, and the decision reverts to the
+      # existing one. A keep the existing rules gave before the content gate stays as it was.
+      nr_note=""
+      if [ -n "$nr_dirty" ]; then
+        case "$classification" in
+          REMOVABLE|REMOVABLE\(*\))
+            nr_holder="none(sweep-snapshot)"
+            { [ "$LSOF_OK" != yes ] || _cc_wj_held "$work" "$wt_path"; } && nr_holder="held"
+            bytes=$(du -sk "$wt_path" 2>/dev/null | awk '{print $1 * 1024}') || bytes=0
+            _cc_wj_size_record "$wt_path" "$bytes"
+            _cc_wj_spotcheck removal would-remove "$nr_rules" "$wt_path" "${bytes:-0}" "$nr_holder" "$wt_path"
+            nr_note="spotcheck: $nr_rules would make it $classification; logged to $(_cc_wj_spotcheck_log), nothing removed" ;;
+        esac
+        case "$classification" in
+          KEEP\(this-session\)) ;;
+          *) [ -n "$git_keep" ] || classification="$(_cc_wj_classify "$wt_path" "$nr_dirty" n/a "$LSOF_OK")" ;;
+        esac
+        dirty="$nr_dirty"; active="n/a"; lease="n/a"; active_detail="-"; lease_detail="-"
+        landed="-"; idle="-"; task_done="no"
+        ACTIVE_OK="$nr_active_ok"; activity_blind="$nr_blind"
+      fi
 
       printf "  WORKTREE  %s\n" "$wt_path"
       printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s  recent=%s  landed=%s  idle=%s\n" \
         "$branch" "${wip_dirty:-$dirty}" "$ahead" "$push_state" "$active" "$lease" "$landed" "$idle"
       printf "    classification: %s\n" "$classification"
+      [ -z "$nr_note" ] || printf "    %s\n" "$nr_note"
       case "$classification" in
         'REMOVABLE(pushed)') printf "    pushed: origin lists a branch that contains HEAD\n" ;;
         'REMOVABLE(wip-pushed)')
@@ -4093,6 +4445,7 @@ KEEP
           if [ "$apply" -ne 1 ]; then
             # What a removal would free; measured here, for the candidates only.
             bytes=$(du -sk "$wt_path" 2>/dev/null | awk '{print $1 * 1024}') || bytes=0
+            _cc_wj_size_record "$wt_path" "$bytes"
             total_estimate=$((total_estimate + ${bytes:-0}))
           fi
           if [ "$apply" -eq 1 ]; then
@@ -4182,6 +4535,7 @@ KEEP
             # between a verified copy and the removal.
             bytes=0
             bytes=$(du -sk "$wt_path" 2>/dev/null | awk '{print $1 * 1024}') || bytes=0
+            _cc_wj_size_record "$wt_path" "$bytes"
             if [ -s "$work/archive-list" ]; then
               if ! _cc_wj_archive_files "$repo" "$wt_path" "$work/archive-list"; then
                 printf "    → kept: archiving its archive: files to %s failed\n" "$_CC_WJ_ARCHIVE_DEST"
@@ -4211,6 +4565,7 @@ KEEP
             if _cc_wj_remove_worktree "$repo" "$wt_path" "$([ "$wip" = yes ] && echo --force)"; then
               total_removed=$((total_removed + 1))
               total_reclaimed=$((total_reclaimed + bytes))
+              _cc_wj_size_record "$wt_path" -
               printf "    → removed (%s bytes reclaimed)\n" "$bytes"
               [ -n "$lock" ] && touch "$lock" 2>/dev/null
               # Queue prune for this repo
@@ -4231,7 +4586,7 @@ KEEP
     [ -n "$lock" ] && _cc_wj_unlock "$lock"
   done
   if [ "$budget_hit" -eq 1 ]; then
-    echo "worktree-janitor: $phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined; kept them for the next sweep, which resumes after the last examined"
+    echo "worktree-janitor: $phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined; kept them for the next sweep, which $([ "$_CC_WJ_ORDER" = largest ] && echo "starts with those not yet examined in this cycle, largest first" || echo "resumes after the last examined")"
     _cc_wj_log_write "$phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined"
     [ -n "$progress_common" ] && _cc_wj_cursor_write "$repo_cursor_file" "$progress_common"
   fi
@@ -4314,6 +4669,8 @@ _cc_wj_run() {
   for arg in "$@"; do
     [ "$arg" = --scheduled ] && scheduled=1
   done
+  # One id for both phases of a sweep, so spot-check records of one run can be read together.
+  _CC_WJ_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   if [ "$scheduled" -eq 1 ]; then
     _cc_wj_bound_log "$HOME/.cc-reaper/logs/launchd-worktree-janitor-stdout.log"
     _cc_wj_bound_log "$HOME/.cc-reaper/logs/launchd-worktree-janitor-stderr.log"

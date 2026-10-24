@@ -17,6 +17,7 @@ user-caches	~/Library/Caches	caches
 xdg-cache	~/.cache	caches
 npm-cache	~/.npm	npm/cc-reaper-weekly
 go-mod-cache	~/go/pkg/mod	go/cc-reaper-weekly-pressure
+node-templates	~/.claude/node-modules-templates	sessions/skills-node-modules-template	10
 claude-transcripts	~/.claude/projects	harness-transcripts
 codex-sessions	~/.codex/sessions	harness-transcripts
 docker-images	docker:Images	docker
