@@ -121,6 +121,10 @@ class DoneCheckBy(unittest.TestCase):
         self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
         self.assertEqual(self.keep(), [])
 
+    def test_inbox_done_without_a_claimed_issue_is_ignored(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
+        self.assertEqual(self.keep(claims=[]), ["claim-unknown"])
+
     def test_a_recent_inbox_done_keeps_the_session(self):
         self.write("K1 DONE · 2026-10-25 21:30 TPE · ops-dispatch")
         self.assertEqual(self.keep(), ["issue-open:#2"])
