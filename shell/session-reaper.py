@@ -254,6 +254,8 @@ def checkby_state(repo, num, cfg):
             if rc != 0:
                 raise ValueError(rc)
             d = json.loads(out)
+            if isinstance(d, dict) and d.get("state") == "closed":
+                d = dict(d, pending_check_by="", due_check="")  # a closed issue's payload has neither key
             pending, due = d["pending_check_by"], d["due_check"]
             if not isinstance(pending, str) or not isinstance(due, str):
                 raise ValueError("shape")

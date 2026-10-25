@@ -202,6 +202,11 @@ class CheckByState(unittest.TestCase):
     def test_both_empty_is_clear(self):
         self.assertEqual(self.state(json.dumps({"pending_check_by": "", "due_check": "", "x": 1})), "CLEAR")
 
+    def test_a_closed_issue_is_clear(self):
+        payload = {"issue": 6090, "state": "closed", "stop": None,
+                   "next": {"action": "none", "command": "", "detail": "closed as completed", "kind": "done"}}
+        self.assertEqual(self.state(json.dumps(payload)), "CLEAR")
+
     def test_error_timeout_bad_json_or_missing_keys_is_unknown(self):
         self.assertEqual(self.state("{}", rc=1), "UNKNOWN")  # nonzero exit; run() also returns (1, "") on timeout
         self.assertEqual(self.state("not json"), "UNKNOWN")
