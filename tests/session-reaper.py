@@ -184,7 +184,7 @@ class CheckByState(unittest.TestCase):
     def state(self, out="", rc=0):
         reaper._checkby_cache.clear()
         with mock.patch.object(reaper, "run", return_value=(rc, out)) as r:
-            st = reaper.checkby_state("o/r", "9", CFG)
+            st = reaper.checkby_state("theQuert/stima-api", "9", CFG)
         self.calls = r.call_args
         return st
 
@@ -208,10 +208,15 @@ class CheckByState(unittest.TestCase):
         self.assertEqual(self.state(json.dumps({"pending_check_by": ""})), "UNKNOWN")
         self.assertEqual(self.state("[]"), "UNKNOWN")
 
+    def test_a_claim_in_another_repo_is_unknown_without_asking(self):
+        reaper._checkby_cache.clear()
+        with mock.patch.object(reaper, "run", side_effect=AssertionError("asked")):
+            self.assertEqual(reaper.checkby_state("theQuert/skills", "9", CFG), "UNKNOWN")
+
     def test_a_missing_oracle_file_is_unknown(self):
         reaper._checkby_cache.clear()
         cfg = dict(CFG, CHECKBY_ORACLE="/nonexistent/a/b/delivery_state.py")
-        self.assertEqual(reaper.checkby_state("o/r", "9", cfg), "UNKNOWN")
+        self.assertEqual(reaper.checkby_state("theQuert/stima-api", "9", cfg), "UNKNOWN")
 
 
 class ClaimTime(unittest.TestCase):

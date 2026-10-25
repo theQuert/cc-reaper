@@ -46,6 +46,7 @@ DEFAULTS = {
     "IDLE_LIST_INBOX": "",  # a path: append the list once per local day under ## key=IDLE-SESSIONS-<date>; empty: off
     "DONE_INBOX": "~/handoffs/neo-inbox.md",  # a session whose newest header here is DONE (>= IDLE_MINUTES old) is done; empty: off
     "CHECKBY_ORACLE": "/Users/stimaclaw/GitHub/stima-api/scripts/ci/delivery_state.py",  # --json: pending_check_by, due_check
+    "CHECKBY_REPO": "theQuert/stima-api",  # the only repo the oracle reads; a claim elsewhere is UNKNOWN (kept)
     "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
@@ -243,6 +244,8 @@ _checkby_cache = {}
 def checkby_state(repo, num, cfg):
     """OPEN when the repo's oracle reports a pending check-by or a due check; UNKNOWN when it cannot say."""
     key = (repo, num)
+    if key not in _checkby_cache and repo != cfg["CHECKBY_REPO"]:
+        _checkby_cache[key] = "UNKNOWN"  # the oracle would read another repo's issue with this number
     if key not in _checkby_cache:
         oracle = os.path.expanduser(cfg["CHECKBY_ORACLE"])
         root = os.path.dirname(os.path.dirname(os.path.dirname(oracle)))
