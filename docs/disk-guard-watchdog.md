@@ -17,6 +17,7 @@ the scripts.
 | Scratchpad time budget: stop before the next directory (always after at least one), save a cursor, continue next run. A directory not reached is kept | `reclaim-byproducts.sh`, `<state>/reclaim-byproducts.scratch-cursor` | `CC_RB_SCRATCH_BUDGET_SECONDS` (900, 0 = off) |
 | A lock holder that is stopped or too old: ERROR, `ALERT:byproducts-lock-held` / `-old`, exit 1, a notification at most once per cooldown. Never taken over, never signalled | `reclaim-byproducts.sh` | `CC_RB_LOCK_MAX_AGE_SECONDS` (10800, 0 = off), `CC_RB_ALERT_COOLDOWN_SECS` (3600) |
 | `--go-cache` / `--go-cache-cap` take their own lock, so a sweep cannot block them | `<state>/reclaim-byproducts-go.lock` | `CC_RB_GO_LOCK_DIR` |
+| Two sweeps in a row that reached the reap phases and freed under 0.05GB, while free space is under the floor: ERROR, `ALERT:byproducts-zero-freed`, a notification at most once per cooldown. Above the floor the streak only counts; dry runs and skipped runs never count | `reclaim-byproducts.sh`, `<state>/byproducts-zero-freed-streak` | `CC_RB_ZERO_FREED_FLOOR_GB` (40) |
 
 No deletion rule changed: only order, timing and alerts. Tests: `tests/resource-watch-watchdog.sh`
 (W1-W3) and `tests/reclaim-byproducts-watchdog.sh` (R1-R3).

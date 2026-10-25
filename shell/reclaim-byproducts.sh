@@ -356,7 +356,37 @@ sweep_ended() {
     *) delta="free on $DATA_VOLUME $(as_gb "$FREE_BEFORE") -> $(as_gb "$after") ($(awk -v a="$FREE_BEFORE" -v b="$after" 'BEGIN{d=(b-a)/1048576; if (d>-0.05 && d<0.05) d=0; printf "%+.1fGB", d}'))" ;;
   esac
   log "== byproducts sweep ended $(now_iso) after ${SECONDS}s; $delta =="
+  zero_freed_check "$after"
   release_lock   # this trap replaced acquire_lock's EXIT trap, so it releases the lock itself
+}
+
+# A reaper that frees nothing while the disk runs out raises no alarm of its own (stima-api
+# #5886, failure 4: on 2026-10-24 sweeps ran for hours while free space fell). So a sweep that
+# reached the reap phases (SWEPT=1) and returned under 0.05GB counts toward a streak in
+# $ZERO_FREED_STATE; a sweep that freed more resets it. Two in a row while free space is under
+# ZERO_FREED_FLOOR_GB is an ERROR with ALERT:byproducts-zero-freed and a notification at most once
+# per ALERT_COOLDOWN_SECS. Above the floor a 0B sweep is the normal "nothing to do" and only
+# counts. Alert only: it deletes nothing. Arg: free KiB after the sweep.
+ZERO_FREED_FLOOR_GB="${CC_RB_ZERO_FREED_FLOOR_GB:-40}"
+case "$ZERO_FREED_FLOOR_GB" in ''|*[!0-9]*|??????*) ZERO_FREED_FLOOR_GB=40 ;; esac
+ZERO_FREED_STATE="$RB_STATE_DIR/byproducts-zero-freed-streak"
+SWEPT=0
+zero_freed_check() {
+  local after="$1" n free now mt stamp
+  [ "$SWEPT" -eq 1 ] && [ "$DRY" -eq 0 ] || return 0
+  case "${FREE_BEFORE:-x}${after:-x}" in *[!0-9]*) return 0 ;; esac
+  mkdir -p "$RB_STATE_DIR" 2>/dev/null
+  if [ $((after - FREE_BEFORE)) -ge 52429 ]; then printf '0\n' > "$ZERO_FREED_STATE" 2>/dev/null; return 0; fi
+  n="$(cat "$ZERO_FREED_STATE" 2>/dev/null)"; case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1)); printf '%s\n' "$n" > "$ZERO_FREED_STATE" 2>/dev/null
+  free="$(free_gb)"; case "$free" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$n" -ge 2 ] && [ "$free" -lt "$ZERO_FREED_FLOOR_GB" ] || return 0
+  log "byproducts: ERROR $n sweeps in a row freed under 0.05GB with ${free}GB free (floor ${ZERO_FREED_FLOOR_GB}GB) ALERT:byproducts-zero-freed"
+  stamp="$RB_STATE_DIR/cooldown-byproducts-zero-freed"; now="$(date +%s)"; mt="$(mtime_of "$stamp")"
+  case "$mt" in ''|*[!0-9]*) ;; *) [ $((now - mt)) -lt "$ALERT_COOLDOWN_SECS" ] && return 0 ;; esac
+  touch "$stamp" 2>/dev/null
+  "$OSASCRIPT" -e "display notification \"$n sweeps freed nothing at ${free}GB free\" with title \"cc-reaper: reclaim-byproducts\" subtitle \"byproducts-zero-freed\"" >/dev/null 2>&1 || true
+  return 0
 }
 
 # A whole number of hours, refused rather than silently reinterpreted. `off` in
@@ -1694,6 +1724,7 @@ fi
 
 # The go cache first (stima-api #5886): it is cheap and certain to free space, while the
 # scratchpad liveness phase is the slow one; on 2026-10-24 it ran 4 hours and nothing behind it ran.
+SWEPT=1
 log "-- go cache";   reap_go_cache
 log "-- scratchpads"; reap_scratchpads
 log "-- session temp"; reap_session_temp
