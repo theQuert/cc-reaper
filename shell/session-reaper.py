@@ -539,7 +539,7 @@ def decide(s, cfg, now=None):
         keep.append("handoff-pending:prompt")
     keep.extend("handoff-missing:" + os.path.basename(p) for p in missing_handoffs(cfg, s["last_text"]))
     done = bool(DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])
-                or inbox_done(cfg, (s.get("name"), s["tmux"]), now if now is not None else time.time()))
+                or (s["claims"] and inbox_done(cfg, (s.get("name"), s["tmux"]), now if now is not None else time.time())))
     if done:
         if s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"]) and s["claims"]:
             cb = [checkby_state(r, n) for r, n in s["claims"]]
