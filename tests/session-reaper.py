@@ -22,7 +22,7 @@ CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", DONE_INBOX="
 
 
 def session(**kw):
-    s = {"tmux": "work", "name": "work", "status": "idle", "idle_min": 90, "bg_shells": [],
+    s = {"tmux": "work", "name": "work", "sid": "sid-1", "status": "idle", "idle_min": 90, "bg_shells": [],
          "loop": False, "crons": 0, "scheduled": False, "asking": False,
          "last_text": "SESSION-DONE: shipped the fix", "claims": [], "owned": []}
     s.update(kw)
@@ -339,7 +339,7 @@ class RecoverExiting(unittest.TestCase):
         self.d = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.d)
         self.cfg = dict(CFG, REAPED_DIR=str(self.d / "reaped"), CLOSED_LOG=str(self.d / "closed.md"))
-        s = {"tmux": "work", "name": "work", "sid": "sid-1", "cwd": "/w", "claims": [("o/r", "7")],
+        s = {"tmux": "work", "name": "work", "sid": "sid-1", "sid": "sid-1", "cwd": "/w", "claims": [("o/r", "7")],
              "owned": [], "last_text": "SESSION-DONE: x", "pid": 4242, "start": "t0", "pane": "%9",
              "session_id": "$3"}
         self.rec = reaper.write_record(s, self.cfg, 0, "exiting")
