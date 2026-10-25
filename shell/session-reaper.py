@@ -44,6 +44,7 @@ DEFAULTS = {
     "IDLE_LIST_HOURS": "0",  # list idle/shell sessions with no claimed issue idle this long; 0: off
     "IDLE_LIST_FILE": "~/.cc-reaper/state/idle-sessions.md",  # rewritten every sweep with that list
     "IDLE_LIST_INBOX": "",  # a path: append the list once per local day under ## key=IDLE-SESSIONS-<date>; empty: off
+    "DONE_INBOX": "~/handoffs/neo-inbox.md",  # a session whose newest header here is DONE (>= IDLE_MINUTES old) is done; empty: off
     "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
@@ -233,6 +234,63 @@ def issue_state(repo, num):
         rc, out = run(["gh", "issue", "view", num, "-R", repo, "--json", "state", "-q", ".state"])
         _issue_cache[key] = out.strip() if rc == 0 else "UNKNOWN"
     return _issue_cache[key]
+
+
+_checkby_cache = {}
+CHECK_BY_RE = re.compile(r"(?m)^[\s>*_`-]*check-by\s+\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?Z")
+CHECK_RESULT_RE = re.compile(r"(?m)^[\s>*_`-]*check-result:")
+
+
+def checkby_state(repo, num):
+    """OPEN when the newest check-by comment has no later check-result; UNKNOWN when unreadable."""
+    key = (repo, num)
+    if key not in _checkby_cache:
+        rc, out = run(["gh", "issue", "view", num, "-R", repo, "--json", "comments",
+                       "-q", ".comments"], 60)
+        try:
+            if rc != 0:
+                raise ValueError(rc)
+            open_, state = False, "CLEAR"
+            for c in json.loads(out):
+                body = c.get("body") or ""
+                if CHECK_RESULT_RE.search(body):
+                    open_ = False
+                if CHECK_BY_RE.search(body):
+                    open_ = True
+            state = "OPEN" if open_ else "CLEAR"
+        except (ValueError, TypeError, AttributeError):
+            state = "UNKNOWN"
+        _checkby_cache[key] = state
+    return _checkby_cache[key]
+
+
+INBOX_HEADER_RE = re.compile(r"^## .*?(\w+) · (\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d) TPE · (.+?)\s*$")
+
+
+def inbox_done(cfg, names, now):
+    """True when the newest inbox header written by one of `names` is DONE and old enough.
+    Only header lines are examined; any read or parse failure means not done."""
+    path = cfg.get("DONE_INBOX")
+    names = {n for n in names if n}
+    if not path or not names:
+        return False
+    newest = None
+    try:
+        with open(os.path.expanduser(path), errors="replace") as f:
+            for line in f:
+                if line.startswith("## ") and " · " in line and line.rstrip().rsplit(" · ", 1)[1] in names:
+                    newest = line.rstrip()
+    except OSError:
+        return False
+    m = INBOX_HEADER_RE.match(newest or "")
+    if not m or m.group(1) != "DONE":
+        return False
+    y, mo, d, h, mi = (int(x) for x in m.group(2, 3, 4, 5, 6))
+    try:
+        at = calendar.timegm((y, mo, d, h, mi, 0, 0, 0, 0)) - 8 * 3600  # Asia/Taipei is UTC+8
+    except (ValueError, OverflowError):
+        return False
+    return now - at >= float(cfg["IDLE_MINUTES"]) * 60
 
 
 # ---------- transcript ----------
@@ -452,7 +510,7 @@ def waiting_re(cfg):
     return re.compile(WAITING_RE.pattern + ("|" + extra if extra else ""), re.I)
 
 
-def decide(s, cfg):
+def decide(s, cfg, now=None):
     """Return the list of reasons that keep the session; empty means reap."""
     keep = []
     if protected(cfg, s["tmux"], s["name"]):
@@ -480,7 +538,16 @@ def decide(s, cfg):
     if cfg["PROMPT_RE"] and re.search(cfg["PROMPT_RE"], s.get("screen_tail", ""), re.I):
         keep.append("handoff-pending:prompt")
     keep.extend("handoff-missing:" + os.path.basename(p) for p in missing_handoffs(cfg, s["last_text"]))
-    if not (DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])):
+    done = bool(DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])
+                or inbox_done(cfg, (s.get("name"), s["tmux"]), now if now is not None else time.time()))
+    if done:
+        if s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"]) and s["claims"]:
+            cb = [checkby_state(r, n) for r, n in s["claims"]]
+            if "OPEN" in cb:
+                keep.append("check-by-open")
+            elif "UNKNOWN" in cb:
+                keep.append("check-by-unknown")
+    else:
         states = [issue_state(r, n) for r, n in s["claims"]]
         if not s["claims"]:
             keep.append("claim-unknown")
