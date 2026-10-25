@@ -2009,6 +2009,10 @@ build_fixture "$ZF"; mkdir -p "$(dirname "$ZFSTATE")"; echo 5 > "$ZFSTATE"
 OUT="$(FREE_GB_OVERRIDE=30 MIN_HOURS_OVERRIDE=12 run_stale_fresh "$ZF" "$SCRIPT")"
 check "a sweep the staleness gate skipped does not alert" "$OUT" "skipping" "ALERT:byproducts-zero-freed"
 [ "$(cat "$ZFSTATE")" = 5 ] && pass "and leaves the streak alone" || fail "a skipped sweep changed the streak: $(cat "$ZFSTATE")"
+build_fixture "$ZF"; mkdir -p "$(dirname "$ZFSTATE")"; echo 5 > "$ZFSTATE"
+OUT="$(FREE_GB_OVERRIDE=30 run_fail "$ZF" "$SCRIPT")"
+check "a failed sweep does not alert" "$OUT" "sweep ended" "ALERT:byproducts-zero-freed"
+[ "$(cat "$ZFSTATE")" = 5 ] && pass "and leaves the streak alone (it already reports its failure)" || fail "a failed sweep changed the streak: $(cat "$ZFSTATE")"
 unset BYPRODUCT_OSASCRIPT_BIN
 
 echo
