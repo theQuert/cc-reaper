@@ -1988,6 +1988,33 @@ build_fixture "$LK"
 OUT="$(run_fail "$LK" "$SCRIPT")"
 [ ! -e "$LKDIR" ] && pass "the lock is released after a failed run" || fail "lock left behind after a failed run"
 
+# ---------------------------------------------------------------- zero-freed streak (#5886)
+# The fixture frees well under 0.05GB, so every real sweep here is a "0B" sweep.
+ZF="$WORK/zf"; ZFSTATE="$ZF/home/.cc-reaper/state/byproducts-zero-freed-streak"
+export BYPRODUCT_OSASCRIPT_BIN=true
+build_fixture "$ZF"
+OUT="$(FREE_GB_OVERRIDE=30 run_real "$ZF" "$SCRIPT")"
+check "one 0B sweep under the floor does not alert" "$OUT" "sweep ended" "ALERT:byproducts-zero-freed"
+OUT="$(FREE_GB_OVERRIDE=30 run_real "$ZF" "$SCRIPT")"
+check "a second 0B sweep in a row under the floor alerts" "$OUT" "ALERT:byproducts-zero-freed"
+build_fixture "$ZF"
+OUT="$(FREE_GB_OVERRIDE=50 run_real "$ZF" "$SCRIPT")"; OUT="$(FREE_GB_OVERRIDE=50 run_real "$ZF" "$SCRIPT")"
+check "0B sweeps above the floor do not alert" "$OUT" "sweep ended" "ALERT:byproducts-zero-freed"
+[ "$(cat "$ZFSTATE" 2>/dev/null)" = 2 ] && pass "but they still count" || fail "streak not counted above the floor: $(cat "$ZFSTATE" 2>/dev/null)"
+build_fixture "$ZF"
+OUT="$(FREE_GB_OVERRIDE=30 run "$ZF" "$SCRIPT")"; OUT="$(FREE_GB_OVERRIDE=30 run "$ZF" "$SCRIPT")"
+check "dry runs never alert" "$OUT" "sweep ended" "ALERT:byproducts-zero-freed"
+[ ! -e "$ZFSTATE" ] && pass "and never count" || fail "a dry run counted toward the streak"
+build_fixture "$ZF"; mkdir -p "$(dirname "$ZFSTATE")"; echo 5 > "$ZFSTATE"
+OUT="$(FREE_GB_OVERRIDE=30 MIN_HOURS_OVERRIDE=12 run_stale_fresh "$ZF" "$SCRIPT")"
+check "a sweep the staleness gate skipped does not alert" "$OUT" "skipping" "ALERT:byproducts-zero-freed"
+[ "$(cat "$ZFSTATE")" = 5 ] && pass "and leaves the streak alone" || fail "a skipped sweep changed the streak: $(cat "$ZFSTATE")"
+build_fixture "$ZF"; mkdir -p "$(dirname "$ZFSTATE")"; echo 5 > "$ZFSTATE"
+OUT="$(FREE_GB_OVERRIDE=30 run_fail "$ZF" "$SCRIPT")"
+check "a failed sweep does not alert" "$OUT" "sweep ended" "ALERT:byproducts-zero-freed"
+[ "$(cat "$ZFSTATE")" = 5 ] && pass "and leaves the streak alone (it already reports its failure)" || fail "a failed sweep changed the streak: $(cat "$ZFSTATE")"
+unset BYPRODUCT_OSASCRIPT_BIN
+
 echo
 echo "passed: $PASSED, failed: $FAILURES"
 [ "$FAILURES" -eq 0 ]
