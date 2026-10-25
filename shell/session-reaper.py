@@ -44,6 +44,9 @@ DEFAULTS = {
     "IDLE_LIST_HOURS": "0",  # list idle/shell sessions with no claimed issue idle this long; 0: off
     "IDLE_LIST_FILE": "~/.cc-reaper/state/idle-sessions.md",  # rewritten every sweep with that list
     "IDLE_LIST_INBOX": "",  # a path: append the list once per local day under ## key=IDLE-SESSIONS-<date>; empty: off
+    "DONE_INBOX": "~/handoffs/neo-inbox.md",  # a session whose newest header here is DONE (>= IDLE_MINUTES old) is done; empty: off
+    "CHECKBY_ORACLE": "/Users/stimaclaw/GitHub/stima-api/scripts/ci/delivery_state.py",  # --json: pending_check_by, due_check
+    "CHECKBY_REPO": "theQuert/stima-api",  # the only repo the oracle reads; a claim elsewhere is UNKNOWN (kept)
     "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
@@ -79,9 +82,9 @@ def load_config(path):
     return cfg
 
 
-def run(cmd, timeout=30):
+def run(cmd, timeout=30, cwd=None):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
         return p.returncode, p.stdout
     except (OSError, subprocess.TimeoutExpired):
         return 1, ""
@@ -233,6 +236,90 @@ def issue_state(repo, num):
         rc, out = run(["gh", "issue", "view", num, "-R", repo, "--json", "state", "-q", ".state"])
         _issue_cache[key] = out.strip() if rc == 0 else "UNKNOWN"
     return _issue_cache[key]
+
+
+_checkby_cache = {}
+
+
+def checkby_state(repo, num, cfg):
+    """OPEN when the repo's oracle reports a pending check-by or a due check; UNKNOWN when it cannot say."""
+    key = (repo, num)
+    if key not in _checkby_cache and repo != cfg["CHECKBY_REPO"]:
+        _checkby_cache[key] = "UNKNOWN"  # the oracle would read another repo's issue with this number
+    if key not in _checkby_cache:
+        oracle = os.path.expanduser(cfg["CHECKBY_ORACLE"])
+        root = os.path.dirname(os.path.dirname(os.path.dirname(oracle)))
+        rc, out = run(["python3", oracle, str(num), "--json"], 60, cwd=root)
+        try:
+            if rc != 0:
+                raise ValueError(rc)
+            d = json.loads(out)
+            if isinstance(d, dict) and d.get("state") == "closed":
+                d = dict(d, pending_check_by="", due_check="")  # a closed issue's payload has neither key
+            pending, due = d["pending_check_by"], d["due_check"]
+            if not isinstance(pending, str) or not isinstance(due, str):
+                raise ValueError("shape")
+            state = "OPEN" if pending or due else "CLEAR"
+        except (ValueError, TypeError, KeyError):
+            state = "UNKNOWN"
+        _checkby_cache[key] = state
+    return _checkby_cache[key]
+
+
+_claim_cache = {}
+
+
+def claim_time(repo, num, sid):
+    """Epoch of the newest `Claimed by ... session <sid>` comment on the issue; None when unknown."""
+    key = (repo, num, sid)
+    if key not in _claim_cache:
+        rc, out = run(["gh", "issue", "view", str(num), "-R", repo, "--json", "comments",
+                       "-q", ".comments"], 60)
+        at = None
+        try:
+            if rc != 0:
+                raise ValueError(rc)
+            for c in json.loads(out):
+                if re.search(r"Claimed by[^\n]*session\s+" + re.escape(sid), c.get("body") or ""):
+                    t = calendar.timegm(time.strptime(c["createdAt"], "%Y-%m-%dT%H:%M:%SZ"))
+                    at = t if at is None or t > at else at
+        except (ValueError, TypeError, KeyError, AttributeError):
+            at = None
+        _claim_cache[key] = at
+    return _claim_cache[key]
+
+
+INBOX_HEADER_RE = re.compile(r"^## .*?(\w+) · (\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d) TPE · (.+?)\s*$")
+
+
+def inbox_done(cfg, names, now, claim_at=None):
+    """True when the newest inbox header written by one of `names` is DONE and old enough.
+    The header must be later than the newest claim (`claim_at()` -> epoch or None; None: not done).
+    Only header lines are examined; any read or parse failure means not done."""
+    path = cfg.get("DONE_INBOX")
+    names = {n for n in names if n}
+    if not path or not names:
+        return False
+    newest = None
+    try:
+        with open(os.path.expanduser(path), errors="replace") as f:
+            for line in f:
+                if line.startswith("## ") and " · " in line and line.rstrip().rsplit(" · ", 1)[1] in names:
+                    newest = line.rstrip()
+    except OSError:
+        return False
+    m = INBOX_HEADER_RE.match(newest or "")
+    if not m or m.group(1) != "DONE":
+        return False
+    y, mo, d, h, mi = (int(x) for x in m.group(2, 3, 4, 5, 6))
+    try:
+        at = calendar.timegm((y, mo, d, h, mi, 0, 0, 0, 0)) - 8 * 3600  # Asia/Taipei is UTC+8
+    except (ValueError, OverflowError):
+        return False
+    if now - at < float(cfg["IDLE_MINUTES"]) * 60:
+        return False
+    claimed = claim_at() if claim_at else None
+    return claimed is not None and at > claimed
 
 
 # ---------- transcript ----------
@@ -452,7 +539,12 @@ def waiting_re(cfg):
     return re.compile(WAITING_RE.pattern + ("|" + extra if extra else ""), re.I)
 
 
-def decide(s, cfg):
+def _newest_claim(s):
+    ts = [claim_time(r, n, s["sid"]) for r, n in s["claims"]]
+    return None if None in ts else max(ts)
+
+
+def decide(s, cfg, now=None):
     """Return the list of reasons that keep the session; empty means reap."""
     keep = []
     if protected(cfg, s["tmux"], s["name"]):
@@ -480,7 +572,17 @@ def decide(s, cfg):
     if cfg["PROMPT_RE"] and re.search(cfg["PROMPT_RE"], s.get("screen_tail", ""), re.I):
         keep.append("handoff-pending:prompt")
     keep.extend("handoff-missing:" + os.path.basename(p) for p in missing_handoffs(cfg, s["last_text"]))
-    if not (DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])):
+    done = bool(DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])
+                or (s["claims"] and inbox_done(cfg, (s.get("name"), s["tmux"]), now if now is not None else time.time(),
+                                            lambda: _newest_claim(s))))
+    if done:
+        if s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"]) and s["claims"]:
+            cb = [checkby_state(r, n, cfg) for r, n in s["claims"]]
+            if "OPEN" in cb:
+                keep.append("check-by-open")
+            elif "UNKNOWN" in cb:
+                keep.append("check-by-unknown")
+    else:
         states = [issue_state(r, n) for r, n in s["claims"]]
         if not s["claims"]:
             keep.append("claim-unknown")

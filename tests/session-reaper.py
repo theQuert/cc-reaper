@@ -18,11 +18,11 @@ spec = importlib.util.spec_from_file_location("session_reaper", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
 
-CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60")
+CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", DONE_INBOX="")
 
 
 def session(**kw):
-    s = {"tmux": "work", "name": "work", "status": "idle", "idle_min": 90, "bg_shells": [],
+    s = {"tmux": "work", "name": "work", "sid": "sid-1", "status": "idle", "idle_min": 90, "bg_shells": [],
          "loop": False, "crons": 0, "scheduled": False, "asking": False,
          "last_text": "SESSION-DONE: shipped the fix", "claims": [], "owned": []}
     s.update(kw)
@@ -91,6 +91,152 @@ class Decide(unittest.TestCase):
 
     def test_the_done_line_itself_does_not_read_as_waiting(self):
         self.assertEqual(self.keep(last_text="SESSION-DONE: PR approved and merged"), [])
+
+
+class DoneCheckBy(unittest.TestCase):
+    """Inbox DONE as a done marker, and the check-by-open keep gate (EL-FLOW-P2-2106)."""
+    # 2026-10-25 22:00 TPE == 14:00 UTC
+    NOW = reaper.calendar.timegm((2026, 10, 25, 14, 0, 0, 0, 0, 0))
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        self.inbox = Path(d) / "neo-inbox.md"
+        self.cfg = dict(CFG, DONE_INBOX=str(self.inbox))
+        self.checkby = "CLEAR"
+        self.claim = reaper.calendar.timegm((2026, 10, 25, 10, 0, 0, 0, 0, 0))  # 18:00 TPE
+
+    def write(self, *headers):
+        self.inbox.write_text("# inbox\n\nbody\n" + "\n".join(f"## {h}\n\ntext\n" for h in headers))
+
+    def keep(self, **kw):
+        kw.setdefault("last_text", "all good")
+        kw.setdefault("name", "ops-dispatch")
+        kw.setdefault("claims", [("o/r", "2")])
+        with mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
+             mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.checkby), \
+             mock.patch.object(reaper, "claim_time", side_effect=lambda r, n, sid: self.claim), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]):
+            return reaper.decide(session(**kw), self.cfg, self.NOW)
+
+    def test_old_inbox_done_by_the_session_is_reaped(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
+        self.assertEqual(self.keep(), [])
+
+    def test_done_older_than_the_newest_claim_is_not_done(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
+        self.claim = reaper.calendar.timegm((2026, 10, 25, 12, 30, 0, 0, 0, 0))  # 20:30 TPE
+        self.assertEqual(self.keep(), ["issue-open:#2"])
+
+    def test_unknown_claim_time_is_not_done(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
+        self.claim = None
+        self.assertEqual(self.keep(), ["issue-open:#2"])
+
+    def test_inbox_done_without_a_claimed_issue_is_ignored(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
+        self.assertEqual(self.keep(claims=[]), ["claim-unknown"])
+
+    def test_a_recent_inbox_done_keeps_the_session(self):
+        self.write("K1 DONE · 2026-10-25 21:30 TPE · ops-dispatch")
+        self.assertEqual(self.keep(), ["issue-open:#2"])
+
+    def test_a_later_ack_by_the_same_session_is_not_done(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch",
+                   "K2 ACK · 2026-10-25 20:30 TPE · ops-dispatch")
+        self.assertEqual(self.keep(), ["issue-open:#2"])
+
+    def test_another_sessions_done_does_not_count(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · other-session")
+        self.assertEqual(self.keep(), ["issue-open:#2"])
+
+    def test_a_later_done_by_another_session_does_not_hide_this_ones(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch",
+                   "K2 ACK · 2026-10-25 20:30 TPE · other-session")
+        self.assertEqual(self.keep(), [])
+
+    def test_unreadable_or_unparsable_inbox_is_not_done(self):
+        self.assertEqual(self.keep(), ["issue-open:#2"])  # file absent
+        self.write("K1 DONE · yesterday-ish · ops-dispatch")
+        self.assertEqual(self.keep(), ["issue-open:#2"])
+
+    def test_open_check_by_keeps_an_inbox_done_session(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
+        self.checkby = "OPEN"
+        self.assertEqual(self.keep(), ["check-by-open"])
+
+    def test_open_check_by_keeps_a_session_done_line_session(self):
+        self.checkby = "OPEN"
+        self.assertEqual(self.keep(last_text="SESSION-DONE: shipped"), ["check-by-open"])
+
+    def test_gh_failure_keeps_check_by_unknown(self):
+        self.checkby = "UNKNOWN"
+        self.assertEqual(self.keep(last_text="SESSION-DONE: shipped"), ["check-by-unknown"])
+
+    def test_check_by_is_not_read_for_a_session_that_is_not_idle_long_enough(self):
+        with mock.patch.object(reaper, "checkby_state", side_effect=AssertionError("fetched")), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]):
+            keep = reaper.decide(session(idle_min=10, claims=[("o/r", "2")]), self.cfg, self.NOW)
+        self.assertEqual(keep, ["idle:10<60min"])
+
+
+class CheckByState(unittest.TestCase):
+    def state(self, out="", rc=0):
+        reaper._checkby_cache.clear()
+        with mock.patch.object(reaper, "run", return_value=(rc, out)) as r:
+            st = reaper.checkby_state("theQuert/stima-api", "9", CFG)
+        self.calls = r.call_args
+        return st
+
+    def test_asks_the_oracle_for_json(self):
+        self.state(json.dumps({"pending_check_by": "", "due_check": ""}))
+        cmd = self.calls.args[0]
+        self.assertEqual(cmd[0], "python3")
+        self.assertEqual(cmd[1:], [reaper.DEFAULTS["CHECKBY_ORACLE"], "9", "--json"])
+        self.assertEqual(self.calls.kwargs["cwd"], "/Users/stimaclaw/GitHub/stima-api")
+
+    def test_pending_or_due_is_open(self):
+        self.assertEqual(self.state(json.dumps({"pending_check_by": "2026-10-26T06:00:00Z", "due_check": ""})), "OPEN")
+        self.assertEqual(self.state(json.dumps({"pending_check_by": "", "due_check": "check-by x"})), "OPEN")
+
+    def test_both_empty_is_clear(self):
+        self.assertEqual(self.state(json.dumps({"pending_check_by": "", "due_check": "", "x": 1})), "CLEAR")
+
+    def test_a_closed_issue_is_clear(self):
+        payload = {"issue": 6090, "state": "closed", "stop": None,
+                   "next": {"action": "none", "command": "", "detail": "closed as completed", "kind": "done"}}
+        self.assertEqual(self.state(json.dumps(payload)), "CLEAR")
+
+    def test_error_timeout_bad_json_or_missing_keys_is_unknown(self):
+        self.assertEqual(self.state("{}", rc=1), "UNKNOWN")  # nonzero exit; run() also returns (1, "") on timeout
+        self.assertEqual(self.state("not json"), "UNKNOWN")
+        self.assertEqual(self.state(json.dumps({"pending_check_by": ""})), "UNKNOWN")
+        self.assertEqual(self.state("[]"), "UNKNOWN")
+
+    def test_a_claim_in_another_repo_is_unknown_without_asking(self):
+        reaper._checkby_cache.clear()
+        with mock.patch.object(reaper, "run", side_effect=AssertionError("asked")):
+            self.assertEqual(reaper.checkby_state("theQuert/skills", "9", CFG), "UNKNOWN")
+
+    def test_a_missing_oracle_file_is_unknown(self):
+        reaper._checkby_cache.clear()
+        cfg = dict(CFG, CHECKBY_ORACLE="/nonexistent/a/b/delivery_state.py")
+        self.assertEqual(reaper.checkby_state("theQuert/stima-api", "9", cfg), "UNKNOWN")
+
+
+class ClaimTime(unittest.TestCase):
+    def test_newest_claim_comment_for_the_session(self):
+        reaper._claim_cache.clear()
+        out = json.dumps([
+            {"body": "Claimed by x session abc", "createdAt": "2026-10-25T10:00:00Z"},
+            {"body": "Claimed by x session abc", "createdAt": "2026-10-25T11:00:00Z"},
+            {"body": "Claimed by y session zzz", "createdAt": "2026-10-25T13:00:00Z"}])
+        with mock.patch.object(reaper, "run", return_value=(0, out)):
+            self.assertEqual(reaper.claim_time("o/r", "9", "abc"),
+                             reaper.calendar.timegm((2026, 10, 25, 11, 0, 0, 0, 0, 0)))
+        reaper._claim_cache.clear()
+        with mock.patch.object(reaper, "run", return_value=(1, "")):
+            self.assertIsNone(reaper.claim_time("o/r", "9", "abc"))
 
 
 class Transcript(unittest.TestCase):
@@ -203,7 +349,7 @@ class RecoverExiting(unittest.TestCase):
         self.d = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.d)
         self.cfg = dict(CFG, REAPED_DIR=str(self.d / "reaped"), CLOSED_LOG=str(self.d / "closed.md"))
-        s = {"tmux": "work", "name": "work", "sid": "sid-1", "cwd": "/w", "claims": [("o/r", "7")],
+        s = {"tmux": "work", "name": "work", "sid": "sid-1", "sid": "sid-1", "cwd": "/w", "claims": [("o/r", "7")],
              "owned": [], "last_text": "SESSION-DONE: x", "pid": 4242, "start": "t0", "pane": "%9",
              "session_id": "$3"}
         self.rec = reaper.write_record(s, self.cfg, 0, "exiting")
