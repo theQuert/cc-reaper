@@ -39,3 +39,14 @@ Each report row SHALL state:
 #### Scenario: Comparing before trusting
 - **WHEN** an operator reads a report-only sweep
 - **THEN** every row the new gates alone kept is marked "kept only by new gates"
+
+### Requirement: An idle session's open claims are judged by the delivery oracle
+For a session idle at least `IDLE_MINUTES` with no DONE signal, the reaper SHALL classify each claimed issue with `python3 scripts/ci/delivery_state.py <N> --brief` run in `ORACLE_ROOT` (30 s timeout, answer cached `ORACLE_CACHE_MINUTES`, default 10, in `ORACLE_CACHE_DIR`):
+- `ended`: the brief says "the session may end", names another session as claimant, or the issue is closed; it adds no keep reason;
+- `owed`: the claimant is this session; keep reason `owed-step:#N`, and the report marks the claim `stalled` when a check-by in the brief is past;
+- `unknown`: oracle failed or unparseable; keep reason `issue-unknown:#N`.
+A session that is not idle keeps `issue-open:#N`. Every other gate, and `PROTECT`, are unchanged. The report's issues column shows `#N:ended|owed|unknown[:stalled]`.
+
+#### Scenario: Every claim has ended
+- **WHEN** an idle session's claims are all `ended` and no other gate holds
+- **THEN** the row is `would-reap` and the claim stays on the issue, resumable from the closed-sessions record
