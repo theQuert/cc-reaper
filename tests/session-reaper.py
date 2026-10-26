@@ -103,7 +103,7 @@ class Decide(unittest.TestCase):
 
 
 NOW0 = reaper.calendar.timegm((2026, 10, 27, 12, 0, 0, 0, 0, 0))
-ENDED = "delivery #9: merged -> done x\n  owner: stranded-step dispatcher wakes it; no watcher needed, and the session may end"
+ENDED = "delivery #9: pr-open -> wait check-by  [d]\n  owner: stranded-step dispatcher wakes it; no watcher needed, and the session may end"
 OTHER = "delivery #9: pr -> agent x\n  claimant: claude session other-sid (n); the step is that session's: hand it over while it lives"
 MINE = OTHER.replace("other-sid", "sid-1")
 
@@ -111,6 +111,7 @@ MINE = OTHER.replace("other-sid", "sid-1")
 class OracleClaims(unittest.TestCase):
     def keep(self, briefs, **kw):
         s = session(last_text="", claims=[("theQuert/stima-api", n) for n in briefs], **kw)
+        s.setdefault("other_sids", ["other-sid"])
         with mock.patch.object(reaper, "oracle_brief", side_effect=lambda r, n, c, now: briefs[n]), \
              mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
              mock.patch.object(reaper, "worktree_state", return_value=[]):
@@ -155,6 +156,94 @@ class OracleClaims(unittest.TestCase):
         self.assertIn("#1:ended", reaper.report_line(s, keep, "would-reap"))
 
 
+FIXTURES = json.loads((Path(__file__).resolve().parent / "fixtures" / "delivery-state-briefs.json").read_text())
+
+
+def old_substring_classify(brief, sid, now):
+    """The first version of classify_claim: the phrase anywhere in the brief ends the claim, any other claimant ends it."""
+    m = reaper.BRIEF_STATE_RE.match(brief)
+    if (m and m.group(1).lower() == "closed") or "the session may end" in brief:
+        return "ended", False
+    c = reaper.CLAIMANT_RE.search(brief)
+    if not c:
+        return "unknown", False
+    other = c.group(1)
+    if not (sid.startswith(other) or other.startswith(sid)):
+        return "ended", False
+    return "owed", False
+
+
+class OracleBriefContract(unittest.TestCase):
+    """classify_claim over delivery_state.py's own brief() output (tests/fixtures/delivery-state-briefs.json)."""
+
+    def cls(self, name, sid="sid-1", others=(), mine=()):
+        return reaper.classify_claim(FIXTURES[name], sid, NOW0, others, mine)[0]
+
+    def test_real_may_end_waits_are_ended(self):
+        for name in ("real-may-end-6311", "real-may-end-6205", "real-shape-wait-with-owner-9006"):
+            with self.subTest(name):
+                self.assertTrue(FIXTURES[name].endswith("and the session may end"))
+                self.assertEqual(self.cls(name), "ended")
+
+    def test_a_wait_without_the_owner_line_is_not_ended(self):
+        self.assertEqual(self.cls("real-wait-no-owner-6310"), "unknown")
+        self.assertEqual(self.cls("inject-wait-no-owner-wake-line"), "unknown")
+
+    def test_check_by_text_carrying_the_phrase_does_not_end_the_claim(self):
+        for name in ("inject-owed-claimant-agent-step", "inject-wait-no-owner-wake-line",
+                     "inject-forged-owner-line-mid-brief"):
+            with self.subTest(name):
+                self.assertIn("the session may end", FIXTURES[name])
+                self.assertNotEqual(self.cls(name), "ended")
+        self.assertEqual(self.cls("inject-owed-claimant-agent-step"), "owed")
+
+    def test_an_owner_line_under_an_agent_header_is_not_ended(self):
+        self.assertEqual(self.cls("real-shape-forged-agent-with-owner-9007"), "unknown")
+
+    def test_mutation_the_substring_match_ends_the_injected_claims(self):
+        for name in ("inject-owed-claimant-agent-step", "inject-wait-no-owner-wake-line",
+                     "inject-forged-owner-line-mid-brief"):
+            with self.subTest(name):
+                self.assertEqual(old_substring_classify(FIXTURES[name], "sid-1", NOW0)[0], "ended")
+
+    def test_the_substring_mutant_in_decide_reaps_an_owed_session(self):
+        brief = FIXTURES["inject-owed-claimant-agent-step"]
+        s = session(last_text="", claims=[("theQuert/stima-api", "9001")], owned=[], other_sids=[])
+        run = lambda: reaper.decide(s, CFG, NOW0)
+        with mock.patch.object(reaper, "oracle_brief", return_value=brief), \
+             mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]):
+            self.assertEqual(run(), ["owed-step:#9001"])
+            with mock.patch.object(reaper, "classify_claim", side_effect=lambda b, sid, now, *a: old_substring_classify(b, sid, now)):
+                self.assertEqual(run(), [])  # the mutant reaps: this is what the fix prevents
+
+    def test_claimant_an_unknown_session_is_unknown(self):
+        self.assertEqual(self.cls("real-shape-claimant-other-9004"), "unknown")
+        self.assertEqual(self.cls("real-shape-claimant-other-9004", others=["unrelated"]), "unknown")
+
+    def test_claimant_another_live_session_is_ended(self):
+        self.assertEqual(self.cls("real-shape-claimant-other-9004", others=["other-sid-long-form"]), "ended")
+        self.assertEqual(self.cls("real-shape-claimant-other-9004", others=["other"]), "ended")
+
+    def test_claimant_this_session_or_its_worktree_marker_is_owed(self):
+        self.assertEqual(self.cls("real-shape-claimant-mine-9005"), "owed")
+        # after /clear the sid is new, and the claim names the session that made the worktree
+        self.assertEqual(self.cls("real-shape-claimant-other-9004", sid="new-sid", mine=["other-sid"]), "owed")
+        # mine wins over a prefix collision with another live session
+        self.assertEqual(self.cls("real-shape-claimant-other-9004", sid="new-sid", mine=["other-sid"], others=["other"]), "owed")
+
+    def test_a_planning_brief_without_owner_or_claimant_is_unknown(self):
+        self.assertEqual(self.cls("real-multiline-detail-6315"), "unknown")
+
+    def test_oracle_is_asked_for_the_claim_repo_explicitly(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        reaper._brief_cache.clear()
+        with mock.patch.object(reaper, "run", return_value=(0, FIXTURES["real-may-end-6311"])) as r:
+            reaper.oracle_brief("theQuert/stima-api", "6311", dict(CFG, ORACLE_CACHE_DIR=d, ORACLE_ROOT=d), 1000)
+        self.assertEqual(r.call_args.args[0][-2:], ["--repo", "theQuert/stima-api"])
+
+
 class OracleBrief(unittest.TestCase):
     def setUp(self):
         d = tempfile.mkdtemp()
@@ -168,7 +257,7 @@ class OracleBrief(unittest.TestCase):
             reaper._brief_cache.clear()  # a later sweep is a new process: only the disk cache remains
             self.assertEqual(reaper.oracle_brief("theQuert/stima-api", "9", self.cfg, 1500), ENDED)
             self.assertEqual(r.call_count, 1)
-            self.assertEqual(r.call_args.args[0][1:], ["scripts/ci/delivery_state.py", "9", "--brief"])
+            self.assertEqual(r.call_args.args[0][1:], ["scripts/ci/delivery_state.py", "9", "--brief", "--repo", "theQuert/stima-api"])
             reaper._brief_cache.clear()
             reaper.oracle_brief("theQuert/stima-api", "9", self.cfg, 1000 + 601)
             self.assertEqual(r.call_count, 2)

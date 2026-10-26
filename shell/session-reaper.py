@@ -289,7 +289,7 @@ def oracle_brief(repo, num, cfg, now):
     except (OSError, ValueError, KeyError, TypeError):
         pass
     root = os.path.expanduser(cfg["ORACLE_ROOT"])
-    rc, out = run(["python3", "scripts/ci/delivery_state.py", str(num), "--brief"], 30, cwd=root)
+    rc, out = run(["python3", "scripts/ci/delivery_state.py", str(num), "--brief", "--repo", repo], 30, cwd=root)
     brief = out if rc == 0 and out.startswith("delivery #") else None
     if brief is not None:
         try:
@@ -302,23 +302,43 @@ def oracle_brief(repo, num, cfg, now):
 
 
 BRIEF_STATE_RE = re.compile(r"\Adelivery #\d+: (\w+)")
+BRIEF_KIND_RE = re.compile(r"\Adelivery #\d+: [^\n]*? -> (\w+)")
 CLAIMANT_RE = re.compile(r"(?m)^\s*claimant:.*?session ([0-9A-Za-z-]+)(?: \(.*?\))?; the step is that session's")
+OWNER_END_RE = re.compile(r"\A\s*owner: .+ wakes it; no watcher needed, and the session may end\Z")
 CHECKBY_AT_RE = re.compile(r"check-by(?: scheduled for)?:? (\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?)")
 
 
-def classify_claim(brief, sid, now):
-    """(`ended`|`owed`|`unknown`, overdue) from one oracle brief for a session that is idle."""
+def _same_session(a, b):
+    return bool(a) and bool(b) and (a.startswith(b) or b.startswith(a))
+
+
+def classify_claim(brief, sid, now, others=(), mine=()):
+    """(`ended`|`owed`|`unknown`, overdue) from one oracle brief for a session that is idle.
+
+    `ended` only on a closed issue, on the oracle's own last line (`owner: ... the session may end`) under a
+    `-> wait` header, or when the step is claimed by another LIVE session (`others`: their ids). Check-by text is
+    free text from issue comments, so a phrase anywhere else in the brief never ends a claim. The claimant is
+    this session's when it is `sid` or a worktree marker this session owns (`mine`: a /clear changes the sid
+    but not the marker); an id that is neither mine nor another live session's is `unknown` (kept)."""
     if not brief:
         return "unknown", False
     m = BRIEF_STATE_RE.match(brief)
-    if (m and m.group(1).lower() == "closed") or "the session may end" in brief:
+    k = BRIEF_KIND_RE.match(brief)
+    last = brief.rstrip("\n").rsplit("\n", 1)[-1]
+    if m and m.group(1).lower() == "closed":
+        return "ended", False
+    if k and k.group(1) == "wait" and OWNER_END_RE.match(last):
         return "ended", False
     c = CLAIMANT_RE.search(brief)
-    if not c:
+    if not c or not (k and k.group(1) == "agent"):
         return "unknown", False
     other = c.group(1)
-    if not (sid.startswith(other) or other.startswith(sid)):
+    if _same_session(other, sid) or any(_same_session(other, x) for x in mine):
+        pass  # this session's own step
+    elif any(_same_session(other, x) for x in others):
         return "ended", False
+    else:
+        return "unknown", False
     overdue = False
     for at in CHECKBY_AT_RE.findall(brief):
         try:
@@ -557,6 +577,8 @@ def gather(cfg, now):
             **transcript_facts(transcript_path(sid), now),
         })
         found[-1]["relay_pending"] = relay_pending(cfg, claims, now)
+    for s in found:
+        s["other_sids"] = [o["sid"] for o in found if o is not s and o["sid"]]
     return found
 
 
@@ -652,7 +674,9 @@ def decide(s, cfg, now=None):
             at = now if now is not None else time.time()
             marks, owed, unknown = [], [], []
             for r, n in s["claims"]:
-                cls, overdue = classify_claim(oracle_brief(r, n, cfg, at), s["sid"], at)
+                cls, overdue = classify_claim(
+                    oracle_brief(r, n, cfg, at), s["sid"], at, s.get("other_sids", ()),
+                    [w["marker"] for w in s["owned"] if w.get("marker")])
                 marks.append(f"#{n}:{cls}" + (":stalled" if overdue else ""))
                 if cls == "owed":
                     owed.append(f"#{n}")
