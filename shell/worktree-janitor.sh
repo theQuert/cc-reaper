@@ -54,6 +54,7 @@ Environment:
   CC_WJ_HARNESS_ROOTS     Colon-separated Claude/Codex worktree roots
   CC_WJ_LOG               Log file path (default: ~/.cc-reaper/logs/worktree-janitor.log)
   CC_WJ_STATE_DIR         State directory for cooldown files (default: ~/.cc-reaper/state)
+  CC_WJ_LANDED_CACHE      0 turns off the cache of merged-PR answers under <state>/landed-pr-cache (default: on)
   CC_WJ_IDLE_HOURS        Keep a worktree modified within this many hours (default: 48)
   CC_WJ_SESSION_GRACE_HOURS Keep a worktree after mapped harness activity (default: 48)
   CC_WJ_RECLAIM_PUSHED    1 (default): a worktree whose HEAD origin already holds is removable;
@@ -3421,7 +3422,37 @@ _cc_wj_landed_by_pr() {
   esac
   case "$slug" in */*) ;; *) return 1 ;; esac
   [ -n "$host" ] || return 1
-  local listed n numbers
+  local listed n numbers ckey cfile cdir="" cline cbad=""
+  # A merged PR into the base at this head stays merged, so the merge commits it names are
+  # remembered (CC_WJ_LANDED_CACHE=0 turns it off). Only a positive answer is stored: an
+  # unlanded answer can change. The ancestry check against $ref below always runs live.
+  # Any cache failure falls through to the API, never to a different verdict.
+  if [ "${CC_WJ_LANDED_CACHE:-1}" != 0 ] && command -v shasum >/dev/null 2>&1; then
+    ckey="$host $slug $_CC_WJ_BASE $head"
+    cdir="$(_cc_wj_state_dir)/landed-pr-cache"
+    cfile="$cdir/$(printf '%s' "$ckey" | shasum -a 256 2>/dev/null | awk '{ print $1 }')"
+    if [ -f "$cfile" ] && [ "$(head -n 1 "$cfile" 2>/dev/null)" = "$ckey" ]; then
+      merges="$(tail -n +2 "$cfile" 2>/dev/null)" || merges=""
+      # Every line must be a full commit id: anything else (a branch name, a short prefix)
+      # would resolve locally and is read as a miss.
+      while IFS= read -r mc; do
+        [ -n "$mc" ] || continue
+        case "$mc" in *[!0-9a-f]*) cbad=1 ;; esac
+        [ "${#mc}" = 40 ] || [ "${#mc}" = 64 ] || cbad=1
+      done <<CHECKED
+$merges
+CHECKED
+      if [ -n "$merges" ] && [ -z "$cbad" ]; then
+        while IFS= read -r mc; do
+          [ -n "$mc" ] || continue
+          git -C "$wt" merge-base --is-ancestor "$mc" "$ref" 2>/dev/null && return 0
+        done <<CACHED
+$merges
+CACHED
+        return 1
+      fi
+    fi
+  fi
   listed="$(_cc_wj_with_timeout 30 gh api --hostname "$host" "repos/$slug/commits/$head/pulls" \
      --paginate \
      --jq ".[] | select(.merged_at != null and .head.sha == \"$head\") | \"\\(.base.ref) \\(.merge_commit_sha)\"" \
@@ -3449,6 +3480,11 @@ $numbers
 NUMBERS
   fi
   [ -n "$merges" ] || return 1
+  if [ -n "$cdir" ] && mkdir -p "$cdir" 2>/dev/null; then
+    cline="$(mktemp "$cdir/.tmp.XXXXXX" 2>/dev/null)" &&
+      { { printf '%s\n' "$ckey"; printf '%s' "$merges"; } > "$cline" 2>/dev/null &&
+        mv -f "$cline" "$cfile" 2>/dev/null || rm -f "$cline" 2>/dev/null; }
+  fi
   while IFS= read -r mc; do
     [ -n "$mc" ] || continue
     git -C "$wt" merge-base --is-ancestor "$mc" "$ref" 2>/dev/null && return 0

@@ -935,7 +935,8 @@ expect_yes "sourcing the janitor leaves the caller's PATH unchanged" \
 # The PR proof must not outlive the base: the merge commit has to be on what was fetched.
 printf '%s %s %s main\n' "$PR_HEAD" "$PR_HEAD" "1111111111111111111111111111111111111111" > "$GH_PULLS_FILE"
 OUT_L2="$TMPDIR_ROOT/out-landed2.txt"
-_wj_idle --repo "$L_PRIMARY" > "$OUT_L2"
+# The fixture rewrites a merged PR's merge commit, which GitHub never does: no cache here.
+CC_WJ_LANDED_CACHE=0 _wj_idle --repo "$L_PRIMARY" > "$OUT_L2"
 expect_yes "a merged PR whose merge commit is not on the base does not count" \
   file_after "$OUT_L2" "wt-pr$" 2 "KEEP(unlanded)"
 : > "$GH_PULLS_FILE"
@@ -2390,6 +2391,8 @@ GHX_HEAD="$(git -C "$GHX_WT" rev-parse HEAD)"
 git -C "$GHX_WT" remote add origin https://github.com/acme/demo.git
 
 ghx_landed() { PATH="$GHX_STUBS:$PATH" _CC_WJ_BASE=main _cc_wj_landed_by_pr "$GHX_WT" refs/remotes/origin/main; }
+# The legacy cases below change one fixture under a fixed head; the cache is off for them.
+export CC_WJ_LANDED_CACHE=0
 ghx_closed_is() { [ "$(PATH="$GHX_STUBS:$PATH" _cc_wj_closed_at_head "$GHX_WT")" = "$1" ]; }
 
 # The commit's PR list names only the stacked PR into another branch.
@@ -2412,6 +2415,60 @@ expect_no "a search that fails keeps the worktree unlanded" ghx_landed
 ghx "search/issues?q=repo:acme/demo+is:pr+is:merged+$GHX_HEAD&per_page=20" '{"items":[{"number":2490}]}'
 ghx "repos/acme/demo/commits/$GHX_HEAD/pulls" '[]'
 expect_no "a head with no merged PR at all does not spend a search" ghx_landed
+
+# The merged-PR cache: a positive answer is remembered, anything else never is.
+LC_CALLS="$GHX_ROOT/calls"; LC_STUBS="$GHX_ROOT/bin-count"; mkdir -p "$LC_STUBS"
+cat > "$LC_STUBS/gh" <<'STUB'
+#!/usr/bin/env bash
+echo call >> "$LC_CALLS"
+exec "$GHX_STUBS/gh" "$@"
+STUB
+chmod +x "$LC_STUBS/gh"; export LC_CALLS GHX_STUBS
+lc_calls() { [ -f "$LC_CALLS" ] && wc -l < "$LC_CALLS" | tr -d ' ' || echo 0; }
+lc_landed() { PATH="$LC_STUBS:$PATH" _CC_WJ_BASE=main _cc_wj_landed_by_pr "$GHX_WT" refs/remotes/origin/main; }
+lc_reset() { rm -f "$LC_CALLS"; rm -rf "$GHX_ROOT/state"; }
+lc_merged() { ghx "repos/acme/demo/commits/$GHX_HEAD/pulls" \
+  "[{\"number\":2490,\"merged_at\":\"2026-09-23T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"head\":{\"sha\":\"$GHX_HEAD\"},\"merge_commit_sha\":\"$GHX_MERGE\"}]"; }
+LC_PREV_STATE="$CC_WJ_STATE_DIR"
+export CC_WJ_STATE_DIR="$GHX_ROOT/state"
+CC_WJ_LANDED_CACHE=1
+lc_merged; lc_reset
+lc_landed; lc_first=$?; c1="$(lc_calls)"; lc_landed; lc_second=$?; c2="$(lc_calls)"
+expect_yes "cache: a landed answer is returned live, then from the cache" test "$lc_first$lc_second" = 00
+expect_yes "cache: the second landed answer makes no gh call" test "$c1" -gt 0 -a "$c2" = "$c1"
+ghx "repos/acme/demo/commits/$GHX_HEAD/pulls" '[]'; lc_reset
+lc_landed; c1="$(lc_calls)"; lc_landed; c2="$(lc_calls)"
+expect_yes "cache: a not-landed answer is never cached, gh is asked again" test "$c1" -gt 0 -a "$c2" -gt "$c1"
+expect_no "cache: and nothing is written for it" sh -c 'ls "$1"/landed-pr-cache/* 2>/dev/null | grep -q .' _ "$GHX_ROOT/state"
+lc_merged; lc_reset
+CC_WJ_LANDED_CACHE=0 lc_landed; c1="$(lc_calls)"; CC_WJ_LANDED_CACHE=0 lc_landed; c2="$(lc_calls)"
+expect_yes "cache: CC_WJ_LANDED_CACHE=0 asks gh every time" test "$c1" -gt 0 -a "$c2" -eq $((c1 * 2))
+expect_no "cache: CC_WJ_LANDED_CACHE=0 writes nothing" test -d "$GHX_ROOT/state/landed-pr-cache"
+lc_reset; mkdir -p "$GHX_ROOT/state"; : > "$GHX_ROOT/state/landed-pr-cache"
+lc_landed; lc_u=$?; c1="$(lc_calls)"; lc_landed; c2="$(lc_calls)"
+expect_yes "cache: an unwritable cache dir still returns the live verdict" test "$lc_u" = 0 -a "$c1" -gt 0 -a "$c2" -gt "$c1"
+lc_reset; lc_landed; mkdir -p "$GHX_ROOT/state/landed-pr-cache"
+for f in "$GHX_ROOT"/state/landed-pr-cache/*; do echo garbage > "$f"; done
+rm -f "$LC_CALLS"; lc_landed; lc_g=$?
+expect_yes "cache: a corrupt entry falls through to gh" test "$lc_g" = 0 -a "$(lc_calls)" -gt 0
+# A hit still checks the merge commit against the fetched base: one that is not on it
+# (the base was force-pushed past the merge) keeps the tree, with no gh call.
+lc_merged; lc_reset; lc_landed
+for f in "$GHX_ROOT"/state/landed-pr-cache/*; do
+  { head -n 1 "$f"; echo 2222222222222222222222222222222222222222; } > "$f.new" && mv "$f.new" "$f"
+done
+rm -f "$LC_CALLS"; lc_landed; lc_n=$?
+expect_yes "cache: a cached merge commit not on the fetched base is not landed, from the cache" test "$lc_n" = 1 -a "$(lc_calls)" = 0
+# A cached line that is not a full commit id (a branch name resolves locally) is a miss.
+lc_reset; lc_landed
+for f in "$GHX_ROOT"/state/landed-pr-cache/*; do
+  { head -n 1 "$f"; echo main; } > "$f.new" && mv "$f.new" "$f"
+done
+rm -f "$LC_CALLS"; lc_landed
+expect_yes "cache: a cached line that is not a full commit id is asked of gh again" test "$(lc_calls)" -gt 0
+# The legacy fixtures after this section rewrite merged-PR facts under one head too: cache stays off.
+lc_reset; CC_WJ_LANDED_CACHE=0
+export CC_WJ_STATE_DIR="$LC_PREV_STATE"
 
 # Closed unmerged at this HEAD, long enough ago, with nothing open.
 ghx_iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
