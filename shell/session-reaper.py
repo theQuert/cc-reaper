@@ -47,6 +47,9 @@ DEFAULTS = {
     "DONE_INBOX": "~/handoffs/neo-inbox.md",  # a session whose newest header here is DONE (>= IDLE_MINUTES old) is done; empty: off
     "CHECKBY_ORACLE": "/Users/stimaclaw/GitHub/stima-api/scripts/ci/delivery_state.py",  # --json: pending_check_by, due_check
     "CHECKBY_REPO": "theQuert/stima-api",  # the only repo the oracle reads; a claim elsewhere is UNKNOWN (kept)
+    "ORACLE_ROOT": "/Users/stimaclaw/GitHub/stima-api",  # checkout whose `scripts/ci/delivery_state.py N --brief` judges an idle session's open claims
+    "ORACLE_CACHE_DIR": "~/.cc-reaper/state/oracle-brief",  # one brief per issue, reused for ORACLE_CACHE_MINUTES (GitHub REST budget)
+    "ORACLE_CACHE_MINUTES": "10",
     "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
@@ -264,6 +267,66 @@ def checkby_state(repo, num, cfg):
             state = "UNKNOWN"
         _checkby_cache[key] = state
     return _checkby_cache[key]
+
+
+_brief_cache = {}
+
+
+def oracle_brief(repo, num, cfg, now):
+    """`delivery_state.py N --brief` for the claim, cached on disk for ORACLE_CACHE_MINUTES; None when it cannot say."""
+    if repo != cfg["CHECKBY_REPO"]:
+        return None  # the oracle would read another repo's issue with this number
+    key = (repo, str(num))
+    if key in _brief_cache:
+        return _brief_cache[key]
+    cache = Path(os.path.expanduser(cfg["ORACLE_CACHE_DIR"])) / f"{repo.replace('/', '_')}-{num}.json"
+    ttl = float(cfg["ORACLE_CACHE_MINUTES"]) * 60
+    try:
+        d = json.loads(cache.read_text())
+        if 0 <= now - d["at"] < ttl and isinstance(d["brief"], str):
+            _brief_cache[key] = d["brief"]
+            return d["brief"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    root = os.path.expanduser(cfg["ORACLE_ROOT"])
+    rc, out = run(["python3", "scripts/ci/delivery_state.py", str(num), "--brief"], 30, cwd=root)
+    brief = out if rc == 0 and out.startswith("delivery #") else None
+    if brief is not None:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"at": now, "brief": brief}))
+        except OSError:
+            pass
+    _brief_cache[key] = brief
+    return brief
+
+
+BRIEF_STATE_RE = re.compile(r"\Adelivery #\d+: (\w+)")
+CLAIMANT_RE = re.compile(r"(?m)^\s*claimant:.*?session ([0-9A-Za-z-]+)(?: \(.*?\))?; the step is that session's")
+CHECKBY_AT_RE = re.compile(r"check-by(?: scheduled for)?:? (\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?)")
+
+
+def classify_claim(brief, sid, now):
+    """(`ended`|`owed`|`unknown`, overdue) from one oracle brief for a session that is idle."""
+    if not brief:
+        return "unknown", False
+    m = BRIEF_STATE_RE.match(brief)
+    if (m and m.group(1).lower() == "closed") or "the session may end" in brief:
+        return "ended", False
+    c = CLAIMANT_RE.search(brief)
+    if not c:
+        return "unknown", False
+    other = c.group(1)
+    if not (sid.startswith(other) or other.startswith(sid)):
+        return "ended", False
+    overdue = False
+    for at in CHECKBY_AT_RE.findall(brief):
+        try:
+            tt = calendar.timegm(time.strptime(at[:16], "%Y-%m-%dT%H:%M"))
+        except ValueError:
+            continue
+        overdue = overdue or tt < now
+    return "owed", overdue
 
 
 _claim_cache = {}
@@ -583,12 +646,28 @@ def decide(s, cfg, now=None):
             elif "UNKNOWN" in cb:
                 keep.append("check-by-unknown")
     else:
-        states = [issue_state(r, n) for r, n in s["claims"]]
         if not s["claims"]:
             keep.append("claim-unknown")
-        elif any(st != "CLOSED" for st in states):
-            keep.append("issue-open:" + ",".join(f"#{n}" for (_, n), st in zip(s["claims"], states)
-                                                  if st != "CLOSED"))
+        elif s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"]):
+            at = now if now is not None else time.time()
+            marks, owed, unknown = [], [], []
+            for r, n in s["claims"]:
+                cls, overdue = classify_claim(oracle_brief(r, n, cfg, at), s["sid"], at)
+                marks.append(f"#{n}:{cls}" + (":stalled" if overdue else ""))
+                if cls == "owed":
+                    owed.append(f"#{n}")
+                elif cls == "unknown":
+                    unknown.append(f"#{n}")
+            s["claim_marks"] = marks
+            if owed:
+                keep.append("owed-step:" + ",".join(owed))
+            if unknown:
+                keep.append("issue-unknown:" + ",".join(unknown))
+        else:
+            states = [issue_state(r, n) for r, n in s["claims"]]
+            if any(st != "CLOSED" for st in states):
+                keep.append("issue-open:" + ",".join(f"#{n}" for (_, n), st in zip(s["claims"], states)
+                                                      if st != "CLOSED"))
     for w in s["owned"]:
         keep.extend(worktree_state(w, cfg))
     return keep
@@ -843,7 +922,7 @@ def alert(cfg, lines):
 
 def report_line(s, keep, outcome):
     wt = ",".join(w["path"].name for w in s["owned"]) or "-"
-    issues = ",".join(f"#{n}" for _, n in s["claims"]) or "-"
+    issues = ",".join(s.get("claim_marks") or [f"#{n}" for _, n in s["claims"]]) or "-"
     plan = f"pid {s['pid']}+{s['descendants']} desc; tmux {s['tmux']}; worktrees {wt}"
     background_only = "yes" if keep and set(keep) <= BACKGROUND_ONLY else "-"
     new_only = "yes" if keep and all(k.startswith(NEW_GATES) for k in keep) else "-"
