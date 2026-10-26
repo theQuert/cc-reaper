@@ -2439,6 +2439,7 @@ expect_yes "cache: the second landed answer makes no gh call" test "$c1" -gt 0 -
 ghx "repos/acme/demo/commits/$GHX_HEAD/pulls" '[]'; lc_reset
 lc_landed; c1="$(lc_calls)"; lc_landed; c2="$(lc_calls)"
 expect_yes "cache: a not-landed answer is never cached, gh is asked again" test "$c1" -gt 0 -a "$c2" -gt "$c1"
+expect_no "cache: and nothing is written for it" sh -c 'ls "$1"/landed-pr-cache/* 2>/dev/null | grep -q .' _ "$GHX_ROOT/state"
 lc_merged; lc_reset
 CC_WJ_LANDED_CACHE=0 lc_landed; c1="$(lc_calls)"; CC_WJ_LANDED_CACHE=0 lc_landed; c2="$(lc_calls)"
 expect_yes "cache: CC_WJ_LANDED_CACHE=0 asks gh every time" test "$c1" -gt 0 -a "$c2" -eq $((c1 * 2))
