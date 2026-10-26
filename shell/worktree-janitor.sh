@@ -3422,7 +3422,7 @@ _cc_wj_landed_by_pr() {
   esac
   case "$slug" in */*) ;; *) return 1 ;; esac
   [ -n "$host" ] || return 1
-  local listed n numbers ckey cfile cdir="" cline
+  local listed n numbers ckey cfile cdir="" cline cbad=""
   # A merged PR into the base at this head stays merged, so the merge commits it names are
   # remembered (CC_WJ_LANDED_CACHE=0 turns it off). Only a positive answer is stored: an
   # unlanded answer can change. The ancestry check against $ref below always runs live.
@@ -3433,7 +3433,16 @@ _cc_wj_landed_by_pr() {
     cfile="$cdir/$(printf '%s' "$ckey" | shasum -a 256 2>/dev/null | awk '{ print $1 }')"
     if [ -f "$cfile" ] && [ "$(head -n 1 "$cfile" 2>/dev/null)" = "$ckey" ]; then
       merges="$(tail -n +2 "$cfile" 2>/dev/null)" || merges=""
-      if [ -n "$merges" ]; then
+      # Every line must be a full commit id: anything else (a branch name, a short prefix)
+      # would resolve locally and is read as a miss.
+      while IFS= read -r mc; do
+        [ -n "$mc" ] || continue
+        case "$mc" in *[!0-9a-f]*) cbad=1 ;; esac
+        [ "${#mc}" = 40 ] || [ "${#mc}" = 64 ] || cbad=1
+      done <<CHECKED
+$merges
+CHECKED
+      if [ -n "$merges" ] && [ -z "$cbad" ]; then
         while IFS= read -r mc; do
           [ -n "$mc" ] || continue
           git -C "$wt" merge-base --is-ancestor "$mc" "$ref" 2>/dev/null && return 0

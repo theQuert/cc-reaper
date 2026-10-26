@@ -2451,7 +2451,23 @@ lc_reset; lc_landed; mkdir -p "$GHX_ROOT/state/landed-pr-cache"
 for f in "$GHX_ROOT"/state/landed-pr-cache/*; do echo garbage > "$f"; done
 rm -f "$LC_CALLS"; lc_landed; lc_g=$?
 expect_yes "cache: a corrupt entry falls through to gh" test "$lc_g" = 0 -a "$(lc_calls)" -gt 0
-CC_WJ_LANDED_CACHE=0; lc_reset
+# A hit still checks the merge commit against the fetched base: one that is not on it
+# (the base was force-pushed past the merge) keeps the tree, with no gh call.
+lc_merged; lc_reset; lc_landed
+for f in "$GHX_ROOT"/state/landed-pr-cache/*; do
+  { head -n 1 "$f"; echo 2222222222222222222222222222222222222222; } > "$f.new" && mv "$f.new" "$f"
+done
+rm -f "$LC_CALLS"; lc_landed; lc_n=$?
+expect_yes "cache: a cached merge commit not on the fetched base is not landed, from the cache" test "$lc_n" = 1 -a "$(lc_calls)" = 0
+# A cached line that is not a full commit id (a branch name resolves locally) is a miss.
+lc_reset; lc_landed
+for f in "$GHX_ROOT"/state/landed-pr-cache/*; do
+  { head -n 1 "$f"; echo main; } > "$f.new" && mv "$f.new" "$f"
+done
+rm -f "$LC_CALLS"; lc_landed
+expect_yes "cache: a cached line that is not a full commit id is asked of gh again" test "$(lc_calls)" -gt 0
+# The legacy fixtures after this section rewrite merged-PR facts under one head too: cache stays off.
+lc_reset; CC_WJ_LANDED_CACHE=0
 export CC_WJ_STATE_DIR="$LC_PREV_STATE"
 
 # Closed unmerged at this HEAD, long enough ago, with nothing open.
