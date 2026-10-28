@@ -8,6 +8,9 @@ waiting on a person, and not protected. Reaping types /exit at a verified empty 
 then verifies the process tree, tmux session, session file and worktree locks are gone.
 
 Report-only unless the config sets APPLY=1 or --apply is passed.
+
+Shadow verdict (#6477): a kept session that a person would also call finished gets the outcome
+`would-close` in the report. It is never acted on: reap() runs only for a session with no keep reason.
 """
 
 import argparse
@@ -50,6 +53,7 @@ DEFAULTS = {
     "ORACLE_ROOT": "/Users/stimaclaw/GitHub/stima-api",  # checkout whose `scripts/ci/delivery_state.py N --brief` judges an idle session's open claims
     "ORACLE_CACHE_DIR": "~/.cc-reaper/state/oracle-brief",  # one brief per issue, reused for ORACLE_CACHE_MINUTES (GitHub REST budget)
     "ORACLE_CACHE_MINUTES": "10",
+    "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
     "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
@@ -62,6 +66,12 @@ DONE_PHRASE_RE = re.compile(r"這個主題(已經)?結束|may be closed", re.I)
 WAITING_RE = re.compile(
     r"production-authorization|authoriz|approv|授權|批准|等你|你決定|請確認", re.I
 )
+# A close line that is not SESSION-DONE: the session says it has no scope left (#6477).
+# DONE / IDLE-no-scope are the self-labels, so only their exact case counts: "Done with step 1" is progress.
+CLOSE_LINE_RE = re.compile(r"(?i:no open scope|reaper can close|safe to close)|(?m:^\W*(?:DONE|IDLE-no-scope)\b)")
+BLOCKED_RE = re.compile(r"BLOCKED:#(\d{3,6})")
+NAMED_RE = re.compile(r"(?<![\w/])#(\d{3,6})\b")
+SOFT_KEEP = ("claim-unknown", "waiting")  # `waiting-keyword` also starts with `waiting`
 ISSUE_RE = re.compile(r"(?:^|/)(\d{3,6})(?:-|$)")
 PATH_RE = re.compile(r"(?:~|/)[\w./@+-]+")
 # Keep reasons added after the first 48 h of live reaping: a row kept only by these is one the
@@ -536,23 +546,45 @@ def missing_handoffs(cfg, text):
 
 # ---------- gather and decide ----------
 
+SKIPPED = []  # (label, reason, live) for every session file gather did not return; reset by each gather()
+
+
+def _skip(d, f, reason, live):
+    label = " ".join(x for x in (d.get("name") or "", f"tmux={d.get('tmux')}" if d.get("tmux") else "",
+                                 f"sid={str(d.get('sessionId') or f.stem)[:8]}", f"pid={d.get('pid')}") if x)
+    SKIPPED.append((label, reason, live))
+
+
 def gather(cfg, now):
     table = ps_table()
     wts = worktrees(cfg)
     found = []
+    SKIPPED.clear()
     for f in sorted(SESSIONS_DIR.glob("*.json")):
         try:
             d = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
-        if d.get("kind") != "interactive" or not d.get("tmux"):
-            continue
         pid = d.get("pid")
-        alive = pid in table and " ".join(d.get("procStart", "").split()) == table[pid][1]
+        running = pid in table
+        if d.get("kind") != "interactive":
+            _skip(d, f, f"kind:{d.get('kind')}", running)
+            continue
+        if not d.get("tmux"):
+            _skip(d, f, "no-tmux-field", running)
+            continue
+        alive = running and " ".join(d.get("procStart", "").split()) == table[pid][1]
+        if not alive:
+            _skip(d, f, "procstart-mismatch" if running else "pid-gone", running)
+            continue
         pane = d["tmux"].rsplit(".", 1)[-1]
-        state = pane_state(pane) if alive else None
-        if not alive or not state or not is_ancestor(table, state["pane_pid"], pid):
-            continue  # stale file, recycled pid, or a pane that no longer holds this claude
+        state = pane_state(pane)
+        if not state:
+            _skip(d, f, f"pane-missing:{pane}", True)
+            continue
+        if not is_ancestor(table, state["pane_pid"], pid):
+            _skip(d, f, f"pane-ancestor-mismatch:{pane}", True)
+            continue  # a pane that no longer holds this claude
         sid, cwd = d["sessionId"], d.get("cwd", "")
         owned = [w for w in wts if w["marker"] == sid
                  or (cwd + "/").startswith(str(w["path"]) + "/")]
@@ -648,8 +680,12 @@ def decide(s, cfg, now=None):
         keep.append("loop-pending")
     if s["crons"] > 0 or s["scheduled"]:
         keep.append("scheduled-task")
-    if s["asking"] or waiting_re(cfg).search(DONE_RE.sub("", s["last_text"])):
+    if s["asking"]:
         keep.append("waiting")
+    elif waiting_re(cfg).search(DONE_RE.sub("", s["last_text"])):
+        # The keyword alone counts for a session with no claim or a claim at a person step. Otherwise it
+        # is only a hint: still kept (shadow, #6477), under a name the shadow verdict can tell apart.
+        keep.append("waiting" if not s["claims"] or person_step(s, cfg, now) else "waiting-keyword")
     if s.get("sub_active"):
         keep.append("subagent-active")
     if s.get("relay_pending"):
@@ -695,6 +731,90 @@ def decide(s, cfg, now=None):
     for w in s["owned"]:
         keep.extend(worktree_state(w, cfg))
     return keep
+
+
+def _brief_kind(brief):
+    k = BRIEF_KIND_RE.match(brief or "")
+    return k.group(1) if k else ""
+
+
+def claim_briefs(refs, cfg, now):
+    return [(ref, oracle_brief(ref[0], ref[1], cfg, now)) for ref in refs]
+
+
+def person_step(s, cfg, now=None):
+    """True when the oracle's step for one of the session's worktree claims is a stop (a person's)."""
+    at = now if now is not None else time.time()
+    return any(_brief_kind(b) == "stop" for _, b in claim_briefs(s["claims"], cfg, at))
+
+
+def oracle_claims(s, cfg, now, limit=8):
+    """Issues the session names (`#N` in its last text or name) whose oracle brief says THIS session is the
+    claimant (its id or a worktree marker it owns); the claim a worktree-less session has no branch for."""
+    repo = cfg["CHECKBY_REPO"]
+    named = []
+    for n in NAMED_RE.findall(f"{s.get('name', '')}\n{s['last_text']}"):
+        if n not in named and (repo, n) not in s["claims"]:
+            named.append(n)
+    mine = [w["marker"] for w in s["owned"] if w.get("marker")]
+    out = []
+    for n in named[:limit]:
+        c = CLAIMANT_RE.search(oracle_brief(repo, n, cfg, now) or "")
+        if c and (_same_session(c.group(1), s["sid"]) or any(_same_session(c.group(1), m) for m in mine)):
+            out.append((repo, n))
+    return out
+
+
+def shadow_verdict(s, cfg, keep, now):
+    """Report-only view of a KEPT session: {"would_close": why|"", "blocked": [issue numbers]}.
+
+    would-close needs every keep reason to be a soft one (`claim-unknown`, a keyword `waiting`) and no work or
+    person left: not protected or uiux/homepage, idle past the threshold, no uncommitted or unpushed work in a
+    worktree or the cwd, no background child, no question or BLOCKED text, no oracle stop. Then either no claim
+    (worktree or oracle) and a close line, or every claim `ended`. Nothing acts on it."""
+    blocked = []
+
+    def block(n):
+        if n not in blocked:
+            blocked.append(n)
+    for n in BLOCKED_RE.findall(s["last_text"]):
+        block(n)
+    idle = s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"])
+    claims = list(s["claims"])
+    marks = []
+    mine = [w["marker"] for w in s["owned"] if w.get("marker")]
+
+    def judge(refs):
+        for (r, n), b in zip(refs, [oracle_brief(r, n, cfg, now) for r, n in refs]):
+            for m in BLOCKED_RE.findall(b or ""):
+                block(m)
+            marks.append(classify_claim(b, s["sid"], now, s.get("other_sids", ()), mine)[0])
+    if idle:
+        judge(claims)  # worktree claims: decide() already briefed them, so these hit the cache
+    out = {"would_close": "", "blocked": blocked, "claims": claims}
+    never = [n for n in (s["tmux"], s.get("name")) if n]
+    if (not keep or not idle or blocked or s["asking"] or s["bg_shells"] or s.get("sub_active")
+            or any(not k.startswith(SOFT_KEEP) for k in keep)
+            or any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in never)
+            or protected(cfg, *never)):
+        return out
+    cwd_wt = [] if any(str(w["path"]) == s.get("cwd") for w in s["owned"]) or not s.get("cwd") \
+        else [{"path": Path(s["cwd"])}]
+    if any(worktree_state(w, cfg) for w in [*s["owned"], *cwd_wt]):
+        return out
+    # Only a session every cheap gate leaves standing pays for the oracle lookups of the issues its text names.
+    named = oracle_claims(s, cfg, now)
+    claims += named
+    judge(named)
+    if blocked:
+        return out
+    text = s["last_text"]
+    if not claims:
+        if DONE_RE.search(text) or DONE_PHRASE_RE.search(text) or CLOSE_LINE_RE.search(text):
+            out["would_close"] = "no claim, close line"
+    elif all(m == "ended" for m in marks):
+        out["would_close"] = "all claims ended"
+    return out
 
 
 def summary(s):
@@ -950,8 +1070,10 @@ def report_line(s, keep, outcome):
     plan = f"pid {s['pid']}+{s['descendants']} desc; tmux {s['tmux']}; worktrees {wt}"
     background_only = "yes" if keep and set(keep) <= BACKGROUND_ONLY else "-"
     new_only = "yes" if keep and all(k.startswith(NEW_GATES) for k in keep) else "-"
+    why = [f"would-close: {s['would_close']}"] if s.get("would_close") else []
+    blocked = [", ".join(f"blocked: #{n}" for n in s["blocked"])] if s.get("blocked") else []
     return (f"| {s['tmux']} | `{s['sid'][:8]}` | {s['status']} {s['idle_min']:.0f}m | {issues} | "
-            f"{outcome} | {', '.join(keep) or '-'} | {background_only} | {new_only} | {plan} |")
+            f"{outcome} | {', '.join([*keep, *why, *blocked]) or '-'} | {background_only} | {new_only} | {plan} |")
 
 
 def main(argv=None):
@@ -974,7 +1096,7 @@ def main(argv=None):
         print("session-reaper: another run holds the lock")
         return 0
     now = time.time()
-    rows, failures, reaped, seen, stale = [], [], 0, [], []
+    rows, failures, reaped, seen, stale, notes = [], [], 0, [], [], []
     try:
         if apply and not args.only:
             stale = recover_exiting(cfg, now)
@@ -988,6 +1110,13 @@ def main(argv=None):
             try:
                 keep = decide(s, cfg)
                 outcome = "keep" if keep else ("reap" if apply else "would-reap")
+                if keep:  # shadow only: the outcome label changes, nothing below acts on it
+                    try:
+                        sv = shadow_verdict(s, cfg, keep, now)
+                        s["blocked"], s["would_close"] = sv["blocked"], sv["would_close"]
+                        outcome = "would-close" if sv["would_close"] else outcome
+                    except Exception as e:  # a report-only verdict must not fail the sweep
+                        notes.append(f"{s['tmux']} ({s['sid']}): shadow verdict: {type(e).__name__}: {e}")
                 if not keep and apply:
                     outcome, fails = reap(s, cfg, now)
                     if s.get("record") and outcome != "skipped:close-unconfirmed":  # stays "exiting" for recovery
@@ -1014,6 +1143,12 @@ def main(argv=None):
               "| tmux | session | status idle | issues | outcome | keeps it | held only by background shells "
               "| kept only by new gates | verification target |",
               "|---|---|---|---|---|---|---|---|---|", *rows]
+    live = [f"- {label}: {why}" for label, why, is_live in SKIPPED if is_live]
+    dead = sum(1 for _, _, is_live in SKIPPED if not is_live)
+    report += ["", "## Skipped live sessions (not judged)", *(live or ["none"]),
+               f"({dead} session files with no live process not listed)"]
+    if notes:
+        report += ["", "## Shadow notes", *[f"- {n}" for n in notes]]
     if stale:
         report += ["", "## Stale exiting records", *[f"- {f}" for f in stale]]
     if failures:

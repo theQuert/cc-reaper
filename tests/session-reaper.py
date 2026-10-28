@@ -856,5 +856,205 @@ class IdleList(unittest.TestCase):
         self.assertEqual(list(self.tmp.iterdir()), [])
 
 
+REPO = "theQuert/stima-api"
+STOP6432 = ("delivery #5630: reviewed (backend) -> stop no-production-authority  [d]\n"
+            "  stop: no-production-authority (reported)\n  BLOCKED:#6432 main allowed_signers trusts only retired keys")
+
+
+class ShadowVerdict(unittest.TestCase):
+    """#6477: `would-close` and `blocked: #N` are report-only views of a session decide() keeps."""
+
+    def view(self, briefs=None, wt_problems=(), now=NOW0, force_keep=None, **kw):
+        briefs = briefs or {}
+        s = session(**dict(dict(last_text="", cwd="/work/x"), **kw))
+        s.setdefault("other_sids", [])
+        with mock.patch.object(reaper, "oracle_brief", side_effect=lambda r, n, c, at: briefs.get(n)), \
+             mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
+             mock.patch.object(reaper, "worktree_state",
+                               side_effect=lambda w, c: list(wt_problems) + w.get("problems", [])):
+            keep = reaper.decide(s, CFG, now)
+            return keep, reaper.shadow_verdict(s, CFG, force_keep or keep, now)
+
+    SEC_P1 = ("Merged the authorization fix. No open scope: the reaper can close this session.")
+
+    def test_sec_p1_like_session_without_a_worktree_would_close(self):
+        keep, v = self.view(last_text=self.SEC_P1, name="sec-p1", tmux="sec-p1")
+        self.assertEqual(keep, ["waiting", "claim-unknown"])
+        self.assertEqual(v["would_close"], "no claim, close line")
+
+    def test_openlux_like_session_would_close_and_names_no_issue(self):
+        keep, v = self.view(last_text="OpenLux supply approved by the founder.\nIDLE-no-scope", name="openlux-supply",
+                            tmux="openlux-supply")
+        self.assertEqual(v["would_close"], "no claim, close line")
+        self.assertEqual(v["blocked"], [])
+
+    def test_all_ended_worktree_claims_with_a_waiting_keyword_would_close(self):
+        keep, v = self.view({"9": ENDED}, last_text="PR approved, merged.", claims=[(REPO, "9")])
+        self.assertEqual(keep, ["waiting-keyword"])
+        self.assertEqual(v["would_close"], "all claims ended")
+
+    def test_a_claim_the_oracle_names_to_this_session_is_found_and_keeps_it(self):
+        # no worktree: the claim only exists as `claimant: claude session sid-1` on the issue the text names
+        keep, v = self.view({"6200": MINE}, last_text=self.SEC_P1 + " Follow-up in #6200.")
+        self.assertEqual(v["claims"], [(REPO, "6200")])
+        self.assertEqual(v["would_close"], "")
+
+    def test_an_issue_claimed_by_another_session_is_not_this_sessions_claim(self):
+        keep, v = self.view({"6200": OTHER}, last_text=self.SEC_P1 + " See #6200.")
+        self.assertEqual(v["claims"], [])
+        self.assertEqual(v["would_close"], "no claim, close line")
+
+    def test_an_owed_or_unknown_claim_is_never_would_close(self):
+        for brief in (MINE, None):
+            with self.subTest(brief):
+                _, v = self.view({"9": brief}, last_text="approved and merged", claims=[(REPO, "9")])
+                self.assertEqual(v["would_close"], "")
+
+    def test_one_ended_claim_beside_an_owed_one_is_not_would_close(self):
+        # force_keep isolates the claim rule: decide() would add owed-step:#10 and end the question earlier
+        _, v = self.view({"9": ENDED, "10": MINE}, last_text="approved and merged", claims=[(REPO, "9"), (REPO, "10")],
+                         force_keep=["waiting-keyword"])
+        self.assertEqual(v["would_close"], "")
+
+    def test_the_report_row_carries_blocked_and_would_close(self):
+        s = session(pid=1, descendants=0, blocked=["6432", "5630"], would_close="")
+        self.assertIn("waiting, blocked: #6432, blocked: #5630 |", reaper.report_line(s, ["waiting"], "keep"))
+        s["would_close"] = "no claim, close line"
+        self.assertIn("would-close: no claim, close line", reaper.report_line(s, ["claim-unknown"], "would-close"))
+
+    def test_auth_audit_like_session_is_kept_blocked_on_6432(self):
+        keep, v = self.view(last_text="Waiting for authorization. BLOCKED:#6432", name="auth-audit", tmux="auth-audit")
+        self.assertEqual(keep, ["waiting", "claim-unknown"])
+        self.assertEqual(v["blocked"], ["6432"])
+        self.assertEqual(v["would_close"], "")
+
+    def test_release_owner_like_session_with_a_background_shell_is_kept_blocked(self):
+        keep, v = self.view(last_text="No open scope. BLOCKED:#6432 until the signers are fixed.", bg_shells=[77])
+        self.assertIn("shell-child", keep)
+        self.assertEqual((v["would_close"], v["blocked"]), ("", ["6432"]))
+
+    def test_a_claims_oracle_stop_names_the_blocking_issue_and_is_a_person_step(self):
+        keep, v = self.view({"5630": STOP6432}, last_text="staged; needs authorization", claims=[(REPO, "5630")])
+        self.assertIn("waiting", keep)  # a person step: the keyword still counts
+        self.assertEqual((v["would_close"], v["blocked"]), ("", ["6432"]))
+
+    def test_the_waiting_keyword_is_only_a_hint_without_a_person_step(self):
+        keep, _ = self.view({"9": MINE}, last_text="needs approval", claims=[(REPO, "9")], status="busy")
+        self.assertEqual(keep, ["status:busy", "waiting-keyword", "issue-open:#9"])
+        keep, _ = self.view({"9": MINE}, last_text="needs approval", claims=[])
+        self.assertIn("waiting", keep)
+
+    def test_a_question_to_a_person_is_still_waiting_with_claims(self):
+        keep, v = self.view({"9": ENDED}, last_text="all done", claims=[(REPO, "9")], asking=True)
+        self.assertEqual(keep, ["waiting"])
+        self.assertEqual(v["would_close"], "")
+
+    def test_uncommitted_or_unpushed_work_is_never_would_close(self):
+        for kw, probs in ((dict(owned=[{"path": Path("/w/a"), "problems": ["uncommitted:a"]}]), ()),
+                          (dict(owned=[{"path": Path("/w/a"), "problems": ["unpushed:a"]}]), ()),
+                          (dict(), ["uncommitted:x"])):  # the cwd itself is dirty, no worktree owned
+            with self.subTest(kw=kw, cwd_problems=probs):
+                _, v = self.view(last_text=self.SEC_P1, wt_problems=probs, **kw)
+                self.assertEqual(v["would_close"], "")
+
+    def test_no_other_gate_is_overridden(self):
+        cases = {"background child": dict(bg_shells=[1]), "not idle long enough": dict(idle_min=30),
+                 "busy": dict(status="busy"), "protected": dict(tmux="keep-me"), "uiux": dict(tmux="uiux-1"),
+                 "homepage by name": dict(name="Homepage"), "subagent": dict(sub_active=2),
+                 "loop": dict(loop=True), "scheduled": dict(crons=1), "prompt": dict(screen_tail="do you want to proceed"),
+                 "relay": dict(relay_pending=["9"])}
+        for label, kw in cases.items():
+            with self.subTest(label):
+                _, v = self.view(last_text=self.SEC_P1, **kw)
+                self.assertEqual(v["would_close"], "")
+
+    def test_the_verdict_itself_refuses_a_background_child_whatever_the_keep_list_says(self):
+        _, v = self.view(last_text=self.SEC_P1, bg_shells=[1], force_keep=["waiting"])
+        self.assertEqual(v["would_close"], "")
+
+    def test_a_kept_session_without_a_close_line_is_not_would_close(self):
+        _, v = self.view(last_text="I am waiting for your approval of the plan.")
+        self.assertEqual(v["would_close"], "")
+
+
+    def test_progress_or_conditional_wording_is_not_a_close_line(self):
+        for text in ("Done with step 1. Waiting for Leo to approve the payment.",
+                     "done: patch staged, needs authorization",
+                     "The PR can be closed once Leo approves",
+                     "Nothing left for me until you approve"):
+            with self.subTest(text):
+                _, v = self.view(last_text=text)
+                self.assertEqual(v["would_close"], "")
+
+    def test_the_named_issue_lookups_run_only_for_a_candidate(self):
+        calls = []
+        with mock.patch.object(reaper, "oracle_claims", side_effect=lambda *a: calls.append(1) or []):
+            self.view(last_text=self.SEC_P1 + " See #6200.", bg_shells=[1])
+            self.assertEqual(calls, [])
+            self.view(last_text=self.SEC_P1 + " See #6200.")
+            self.assertEqual(calls, [1])
+
+class SkippedAndApply(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        (self.tmp / "sessions").mkdir()
+        self.cfgfile = self.tmp / "conf"
+        self.cfgfile.write_text(f"APPLY=1\nDONE_INBOX=\nREPORT={self.tmp / 'report.md'}\nREAPED_DIR={self.tmp / 'reaped'}\n"
+                                f"IDLE_LIST_HOURS=0\n")
+
+    def write(self, fname, **d):
+        (self.tmp / "sessions" / f"{fname}.json").write_text(json.dumps(d))
+
+    def test_every_live_session_gather_does_not_return_is_listed_with_its_reason(self):
+        table = {10: (1, "A", "claude"), 11: (1, "B", "claude"), 12: (1, "C", "claude"), 13: (1, "D", "claude")}
+        self.write("a", kind="interactive", tmux="%1", pid=10, procStart="WRONG", sessionId="aaaaaaaa11", name="auth-audit")
+        self.write("b", kind="background", pid=11, sessionId="bbbbbbbb22")
+        self.write("c", kind="interactive", pid=12, procStart="C", sessionId="cccccccc33")
+        self.write("d", kind="interactive", tmux="%4", pid=13, procStart="D", sessionId="dddddddd44")
+        self.write("e", kind="interactive", tmux="%5", pid=99, procStart="E", sessionId="eeeeeeee55")
+        with mock.patch.object(reaper, "SESSIONS_DIR", self.tmp / "sessions"), \
+             mock.patch.object(reaper, "ps_table", return_value=table), \
+             mock.patch.object(reaper, "worktrees", return_value=[]), \
+             mock.patch.object(reaper, "pane_state", return_value=None):
+            self.assertEqual(reaper.gather(CFG, time.time()), [])
+        got = {label.split("pid=")[1]: (why, live) for label, why, live in reaper.SKIPPED}
+        self.assertEqual(got, {"10": ("procstart-mismatch", True), "11": ("kind:background", True),
+                               "12": ("no-tmux-field", True), "13": ("pane-missing:%4", True), "99": ("pid-gone", False)})
+        self.assertIn("auth-audit", [l for l, _, _ in reaper.SKIPPED][0])
+
+    def test_the_report_lists_skipped_live_sessions_and_counts_dead_files(self):
+        reaper.SKIPPED[:] = [("auth-audit tmux=%1 sid=aaaaaaaa pid=10", "procstart-mismatch", True),
+                             ("old sid=zz pid=99", "pid-gone", False)]
+        with mock.patch.object(reaper, "HOME", self.tmp), mock.patch.object(reaper, "gather", return_value=[]), \
+             mock.patch.object(reaper, "recover_exiting", return_value=[]), \
+             mock.patch.object(reaper, "alert"):
+            reaper.main(["--config", str(self.cfgfile)])
+        report = (self.tmp / "report.md").read_text()
+        self.assertIn("- auth-audit tmux=%1 sid=aaaaaaaa pid=10: procstart-mismatch", report)
+        self.assertNotIn("old sid=zz", report)
+        self.assertIn("(1 session files with no live process not listed)", report)
+
+    def test_apply_reports_would_close_and_closes_nothing(self):
+        s = session(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0, fg=True,
+                    last_text="Authorization fix merged. No open scope: the reaper can close this session.", name="sec-p1", tmux="sec-p1",
+                    sid="abcdef0123", sub_active=0, relay_pending=[], screen_tail="")
+        boom = AssertionError("closed a would-close session")
+        with mock.patch.object(reaper, "HOME", self.tmp), mock.patch.object(reaper, "gather", return_value=[s]), \
+             mock.patch.object(reaper, "recover_exiting", return_value=[]), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "reap", side_effect=boom) as reap, \
+             mock.patch.object(reaper, "tmux", side_effect=boom), mock.patch.object(reaper, "write_record", side_effect=boom), \
+             mock.patch.object(reaper, "alert") as alert:
+            rc = reaper.main(["--config", str(self.cfgfile), "--apply"])
+        self.assertEqual(rc, 0)
+        reap.assert_not_called()
+        alert.assert_not_called()
+        row = [l for l in (self.tmp / "report.md").read_text().splitlines() if l.startswith("| sec-p1")][0]
+        self.assertIn("| would-close |", row)
+        self.assertIn("would-close: no claim, close line", row)
+        self.assertEqual(reaper.decide(s, CFG, NOW0), ["waiting", "claim-unknown"])  # decide() itself still keeps it
+
+
 if __name__ == "__main__":
     unittest.main()
