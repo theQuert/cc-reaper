@@ -67,9 +67,8 @@ WAITING_RE = re.compile(
     r"production-authorization|authoriz|approv|授權|批准|等你|你決定|請確認", re.I
 )
 # A close line that is not SESSION-DONE: the session says it has no scope left (#6477).
-CLOSE_LINE_RE = re.compile(
-    r"no open scope|reaper can close|can be (?:closed|reaped)|safe to close|nothing (?:left|open|owed)"
-    r"|(?m:^\W*(?:DONE|IDLE-no-scope)\b)", re.I)
+# DONE / IDLE-no-scope are the self-labels, so only their exact case counts: "Done with step 1" is progress.
+CLOSE_LINE_RE = re.compile(r"(?i:no open scope|reaper can close|safe to close)|(?m:^\W*(?:DONE|IDLE-no-scope)\b)")
 BLOCKED_RE = re.compile(r"BLOCKED:#(\d{3,6})")
 NAMED_RE = re.compile(r"(?<![\w/])#(\d{3,6})\b")
 SOFT_KEEP = ("claim-unknown", "waiting")  # `waiting-keyword` also starts with `waiting`
@@ -783,13 +782,15 @@ def shadow_verdict(s, cfg, keep, now):
     idle = s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"])
     claims = list(s["claims"])
     marks = []
-    if idle:
-        claims += oracle_claims(s, cfg, now)
-        mine = [w["marker"] for w in s["owned"] if w.get("marker")]
-        for (r, n), b in zip(claims, [oracle_brief(r, n, cfg, now) for r, n in claims]):
+    mine = [w["marker"] for w in s["owned"] if w.get("marker")]
+
+    def judge(refs):
+        for (r, n), b in zip(refs, [oracle_brief(r, n, cfg, now) for r, n in refs]):
             for m in BLOCKED_RE.findall(b or ""):
                 block(m)
             marks.append(classify_claim(b, s["sid"], now, s.get("other_sids", ()), mine)[0])
+    if idle:
+        judge(claims)  # worktree claims: decide() already briefed them, so these hit the cache
     out = {"would_close": "", "blocked": blocked, "claims": claims}
     never = [n for n in (s["tmux"], s.get("name")) if n]
     if (not keep or not idle or blocked or s["asking"] or s["bg_shells"] or s.get("sub_active")
@@ -800,6 +801,12 @@ def shadow_verdict(s, cfg, keep, now):
     cwd_wt = [] if any(str(w["path"]) == s.get("cwd") for w in s["owned"]) or not s.get("cwd") \
         else [{"path": Path(s["cwd"])}]
     if any(worktree_state(w, cfg) for w in [*s["owned"], *cwd_wt]):
+        return out
+    # Only a session every cheap gate leaves standing pays for the oracle lookups of the issues its text names.
+    named = oracle_claims(s, cfg, now)
+    claims += named
+    judge(named)
+    if blocked:
         return out
     text = s["last_text"]
     if not claims:

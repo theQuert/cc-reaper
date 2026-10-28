@@ -977,6 +977,23 @@ class ShadowVerdict(unittest.TestCase):
         self.assertEqual(v["would_close"], "")
 
 
+    def test_progress_or_conditional_wording_is_not_a_close_line(self):
+        for text in ("Done with step 1. Waiting for Leo to approve the payment.",
+                     "done: patch staged, needs authorization",
+                     "The PR can be closed once Leo approves",
+                     "Nothing left for me until you approve"):
+            with self.subTest(text):
+                _, v = self.view(last_text=text)
+                self.assertEqual(v["would_close"], "")
+
+    def test_the_named_issue_lookups_run_only_for_a_candidate(self):
+        calls = []
+        with mock.patch.object(reaper, "oracle_claims", side_effect=lambda *a: calls.append(1) or []):
+            self.view(last_text=self.SEC_P1 + " See #6200.", bg_shells=[1])
+            self.assertEqual(calls, [])
+            self.view(last_text=self.SEC_P1 + " See #6200.")
+            self.assertEqual(calls, [1])
+
 class SkippedAndApply(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
