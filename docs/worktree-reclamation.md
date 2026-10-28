@@ -248,6 +248,25 @@ removed, and the trim never asked for landing; what a log changed for the trim i
 made the tree dirty, and a dirty tree is trimmed only after `CC_WJ_TRIM_DIRTY_IDLE_HOURS`
 (168).
 
+### Two more rules on probation: `pushed-idle` and `dirty-pressure`
+
+Both obey `CC_WJ_NEW_RULES_MODE` like the two pins above: `spotcheck` (the default) logs
+`rule=pushed-idle` or `rule=dirty-pressure` to the spot-check log and changes no decision; `auto` lets
+them decide.
+
+- **`pushed-idle`** (removal phase). A clean tree whose only reason to be kept is `KEEP(unlanded)`, whose
+  HEAD a `refs/remotes/origin/*` ref of this clone already contains (fetched state, no network), and
+  which has sat idle for `CC_WJ_PUSHED_IDLE_HOURS` (default 72, never shorter than the ordinary window;
+  0 turns the rule off). It is the case "Work origin already holds" cannot see: origin's live listing no
+  longer names the branch (deleted after a merge, or the listing failed) but the tracking ref still does.
+  Holders, live and recent sessions, claims, the deny list, task markers and the recheck before removal
+  all still decide, and removal takes the checkout only: the branch and its commits stay. A tree with
+  edits to snapshot (`wip`) is not reached, and `CC_WJ_RECLAIM_PUSHED=0` turns the rule off.
+- **`dirty-pressure`** (trim phase). Under disk pressure a dirty tree waits
+  `CC_WJ_TRIM_DIRTY_IDLE_HOURS_PRESSURE` (default 24; never longer than `CC_WJ_TRIM_DIRTY_IDLE_HOURS`;
+  0 turns it off) instead of 168 before its ignored regenerable directories are trimmed. Only those
+  directories are ever listed, so the uncommitted files stay. The ordinary knob at 0 still means never.
+
 ### Names nothing may touch
 
 `CC_WJ_DENY_NAMES` (whitespace-separated; the installed config sets
