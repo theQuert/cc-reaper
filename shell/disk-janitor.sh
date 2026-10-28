@@ -58,11 +58,18 @@ Environment:
                            (default: ~/.claude/hooks/node-modules-template.sh)
   CC_DJ_TEMPLATE_STORE  The template store (default: $NODE_MODULES_TEMPLATE_STORE or
                            ~/.claude/node-modules-templates)
-  CC_DJ_GO_BUILD_MAX_AGE_MIN  Under CC_DJ_ACT_LOW_FREE_GB free, the act deletes go build cache
+  CC_DJ_GO_BUILD_MAX_AGE_MIN  When the step runs (see CC_DJ_GO_BUILD_FREE_GB), it deletes go build cache
                            entries (regular files in the 00..ff subdirectories) unused this many
                            minutes, rule go-build-age, or `off` (default: 120, minimum 60: Go
                            refreshes a used entry's mtime at most hourly); see CC_DJ_NEW_STEPS_MODE
   CC_DJ_GO_BUILD_DIR    The go build cache that step trims (default: `go env GOCACHE`)
+  CC_DJ_GO_BUILD_CAP_GB  The go-build-age step also runs, whatever the free space, when the cache is
+                           over this many GB (decimals allowed; measured with a bounded `du -sk`),
+                           or `off` (default: 8)
+  CC_DJ_GO_BUILD_FREE_GB  ... and when free space is under this many GB, a soft floor above
+                           CC_DJ_ACT_LOW_FREE_GB, or `off` (default: 35). Both obey
+                           CC_DJ_NEW_STEPS_MODE: spotcheck (default) logs decision=would-remove
+                           and deletes nothing.
   CC_DJ_NEW_STEPS_MODE  spotcheck or auto (default: spotcheck) for deletion steps added to the act
                            after 2026-10-24: spotcheck logs what it would remove, with size (and,
                            for templates, a per-path lsof result) to CC_DJ_SPOTCHECK_LOG and deletes
@@ -114,6 +121,12 @@ CC_DJ_ACT_TEMPLATES_PRUNE_DAYS="${CC_DJ_ACT_TEMPLATES_PRUNE_DAYS:-7}"
 # Under CC_DJ_ACT_LOW_FREE_GB the act deletes go build cache entries unused this many minutes
 # (rule go-build-age; a new step, so CC_DJ_NEW_STEPS_MODE gates it).
 CC_DJ_GO_BUILD_MAX_AGE_MIN="${CC_DJ_GO_BUILD_MAX_AGE_MIN:-120}"
+# The same step also runs, independent of reclaim-byproducts.sh and of the low-disk act, when the go
+# build cache is over a size ceiling (GB, decimals allowed; `off` disables) or free space is under
+# a higher soft floor than CC_DJ_ACT_LOW_FREE_GB (GB; `off` disables). On 2026-10-24 reclaim-byproducts
+# was the only trimmer of that cache and it hung for hours (stima-api#5886).
+CC_DJ_GO_BUILD_CAP_GB="${CC_DJ_GO_BUILD_CAP_GB:-8}"
+CC_DJ_GO_BUILD_FREE_GB="${CC_DJ_GO_BUILD_FREE_GB:-35}"
 # Deletion steps added to the act run in spot-check mode (log, delete nothing) until an
 # operator switches them to auto. Existing, already-automatic steps are not gated by this.
 CC_DJ_NEW_STEPS_MODE="${CC_DJ_NEW_STEPS_MODE:-spotcheck}"
@@ -482,10 +495,63 @@ _cc_dj_act_template_prune() {
   return 0
 }
 
+# A non-negative decimal number of GB as whole KiB. Status 1 for anything else.
+_cc_dj_gb_to_kb() {
+  case "$1" in ''|*[!0-9.]*|.|*.*.*) return 1 ;; esac
+  awk -v g="$1" 'BEGIN { printf "%d", g * 1048576 }'
+}
+
+# Open files under a directory, for the go build cache step: ONE system-wide `lsof -nP -Fn`
+# right before a delete, filtered by prefix, never a per-file lsof over ~100k entries. Writes the
+# held paths (spelled under $1) to $2 and returns 0 when the listing is usable. An lsof that
+# cannot report (missing, it timed out after CC_DJ_HOLDER_TIMEOUT_SECONDS, it exited non-zero, it
+# cannot even see this shell's working directory, or lists no path) returns 1: unknown is held,
+# and the caller deletes nothing.
+_cc_dj_go_build_held() {  # <dir> <outfile>
+  local dir="$1" out="$2" snap real rc=0 t="${CC_DJ_HOLDER_TIMEOUT_SECONDS:-120}"
+  case "$t" in ''|*[!0-9]*|0) t=120 ;; esac
+  _cc_dj_lsof_usable || return 1
+  snap="$(mktemp "${TMPDIR:-/tmp}/go-build-lsof.XXXXXX")" || return 1
+  # Bounded, and with -b (no kernel call that can block): on a dead network mount an unbounded
+  # system-wide lsof hangs the whole --check and the growth-watch alert after it. A timeout, or
+  # any non-zero exit even with part of a listing, is not a listing: unknown is held.
+  _cc_dj_run_bounded "$t" lsof -nP -b -Fn > "$snap" 2>/dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$snap"; return 1; fi
+  if ! grep -q '^n/' "$snap"; then rm -f "$snap"; return 1; fi
+  real="$(cd "$dir" 2>/dev/null && pwd -P)" || real="$dir"
+  awk -v a="$dir/" -v b="$real/" '
+    /^n/ { n = substr($0, 2)
+           if (index(n, a) == 1) print n
+           else if (index(n, b) == 1) print a substr(n, length(b) + 1) }' "$snap" > "$out"
+  rm -f "$snap"
+  return 0
+}
+
+# How many listed entries ($2, NUL-separated) are in the held set ($1, one path per line).
+_cc_dj_go_build_count_held() {  # <held> <list>
+  [ -s "$1" ] || { printf 0; return; }
+  perl -e 'open(H, "<", $ARGV[0]) or exit 2; my %h; while (<H>) { chomp; $h{$_} = 1 } close H;
+           $/ = "\0"; open(L, "<", $ARGV[1]) or exit 2; my $n = 0;
+           while (my $f = <L>) { chomp $f; $n++ if $h{$f} } print $n' "$1" "$2" 2>/dev/null || printf unknown
+}
+# The listed entries ($2) that are not in the held set ($1), NUL-separated, in order. Nonzero when
+# it could not be built, and the caller then deletes nothing.
+_cc_dj_go_build_unheld() {  # <held> <list>
+  perl -e 'open(H, "<", $ARGV[0]) or exit 2; my %h; while (<H>) { chomp; $h{$_} = 1 } close H;
+           $/ = "\0"; open(L, "<", $ARGV[1]) or exit 2;
+           while (my $f = <L>) { chomp $f; print $f, "\0" unless $h{$f} } close STDOUT or exit 3' "$1" "$2"
+}
+
 # Go build cache age trim (rule go-build-age), a step added to the act after 2026-10-24
-# (stima-api#5886). It runs only under CC_DJ_ACT_LOW_FREE_GB (the CI heavy-slot floor), where
-# the skills hook's pressure trim above has not freed enough, and deletes entries unused for
-# CC_DJ_GO_BUILD_MAX_AGE_MIN minutes.
+# (stima-api#5886). It runs when any of three triggers holds, and deletes entries unused for
+# CC_DJ_GO_BUILD_MAX_AGE_MIN minutes:
+#   low-free   free space under CC_DJ_ACT_LOW_FREE_GB (the CI heavy-slot floor), where the skills
+#              hook's pressure trim above has not freed enough;
+#   soft-free  free space under CC_DJ_GO_BUILD_FREE_GB (default 35), the earlier floor;
+#   over-cap   the cache itself over CC_DJ_GO_BUILD_CAP_GB (default 8), measured with one bounded
+#              `du -sk`, whatever the free space.
+# The last two also run from --check outside the act (_cc_dj_go_build_guard), so the cache is held
+# down without reclaim-byproducts.sh, which was its only trimmer and hung for hours on 2026-10-24.
 #
 # mtime is the LRU signal: Go refreshes an entry's mtime each time a build uses it, at most once
 # an hour (cmd/go/internal/cache, mtimeInterval), and its own trim deletes by the same mtime after
@@ -495,7 +561,10 @@ _cc_dj_act_template_prune() {
 # No per-file lsof, unlike the template prune: Go treats a missing, truncated or mismatched entry
 # as a cache miss and rebuilds it, a build that already opened a file keeps reading it after the
 # unlink, and an entry being written right now is minutes old, never a candidate. Per-file lsof
-# over ~100k entries would also cost more than the step frees time for. Only regular files one
+# over ~100k entries would also cost more than the step frees time for. What it does instead is ONE
+# system-wide lsof listing taken right before the delete: an entry any process holds open is taken
+# off the list, and an lsof that cannot report deletes nothing (verdict=nothing-deleted
+# reason=lsof-unusable). Only regular files one
 # level under the two-hex-digit subdirectories: never README, trim.txt or other top-level files
 # (an old testexpire.txt deleted would make expired test results valid again), never the
 # directories, never through a symlink (find does not follow them, and a symlinked cache root
@@ -509,6 +578,7 @@ _cc_dj_act_template_prune() {
 _cc_dj_act_go_build_age() {
   local step_before="$1" age="$CC_DJ_GO_BUILD_MAX_AGE_MIN" mode="$CC_DJ_NEW_STEPS_MODE"
   local low_gb dir why slog runid list sizes bound deadline left rc count bytes sample label
+  local trigger soft_kb cap_kb cache_kb="" du_out mbound held held_n=0 keep kept_n
   _CC_DJ_STEP_LINES=""
   label="go build cache age trim"
   [ "$age" = off ] && return 0
@@ -523,13 +593,9 @@ _cc_dj_act_go_build_age() {
     _CC_DJ_STEP_LINES="- ERROR: $label not run (CC_DJ_GO_BUILD_MAX_AGE_MIN=$age is under 60)"
     return 0
   fi
-  # The act validated CC_DJ_ACT_LOW_FREE_GB and CC_DJ_ACT_TRIM_SECONDS before calling.
+  # The caller validated CC_DJ_ACT_LOW_FREE_GB and CC_DJ_ACT_TRIM_SECONDS before calling.
   low_gb=$((10#$CC_DJ_ACT_LOW_FREE_GB))
   case "$step_before" in ''|*[!0-9]*) _CC_DJ_STEP_LINES="- $label: free space unreadable; not run"; return 0 ;; esac
-  if [ "$step_before" -ge $(( low_gb * 1048576 )) ]; then
-    _CC_DJ_STEP_LINES="- $label: not run, free $(_cc_dj_fmt_kb_delta "$step_before") is not under ${low_gb} GB"
-    return 0
-  fi
   case "$mode" in
     spotcheck|auto) ;;
     *) _cc_dj_log "act: CC_DJ_NEW_STEPS_MODE=$mode is not spotcheck or auto; using spotcheck"; mode=spotcheck ;;
@@ -559,13 +625,50 @@ _cc_dj_act_go_build_age() {
     _CC_DJ_STEP_LINES="- $label: not run ($dir is protected: $why)"
     return 0
   fi
+  bound=$(( 10#$CC_DJ_ACT_TRIM_SECONDS / 3 )); [ "$bound" -ge 1 ] || bound=1
+  # Why it runs. Free space first (no measuring), the cache's own size last (one bounded du).
+  trigger=""
+  if [ "$step_before" -lt $(( low_gb * 1048576 )) ]; then
+    trigger="low-free"
+  else
+    if [ "$CC_DJ_GO_BUILD_FREE_GB" != off ]; then
+      if soft_kb="$(_cc_dj_gb_to_kb "$CC_DJ_GO_BUILD_FREE_GB")"; then
+        [ "$step_before" -lt "$soft_kb" ] && trigger="soft-free"
+      else
+        _cc_dj_log "ERROR act: CC_DJ_GO_BUILD_FREE_GB=$CC_DJ_GO_BUILD_FREE_GB is not a number of GB or off; the soft free-space trigger is off"
+      fi
+    fi
+    if [ -z "$trigger" ] && [ "$CC_DJ_GO_BUILD_CAP_GB" != off ]; then
+      if cap_kb="$(_cc_dj_gb_to_kb "$CC_DJ_GO_BUILD_CAP_GB")"; then
+        du_out="$CC_DJ_STATE_DIR/go-build-age.$$.du"
+        mbound=$bound; [ "$mbound" -le 120 ] || mbound=120
+        rc=0
+        _cc_dj_run_bounded "$mbound" /bin/sh -c 'exec /usr/bin/du -sk "$1" > "$2" 2>/dev/null' _ "$dir" "$du_out" || rc=$?
+        cache_kb="$(awk 'NR == 1 && $1 ~ /^[0-9]+$/ { print $1 }' "$du_out" 2>/dev/null)"
+        rm -f "$du_out"
+        if [ "$rc" -eq 124 ] || [ -z "$cache_kb" ]; then
+          # Unmeasured is not over the cap: the free-space triggers still stand, and nothing is
+          # deleted on a guess. Said in the log so a cache nobody could measure is not silent.
+          _cc_dj_log "act: go build cache $dir could not be measured within ${mbound}s (rc=$rc); the cap trigger did not run"
+          cache_kb=""
+        elif [ "$cache_kb" -ge "$cap_kb" ]; then
+          trigger="over-cap"
+        fi
+      else
+        _cc_dj_log "ERROR act: CC_DJ_GO_BUILD_CAP_GB=$CC_DJ_GO_BUILD_CAP_GB is not a number of GB or off; the size cap trigger is off"
+      fi
+    fi
+  fi
+  if [ -z "$trigger" ]; then
+    _CC_DJ_STEP_LINES="- $label: not run, free $(_cc_dj_fmt_kb_delta "$step_before") is not under ${low_gb} GB (soft floor ${CC_DJ_GO_BUILD_FREE_GB}) and the cache is $([ -n "$cache_kb" ] && _cc_dj_fmt_kb_delta "$cache_kb" || printf 'not measured'), not over the ${CC_DJ_GO_BUILD_CAP_GB} GB cap"
+    return 0
+  fi
   slog="${CC_DJ_SPOTCHECK_LOG:-$HOME/.cc-reaper/logs/spotcheck-disk-janitor.log}"
   mkdir -p "$(dirname "$slog")" 2>/dev/null || true
   runid="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
   _cc_dj_spot() { printf '[%s] run=%s step=go-build-age %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$runid" "$*" >> "$slog" 2>/dev/null || true; }
-  _cc_dj_spot "start mode=$mode rule=go-build-age dir=$dir max_age_min=$age"
+  _cc_dj_spot "start mode=$mode rule=go-build-age dir=$dir max_age_min=$age trigger=$trigger${cache_kb:+ cache_kb=$cache_kb}"
   list="$CC_DJ_STATE_DIR/go-build-age.$$.list"; sizes="$CC_DJ_STATE_DIR/go-build-age.$$.sizes"
-  bound=$(( 10#$CC_DJ_ACT_TRIM_SECONDS / 3 )); [ "$bound" -ge 1 ] || bound=1
   deadline=$(( $(date +%s) + bound ))
   # find does not follow symlinks (-P is its default): a symlinked hex directory is not
   # descended, and a symlinked entry is not -type f.
@@ -596,20 +699,40 @@ _cc_dj_act_go_build_age() {
     _cc_dj_spot "end mode=$mode rule=go-build-age count=0 bytes=0 verdict=none"
     _CC_DJ_STEP_LINES="- $label ($mode): no entry in $dir unused for ${age}+ min"
   elif [ "$mode" = spotcheck ]; then
-    _cc_dj_spot "end mode=spotcheck rule=go-build-age count=$count bytes=$bytes verdict=would-remove sample=$sample"
-    _CC_DJ_STEP_LINES="- $label (spotcheck, rule go-build-age): would remove $count entries ($bytes bytes) unused ${age}+ min in $dir; nothing deleted; run=$runid in $slog"
+    # What an auto run would skip: the entries a process holds open right now, from one lsof.
+    held="$CC_DJ_STATE_DIR/go-build-age.$$.held"
+    if _cc_dj_go_build_held "$dir" "$held"; then held_n="$(_cc_dj_go_build_count_held "$held" "$list")"; else held_n="unknown"; fi
+    rm -f "$held"
+    _cc_dj_spot "end mode=spotcheck rule=go-build-age count=$count bytes=$bytes verdict=would-remove decision=would-remove trigger=$trigger held=$held_n sample=$sample"
+    _CC_DJ_STEP_LINES="- $label (spotcheck, rule go-build-age): would remove $count entries ($bytes bytes) unused ${age}+ min in $dir; trigger $trigger; nothing deleted; run=$runid in $slog"
   else
     left=$(( deadline - $(date +%s) ))
     if [ "$left" -lt 1 ]; then
-      _cc_dj_spot "end mode=auto rule=go-build-age count=$count bytes=$bytes verdict=nothing-deleted reason=budget-spent"
+      _cc_dj_spot "end mode=auto rule=go-build-age count=$count bytes=$bytes verdict=nothing-deleted reason=budget-spent trigger=$trigger"
       _CC_DJ_STEP_LINES="- $label (auto): the ${bound}s bound was spent listing $count entries; nothing deleted; run=$runid in $slog"
     else
+      # The listing may be minutes old and the lsof is taken now: an entry a process holds open
+      # is taken off the list, and an lsof that cannot report deletes nothing.
+      held="$CC_DJ_STATE_DIR/go-build-age.$$.held"; keep="$CC_DJ_STATE_DIR/go-build-age.$$.keep"
+      if ! _cc_dj_go_build_held "$dir" "$held"; then
+        rm -f "$held" "$keep"
+        _cc_dj_spot "end mode=auto rule=go-build-age count=$count bytes=$bytes verdict=nothing-deleted reason=lsof-unusable trigger=$trigger"
+        _CC_DJ_STEP_LINES="- $label (auto): lsof cannot report open files, so holders cannot be ruled out; nothing deleted; run=$runid in $slog"
+        unset -f _cc_dj_spot; rm -f "$list" "$sizes"
+        return 0
+      fi
+      held_n="$(_cc_dj_go_build_count_held "$held" "$list")"
+      _cc_dj_go_build_unheld "$held" "$list" > "$keep" 2>/dev/null || { : > "$keep"; held_n="unknown"; }
+      kept_n="$(tr -cd '\000' < "$keep" 2>/dev/null | wc -c | tr -d ' ')"; kept_n="${kept_n:-0}"
       # rm -f without -r: a path that became a directory since the listing is left; a path
       # that became a symlink loses the link, never its target.
       rc=0
-      _cc_dj_run_bounded "$left" /bin/sh -c 'exec xargs -0 rm -f -- < "$1"' _ "$list" >/dev/null 2>&1 || rc=$?
-      _cc_dj_spot "end mode=auto rule=go-build-age count=$count bytes=$bytes rc=$rc verdict=removed sample=$sample"
-      _CC_DJ_STEP_LINES="- $label (auto, rule go-build-age): removed $count entries ($bytes bytes listed) unused ${age}+ min in $dir (rc=$rc; $(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before ))) freed); run=$runid in $slog"
+      if [ "$kept_n" -gt 0 ]; then
+        _cc_dj_run_bounded "$left" /bin/sh -c 'exec xargs -0 rm -f -- < "$1"' _ "$keep" >/dev/null 2>&1 || rc=$?
+      fi
+      _cc_dj_spot "end mode=auto rule=go-build-age count=$count bytes=$bytes rc=$rc verdict=removed trigger=$trigger removed=$kept_n held=$held_n sample=$sample"
+      _CC_DJ_STEP_LINES="- $label (auto, rule go-build-age): removed $count entries ($bytes bytes listed) unused ${age}+ min in $dir; trigger $trigger (rc=$rc; $(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before ))) freed)$([ "$held_n" != 0 ] && printf '; %s held open and kept' "$held_n"); run=$runid in $slog"
+      rm -f "$held" "$keep"
     fi
   fi
   unset -f _cc_dj_spot; rm -f "$list" "$sizes"
@@ -622,9 +745,12 @@ _cc_dj_act_go_build_age() {
 # minutes (stima-api#3337). GB, not %, because the floor that matters is the CI's 20 GB.
 #
 # Each step is the owner's own reclaimer, bounded and safe beside running work: the skills
-# hook's pressure trim of the go cache (idle entries first, never a clear for pressure); under
-# CC_DJ_ACT_LOW_FREE_GB the go build cache age trim (go-build-age) and, always, the node-modules
-# template prune, both gated by CC_DJ_NEW_STEPS_MODE; then the worktree janitor's regenerable trim (unheld, unclaimed trees only; trees and branches
+# hook's pressure trim of the go cache (idle entries first, never a clear for pressure); the go
+# build cache age trim (go-build-age) and, always, the node-modules template prune, both gated by
+# CC_DJ_NEW_STEPS_MODE. The act itself runs only below CC_DJ_ACT_FREE_GB (30), which is under the
+# step's soft floor (CC_DJ_GO_BUILD_FREE_GB, 35), so the step's effective free-space trigger inside
+# the act is that 30 GB, not CC_DJ_ACT_LOW_FREE_GB (20), which only picks the label and the shorter
+# cooldown; then the worktree janitor's regenerable trim (unheld, unclaimed trees only; trees and branches
 # stay). Chrome clones and host temp already ran above. One run at a time (a lock), and
 # at most one per CC_DJ_ACT_COOLDOWN_SECS, so hourly checks do not stack. The record goes
 # to CC_DJ_ALERT_ISSUE, where a person reads it; the desktop notification stays as well.
@@ -676,6 +802,7 @@ _cc_dj_low_disk_act() {
   fi
 
   step_before="$(_cc_dj_free_kb)"
+  _CC_DJ_GO_BUILD_RAN=1
   _cc_dj_act_go_build_age "$step_before"
   [ -z "$_CC_DJ_STEP_LINES" ] || body="$body"$'\n'"$_CC_DJ_STEP_LINES"
 
@@ -710,6 +837,29 @@ _cc_dj_low_disk_act() {
   while IFS= read -r rc; do _cc_dj_log "act: $rc"; done <<< "$body"
 
   _cc_dj_alert act "$body"
+}
+
+# The go build cache guard, from --check, independent of the low-disk act and of
+# reclaim-byproducts.sh (stima-api#5886): the cache over its size ceiling, or free space under the
+# soft floor, runs the same go-build-age step the act runs (spot-check by default: it logs
+# decision=would-remove and deletes nothing). Skipped when the act already ran the step in this
+# check, when CC_DJ_ACT_FREE_GB=off (the operator's switch for every action), and when both new
+# triggers are off. Log only: the act's alert comment is not posted for it.
+_CC_DJ_GO_BUILD_RAN=0
+_cc_dj_go_build_guard() {
+  local v line
+  [ "$_CC_DJ_GO_BUILD_RAN" = 1 ] && return 0
+  [ "$CC_DJ_ACT_FREE_GB" = off ] && return 0
+  [ "$CC_DJ_GO_BUILD_CAP_GB" = off ] && [ "$CC_DJ_GO_BUILD_FREE_GB" = off ] && return 0
+  for v in CC_DJ_ACT_LOW_FREE_GB CC_DJ_ACT_TRIM_SECONDS; do
+    case "${!v}" in ''|*[!0-9]*) _cc_dj_log "go-build guard: $v=${!v} is not a number; not run"; return 0 ;; esac
+  done
+  _CC_DJ_GO_BUILD_RAN=1
+  _cc_dj_act_go_build_age "$(_cc_dj_free_kb)"
+  while IFS= read -r line; do
+    [ -z "$line" ] || _cc_dj_log "go-build guard: ${line#- }"
+  done <<< "$_CC_DJ_STEP_LINES"
+  return 0
 }
 
 # Comment $2 on CC_DJ_ALERT_ISSUE (owner/repo#N) when it is set; $1 prefixes the log lines.
@@ -780,6 +930,8 @@ _cc_dj_check() {
   fi
   # By GB, apart from the % notice above: 30 GB is 6% of this host's volume.
   _cc_dj_low_disk_act "$(_cc_dj_free_kb)"
+  # The go build cache, whatever the free space: over its size ceiling, or under the soft floor.
+  _cc_dj_go_build_guard
   # Last, because it can spend its budget plus one per-target timeout, and a disk that is
   # filling must not wait that long for its alert.
   _cc_dj_growth_watch

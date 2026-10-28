@@ -160,6 +160,17 @@ RB_STATE_DIR="${CC_RB_STATE_DIR:-$HOME/.cc-reaper/state}"
 SCRATCH_BUDGET_SECONDS="${CC_RB_SCRATCH_BUDGET_SECONDS:-900}"
 SCRATCH_CURSOR="${CC_RB_SCRATCH_CURSOR:-$RB_STATE_DIR/reclaim-byproducts.scratch-cursor}"
 CODEX_SESSIONS_DIR="${BYPRODUCT_CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
+# The transcript lookup (build_mention_index) is one pass over every transcript written in the
+# window, and it is not free: the Codex sessions directory alone is ~21 GB on this machine. Two
+# guards (stima-api#5886). (1) It is cached under the state directory and rebuilt only when the
+# corpus fingerprint changes (CHEAP-DETECT: a hash of each window transcript's mtime and size, so
+# the newest mtime, the total size and the file set are all in it). (2) It has its own hard time
+# budget, whole seconds, 0 = none, because it runs before the per-directory budget above can stop
+# anything. A lookup that does not finish fails closed: the phase judges nothing, every directory
+# is kept, and the run is not stamped.
+MENTION_BUDGET_SECONDS="${CC_RB_MENTION_BUDGET_SECONDS:-600}"
+MENTION_CACHE="${CC_RB_MENTION_CACHE:-$RB_STATE_DIR/reclaim-byproducts.mention-index}"
+GREP_BIN="${BYPRODUCT_GREP_BIN:-grep}"
 
 # The minimum age of an ANONYMOUS VOLUME, which was the line above until 2026-09-13 and is
 # not the same question. A volume an `--ephemeral` CI runner container left is dead the
@@ -415,6 +426,10 @@ case "$SCRATCH_BUDGET_SECONDS" in
   ''|*[!0-9]*|????????*) echo "byproducts: CC_RB_SCRATCH_BUDGET_SECONDS=$SCRATCH_BUDGET_SECONDS is not a whole number of seconds; using 900" >&2; SCRATCH_BUDGET_SECONDS=900 ;;
   *) SCRATCH_BUDGET_SECONDS=$((10#$SCRATCH_BUDGET_SECONDS)) ;;
 esac
+case "$MENTION_BUDGET_SECONDS" in
+  ''|*[!0-9]*|????????*) echo "byproducts: CC_RB_MENTION_BUDGET_SECONDS=$MENTION_BUDGET_SECONDS is not a whole number of seconds; using 600" >&2; MENTION_BUDGET_SECONDS=600 ;;
+  *) MENTION_BUDGET_SECONDS=$((10#$MENTION_BUDGET_SECONDS)) ;;
+esac
 case "$NEW_RULES_MODE" in
   auto|spotcheck) ;;
   *) echo "byproducts: CC_RB_NEW_RULES_MODE=$NEW_RULES_MODE is not auto or spotcheck; using spotcheck" >&2; NEW_RULES_MODE=spotcheck ;;
@@ -626,30 +641,137 @@ resumable_session_ids() {
   done < "$CLOSED_SESSIONS_FILE"
 }
 
+# Run "$@" for at most $1 seconds in its own process group, and kill the whole group when the time
+# is up (a pipeline's xargs and grep children included). Stdin, stdout and stderr pass through.
+# Status: the command's, or 124 when it was stopped. $1 = 0 runs it unbounded.
+bounded_group() {
+  local secs="$1"; shift
+  if [ "$secs" -le 0 ]; then "$@"; return; fi
+  perl -e '
+    my $secs = shift @ARGV;
+    my $pid = fork; defined $pid or exit 125;
+    if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 }
+    setpgrp($pid, $pid);  # the parent too, so the group exists before the child is scheduled
+    $SIG{ALRM} = sub { kill "KILL", -$pid; kill "KILL", $pid; waitpid $pid, 0; exit 124 };
+    # launchd stops a job with TERM: take the whole group down with the wrapper, never an orphan.
+    my %num = (HUP => 1, INT => 2, TERM => 15);
+    for my $sig (keys %num) { $SIG{$sig} = sub { kill "KILL", -$pid; kill "KILL", $pid; waitpid $pid, 0; exit 128 + $num{$sig} } }
+    alarm $secs;
+    waitpid $pid, 0; my $st = $?; alarm 0;
+    exit($st & 127 ? 128 + ($st & 127) : $st >> 8);' "$secs" "$@"
+}
+
+# A fingerprint of the transcript corpus and of everything the index depends on besides the
+# files: the window, the scratch root's name and the caller's own session id (its transcript is
+# skipped). One stat per file, no read: the file set, each file's mtime and size. Prints it, or
+# nothing when it could not be taken whole (status 124 when the time ran out, 1 otherwise), and
+# the caller then neither reuses nor writes the cache.
+mention_fingerprint() {  # <listfile> <seconds-left>
+  local root="${SCRATCH_ROOT##*/}" statf rc=0
+  statf="$(mktemp "${TMPDIR:-/tmp}/byproducts-fp.XXXXXX")" || return 1
+  if [ -s "$1" ]; then
+    bounded_group "$2" /bin/sh -c 'xargs -0 /usr/bin/stat -f "%m %z %N" < "$1" > "$2"' _ "$1" "$statf" 2>/dev/null || rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then rm -f "$statf"; [ "$rc" -eq 124 ] && return 124; return 1; fi
+  { printf 'v2 %s %s %s %s\n' "$root" "$IDLE_HOURS" "${CLAUDE_CODE_SESSION_ID:-}" \
+      "$({ printf '%s\n%s\n' "$MENTION_RE_TMPL" "$MENTION_AWK"; } | { shasum -a 256 2>/dev/null || cksum; } | awk '{ print $1 }')"
+    LC_ALL=C sort "$statf"; } \
+    | { shasum -a 256 2>/dev/null || cksum; } | awk '{ print $1 }'
+  rm -f "$statf"
+}
+
+# The extraction rule: the regex (@ROOT@ is the scratch root's name) and the awk program that
+# turns the matches into the index. Both are hashed into the cache key (mention_fingerprint), so
+# a change to either can never be served an index built by the other.
+MENTION_RE_TMPL='@ROOT@/[^/" \\]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+MENTION_AWK='{
+        n = split($1, a, "/"); f = a[n]
+        if (self != "" && f == self ".jsonl") next
+        m = $2; sub(/^[^\/]*\//, "", m); print m "\t" f }'
+# Why a lookup ended with status 2 when it was not the clock (empty for the clock); for the log.
+MENTION_WHY=""
+
 # Which scratchpads do transcripts written in the window NAME - the old mention rule, read
 # once. Lines of `<project>/<session-id><TAB><transcript>` in $1. The caller's own
-# transcript is skipped, as path-in-use.sh skips it. 0 when the index could be built; a
-# project directory that cannot be searched is "unknown", and the caller then leaves every
-# directory to path-in-use.sh as before.
+# transcript is skipped, as path-in-use.sh skips it. Status: 0 when the index could be built (or
+# reused, see mention_fingerprint: unchanged corpus, same index); 1 when a project directory
+# cannot be searched, and the caller then leaves every directory to path-in-use.sh as before; 2
+# when the lookup did not finish within MENTION_BUDGET_SECONDS, and the caller keeps everything.
+# The old answer for a path was one `grep -qF` per spelling per transcript; this is one pass for
+# every path, and no pass at all while the corpus is unchanged.
 build_mention_index() {  # <outfile>
-  local d any=0 root; root="${SCRATCH_ROOT##*/}"
+  local d any=0 root rc left start=$SECONDS work list fp="" budget="$MENTION_BUDGET_SECONDS"
+  root="${SCRATCH_ROOT##*/}"
   for d in "$PROJECTS_DIR" "$CODEX_SESSIONS_DIR"; do
     [ -d "$d" ] || continue
     [ -r "$d" ] && [ -x "$d" ] || return 1
     any=1
   done
   [ "$any" -eq 1 ] || return 1
-  {
-    for d in "$PROJECTS_DIR" "$CODEX_SESSIONS_DIR"; do
-      [ -d "$d" ] || continue
-      "$FIND" "$d" -name '*.jsonl' -mmin -"$((IDLE_HOURS * 60))" -type f -print0 2>/dev/null
-    done
-  } | xargs -0 grep -HoE "$root/[^/\" \\\\]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" 2>/dev/null \
-    | awk -F: -v self="${CLAUDE_CODE_SESSION_ID:-}" '{
-        n = split($1, a, "/"); f = a[n]
-        if (self != "" && f == self ".jsonl") next
-        m = $2; sub(/^[^\/]*\//, "", m); print m "\t" f }' \
-    | sort -u > "$1"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/byproducts-mention.XXXXXX")" || return 1
+  list="$work/list"; : > "$list"
+  # The seconds left of the lookup's budget; 0 when none is set. At the end of it: out of time.
+  _mention_left() {
+    left=0
+    [ "$budget" -gt 0 ] || return 0
+    left=$((budget - (SECONDS - start)))
+    [ "$left" -gt 0 ] || return 1
+  }
+  for d in "$PROJECTS_DIR" "$CODEX_SESSIONS_DIR"; do
+    [ -d "$d" ] || continue
+    _mention_left || { rm -rf "$work"; return 2; }
+    bounded_group "$left" "$FIND" "$d" -name '*.jsonl' -mmin -"$((IDLE_HOURS * 60))" -type f -print0 >> "$list" 2>/dev/null
+    rc=$?
+    [ "$rc" -ne 124 ] || { rm -rf "$work"; return 2; }
+    # Only a clean find is a whole file list. A find that could not read a directory (or died)
+    # says nothing about the transcripts in it, and an index built without them reads as "nobody
+    # names this path": keep everything, as for the clock.
+    [ "$rc" -eq 0 ] || { MENTION_WHY="find exited $rc in $d"; rm -rf "$work"; return 2; }
+  done
+  _mention_left || { rm -rf "$work"; return 2; }
+  fp="$(mention_fingerprint "$list" "$left")" || { rc=$?; [ "$rc" -ne 124 ] || { rm -rf "$work"; return 2; }; fp=""; }
+  if [ -n "$fp" ] && [ -r "$MENTION_CACHE" ] && [ "$(cat "$MENTION_CACHE.fp" 2>/dev/null)" = "$fp" ]; then
+    if cp "$MENTION_CACHE" "$1" 2>/dev/null; then
+      log "scratchpads: transcript index reused (corpus unchanged, fingerprint ${fp:0:12})"
+      rm -rf "$work"; return 0
+    fi
+  fi
+  _mention_left || { rm -rf "$work"; return 2; }
+  if [ -s "$list" ]; then
+    # One grep per batch of files. A batch with no match exits 1, which is an answer. 2 or more
+    # (an error; 127, a binary that is not there) and death by a signal are not: grep1.sh turns
+    # those into 255, which stops xargs, and leaves grep's status in err. Only xargs ending 0 with
+    # no err is a whole index; anything else, a signalled child included, is a lookup that did
+    # not finish, and an empty or partial index is never used or cached.
+    cat > "$work/grep1.sh" <<'GREP1'
+g="$1"; re="$2"; err="$3"; shift 3
+"$g" -HoE "$re" "$@"; r=$?
+[ "$r" -le 1 ] || { echo "$r" > "$err"; exit 255; }
+exit 0
+GREP1
+    bounded_group "$left" /bin/sh -c 'xargs -0 /bin/sh "$1" "$2" "$3" "$4" < "$5"' _ "$work/grep1.sh" \
+      "$GREP_BIN" "${MENTION_RE_TMPL/@ROOT@/$root}" "$work/err" "$list" > "$work/raw" 2>/dev/null
+    rc=$?
+    if [ -e "$work/err" ]; then MENTION_WHY="grep exited $(cat "$work/err" 2>/dev/null)"; rm -rf "$work"; return 2; fi
+    [ "$rc" -ne 124 ] || { rm -rf "$work"; return 2; }
+    [ "$rc" -eq 0 ] || { MENTION_WHY="the grep pass ended with status $rc"; rm -rf "$work"; return 2; }
+  else
+    : > "$work/raw"
+  fi
+  awk -F: -v self="${CLAUDE_CODE_SESSION_ID:-}" "$MENTION_AWK" "$work/raw" | sort -u > "$work/index" || { rm -rf "$work"; return 1; }
+  cp "$work/index" "$1" 2>/dev/null || { rm -rf "$work"; return 1; }
+  # Cached only by a run that can delete: a dry run writes nothing. The fingerprint goes last,
+  # and is removed first, so a torn write reads as a miss, never as a match.
+  if [ "$DRY" -eq 0 ] && [ -n "$fp" ]; then
+    mkdir -p "$(dirname "$MENTION_CACHE")" 2>/dev/null
+    rm -f "$MENTION_CACHE.fp" 2>/dev/null
+    if cp "$work/index" "$MENTION_CACHE.tmp.$$" 2>/dev/null && mv -f "$MENTION_CACHE.tmp.$$" "$MENTION_CACHE" 2>/dev/null; then
+      printf '%s\n' "$fp" > "$MENTION_CACHE.fp" 2>/dev/null || rm -f "$MENTION_CACHE.fp"
+    else
+      rm -f "$MENTION_CACHE.tmp.$$" 2>/dev/null
+    fi
+  fi
+  rm -rf "$work"
   return 0
 }
 
@@ -712,6 +834,19 @@ scratch_order() {
   done
 }
 
+# The time path-in-use.sh may spend on one directory: what is left of the phase's budget (at
+# least 1s, at most its own 600s default). Its answer for what it did not reach is UNKNOWN, and
+# UNKNOWN keeps the directory, so a stuck gate can no longer outlast the phase. No budget (0): its
+# own default.
+piu_timeout() {  # <phase-start-seconds>
+  local left
+  if [ "$SCRATCH_BUDGET_SECONDS" -le 0 ]; then printf 600; return; fi
+  left=$((SCRATCH_BUDGET_SECONDS - (SECONDS - $1)))
+  [ "$left" -ge 1 ] || left=1
+  [ "$left" -le 600 ] || left=600
+  printf '%s' "$left"
+}
+
 reap_scratchpads() {
   [ -d "$SCRATCH_ROOT" ] || { log "scratchpads: $SCRATCH_ROOT does not exist, nothing to reap"; return 0; }
   # /tmp is shared and the root is named by uid, so another account could have made it.
@@ -738,7 +873,21 @@ reap_scratchpads() {
   prot="$(protected_session_ids)"
   resum="$(resumable_session_ids)"
   midx="$(mktemp "${TMPDIR:-/tmp}/byproducts-mention.XXXXXX")" || midx=""
-  if [ -n "$midx" ] && build_mention_index "$midx"; then midx_ok=1; fi
+  local midx_rc=1
+  if [ -n "$midx" ]; then build_mention_index "$midx"; midx_rc=$?; fi
+  if [ "$midx_rc" -eq 0 ]; then midx_ok=1; fi
+  if [ "$midx_rc" -eq 2 ]; then
+    # Fail closed (stima-api#5886): a lookup that did not finish says nothing about which
+    # directories a transcript names, so none is judged and none is removed this run. The cursor
+    # is untouched, and FAILED keeps the run from being stamped as complete.
+    if [ -n "$MENTION_WHY" ]; then
+      log "scratchpads: the transcript lookup failed ($MENTION_WHY); no directory judged, every one kept; the next run tries again" >&2
+    else
+      log "scratchpads: the transcript lookup did not finish within ${MENTION_BUDGET_SECONDS}s; no directory judged, every one kept; the next run tries again" >&2
+    fi
+    rm -f "$midx" 2>/dev/null
+    FAILED=1; return 0
+  fi
   [ "$midx_ok" -eq 1 ] || log "scratchpads: transcripts could not be searched; path-in-use.sh judges every directory"
   # In cursor order (scratch_order), against the time budget. The check is at the top of the loop,
   # before anything about the directory is judged, so a directory is either judged whole or not
@@ -801,8 +950,10 @@ reap_scratchpads() {
     # rule's, and path-in-use.sh (whose answer would be "in use, mentioned") is not asked.
     class=old; mention=""
     if [ "$midx_ok" -eq 1 ]; then
-      # -e: a project directory is named for its path and starts with a dash.
-      mention="$(grep -F -m1 -e "$(printf '%s/%s\t' "$proj" "$sid")" "$midx" | cut -f2)"
+      # The whole first field, never a substring of it: `grep -F proj/<sid>` also found
+      # `-dash-proj/<sid>`, a different project's directory (stima-api#5886, found by the
+      # per-path equivalence test). A project directory also starts with a dash.
+      mention="$(awk -F'\t' -v k="$proj/$sid" '$1 == k { print $2; exit }' "$midx")"
       [ -n "$mention" ] && class=new
     fi
     # Its session wrote a transcript inside the window: the session is active, whatever its
@@ -823,11 +974,11 @@ reap_scratchpads() {
       # file. That search was 4 x 17s per directory on 2 GB of transcripts, the slow half of
       # a 2h13m sweep, and for a directory the index did not name it can only find nothing.
       if [ "$midx_ok" -eq 1 ]; then
-        verdict="$(PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" PATH_IN_USE_WINDOW_HOURS=0 bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
+        verdict="$(PATH_IN_USE_TIMEOUT="$(piu_timeout "$phase_start")" PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" PATH_IN_USE_WINDOW_HOURS=0 bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
       elif [ "$window" -ne "$IDLE_HOURS" ]; then
-        verdict="$(PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" PATH_IN_USE_WINDOW_HOURS="$window" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
+        verdict="$(PATH_IN_USE_TIMEOUT="$(piu_timeout "$phase_start")" PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" PATH_IN_USE_WINDOW_HOURS="$window" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
       else
-        verdict="$(PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
+        verdict="$(PATH_IN_USE_TIMEOUT="$(piu_timeout "$phase_start")" PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
       fi
       if [ "$rc" -ne 0 ]; then
         # In use ONLY because a transcript names the path (a spelling the index missed): the
