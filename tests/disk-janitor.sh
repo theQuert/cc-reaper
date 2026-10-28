@@ -195,6 +195,11 @@ chmod +x "$FAKE_BIN/ps"
 cat > "$FAKE_BIN/lsof" <<'STUB'
 #!/usr/bin/env bash
 [ "${FAKE_LSOF_FAIL:-0}" = 1 ] && exit 1
+# FAKE_LSOF_OPEN=<file>: the system-wide listing `lsof -nP -Fn` reports one process holding each
+# path in that file (the go build cache step's single listing).
+if [ -n "${FAKE_LSOF_OPEN:-}" ] && [ "$*" = "-nP -Fn" ]; then
+  printf 'p4242\n'; while IFS= read -r l; do printf 'n%s\n' "$l"; done < "$FAKE_LSOF_OPEN"; exit 0
+fi
 if [ -n "${FAKE_LSOF_HOLD:-}" ]; then
   prev=""
   for a in "$@"; do
@@ -698,6 +703,7 @@ _gb_kept_all_but_old() {  # every file except the two old entries is still there
   [ -L "$GB/0a/link-d" ] && [ -L "$GB/0b" ] && [ -f "$GB_OUT/target-d" ] && [ -f "$GB_OUT/dir/9999-d" ] \
     && [ -d "$GB/0a" ] && [ -d "$GB/ff" ]
 }
+_gb_kept_all_but_old_with_big() { _gb_kept_all_but_old && [ -f "$GB/0a/1111-a" ] && [ -f "$GB/ff/9999-d" ]; }
 _gb_run() {  # <free GB>
   _act_reset; CC_DJ_GO_BUILD_DIR="${GB_DIR-$GB}" CC_DJ_TEMPLATE_STORE="$SANDBOX/no-store" _run_act $(( $1 * 1048576 ))
 }
@@ -737,12 +743,12 @@ FAKE_GOCACHE="$GB" CC_DJ_NEW_STEPS_MODE=auto CC_DJ_TEMPLATE_STORE="$SANDBOX/no-s
 expect_no "go-build-age: with no CC_DJ_GO_BUILD_DIR it trims go env GOCACHE" test -e "$GB/0a/1111-a"
 expect_yes "go-build-age: and logs that directory" grep -q "step=go-build-age start mode=auto rule=go-build-age dir=$GB " "$SPOT"
 
-# Above the floor, nothing; and the guards.
-_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto _gb_run 25
-expect_yes "go-build-age: at 25 GB free (over the 20 GB floor) nothing is deleted" test -f "$GB/0a/1111-a"
+# Above the floor, nothing; and the guards. (The soft floor is off here: it is tested below.)
+_mk_gocache; CC_DJ_GO_BUILD_FREE_GB=off CC_DJ_NEW_STEPS_MODE=auto _gb_run 25
+expect_yes "go-build-age: at 25 GB free (over the 20 GB floor, soft floor off) nothing is deleted" test -f "$GB/0a/1111-a"
 expect_no "go-build-age: and no spot-check line is written" grep -q 'step=go-build-age' "$SPOT"
 expect_yes "go-build-age: the alert says why it did not run" grep -q 'go build cache age trim: not run, free .* is not under 20 GB' "$ACT_CAPTURE"
-_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_ACT_LOW_FREE_GB=10 _gb_run 15
+_mk_gocache; CC_DJ_GO_BUILD_FREE_GB=off CC_DJ_NEW_STEPS_MODE=auto CC_DJ_ACT_LOW_FREE_GB=10 _gb_run 15
 expect_yes "go-build-age: the floor is CC_DJ_ACT_LOW_FREE_GB" test -f "$GB/0a/1111-a"
 _mk_gocache; ln -s "$GB" "$SANDBOX/gb/link-cache"; CC_DJ_NEW_STEPS_MODE=auto GB_DIR="$SANDBOX/gb/link-cache" _gb_run 15
 expect_yes "go-build-age: a symlinked cache root is refused" test -f "$GB/0a/1111-a"
@@ -756,6 +762,70 @@ expect_yes "go-build-age: a non-numeric age is an ERROR and deletes nothing" \
 _mk_gocache; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_MAX_AGE_MIN=off _gb_run 15
 expect_yes "go-build-age: off turns the step off" test -f "$GB/0a/1111-a"
 expect_no "go-build-age: and leaves no line" grep -q 'go build cache age trim' "$ACT_CAPTURE"
+# -- G2 (stima-api#5886): the same step also runs on a size cap and on a soft free-space floor, ---
+# independent of the low-disk act and of reclaim-byproducts; spot-check logs decision=would-remove.
+_gb_big() { dd if=/dev/zero of="$GB/ff/9999-d" bs=1024 count=2048 2>/dev/null; }   # a fresh 2 MB entry
+_gb_none() { grep -q 'step=go-build-age' "$SPOT"; }
+_gb_starts() { grep -c 'step=go-build-age start' "$SPOT" || true; }
+
+# Cap trigger with plenty of free space (80 GB: not even the act's floor), default spot-check.
+_mk_gocache; _gb_big; CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
+expect_yes "go-build cap: over the cap with 80 GB free, the step runs" \
+  grep -Eq 'step=go-build-age start mode=spotcheck rule=go-build-age dir=.* trigger=over-cap cache_kb=[0-9]+' "$SPOT"
+expect_yes "go-build cap: it logs decision=would-remove for the two old entries, and the trigger" \
+  grep -Eq 'step=go-build-age end mode=spotcheck rule=go-build-age count=2 bytes=12 verdict=would-remove decision=would-remove trigger=over-cap' "$SPOT"
+expect_yes "go-build cap: spot-check deletes nothing" _gb_kept_all_but_old_with_big
+expect_yes "go-build cap: the old entries are still there" test -f "$GB/0a/1111-a" -a -f "$GB/0a/1111-d"
+expect_no "go-build cap: no act ran (no go hook call, no alert comment)" grep -q 'go-hook\|^gh ' "$ACT_CAPTURE"
+expect_yes "go-build cap: the guard says so in the log" grep -q 'go-build guard: go build cache age trim (spotcheck, rule go-build-age): would remove 2 entries .*; trigger over-cap' "$SANDBOX/dj.log"
+# Auto: only the unused >=120 min entries go, not the 90-minute one, not the fresh big one.
+_mk_gocache; _gb_big; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
+expect_no "go-build cap auto: the 3 h entry is deleted" test -e "$GB/0a/1111-a"
+expect_yes "go-build cap auto: the 90-minute and the fresh entries stay" \
+  bash -c 'test -f "$1/0a/7777-d" && test -f "$1/ff/9999-d" && test -f "$1/ff/8888-d"' _ "$GB"
+# Under the cap: no trigger, no line, nothing deleted even in auto.
+_mk_gocache; _gb_big; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=1 _gb_run 80
+expect_no "go-build cap: under the cap with 80 GB free the step does not run" _gb_none
+expect_yes "go-build cap: and auto deletes nothing" test -f "$GB/0a/1111-a"
+expect_yes "go-build cap: the guard logs why it did not run" grep -q 'go-build guard: go build cache age trim: not run' "$SANDBOX/dj.log"
+_mk_gocache; _gb_big; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=off _gb_run 80
+expect_no "go-build cap: CC_DJ_GO_BUILD_CAP_GB=off turns the cap off" _gb_none
+_mk_gocache; _gb_big; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=big _gb_run 80
+expect_yes "go-build cap: a non-numeric cap is an ERROR and the step does not run" \
+  bash -c 'grep -q "CC_DJ_GO_BUILD_CAP_GB=big is not a number" "$1" && test -f "$2/0a/1111-a"' _ "$SANDBOX/dj.log" "$GB"
+# The default cap is 8 GB: this 2 MB cache is far under it.
+_mk_gocache; _gb_big; _gb_run 80
+expect_no "go-build cap: the default cap (8 GB) is not reached by a 2 MB cache" _gb_none
+# Soft free-space floor: 33 GB free is over the act's 30 GB floor and under the 35 GB default.
+_mk_gocache; _gb_run 33
+expect_yes "go-build soft floor: at 33 GB free (act floor 30, default soft floor 35) the step runs, spot-check" \
+  grep -Eq 'step=go-build-age end mode=spotcheck rule=go-build-age count=2 bytes=12 verdict=would-remove decision=would-remove trigger=soft-free' "$SPOT"
+expect_yes "go-build soft floor: and deletes nothing" test -f "$GB/0a/1111-a"
+_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto _gb_run 36
+expect_no "go-build soft floor: at 36 GB free the step does not run" _gb_none
+_mk_gocache; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_FREE_GB=40 _gb_run 36
+expect_no "go-build soft floor: CC_DJ_GO_BUILD_FREE_GB=40 makes 36 GB free a trigger (auto deletes)" test -e "$GB/0a/1111-a"
+# The act and the guard do not both run the step in one check.
+_mk_gocache; _gb_run 15
+expect_yes "go-build guard: under the act's floor the step runs once, not twice" test "$(_gb_starts)" -eq 1
+# CC_DJ_ACT_FREE_GB=off is the operator's switch for every action, the guard included.
+_mk_gocache; _gb_big; CC_DJ_ACT_FREE_GB=off CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
+expect_yes "go-build guard: CC_DJ_ACT_FREE_GB=off keeps the guard off too" test -f "$GB/0a/1111-a"
+expect_no "go-build guard: and leaves no line" _gb_none
+# Held entries: one lsof listing right before the delete; a held entry stays, unusable lsof deletes nothing.
+_mk_gocache; _gb_big; printf '%s\n' "$GB/0a/1111-a" > "$SANDBOX/lsof-open"
+FAKE_LSOF_OPEN="$SANDBOX/lsof-open" CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
+expect_yes "go-build held: an old entry a process holds open is kept" test -f "$GB/0a/1111-a"
+expect_no "go-build held: the other old entry is deleted" test -e "$GB/0a/1111-d"
+expect_yes "go-build held: the log counts what was held and removed" \
+  grep -Eq 'step=go-build-age end mode=auto rule=go-build-age count=2 bytes=12 rc=0 verdict=removed trigger=over-cap removed=1 held=1' "$SPOT"
+_mk_gocache; _gb_big; : > "$SPOT"
+FAKE_LSOF_OPEN="$SANDBOX/lsof-open" CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
+expect_yes "go-build held: spot-check reports the held count too" grep -Eq 'verdict=would-remove decision=would-remove trigger=over-cap held=1 ' "$SPOT"
+_mk_gocache; _gb_big; FAKE_LSOF_FAIL=1 CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
+expect_yes "go-build held: an lsof that cannot report deletes nothing in auto" test -f "$GB/0a/1111-a" -a -f "$GB/0a/1111-d"
+expect_yes "go-build held: and the log says why" grep -q 'verdict=nothing-deleted reason=lsof-unusable' "$SPOT"
+rm -f "$SANDBOX/lsof-open"
 mkdir -p "$SANDBOX/gb-uiux/uiux"; _mk_gocache; mv "$GB" "$SANDBOX/gb-uiux/uiux/go-build"
 CC_DJ_NEW_STEPS_MODE=auto GB_DIR="$SANDBOX/gb-uiux/uiux/go-build" _gb_run 15
 expect_yes "go-build-age: a cache under a protected tree is never trimmed" test -f "$SANDBOX/gb-uiux/uiux/go-build/0a/1111-a"
