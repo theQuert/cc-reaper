@@ -58,7 +58,7 @@ Environment:
                            (default: ~/.claude/hooks/node-modules-template.sh)
   CC_DJ_TEMPLATE_STORE  The template store (default: $NODE_MODULES_TEMPLATE_STORE or
                            ~/.claude/node-modules-templates)
-  CC_DJ_GO_BUILD_MAX_AGE_MIN  Under CC_DJ_ACT_LOW_FREE_GB free, the act deletes go build cache
+  CC_DJ_GO_BUILD_MAX_AGE_MIN  When the step runs (see CC_DJ_GO_BUILD_FREE_GB), it deletes go build cache
                            entries (regular files in the 00..ff subdirectories) unused this many
                            minutes, rule go-build-age, or `off` (default: 120, minimum 60: Go
                            refreshes a used entry's mtime at most hourly); see CC_DJ_NEW_STEPS_MODE
@@ -504,13 +504,19 @@ _cc_dj_gb_to_kb() {
 # Open files under a directory, for the go build cache step: ONE system-wide `lsof -nP -Fn`
 # right before a delete, filtered by prefix, never a per-file lsof over ~100k entries. Writes the
 # held paths (spelled under $1) to $2 and returns 0 when the listing is usable. An lsof that
-# cannot report (missing, or it cannot even see this shell's working directory, or lists no path)
-# returns 1: unknown is held, and the caller deletes nothing.
+# cannot report (missing, it timed out after CC_DJ_HOLDER_TIMEOUT_SECONDS, it exited non-zero, it
+# cannot even see this shell's working directory, or lists no path) returns 1: unknown is held,
+# and the caller deletes nothing.
 _cc_dj_go_build_held() {  # <dir> <outfile>
-  local dir="$1" out="$2" snap real
+  local dir="$1" out="$2" snap real rc=0 t="${CC_DJ_HOLDER_TIMEOUT_SECONDS:-120}"
+  case "$t" in ''|*[!0-9]*|0) t=120 ;; esac
   _cc_dj_lsof_usable || return 1
   snap="$(mktemp "${TMPDIR:-/tmp}/go-build-lsof.XXXXXX")" || return 1
-  if ! lsof -nP -Fn > "$snap" 2>/dev/null && [ ! -s "$snap" ]; then rm -f "$snap"; return 1; fi
+  # Bounded, and with -b (no kernel call that can block): on a dead network mount an unbounded
+  # system-wide lsof hangs the whole --check and the growth-watch alert after it. A timeout, or
+  # any non-zero exit even with part of a listing, is not a listing: unknown is held.
+  _cc_dj_run_bounded "$t" lsof -nP -b -Fn > "$snap" 2>/dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$snap"; return 1; fi
   if ! grep -q '^n/' "$snap"; then rm -f "$snap"; return 1; fi
   real="$(cd "$dir" 2>/dev/null && pwd -P)" || real="$dir"
   awk -v a="$dir/" -v b="$real/" '
@@ -739,9 +745,12 @@ _cc_dj_act_go_build_age() {
 # minutes (stima-api#3337). GB, not %, because the floor that matters is the CI's 20 GB.
 #
 # Each step is the owner's own reclaimer, bounded and safe beside running work: the skills
-# hook's pressure trim of the go cache (idle entries first, never a clear for pressure); under
-# CC_DJ_ACT_LOW_FREE_GB the go build cache age trim (go-build-age) and, always, the node-modules
-# template prune, both gated by CC_DJ_NEW_STEPS_MODE; then the worktree janitor's regenerable trim (unheld, unclaimed trees only; trees and branches
+# hook's pressure trim of the go cache (idle entries first, never a clear for pressure); the go
+# build cache age trim (go-build-age) and, always, the node-modules template prune, both gated by
+# CC_DJ_NEW_STEPS_MODE. The act itself runs only below CC_DJ_ACT_FREE_GB (30), which is under the
+# step's soft floor (CC_DJ_GO_BUILD_FREE_GB, 35), so the step's effective free-space trigger inside
+# the act is that 30 GB, not CC_DJ_ACT_LOW_FREE_GB (20), which only picks the label and the shorter
+# cooldown; then the worktree janitor's regenerable trim (unheld, unclaimed trees only; trees and branches
 # stay). Chrome clones and host temp already ran above. One run at a time (a lock), and
 # at most one per CC_DJ_ACT_COOLDOWN_SECS, so hourly checks do not stack. The record goes
 # to CC_DJ_ALERT_ISSUE, where a person reads it; the desktop notification stays as well.

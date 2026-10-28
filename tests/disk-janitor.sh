@@ -197,7 +197,12 @@ cat > "$FAKE_BIN/lsof" <<'STUB'
 [ "${FAKE_LSOF_FAIL:-0}" = 1 ] && exit 1
 # FAKE_LSOF_OPEN=<file>: the system-wide listing `lsof -nP -Fn` reports one process holding each
 # path in that file (the go build cache step's single listing).
-if [ -n "${FAKE_LSOF_OPEN:-}" ] && [ "$*" = "-nP -Fn" ]; then
+# The listing is asked for with -b (no call that can block on a dead mount). FAKE_LSOF_SLOW=<secs>
+# makes it hang that long (a stalled NAS mount); FAKE_LSOF_PARTIAL=1 prints part of a listing and
+# exits 1.
+if [ "$*" = "-nP -b -Fn" ] && [ -n "${FAKE_LSOF_SLOW:-}" ]; then exec sleep "$FAKE_LSOF_SLOW"; fi
+if [ "$*" = "-nP -b -Fn" ] && [ "${FAKE_LSOF_PARTIAL:-0}" = 1 ]; then printf 'p4242\nn/\n'; exit 1; fi
+if [ -n "${FAKE_LSOF_OPEN:-}" ] && [ "$*" = "-nP -b -Fn" ]; then
   printf 'p4242\n'; while IFS= read -r l; do printf 'n%s\n' "$l"; done < "$FAKE_LSOF_OPEN"; exit 0
 fi
 if [ -n "${FAKE_LSOF_HOLD:-}" ]; then
@@ -825,6 +830,18 @@ expect_yes "go-build held: spot-check reports the held count too" grep -Eq 'verd
 _mk_gocache; _gb_big; FAKE_LSOF_FAIL=1 CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
 expect_yes "go-build held: an lsof that cannot report deletes nothing in auto" test -f "$GB/0a/1111-a" -a -f "$GB/0a/1111-d"
 expect_yes "go-build held: and the log says why" grep -q 'verdict=nothing-deleted reason=lsof-unusable' "$SPOT"
+# A stalled listing (a dead network mount) is bounded: nothing is deleted and the check goes on.
+_mk_gocache; _gb_big; : > "$SPOT"; T0=$SECONDS
+FAKE_LSOF_SLOW=40 CC_DJ_HOLDER_TIMEOUT_SECONDS=2 CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
+T1=$SECONDS
+expect_yes "go-build lsof bound: a hung system-wide listing deletes nothing in auto" test -f "$GB/0a/1111-a" -a -f "$GB/0a/1111-d"
+expect_yes "go-build lsof bound: and the log says the listing was unusable" grep -q 'verdict=nothing-deleted reason=lsof-unusable' "$SPOT"
+expect_yes "go-build lsof bound: and the check was not held for the 40s the listing hung ($((T1 - T0))s)" test "$((T1 - T0))" -lt 30
+# A non-zero exit with part of a listing is not a listing.
+_mk_gocache; _gb_big; : > "$SPOT"
+FAKE_LSOF_PARTIAL=1 CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
+expect_yes "go-build lsof bound: a listing that exits 1 part-way deletes nothing in auto" test -f "$GB/0a/1111-a" -a -f "$GB/0a/1111-d"
+expect_yes "go-build lsof bound: and is reported unusable" grep -q 'verdict=nothing-deleted reason=lsof-unusable' "$SPOT"
 rm -f "$SANDBOX/lsof-open"
 mkdir -p "$SANDBOX/gb-uiux/uiux"; _mk_gocache; mv "$GB" "$SANDBOX/gb-uiux/uiux/go-build"
 CC_DJ_NEW_STEPS_MODE=auto GB_DIR="$SANDBOX/gb-uiux/uiux/go-build" _gb_run 15
