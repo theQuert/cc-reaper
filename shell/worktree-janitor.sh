@@ -2467,6 +2467,10 @@ _cc_wj_scan_inbound() { # <inventory> <out> [quiet]
     while IFS= read -r link; do
       if [ -d "$link" ]; then
         tgt="$(_cc_wj_realpath "$link")"; tgt="${tgt%/}"
+        # A directory cd -P cannot enter (no x permission) comes back as the link path itself:
+        # unresolved, so the scan cannot show any tree free of an inbound link.
+        case "$tgt" in /*) ;; *) rc=1; continue ;; esac
+        [ "$tgt" != "${link%/}" ] || { rc=1; continue; }
         case "$link$tgt" in *$'\t'*|*$'\n'*) rc=1; continue ;; esac
         printf '%s\t%s\t%s\n' "$hold" "$link" "$tgt" >> "$out" || rc=1
       elif [ -z "$quiet" ] && [ -L "$link" ] && [ ! -e "$link" ]; then
@@ -2477,6 +2481,16 @@ _cc_wj_scan_inbound() { # <inventory> <out> [quiet]
   rm -f "$list" "$list.err" 2>/dev/null
   [ "$rc" -eq 0 ] && _CC_WJ_INBOUND_OK="yes"
   return "$rc"
+}
+
+# Read the links again when the scan is older than CC_WJ_INBOUND_RESCAN_SECS (120): one can have
+# been made since (about 5 s over 117 worktrees warm); a fresher scan is not repeated.
+_cc_wj_inbound_refresh() { # <work dir>
+  local age="${CC_WJ_INBOUND_RESCAN_SECS:-120}"
+  case "$age" in ''|*[!0-9]*) age=120 ;; esac
+  [ $(( $(date +%s) - ${_CC_WJ_INBOUND_AT:-0} )) -lt "$((10#$age))" ] ||
+    _cc_wj_scan_inbound "$1/inventory" "$1/inbound" quiet
+  return 0
 }
 
 # Status 0, with _CC_WJ_INBOUND_REASON set, when worktree $1 must be kept because another
@@ -4954,7 +4968,9 @@ KEEP
           [ -z "$nr_dirty" ] || { ACTIVE_OK="$nr_active_ok"; activity_blind="$nr_blind"; }
           continue
         fi
-        # A tree another worktree's node_modules link resolves into keeps its caches too.
+        # A tree another worktree's node_modules link resolves into keeps its caches too. The
+        # phase can run for almost an hour, so an applying trim reads the links again first.
+        [ "$apply" -ne 1 ] || _cc_wj_inbound_refresh "$work"
         if _cc_wj_inbound_keep "$wt_path"; then
           printf "    classification: KEEP(%s)\n" "$_CC_WJ_INBOUND_REASON"
           [ -z "$nr_dirty" ] || { ACTIVE_OK="$nr_active_ok"; activity_blind="$nr_blind"; }
@@ -5404,10 +5420,8 @@ KEEP
               total_kept=$((total_kept + 1))
               continue
             fi
-            # A link can have been made to it since the scan; one older than two minutes is
-            # read again (about 5 s over 117 worktrees warm), a fresher one is not.
-            [ $(( $(date +%s) - ${_CC_WJ_INBOUND_AT:-0} )) -lt 120 ] ||
-              _cc_wj_scan_inbound "$work/inventory" "$work/inbound" quiet
+            # A link can have been made to it since the scan.
+            _cc_wj_inbound_refresh "$work"
             if _cc_wj_inbound_keep "$wt_path"; then
               printf "    → kept: %s\n" "$_CC_WJ_INBOUND_REASON"
               total_kept=$((total_kept + 1))

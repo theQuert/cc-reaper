@@ -102,6 +102,13 @@ cat > "$STUBS/find" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "\$FIND_LOG"
 case " \$* " in *" -maxdepth 4 "*" -type l "*) [ -z "\${FIND_FAIL_LINKS:-}" ] || exit 1 ;; esac
+# MID_LINK_HOLDER: once the first scan has read that tree, a node_modules link is made in it, as
+# one made while a long phase runs would be. MID_LINK_TARGET is the node_modules it points into.
+if [ -n "\${MID_LINK_HOLDER:-}" ] && [ "\$1" = "\$MID_LINK_HOLDER" ] && [ ! -e "\$MID_LINK_HOLDER/.mid-done" ]; then
+  "$REAL_FIND" "\$@"; rc=\$?
+  mkdir -p "\$MID_LINK_HOLDER/zz" && ln -s "\$MID_LINK_TARGET" "\$MID_LINK_HOLDER/zz/node_modules" && : > "\$MID_LINK_HOLDER/.mid-done"
+  exit \$rc
+fi
 exec "$REAL_FIND" "\$@"
 STUB
 chmod +x "$STUBS"/*
@@ -230,6 +237,27 @@ check "inbound: and the links still resolve" test -d "$T/wt-consumer/web/next/no
 check "auto --apply keeps the held tree" test -d "$T/wt-logheld"
 check "auto --apply keeps the deny-listed trees" test -d "$T/wt-homepage-bento" -a -d "$T/wt-sessiondeny"
 check "auto --apply keeps a link outside the primary checkout" test -L "$T/wt-linkout/.claude/skills"
+
+# ─── Fail-open gaps in the inbound scan ──────────────────────────────────────
+
+# A link made after the phase's scan protects its target when the trim applies: a scan older than
+# CC_WJ_INBOUND_RESCAN_SECS (120) is read again, as the removal path does.
+mkwt midholder; mkwt midlonely; cache midlonely
+MID_LINK_HOLDER="$T/wt-midholder" MID_LINK_TARGET="$T/wt-midlonely/node_modules" CC_WJ_INBOUND_RESCAN_SECS=0 \
+  wj --trim-regenerable --apply > "$T/trim-mid.txt"
+check "inbound: a link made after the trim's scan keeps its target's node_modules" test -d "$T/wt-midlonely/node_modules"
+check "  and says why" judged "$T/trim-mid.txt" midlonely "KEEP(inbound-symlink:wt-midholder)"
+
+# A link whose target is a directory the scan cannot enter (no x permission) cannot be resolved,
+# so no tree can be shown free of inbound links.
+mkwt xdonor; mkdir -p "$T/wt-xdonor/web/next/node_modules"
+mkwt xcons;  mkdir -p "$T/wt-xcons/web/next"; ln -s "$T/wt-xdonor/web/next/node_modules" "$T/wt-xcons/web/next/node_modules"
+mkwt late
+chmod 000 "$T/wt-xdonor/web/next/node_modules"
+wj > "$T/report-unresolved.txt"
+chmod 755 "$T/wt-xdonor/web/next/node_modules"
+check "inbound: a link that cannot be resolved keeps a tree that would be removable" \
+  judged "$T/report-unresolved.txt" late "KEEP(inbound-scan-unknown)"
 
 if [ "$failures" -eq 0 ]; then echo "# all passed"; else echo "# $failures failed"; fi
 [ "$failures" -eq 0 ]
