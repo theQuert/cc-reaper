@@ -48,6 +48,7 @@ DEFAULTS = {
     "IDLE_LIST_FILE": "~/.cc-reaper/state/idle-sessions.md",  # rewritten every sweep with that list
     "IDLE_LIST_INBOX": "",  # a path: append the list once per local day under ## key=IDLE-SESSIONS-<date>; empty: off
     "DONE_INBOX": "~/handoffs/neo-inbox.md",  # a session whose newest header here is DONE (>= IDLE_MINUTES old) is done; empty: off
+    "DONE_INBOX_SHADOW": "",  # report-only: with DONE_INBOX off, mark kept sessions DONE_INBOX=<this> would reap
     "CHECKBY_ORACLE": "/Users/stimaclaw/GitHub/stima-api/scripts/ci/delivery_state.py",  # --json: pending_check_by, due_check
     "CHECKBY_REPO": "theQuert/stima-api",  # the only repo the oracle reads; a claim elsewhere is UNKNOWN (kept)
     "ORACLE_ROOT": "/Users/stimaclaw/GitHub/stima-api",  # checkout whose `scripts/ci/delivery_state.py N --brief` judges an idle session's open claims
@@ -662,7 +663,20 @@ def _newest_claim(s):
 
 
 def decide(s, cfg, now=None):
-    """Return the list of reasons that keep the session; empty means reap."""
+    """Return the list of reasons that keep the session; empty means reap.
+
+    With DONE_INBOX off and DONE_INBOX_SHADOW set (stima-api #6535), a kept session with a claim is decided a second
+    time as if DONE_INBOX were that path; when that would reap it, `inbox_done_shadow` is set for the report
+    (`would-close: inbox DONE (shadow)`) and nothing else changes. That is how the inbox-DONE close path earns its
+    clean rounds before it is switched on (EL-FLOW-P2-2106, SCRIPT-SAFE-RULE)."""
+    keep = _decide(s, cfg, now)
+    shadow = cfg.get("DONE_INBOX_SHADOW")
+    if keep and shadow and not cfg.get("DONE_INBOX") and s["claims"]:
+        s["inbox_done_shadow"] = not _decide(dict(s), dict(cfg, DONE_INBOX=shadow), now)
+    return keep
+
+
+def _decide(s, cfg, now=None):
     keep = []
     if protected(cfg, s["tmux"], s["name"]):
         keep.append("protected")
@@ -1071,6 +1085,7 @@ def report_line(s, keep, outcome):
     background_only = "yes" if keep and set(keep) <= BACKGROUND_ONLY else "-"
     new_only = "yes" if keep and all(k.startswith(NEW_GATES) for k in keep) else "-"
     why = [f"would-close: {s['would_close']}"] if s.get("would_close") else []
+    why += ["would-close: inbox DONE (shadow)"] if s.get("inbox_done_shadow") else []
     blocked = [", ".join(f"blocked: #{n}" for n in s["blocked"])] if s.get("blocked") else []
     return (f"| {s['tmux']} | `{s['sid'][:8]}` | {s['status']} {s['idle_min']:.0f}m | {issues} | "
             f"{outcome} | {', '.join([*keep, *why, *blocked]) or '-'} | {background_only} | {new_only} | {plan} |")
