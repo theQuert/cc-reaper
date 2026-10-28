@@ -782,18 +782,17 @@ def shadow_verdict(s, cfg, keep, now):
         block(n)
     idle = s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"])
     claims = list(s["claims"])
-    marks, stop = [], False
+    marks = []
     if idle:
         claims += oracle_claims(s, cfg, now)
         mine = [w["marker"] for w in s["owned"] if w.get("marker")]
         for (r, n), b in zip(claims, [oracle_brief(r, n, cfg, now) for r, n in claims]):
-            stop = stop or _brief_kind(b) == "stop"
             for m in BLOCKED_RE.findall(b or ""):
                 block(m)
             marks.append(classify_claim(b, s["sid"], now, s.get("other_sids", ()), mine)[0])
     out = {"would_close": "", "blocked": blocked, "claims": claims}
     never = [n for n in (s["tmux"], s.get("name")) if n]
-    if (not keep or not idle or blocked or stop or s["asking"] or s["bg_shells"] or s.get("sub_active")
+    if (not keep or not idle or blocked or s["asking"] or s["bg_shells"] or s.get("sub_active")
             or any(not k.startswith(SOFT_KEEP) for k in keep)
             or any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in never)
             or protected(cfg, *never)):

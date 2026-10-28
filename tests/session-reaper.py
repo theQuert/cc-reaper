@@ -910,6 +910,16 @@ class ShadowVerdict(unittest.TestCase):
                 _, v = self.view({"9": brief}, last_text="approved and merged", claims=[(REPO, "9")])
                 self.assertEqual(v["would_close"], "")
 
+    def test_one_ended_claim_beside_an_owed_one_is_not_would_close(self):
+        _, v = self.view({"9": ENDED, "10": MINE}, last_text="approved and merged", claims=[(REPO, "9"), (REPO, "10")])
+        self.assertEqual(v["would_close"], "")
+
+    def test_the_report_row_carries_blocked_and_would_close(self):
+        s = session(pid=1, descendants=0, blocked=["6432", "5630"], would_close="")
+        self.assertIn("waiting, blocked: #6432, blocked: #5630 |", reaper.report_line(s, ["waiting"], "keep"))
+        s["would_close"] = "no claim, close line"
+        self.assertIn("would-close: no claim, close line", reaper.report_line(s, ["claim-unknown"], "would-close"))
+
     def test_auth_audit_like_session_is_kept_blocked_on_6432(self):
         keep, v = self.view(last_text="Waiting for authorization. BLOCKED:#6432", name="auth-audit", tmux="auth-audit")
         self.assertEqual(keep, ["waiting", "claim-unknown"])
