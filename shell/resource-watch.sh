@@ -49,6 +49,13 @@ Environment:
   CC_RW_RECLAIM_SCRIPT     reclaim-byproducts.sh to run (default: ~/.cc-reaper/reclaim-byproducts.sh)
   CC_RW_JANITOR_SCRIPT     worktree-janitor.sh to run (default: ~/.cc-reaper/worktree-janitor.sh)
   CC_RW_GO_CAP         Set to 0 to stop the every-run `reclaim-byproducts.sh --go-cache-cap` (default: 1)
+  CC_RW_RECLAIM_STALL_SECS  reclaim-byproducts' last-finished stamp older than this raises ALERT:reclaim-stalled,
+                       once per stall; 0 disables. Unset, it is twice the StartInterval of the installed
+                       LaunchAgent (CC_RW_RECLAIM_PLIST), 172800 for a calendar schedule, and 7200 when the
+                       plist cannot be read. Alert only, nothing is ended. Skipped when CC_RW_RECLAIM_SCRIPT
+                       is not installed
+  CC_RW_RECLAIM_STAMP  That stamp (default: ~/.claude/logs/reclaim-byproducts.last, BYPRODUCT_STAMP's default)
+  CC_RW_RECLAIM_PLIST  The reclaimer's LaunchAgent (default: ~/Library/LaunchAgents/com.cc-reaper.reclaim-byproducts.plist)
 Reclaim output goes to resource-watch-act.log beside CC_RW_LOG. Each round appends
 `<epoch>\t<free KB>` to <state>/disk-free-samples.tsv (last 48 hours kept), and first of all
 writes its start epoch to <state>/resource-watch.heartbeat. A detached reclaim that is stopped
@@ -321,6 +328,64 @@ _cc_rw_maybe_notify() {
   if ! _cc_rw_in_cooldown "$metric" "$now"; then
     _cc_rw_notify "$metric" "$message"
     _cc_rw_set_cooldown "$metric"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# A stalled reclaimer (stima-api #5886)
+# ---------------------------------------------------------------------------
+#
+# reclaim-byproducts.sh writes its stamp only when a sweep FINISHED without a failure, and the
+# launchd agent starts one every hour. On 2026-10-24 it hung for hours in a liveness gate and
+# nothing said so. A stamp older than twice the agent's StartInterval means the sweeps are
+# stuck, failing, or not starting (CC_RW_RECLAIM_STALL_SECS overrides; the installed plist says
+# 7200 on the Mac mini, so the line there is 14400, not 7200: at a 7200s period a healthy stamp
+# is up to 7200s plus a sweep's length old). This raises ALERT:reclaim-stalled with a
+# notification, ONCE per stall: <state>/reclaim-stalled.alerted holds the stamp's mtime (or
+# "none") that was alerted, a later round with the same stamp stays quiet, and a fresh stamp
+# removes the file so the next stall alerts again. Alert only: it ends no process and deletes
+# nothing. Not installed (the script is absent) means nothing to be stalled.
+_CC_RW_RECLAIM_STALL_FIRE=""
+_cc_rw_reclaim_stall_limit() {
+  local plist iv
+  if [ -n "${CC_RW_RECLAIM_STALL_SECS:-}" ]; then
+    iv=$(_cc_rw_num CC_RW_RECLAIM_STALL_SECS 7200); echo "${iv%%.*}"; return
+  fi
+  plist="${CC_RW_RECLAIM_PLIST:-$HOME/Library/LaunchAgents/com.cc-reaper.reclaim-byproducts.plist}"
+  if [ -r "$plist" ]; then
+    iv=$(/usr/bin/plutil -extract StartInterval raw -o - "$plist" 2>/dev/null)
+    if [[ "$iv" =~ ^[0-9]+$ ]] && [ "$iv" -gt 0 ]; then echo $(( iv * 2 )); return; fi
+    if /usr/bin/plutil -extract StartCalendarInterval xml1 -o - "$plist" >/dev/null 2>&1; then echo 172800; return; fi
+  fi
+  echo 7200
+}
+_cc_rw_reclaim_stall() {  # <now epoch>
+  local now="$1" limit script stamp state_dir marker mt age key
+  _CC_RW_RECLAIM_STALL_FIRE=""
+  limit=$(_cc_rw_reclaim_stall_limit)
+  [ "${limit:-0}" -gt 0 ] || return 0
+  script="${CC_RW_RECLAIM_SCRIPT:-$HOME/.cc-reaper/reclaim-byproducts.sh}"
+  [ -f "$script" ] || return 0
+  stamp="${CC_RW_RECLAIM_STAMP:-$HOME/.claude/logs/reclaim-byproducts.last}"
+  state_dir=$(_cc_rw_state_dir)
+  marker="${state_dir}/reclaim-stalled.alerted"
+  if [ -f "$stamp" ]; then
+    mt=$(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp" 2>/dev/null)
+    [[ "$mt" =~ ^[0-9]+$ ]] || return 0
+    age=$(( now - mt )); [ "$age" -ge 0 ] || age=0; key=$mt
+  else
+    age=-1; key=none
+  fi
+  if [ "$age" -ge 0 ] && [ "$age" -le "$limit" ]; then
+    rm -f "$marker" 2>/dev/null
+    return 0
+  fi
+  [ "$(cat "$marker" 2>/dev/null)" = "$key" ] && return 0
+  printf '%s\n' "$key" > "$marker" 2>/dev/null || true
+  if [ "$age" -ge 0 ]; then
+    _CC_RW_RECLAIM_STALL_FIRE="the reclaimer's last finished sweep was ${age}s ago (over ${limit}s)"
+  else
+    _CC_RW_RECLAIM_STALL_FIRE="the reclaimer has no finished-sweep stamp at $stamp"
   fi
 }
 
@@ -751,6 +816,7 @@ _cc_rw_snapshot() {
 
   # --- the detached act: is one running, did one overrun? Every round, whatever free space is ---
   _cc_rw_act_supervise "$now"
+  _cc_rw_reclaim_stall "$now"
 
   # --- build markers (MED-2: remove dead alert_tag variable) ---
   local markers=""
@@ -780,6 +846,7 @@ _cc_rw_snapshot() {
   [ "$_CC_RW_ACT_STATE" = "overrun" ] && markers="${markers} ALERT:disk-act-overrun"
   [ "$_CC_RW_ACT_STATE" = "held" ]    && markers="${markers} ALERT:disk-act-held ACT:held:${_CC_RW_ACT_PID}"
   [ "$mem_breach"  = "true" ] && markers="${markers} ALERT:mem"
+  [ -n "$_CC_RW_RECLAIM_STALL_FIRE" ] && markers="${markers} ALERT:reclaim-stalled"
   [ "$act_started" = "true" ] && markers="${markers} ACT:started:${_CC_RW_ACT_PID}"
   [ "$_CC_RW_ACT_STATE" = "running" ] && markers="${markers} ACT:running:${_CC_RW_ACT_PID:-spawning}"
   [ -n "$rate_gbh" ]          && markers="${markers} disk_rate=${rate_gbh}GB/h"
@@ -819,6 +886,8 @@ _cc_rw_snapshot() {
 
   [ "$_CC_RW_ACT_STATE" = "held" ] && _cc_rw_maybe_notify "disk-act-held" \
     "disk reclaim pid ${_CC_RW_ACT_PID} is stopped (operator hold); no reclaim runs until it is continued or ended" "$now"
+
+  [ -n "$_CC_RW_RECLAIM_STALL_FIRE" ] && _cc_rw_notify "reclaim-stalled" "$_CC_RW_RECLAIM_STALL_FIRE"
 
   [ "$mem_breach"  = "true" ] && _cc_rw_maybe_notify "mem" \
     "mem free ${mem_free_pct}% below ${mem_min_pct}% and compressor ${compressor_gb}GB above ${comp_threshold_gb}GB" "$now"

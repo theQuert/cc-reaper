@@ -108,6 +108,9 @@ chmod +x "$stub_dir/top" "$stub_dir/df" "$stub_dir/vm_stat" \
 
 # Hermetic: no case may reach the deployed reclaim scripts (a real go cache cap or sweep).
 export CC_RW_RECLAIM_SCRIPT=/nonexistent/reclaim-byproducts.sh CC_RW_JANITOR_SCRIPT=/nonexistent/worktree-janitor.sh
+# Nor the installed LaunchAgent plist, which sets the stalled-reclaimer line (T19).
+touch "$TMPDIR_ROOT/fresh-stamp"
+export CC_RW_RECLAIM_PLIST=/nonexistent/com.cc-reaper.reclaim-byproducts.plist CC_RW_RECLAIM_STAMP="$TMPDIR_ROOT/fresh-stamp"
 
 # Helper: run a fresh snapshot in a controlled environment
 # Usage: run_snapshot [extra env vars as VAR=val ...]
@@ -762,6 +765,83 @@ expect_yes "T18: a hung go cache cap is ended and the round returns within 10s (
 expect_yes "T18: its pids are gone" test -z "$t18_alive"
 expect_yes "T18: and an ERROR says so" grep -q 'ERROR bash .*--go-cache-cap ran over 1s' "$t18/resource-watch.log"
 for p in $t18_alive; do kill -KILL "$p" 2>/dev/null || true; done
+
+# ---------------------------------------------------------------------------
+# T19: a stalled reclaimer (stima-api #5886): reclaim-byproducts' last-finished stamp older than
+# 2 x its hourly StartInterval (7200s) raises ALERT:reclaim-stalled, once per stall, alert only.
+# ---------------------------------------------------------------------------
+ago() { date -v-"$1"S +%Y%m%d%H%M.%S; }   # a touch -t stamp this many seconds back
+t19_alerts() { grep -c 'ALERT:reclaim-stalled' "$1/resource-watch.log" 2>/dev/null || true; }
+t19_notes() { grep -c 'reclaim-stalled' "$1/osascript" 2>/dev/null || true; }
+
+t19=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkdir -p "$t19/state"
+touch -t "$(ago 10800)" "$t19/stamp"
+guard_case "$t19" 100 CC_RW_RECLAIM_STAMP="$t19/stamp"
+expect_yes "T19a: a stamp 3h old logs ALERT:reclaim-stalled" grep -q 'ALERT:reclaim-stalled' "$t19/resource-watch.log"
+expect_yes "T19a: and notifies once" test "$(t19_notes "$t19")" -eq 1
+expect_yes "T19a: the notification names the age" grep -Eq 'last finished sweep was 1080[0-9]s ago' "$t19/osascript"
+guard_case "$t19" 100 CC_RW_RECLAIM_STAMP="$t19/stamp"
+expect_yes "T19b: a second round on the same stall raises no second alert" test "$(t19_alerts "$t19")" -eq 1
+expect_yes "T19b: and no second notification" test "$(t19_notes "$t19")" -eq 1
+expect_no "T19c: alert only: the round started no reclaim and ended nothing" grep -qE '^janitor|^reclaim $' "$t19/calls"
+touch "$t19/stamp"
+guard_case "$t19" 100 CC_RW_RECLAIM_STAMP="$t19/stamp"
+expect_yes "T19d: a fresh stamp re-arms the alert (the marker is gone)" test ! -e "$t19/state/reclaim-stalled.alerted"
+expect_yes "T19d: and a fresh stamp alerts nothing" test "$(t19_alerts "$t19")" -eq 1
+touch -t "$(ago 9000)" "$t19/stamp"
+guard_case "$t19" 100 CC_RW_RECLAIM_STAMP="$t19/stamp"
+expect_yes "T19e: the next stall alerts again" test "$(t19_alerts "$t19")" -eq 2
+expect_yes "T19e: with its own notification" test "$(t19_notes "$t19")" -eq 2
+
+t19b=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkdir -p "$t19b/state"
+touch -t "$(ago 7100)" "$t19b/stamp"
+guard_case "$t19b" 100 CC_RW_RECLAIM_STAMP="$t19b/stamp"
+expect_no "T19f: 7100s old is inside the 7200s line: no alert" grep -q 'ALERT:reclaim-stalled' "$t19b/resource-watch.log"
+touch -t "$(ago 7300)" "$t19b/stamp"
+guard_case "$t19b" 100 CC_RW_RECLAIM_STAMP="$t19b/stamp"
+expect_yes "T19f: 7300s old is over it: alert" grep -q 'ALERT:reclaim-stalled' "$t19b/resource-watch.log"
+touch -t "$(ago 3000)" "$t19b/stamp"
+guard_case "$t19b" 100 CC_RW_RECLAIM_STAMP="$t19b/stamp" CC_RW_RECLAIM_STALL_SECS=2400
+expect_yes "T19g: the line is a knob (CC_RW_RECLAIM_STALL_SECS=2400, stamp 3000s old)" test "$(t19_alerts "$t19b")" -eq 2
+
+# The line follows the installed agent: twice its StartInterval (7200 on the Mac mini, so 14400),
+# 172800 for a calendar schedule, 7200 when the plist cannot be read.
+mkplist() {  # <file> <keyxml>
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>x</string>%s</dict></plist>\n' "$2" > "$1"
+}
+t19p=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkplist "$t19p/p.plist" '<key>StartInterval</key><integer>7200</integer>'
+touch -t "$(ago 10800)" "$t19p/stamp"
+guard_case "$t19p" 100 CC_RW_RECLAIM_STAMP="$t19p/stamp" CC_RW_RECLAIM_PLIST="$t19p/p.plist"
+expect_no "T19l: a 3h stamp is no stall for an agent that starts every 7200s (line 14400s)" grep -q 'ALERT:reclaim-stalled' "$t19p/resource-watch.log"
+touch -t "$(ago 15000)" "$t19p/stamp"
+guard_case "$t19p" 100 CC_RW_RECLAIM_STAMP="$t19p/stamp" CC_RW_RECLAIM_PLIST="$t19p/p.plist"
+expect_yes "T19l: 15000s is" grep -q 'ALERT:reclaim-stalled' "$t19p/resource-watch.log"
+expect_yes "T19l: and the alert names the line it used" grep -q 'over 14400s' "$t19p/osascript"
+t19q=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkplist "$t19q/p.plist" '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer></dict>'
+touch -t "$(ago 100000)" "$t19q/stamp"
+guard_case "$t19q" 100 CC_RW_RECLAIM_STAMP="$t19q/stamp" CC_RW_RECLAIM_PLIST="$t19q/p.plist"
+expect_no "T19m: a daily agent's stamp 28h old is no stall" grep -q 'ALERT:reclaim-stalled' "$t19q/resource-watch.log"
+t19r=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); touch -t "$(ago 7500)" "$t19r/stamp"
+guard_case "$t19r" 100 CC_RW_RECLAIM_STAMP="$t19r/stamp" CC_RW_RECLAIM_PLIST="$t19r/no-such.plist"
+expect_yes "T19n: an unreadable plist falls back to 7200s" grep -q 'over 7200s' "$t19r/osascript"
+
+t19c=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+guard_case "$t19c" 100 CC_RW_RECLAIM_STAMP="$t19c/no-stamp"
+expect_yes "T19h: no stamp at all is a stall too" grep -q 'ALERT:reclaim-stalled' "$t19c/resource-watch.log"
+expect_yes "T19h: and says so" grep -q 'no finished-sweep stamp' "$t19c/osascript"
+guard_case "$t19c" 100 CC_RW_RECLAIM_STAMP="$t19c/no-stamp"
+expect_yes "T19h: once" test "$(t19_alerts "$t19c")" -eq 1
+
+t19d=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); touch -t "$(ago 10800)" "$t19d/stamp"
+guard_case "$t19d" 100 CC_RW_RECLAIM_STAMP="$t19d/stamp" CC_RW_RECLAIM_SCRIPT=/nonexistent/reclaim-byproducts.sh
+expect_no "T19i: a reclaimer that is not installed cannot be stalled" grep -q 'ALERT:reclaim-stalled' "$t19d/resource-watch.log"
+t19e=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); touch -t "$(ago 10800)" "$t19e/stamp"
+guard_case "$t19e" 100 CC_RW_RECLAIM_STAMP="$t19e/stamp" CC_RW_RECLAIM_STALL_SECS=0
+expect_no "T19j: CC_RW_RECLAIM_STALL_SECS=0 turns it off" grep -q 'ALERT:reclaim-stalled' "$t19e/resource-watch.log"
+t19f=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+touch -t "$(date -v+1H +%Y%m%d%H%M.%S)" "$t19f/stamp"
+guard_case "$t19f" 100 CC_RW_RECLAIM_STAMP="$t19f/stamp"
+expect_no "T19k: a stamp dated in the future is fresh, not a stall" grep -q 'ALERT:reclaim-stalled' "$t19f/resource-watch.log"
 
 if [ "$failures" -gt 0 ]; then
   printf "%s test failure(s)\n" "$failures"
