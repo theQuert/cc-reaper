@@ -827,10 +827,17 @@ expect_yes "T19n: an unreadable plist falls back to 7200s" grep -q 'over 7200s' 
 
 t19c=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
 guard_case "$t19c" 100 CC_RW_RECLAIM_STAMP="$t19c/no-stamp"
-expect_yes "T19h: no stamp at all is a stall too" grep -q 'ALERT:reclaim-stalled' "$t19c/resource-watch.log"
-expect_yes "T19h: and says so" grep -q 'no finished-sweep stamp' "$t19c/osascript"
+# A fresh install has no stamp yet: that is not a stall (the first sweep has not finished). One
+# info line, once; a stale stamp, not a missing one, is what alerts (T19a).
+expect_no "T19h: no stamp at all (a fresh install) raises no alert" grep -q 'ALERT:reclaim-stalled' "$t19c/resource-watch.log"
+expect_no "T19h: and no notification" test -s "$t19c/osascript"
+expect_yes "T19h: but says so, as info" grep -q 'INFO reclaim-stalled: no finished-sweep stamp yet' "$t19c/resource-watch.log"
 guard_case "$t19c" 100 CC_RW_RECLAIM_STAMP="$t19c/no-stamp"
-expect_yes "T19h: once" test "$(t19_alerts "$t19c")" -eq 1
+expect_yes "T19h: once" test "$(grep -c 'INFO reclaim-stalled' "$t19c/resource-watch.log")" -eq 1
+expect_no "T19h: and still no alert on the second round" grep -q 'ALERT:reclaim-stalled' "$t19c/resource-watch.log"
+touch "$t19c/no-stamp"; touch -t "$(ago 40000)" "$t19c/no-stamp"
+guard_case "$t19c" 100 CC_RW_RECLAIM_STAMP="$t19c/no-stamp"
+expect_yes "T19h: the stamp appears and is stale: that alerts" test "$(t19_alerts "$t19c")" -eq 1
 
 t19d=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); touch -t "$(ago 10800)" "$t19d/stamp"
 guard_case "$t19d" 100 CC_RW_RECLAIM_STAMP="$t19d/stamp" CC_RW_RECLAIM_SCRIPT=/nonexistent/reclaim-byproducts.sh

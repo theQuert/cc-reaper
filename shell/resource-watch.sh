@@ -343,7 +343,8 @@ _cc_rw_maybe_notify() {
 # is up to 7200s plus a sweep's length old). This raises ALERT:reclaim-stalled with a
 # notification, ONCE per stall: <state>/reclaim-stalled.alerted holds the stamp's mtime (or
 # "none") that was alerted, a later round with the same stamp stays quiet, and a fresh stamp
-# removes the file so the next stall alerts again. Alert only: it ends no process and deletes
+# removes the file so the next stall alerts again. No stamp at all (a fresh install) is not a stall:
+# one INFO line, once (<state>/reclaim-stalled.nostamp), and no alert. Alert only: it ends no process and deletes
 # nothing. Not installed (the script is absent) means nothing to be stalled.
 _CC_RW_RECLAIM_STALL_FIRE=""
 _cc_rw_reclaim_stall_limit() {
@@ -374,19 +375,23 @@ _cc_rw_reclaim_stall() {  # <now epoch>
     [[ "$mt" =~ ^[0-9]+$ ]] || return 0
     age=$(( now - mt )); [ "$age" -ge 0 ] || age=0; key=$mt
   else
-    age=-1; key=none
+    # No stamp: a fresh install whose first sweep has not finished, or a stamp path that moved.
+    # Neither is a stall that has had its time, so no alert; said once, as info. A stamp that
+    # exists and is stale is what alerts.
+    if [ ! -e "${state_dir}/reclaim-stalled.nostamp" ]; then
+      : > "${state_dir}/reclaim-stalled.nostamp" 2>/dev/null || true
+      _cc_rw_log_line "INFO reclaim-stalled: no finished-sweep stamp yet at $stamp (not alerting until one exists and goes stale)"
+    fi
+    return 0
   fi
-  if [ "$age" -ge 0 ] && [ "$age" -le "$limit" ]; then
+  rm -f "${state_dir}/reclaim-stalled.nostamp" 2>/dev/null
+  if [ "$age" -le "$limit" ]; then
     rm -f "$marker" 2>/dev/null
     return 0
   fi
   [ "$(cat "$marker" 2>/dev/null)" = "$key" ] && return 0
   printf '%s\n' "$key" > "$marker" 2>/dev/null || true
-  if [ "$age" -ge 0 ]; then
-    _CC_RW_RECLAIM_STALL_FIRE="the reclaimer's last finished sweep was ${age}s ago (over ${limit}s)"
-  else
-    _CC_RW_RECLAIM_STALL_FIRE="the reclaimer has no finished-sweep stamp at $stamp"
-  fi
+  _CC_RW_RECLAIM_STALL_FIRE="the reclaimer's last finished sweep was ${age}s ago (over ${limit}s)"
 }
 
 # ---------------------------------------------------------------------------
