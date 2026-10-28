@@ -864,7 +864,7 @@ STOP6432 = ("delivery #5630: reviewed (backend) -> stop no-production-authority 
 class ShadowVerdict(unittest.TestCase):
     """#6477: `would-close` and `blocked: #N` are report-only views of a session decide() keeps."""
 
-    def view(self, briefs=None, wt_problems=(), now=NOW0, **kw):
+    def view(self, briefs=None, wt_problems=(), now=NOW0, force_keep=None, **kw):
         briefs = briefs or {}
         s = session(**dict(dict(last_text="", cwd="/work/x"), **kw))
         s.setdefault("other_sids", [])
@@ -873,7 +873,7 @@ class ShadowVerdict(unittest.TestCase):
              mock.patch.object(reaper, "worktree_state",
                                side_effect=lambda w, c: list(wt_problems) + w.get("problems", [])):
             keep = reaper.decide(s, CFG, now)
-            return keep, reaper.shadow_verdict(s, CFG, keep, now)
+            return keep, reaper.shadow_verdict(s, CFG, force_keep or keep, now)
 
     SEC_P1 = ("Merged the authorization fix. No open scope: the reaper can close this session.")
 
@@ -911,7 +911,9 @@ class ShadowVerdict(unittest.TestCase):
                 self.assertEqual(v["would_close"], "")
 
     def test_one_ended_claim_beside_an_owed_one_is_not_would_close(self):
-        _, v = self.view({"9": ENDED, "10": MINE}, last_text="approved and merged", claims=[(REPO, "9"), (REPO, "10")])
+        # force_keep isolates the claim rule: decide() would add owed-step:#10 and end the question earlier
+        _, v = self.view({"9": ENDED, "10": MINE}, last_text="approved and merged", claims=[(REPO, "9"), (REPO, "10")],
+                         force_keep=["waiting-keyword"])
         self.assertEqual(v["would_close"], "")
 
     def test_the_report_row_carries_blocked_and_would_close(self):
@@ -965,6 +967,10 @@ class ShadowVerdict(unittest.TestCase):
             with self.subTest(label):
                 _, v = self.view(last_text=self.SEC_P1, **kw)
                 self.assertEqual(v["would_close"], "")
+
+    def test_the_verdict_itself_refuses_a_background_child_whatever_the_keep_list_says(self):
+        _, v = self.view(last_text=self.SEC_P1, bg_shells=[1], force_keep=["waiting"])
+        self.assertEqual(v["would_close"], "")
 
     def test_a_kept_session_without_a_close_line_is_not_would_close(self):
         _, v = self.view(last_text="I am waiting for your approval of the plan.")
