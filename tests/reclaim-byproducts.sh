@@ -2057,6 +2057,14 @@ OUT="$(CLAUDE_CODE_SESSION_ID=$EQ_SELF BYPRODUCT_GREP_BIN="$EQ/bin/grep-count" r
 N3="$(wc -l < "$EQ/grep-calls" | tr -d ' ')"
 [ "$N3" = 2 ] && pass "G3: a changed corpus is searched again" || fail "G3: grep calls after a change: $N3"
 check "G3: and the new mention is seen (not served from the stale cache)" "$OUT" "scratchpad spot-check: $EQ/scratch/proj/f6f6f6f6-" "scratchpad reaped: $EQ/scratch/proj/f6f6f6f6-"
+# The extraction rule is part of the cache key: the same corpus under a changed awk program (a
+# comment is enough) is searched again, never served the index the old rule built.
+sed "s|^MENTION_AWK='{|MENTION_AWK='{ # changed rule|" "$SCRIPT" > "$WORK/rb-rule2.sh"
+grep -q 'changed rule' "$WORK/rb-rule2.sh" && pass "G3: (the changed-rule copy was made)" || fail "G3: could not make the changed-rule copy"
+eq_fixture_dirs_only "$EQ"
+OUT="$(CLAUDE_CODE_SESSION_ID=$EQ_SELF BYPRODUCT_GREP_BIN="$EQ/bin/grep-count" run_real "$EQ" "$WORK/rb-rule2.sh")"
+N4="$(wc -l < "$EQ/grep-calls" | tr -d ' ')"
+[ "$N4" = 3 ] && pass "G3: a changed extraction rule is not served the old rule's index" || fail "G3: grep calls under a changed rule: $N4"
 # A dry run reads the cache but writes none.
 eq_fixture "$EQ"
 OUT="$(CLAUDE_CODE_SESSION_ID=$EQ_SELF run "$EQ" "$SCRIPT")"
@@ -2090,6 +2098,67 @@ slow_gone() { local st i
 if [ -z "$SLOW_PID" ]; then pass "G3: the timed-out grep was stopped, not left running (it had not started within the budget)"
 elif slow_gone; then pass "G3: the timed-out grep was stopped, not left running"
 else fail "G3: the slow grep is still running (pid $SLOW_PID, state $(ps -o stat= -p "$SLOW_PID" 2>/dev/null))"; kill "$SLOW_PID" 2>/dev/null; fi
+
+# bounded_group itself, directly (review of a237c1f: the grep-kill assertion above can pass with
+# no proof when the fake grep never started). The command starts a background grandchild, writes
+# its pid, and waits; the group kill has to take the grandchild down, and a missing pid file is a
+# failure here, never a pass.
+BG="$WORK/bg"; mkdir -p "$BG"
+eval "$(sed -n '/^bounded_group() {/,/^}/p' "$SCRIPT")"
+pid_gone() { local p="$1" st i; [ -n "$p" ] || return 1
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    st="$(ps -o stat= -p "$p" 2>/dev/null | tr -d ' ')"
+    case "$st" in ""|Z*) return 0 ;; esac
+    sleep 0.5
+  done; return 1; }
+rm -f "$BG/gc.pid"
+bounded_group 4 sh -c 'sleep 60 & echo $! > "$1"; wait' _ "$BG/gc.pid"; BGRC=$?
+[ "$BGRC" = 124 ] && pass "G3: bounded_group ends 124 when the clock runs out" || fail "G3: bounded_group status $BGRC, not 124"
+if [ -s "$BG/gc.pid" ]; then
+  pid_gone "$(cat "$BG/gc.pid")" && pass "G3: bounded_group's group kill takes a background grandchild down" || fail "G3: the grandchild $(cat "$BG/gc.pid") outlived bounded_group"
+else
+  fail "G3: the grandchild never wrote its pid (the proof did not run)"
+fi
+# launchd stops a job with TERM: the wrapper takes its whole group with it.
+rm -f "$BG/gc2.pid" "$BG/wrap.pid"
+bounded_group 120 sh -c 'echo $PPID > "$2"; sleep 60 & echo $! > "$1"; wait' _ "$BG/gc2.pid" "$BG/wrap.pid" &
+BGJOB=$!
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$BG/gc2.pid" ] && [ -s "$BG/wrap.pid" ] && break; sleep 0.5; done
+if [ -s "$BG/gc2.pid" ] && [ -s "$BG/wrap.pid" ]; then
+  kill -TERM "$(cat "$BG/wrap.pid")" 2>/dev/null; wait "$BGJOB"; BGRC=$?
+  [ "$BGRC" = 143 ] && pass "G3: a TERM to the wrapper ends it 143" || fail "G3: wrapper status after TERM: $BGRC"
+  pid_gone "$(cat "$BG/gc2.pid")" && pass "G3: and a TERM to the wrapper takes the grandchild down too" || fail "G3: the grandchild $(cat "$BG/gc2.pid") outlived a TERM to the wrapper"
+else
+  fail "G3: the TERM proof did not start (no pid files)"; kill "$BGJOB" 2>/dev/null
+fi
+
+# Fail closed on an ERROR as well as on the clock (review of a237c1f). A grep that exits 2, a
+# grep that is not there, and a find that cannot read a directory each leave no usable index;
+# an empty or partial one would read as "no transcript names anything" and the default config
+# would reap directories transcripts name. Each keeps all 10, writes no cache and no stamp.
+g3_failclosed() {  # <label> <pattern the log must show> <VAR=value>...
+  local label="$1" want="$2" n rel out; shift 2
+  eq_fixture "$EQ"
+  [ -n "${G3_PRE:-}" ] && eval "$G3_PRE"
+  out="$( export "$@"; CLAUDE_CODE_SESSION_ID=$EQ_SELF run_real "$EQ" "$SCRIPT"; echo "rc=$?" )"
+  [ -n "${G3_POST:-}" ] && eval "$G3_POST"
+  check "G3: $label: the failed lookup is reported" "$out" "$want"
+  n=0; for rel in $EQ_CANDS; do [ -d "$EQ/scratch/$rel" ] && n=$((n + 1)); done
+  [ "$n" = 10 ] && [ -d "$EQ/scratch/proj/11111111-1111-1111-1111-111111111111" ] && pass "G3: $label: every scratchpad is kept (10 of 10, and the one no transcript names too)" || fail "G3: $label: $n of 10 scratchpads left"
+  check "G3: $label: nothing was reaped" "$out" "" "scratchpad reaped"
+  check "G3: $label: the run reports a failure" "$out" "rc=1"
+  [ ! -e "$EQ/stamp" ] && pass "G3: $label: no stamp" || fail "G3: $label: stamped"
+  [ ! -e "$EQ/home/.cc-reaper/state/reclaim-byproducts.mention-index" ] && [ ! -e "$EQ/home/.cc-reaper/state/reclaim-byproducts.mention-index.fp" ] && pass "G3: $label: no cache" || fail "G3: $label: an index was cached"
+}
+printf '#!/usr/bin/env bash\necho "grep: boom" >&2\nexit 2\n' > "$EQ/grep-err"; chmod +x "$EQ/grep-err"
+g3_failclosed "a grep that exits 2" "transcript lookup failed" "BYPRODUCT_GREP_BIN=$EQ/grep-err"
+g3_failclosed "a grep binary that is not there" "transcript lookup failed" "BYPRODUCT_GREP_BIN=$EQ/no-such-grep"
+printf '#!/usr/bin/env bash\nkill -9 $$\n' > "$EQ/grep-sig"; chmod +x "$EQ/grep-sig"
+g3_failclosed "a grep killed by a signal" "transcript lookup failed" "BYPRODUCT_GREP_BIN=$EQ/grep-sig"
+G3_PRE='mkdir -p "$EQ/home/.claude/projects/-locked"; chmod 000 "$EQ/home/.claude/projects/-locked"'
+G3_POST='chmod 755 "$EQ/home/.claude/projects/-locked"'
+g3_failclosed "a find that cannot read a directory" "transcript lookup failed"
+G3_PRE=""; G3_POST=""
 # A bad budget is defaulted with a message, not obeyed.
 eq_fixture "$EQ"
 OUT="$(CLAUDE_CODE_SESSION_ID=$EQ_SELF CC_RB_MENTION_BUDGET_SECONDS=soon run_real "$EQ" "$SCRIPT")"

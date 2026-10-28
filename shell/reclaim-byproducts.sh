@@ -653,6 +653,9 @@ bounded_group() {
     if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 }
     setpgrp($pid, $pid);  # the parent too, so the group exists before the child is scheduled
     $SIG{ALRM} = sub { kill "KILL", -$pid; kill "KILL", $pid; waitpid $pid, 0; exit 124 };
+    # launchd stops a job with TERM: take the whole group down with the wrapper, never an orphan.
+    my %num = (HUP => 1, INT => 2, TERM => 15);
+    for my $sig (keys %num) { $SIG{$sig} = sub { kill "KILL", -$pid; kill "KILL", $pid; waitpid $pid, 0; exit 128 + $num{$sig} } }
     alarm $secs;
     waitpid $pid, 0; my $st = $?; alarm 0;
     exit($st & 127 ? 128 + ($st & 127) : $st >> 8);' "$secs" "$@"
@@ -670,10 +673,23 @@ mention_fingerprint() {  # <listfile> <seconds-left>
     bounded_group "$2" /bin/sh -c 'xargs -0 /usr/bin/stat -f "%m %z %N" < "$1" > "$2"' _ "$1" "$statf" 2>/dev/null || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then rm -f "$statf"; [ "$rc" -eq 124 ] && return 124; return 1; fi
-  { printf 'v1 %s %s %s\n' "$root" "$IDLE_HOURS" "${CLAUDE_CODE_SESSION_ID:-}"; LC_ALL=C sort "$statf"; } \
+  { printf 'v2 %s %s %s %s\n' "$root" "$IDLE_HOURS" "${CLAUDE_CODE_SESSION_ID:-}" \
+      "$({ printf '%s\n%s\n' "$MENTION_RE_TMPL" "$MENTION_AWK"; } | { shasum -a 256 2>/dev/null || cksum; } | awk '{ print $1 }')"
+    LC_ALL=C sort "$statf"; } \
     | { shasum -a 256 2>/dev/null || cksum; } | awk '{ print $1 }'
   rm -f "$statf"
 }
+
+# The extraction rule: the regex (@ROOT@ is the scratch root's name) and the awk program that
+# turns the matches into the index. Both are hashed into the cache key (mention_fingerprint), so
+# a change to either can never be served an index built by the other.
+MENTION_RE_TMPL='@ROOT@/[^/" \\]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+MENTION_AWK='{
+        n = split($1, a, "/"); f = a[n]
+        if (self != "" && f == self ".jsonl") next
+        m = $2; sub(/^[^\/]*\//, "", m); print m "\t" f }'
+# Why a lookup ended with status 2 when it was not the clock (empty for the clock); for the log.
+MENTION_WHY=""
 
 # Which scratchpads do transcripts written in the window NAME - the old mention rule, read
 # once. Lines of `<project>/<session-id><TAB><transcript>` in $1. The caller's own
@@ -707,6 +723,10 @@ build_mention_index() {  # <outfile>
     bounded_group "$left" "$FIND" "$d" -name '*.jsonl' -mmin -"$((IDLE_HOURS * 60))" -type f -print0 >> "$list" 2>/dev/null
     rc=$?
     [ "$rc" -ne 124 ] || { rm -rf "$work"; return 2; }
+    # Only a clean find is a whole file list. A find that could not read a directory (or died)
+    # says nothing about the transcripts in it, and an index built without them reads as "nobody
+    # names this path": keep everything, as for the clock.
+    [ "$rc" -eq 0 ] || { MENTION_WHY="find exited $rc in $d"; rm -rf "$work"; return 2; }
   done
   _mention_left || { rm -rf "$work"; return 2; }
   fp="$(mention_fingerprint "$list" "$left")" || { rc=$?; [ "$rc" -ne 124 ] || { rm -rf "$work"; return 2; }; fp=""; }
@@ -718,18 +738,27 @@ build_mention_index() {  # <outfile>
   fi
   _mention_left || { rm -rf "$work"; return 2; }
   if [ -s "$list" ]; then
-    # xargs exits nonzero when a batch of grep finds nothing; only the budget is an error here.
-    bounded_group "$left" /bin/sh -c 'xargs -0 "$1" -HoE "$2" < "$3"' _ "$GREP_BIN" \
-      "$root/[^/\" \\\\]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" "$list" > "$work/raw" 2>/dev/null
+    # One grep per batch of files. A batch with no match exits 1, which is an answer. 2 or more
+    # (an error; 127, a binary that is not there) and death by a signal are not: grep1.sh turns
+    # those into 255, which stops xargs, and leaves grep's status in err. Only xargs ending 0 with
+    # no err is a whole index; anything else, a signalled child included, is a lookup that did
+    # not finish, and an empty or partial index is never used or cached.
+    cat > "$work/grep1.sh" <<'GREP1'
+g="$1"; re="$2"; err="$3"; shift 3
+"$g" -HoE "$re" "$@"; r=$?
+[ "$r" -le 1 ] || { echo "$r" > "$err"; exit 255; }
+exit 0
+GREP1
+    bounded_group "$left" /bin/sh -c 'xargs -0 /bin/sh "$1" "$2" "$3" "$4" < "$5"' _ "$work/grep1.sh" \
+      "$GREP_BIN" "${MENTION_RE_TMPL/@ROOT@/$root}" "$work/err" "$list" > "$work/raw" 2>/dev/null
     rc=$?
+    if [ -e "$work/err" ]; then MENTION_WHY="grep exited $(cat "$work/err" 2>/dev/null)"; rm -rf "$work"; return 2; fi
     [ "$rc" -ne 124 ] || { rm -rf "$work"; return 2; }
+    [ "$rc" -eq 0 ] || { MENTION_WHY="the grep pass ended with status $rc"; rm -rf "$work"; return 2; }
   else
     : > "$work/raw"
   fi
-  awk -F: -v self="${CLAUDE_CODE_SESSION_ID:-}" '{
-        n = split($1, a, "/"); f = a[n]
-        if (self != "" && f == self ".jsonl") next
-        m = $2; sub(/^[^\/]*\//, "", m); print m "\t" f }' "$work/raw" | sort -u > "$work/index" || { rm -rf "$work"; return 1; }
+  awk -F: -v self="${CLAUDE_CODE_SESSION_ID:-}" "$MENTION_AWK" "$work/raw" | sort -u > "$work/index" || { rm -rf "$work"; return 1; }
   cp "$work/index" "$1" 2>/dev/null || { rm -rf "$work"; return 1; }
   # Cached only by a run that can delete: a dry run writes nothing. The fingerprint goes last,
   # and is removed first, so a torn write reads as a miss, never as a match.
@@ -851,7 +880,11 @@ reap_scratchpads() {
     # Fail closed (stima-api#5886): a lookup that did not finish says nothing about which
     # directories a transcript names, so none is judged and none is removed this run. The cursor
     # is untouched, and FAILED keeps the run from being stamped as complete.
-    log "scratchpads: the transcript lookup did not finish within ${MENTION_BUDGET_SECONDS}s; no directory judged, every one kept; the next run tries again" >&2
+    if [ -n "$MENTION_WHY" ]; then
+      log "scratchpads: the transcript lookup failed ($MENTION_WHY); no directory judged, every one kept; the next run tries again" >&2
+    else
+      log "scratchpads: the transcript lookup did not finish within ${MENTION_BUDGET_SECONDS}s; no directory judged, every one kept; the next run tries again" >&2
+    fi
     rm -f "$midx" 2>/dev/null
     FAILED=1; return 0
   fi
