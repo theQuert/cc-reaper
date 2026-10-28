@@ -5,6 +5,9 @@
 #   CC_WJ_NEW_RULES_MODE spotcheck (default) logs what they would trim or remove and changes nothing;
 #                        auto lets them decide
 #   CC_WJ_DENY_NAMES     a named worktree is never trimmed or removed
+#   inbound-symlink      a tree that another worktree's node_modules symlink points into is kept
+#                        (active in every mode: a keep only makes the sweep safer); a dead link
+#                        is reported, never counted; a failed scan keeps
 # Plus two costs: one holder scan per sweep, and no per-tree walk for a tree with nothing to trim.
 # Real git repositories and a local bare "origin"; lsof and gh are stubs, find is logged.
 # TAP-style; set WJ_SCRIPT to test another copy of the janitor.
@@ -30,11 +33,13 @@ G() { git -c user.name=Fixture -c user.email=fixture@example.com "$@"; }
 ORIGIN="$T/origin.git"; PRIMARY="$T/primary"
 G init -q --bare "$ORIGIN" -b main
 G clone -q "$ORIGIN" "$PRIMARY" 2>/dev/null
-printf '*.log\nnode_modules/\n.claude/skills\n.claude/commands\n' > "$PRIMARY/.gitignore"
+printf '*.log\nnode_modules\n.claude/skills\n.claude/commands\n' > "$PRIMARY/.gitignore"
 echo init > "$PRIMARY/README.md"
 # Tracked, as in stima-api: otherwise git collapses the whole directory to `!! .claude/`.
 mkdir -p "$PRIMARY/.claude"; echo "{}" > "$PRIMARY/.claude/settings.json"
-G -C "$PRIMARY" add README.md .gitignore .claude/settings.json
+# Tracked too, so git reports web/next/node_modules itself and not a collapsed `!! web/`.
+mkdir -p "$PRIMARY/web/next" "$PRIMARY/web/default"; echo '{}' > "$PRIMARY/web/next/package.json"; echo '{}' > "$PRIMARY/web/default/package.json"
+G -C "$PRIMARY" add README.md .gitignore .claude/settings.json web
 G -C "$PRIMARY" commit -qm init
 G -C "$PRIMARY" push -q origin main
 # What new-task-worktree.sh links into every task worktree.
@@ -63,6 +68,14 @@ mkwt trimme unlanded;  echo x > "$T/wt-trimme/.build-main.log"; cache trimme
 mkwt trimheld unlanded; echo x > "$T/wt-trimheld/.build-main.log"; cache trimheld
 mkwt homepage-bento;  cache homepage-bento
 mkwt sessiondeny;     cache sessiondeny
+# stima-api: web/next/node_modules is a symlink into another worktree's node_modules.
+mkwt donor;    mkdir -p "$T/wt-donor/web/next/node_modules/pkg"; echo pkg > "$T/wt-donor/web/next/node_modules/pkg/index.js"
+mkwt donor2;   mkdir -p "$T/wt-donor2/web/default/node_modules/pkg"; echo pkg > "$T/wt-donor2/web/default/node_modules/pkg/index.js"
+mkwt lonely;   cache lonely
+mkwt ghost
+mkwt consumer; mkdir -p "$T/wt-consumer/web/next"; ln -s "$T/wt-donor/web/next/node_modules" "$T/wt-consumer/web/next/node_modules"
+mkwt consumer2; mkdir -p "$T/wt-consumer2/web/default"; ln -s ../../../wt-donor2/web/default/node_modules "$T/wt-consumer2/web/default/node_modules"
+mkwt deadc;    mkdir -p "$T/wt-deadc/web/next"; ln -s "$T/wt-ghost/web/next/node_modules" "$T/wt-deadc/web/next/node_modules"
 
 # ─── Stubs and env ────────────────────────────────────────────────────────────
 
@@ -70,7 +83,8 @@ STUBS="$T/stubs"; mkdir -p "$STUBS"
 LSOF_CWD_FILE="$T/lsof-cwd.txt"; LSOF_OPEN_FILE="$T/lsof-open.txt"; LSOF_LOG="$T/lsof.log"; FIND_LOG="$T/find.log"
 export LSOF_CWD_FILE LSOF_OPEN_FILE LSOF_LOG FIND_LOG
 # Two worktrees have a process standing in them.
-printf 'p1\nn/\np77\nn%s\np78\nn%s\n' "$T/wt-logheld" "$T/wt-trimheld" > "$LSOF_CWD_FILE"
+printf 'p1\nn/\np77\nn%s\np78\nn%s\np79\nn%s\np80\nn%s\np81\nn%s\n' \
+  "$T/wt-logheld" "$T/wt-trimheld" "$T/wt-consumer" "$T/wt-consumer2" "$T/wt-deadc" > "$LSOF_CWD_FILE"
 printf 'p1\nn/dev/null\n' > "$LSOF_OPEN_FILE"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$STUBS/osascript"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$STUBS/pgrep"
@@ -87,6 +101,7 @@ REAL_FIND="$(command -v find)"
 cat > "$STUBS/find" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "\$FIND_LOG"
+case " \$* " in *" -maxdepth 4 "*" -type l "*) [ -z "\${FIND_FAIL_LINKS:-}" ] || exit 1 ;; esac
 exec "$REAL_FIND" "\$@"
 STUB
 chmod +x "$STUBS"/*
@@ -139,6 +154,20 @@ check "deny: a worktree a live session of a deny-listed name stands in is kept" 
 check "one holder scan per sweep: a report over ten worktrees runs lsof exactly twice (cwd, open files)" \
   test "$(grep -vc -- '\.lock' "$LSOF_LOG")" -eq 2
 
+# Inbound node_modules symlinks (held consumers, so only the targets are under test).
+check "inbound: a tree another worktree's absolute node_modules link points into is kept" \
+  judged "$T/report-auto.txt" donor "KEEP(inbound-symlink:wt-consumer)"
+check "inbound: so is one a relative link points into" judged "$T/report-auto.txt" donor2 "KEEP(inbound-symlink:wt-consumer2)"
+check "inbound: a landed tree nothing links into is still removable" judged "$T/report-auto.txt" lonely REMOVABLE
+check "inbound: a dead link does not keep the tree it named" judged "$T/report-auto.txt" ghost REMOVABLE
+check "inbound: the dead link is reported with its target" \
+  grep -qF "dead-node-modules-link:$T/wt-deadc/web/next/node_modules -> $T/wt-ghost/web/next/node_modules" "$T/report-auto.txt"
+check "inbound: the scan is bounded and prunes real node_modules" \
+  bash -c 'grep -F -- "-name node_modules" "$1" | grep -F -- "-maxdepth 4" | grep -qF -- "-prune"' _ "$FIND_LOG"
+FIND_FAIL_LINKS=1 wj > "$T/report-failscan.txt"
+check "inbound: a failed scan keeps a tree that would be removable" \
+  judged "$T/report-failscan.txt" lonely "KEEP(inbound-scan-unknown)"
+
 : > "$SPOT"
 wj > "$T/report-spot.txt"
 check "spotcheck (default): the log still keeps the tree as before" judged "$T/report-spot.txt" log "KEEP(unrebuildable=1)"
@@ -160,6 +189,10 @@ check "spotcheck: an unlanded idle tree's node_modules is not trimmed" test -d "
 check "  and the would-trim is logged with its path" spot_has "path=$T/wt-trimme/node_modules " "phase=trim action=would-trim rule=top-level-log"
 check "  and the tree is kept as before" judged "$T/trim-spot.txt" trimme "KEEP(unrebuildable=1)"
 refute "spotcheck: a held tree's cache is not logged" grep -qF "wt-trimheld" "$SPOT"
+check "inbound: trim keeps the node_modules another worktree's link points into" \
+  test -d "$T/wt-donor/web/next/node_modules" -a -d "$T/wt-donor2/web/default/node_modules"
+check "  and says why" judged "$T/trim-spot.txt" donor "KEEP(inbound-symlink:wt-consumer)"
+refute "  while a tree nothing links into is trimmed" test -e "$T/wt-lonely/node_modules"
 
 CC_WJ_NEW_RULES_MODE=auto wj --trim-regenerable --apply > "$T/trim-auto.txt"
 refute "auto: an unlanded idle tree whose only pin is a log has its node_modules trimmed" test -e "$T/wt-trimme/node_modules"
@@ -189,6 +222,11 @@ check "auto --apply removes the tree a log alone kept" test ! -e "$T/wt-log"
 check "auto --apply removes the trees a skills link alone kept" test ! -e "$T/wt-skillsabs" -a ! -e "$T/wt-skillsrel"
 check "  and the primary checkout's skills are untouched" test -f "$PRIMARY/.claude/skills/one/SKILL.md"
 check "  and the branches remain" bash -c 'git -C "$1" show-ref -q --verify refs/heads/log && git -C "$1" show-ref -q --verify refs/heads/skillsabs' _ "$PRIMARY"
+check "inbound: --apply removes the tree nothing links into and the one only a dead link named" \
+  test ! -e "$T/wt-lonely" -a ! -e "$T/wt-ghost"
+check "inbound: --apply keeps the trees live links point into, and their node_modules" \
+  test -d "$T/wt-donor/web/next/node_modules" -a -d "$T/wt-donor2/web/default/node_modules"
+check "inbound: and the links still resolve" test -d "$T/wt-consumer/web/next/node_modules/pkg" -a -d "$T/wt-consumer2/web/default/node_modules/pkg"
 check "auto --apply keeps the held tree" test -d "$T/wt-logheld"
 check "auto --apply keeps the deny-listed trees" test -d "$T/wt-homepage-bento" -a -d "$T/wt-sessiondeny"
 check "auto --apply keeps a link outside the primary checkout" test -L "$T/wt-linkout/.claude/skills"

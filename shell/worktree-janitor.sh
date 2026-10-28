@@ -133,6 +133,8 @@ A worktree is removable only when it holds nothing a command cannot rebuild - or
 archive: line in .worktree-regenerable lets --apply copy out first - no process
 has it as a working directory or holds a file in it, its work has landed on the fetched
 base branch, and nothing in it changed within CC_WJ_IDLE_HOURS. Branches are never deleted.
+A worktree that another worktree's node_modules symlink resolves into is kept, removal and trim
+alike (KEEP(inbound-symlink:<tree>)); a dead node_modules link is reported, never deleted.
 A clean worktree whose claude-task-done annotation names its HEAD, on a branch, is judged
 without that window and without the recent-session lease.
 `--trim-regenerable` uses the same holder and harness claim vetoes but does not require
@@ -2426,6 +2428,73 @@ _cc_wj_realpath() {
     base=$(basename "$p")
     echo "$(builtin cd -P -- "$dir" >/dev/null 2>&1 && pwd -P)/$base"
   fi
+}
+
+# ─── Inbound node_modules symlinks ────────────────────────────────────────────
+
+# stima-api worktrees link web/next/node_modules (or web/default/node_modules) into ANOTHER
+# worktree's node_modules to avoid a second install. node_modules is regenerable, so the tree
+# holding the target never counted as having anything worth keeping, and reclaiming it (or
+# trimming its node_modules) left every consumer with a dead link. A worktree that a live
+# node_modules link in another worktree resolves into is therefore kept. The links are
+# gathered once per repository and phase and read again right before a removal. This rule only
+# ever keeps, so it is active in every CC_WJ_NEW_RULES_MODE. A dead link names nothing to keep:
+# it is reported, never deleted.
+_CC_WJ_INBOUND_OK="no"; _CC_WJ_INBOUND_FILE=""; _CC_WJ_INBOUND_REASON=""; _CC_WJ_INBOUND_AT=0
+
+# Fill <out> with one `holder<TAB>link<TAB>target` line per live node_modules symlink found
+# (at most four levels down, real node_modules directories not entered) in a worktree of
+# inventory <inv>; holder and target are physical paths. A scan that could not read everything
+# fails, and the caller keeps.
+_cc_wj_scan_inbound() { # <inventory> <out> [quiet]
+  local inv="$1" out="$2" quiet="${3:-}" wt rest link tgt hold rc=0 list
+  _CC_WJ_INBOUND_OK="no"; _CC_WJ_INBOUND_FILE="$out"; _CC_WJ_INBOUND_AT="$(date +%s)"
+  list="$out.links"
+  : > "$out" 2>/dev/null || return 1
+  while IFS=$'\t' read -r wt rest; do
+    [ -n "$wt" ] || continue
+    case "$rest" in *UNSAFE-PATH*) rc=1; continue ;; esac
+    [ -d "$wt" ] || continue
+    # A directory find may not enter (root-owned, chmod 000) is not an error of the scan: a
+    # worktree with one must not stop every other from being reclaimed. Anything else is.
+    if ! find "$wt" -maxdepth 4 \( -name node_modules -type d -prune \) -o \( -name node_modules -type l -print \) \
+         > "$list" 2> "$list.err"; then
+      LC_ALL=C grep -qv 'Permission denied$' "$list.err" 2>/dev/null && rc=1
+      [ -s "$list.err" ] || rc=1
+    fi
+    [ -s "$list" ] || continue
+    hold="$(_cc_wj_realpath "$wt")"; hold="${hold%/}"
+    while IFS= read -r link; do
+      if [ -d "$link" ]; then
+        tgt="$(_cc_wj_realpath "$link")"; tgt="${tgt%/}"
+        case "$link$tgt" in *$'\t'*|*$'\n'*) rc=1; continue ;; esac
+        printf '%s\t%s\t%s\n' "$hold" "$link" "$tgt" >> "$out" || rc=1
+      elif [ -z "$quiet" ] && [ -L "$link" ] && [ ! -e "$link" ]; then
+        echo "worktree-janitor: dead-node-modules-link:$link -> $(readlink "$link" 2>/dev/null)"
+      fi
+    done < "$list"
+  done < "$inv"
+  rm -f "$list" "$list.err" 2>/dev/null
+  [ "$rc" -eq 0 ] && _CC_WJ_INBOUND_OK="yes"
+  return "$rc"
+}
+
+# Status 0, with _CC_WJ_INBOUND_REASON set, when worktree $1 must be kept because another
+# worktree's node_modules link resolves into it, or because the scan could not tell.
+_cc_wj_inbound_keep() { # <worktree path>
+  local phys holder link tgt
+  [ "$_CC_WJ_INBOUND_OK" = yes ] && [ -n "$_CC_WJ_INBOUND_FILE" ] ||
+    { _CC_WJ_INBOUND_REASON="inbound-scan-unknown"; return 0; }
+  phys="$(_cc_wj_realpath "$1")"; phys="${phys%/}"
+  while IFS=$'\t' read -r holder link tgt; do
+    [ -n "$holder" ] && [ "$holder" != "$phys" ] || continue
+    case "$tgt/" in
+      "$phys"/*)
+        _CC_WJ_INBOUND_REASON="inbound-symlink:$(_cc_wj_unknown_label "${holder##*/}")"
+        return 0 ;;
+    esac
+  done < "$_CC_WJ_INBOUND_FILE"
+  return 1
 }
 
 # ─── Ahead-of-origin count ────────────────────────────────────────────────────
@@ -4725,6 +4794,9 @@ KEEP
     fi
     wt_total="$(wc -l < "$work/inventory" | tr -d ' ')"
     wt_index=0
+    # Which worktrees other worktrees' node_modules links point into, once for this repository.
+    _cc_wj_scan_inbound "$work/inventory" "$work/inbound" ||
+      echo "worktree-janitor: $repo: the node_modules link scan failed, so no worktree in it can be shown free of inbound links"
     while IFS=$'\t' read -r wt_path branch dirty ahead push_state pins; do
       if [ "$apply" -eq 1 ]; then
         if [ "$sweep_budget" -gt 0 ] && [ "$examined" -gt 0 ]; then
@@ -4880,6 +4952,13 @@ KEEP
            [ ! -s "$work/trim-precheck" ]; then
           printf 'TRIM_RESULT count=0 trimmed=0 reclaimed=0\n'
           [ -z "$nr_dirty" ] || { ACTIVE_OK="$nr_active_ok"; activity_blind="$nr_blind"; }
+          continue
+        fi
+        # A tree another worktree's node_modules link resolves into keeps its caches too.
+        if _cc_wj_inbound_keep "$wt_path"; then
+          printf "    classification: KEEP(%s)\n" "$_CC_WJ_INBOUND_REASON"
+          [ -z "$nr_dirty" ] || { ACTIVE_OK="$nr_active_ok"; activity_blind="$nr_blind"; }
+          total_kept=$((total_kept + 1))
           continue
         fi
         # Uncommitted files are never listed, since only ignored regenerable directories
@@ -5133,6 +5212,12 @@ KEEP
             fi ;;
         esac
       fi
+      # Another worktree's node_modules link resolves into it: removing it would leave that
+      # link dead. Asked last, of a tree every other gate would remove; active in every mode.
+      case "$classification" in
+        REMOVABLE|REMOVABLE\(*\))
+          _cc_wj_inbound_keep "$wt_path" && classification="KEEP($_CC_WJ_INBOUND_REASON)" ;;
+      esac
       # pushed-idle, spot check: a tree that stays KEEP(unlanded) only because origin's
       # listing did not name its branch is asked the remaining gates as if it were pushed, and
       # what would be removed is logged. The classification is not touched. Not asked of a tree
@@ -5316,6 +5401,15 @@ KEEP
             ld_keep="$(_cc_wj_launchd_target "$work" "$wt_path")"
             if [ -n "$ld_keep" ]; then
               printf "    → kept: launchd job %s runs from it\n" "$ld_keep"
+              total_kept=$((total_kept + 1))
+              continue
+            fi
+            # A link can have been made to it since the scan; one older than two minutes is
+            # read again (about 5 s over 117 worktrees warm), a fresher one is not.
+            [ $(( $(date +%s) - ${_CC_WJ_INBOUND_AT:-0} )) -lt 120 ] ||
+              _cc_wj_scan_inbound "$work/inventory" "$work/inbound" quiet
+            if _cc_wj_inbound_keep "$wt_path"; then
+              printf "    → kept: %s\n" "$_CC_WJ_INBOUND_REASON"
               total_kept=$((total_kept + 1))
               continue
             fi
