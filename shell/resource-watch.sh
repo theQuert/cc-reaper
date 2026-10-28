@@ -343,8 +343,9 @@ _cc_rw_maybe_notify() {
 # is up to 7200s plus a sweep's length old). This raises ALERT:reclaim-stalled with a
 # notification, ONCE per stall: <state>/reclaim-stalled.alerted holds the stamp's mtime (or
 # "none") that was alerted, a later round with the same stamp stays quiet, and a fresh stamp
-# removes the file so the next stall alerts again. No stamp at all (a fresh install) is not a stall:
-# one INFO line, once (<state>/reclaim-stalled.nostamp), and no alert. Alert only: it ends no process and deletes
+# removes the file so the next stall alerts again. No stamp at all is aged from the plist's mtime
+# (else the script's): inside the line one INFO line, once (<state>/reclaim-stalled.nostamp); over
+# it the same once-only alert, so a first sweep that never finishes cannot stay silent. Alert only: it ends no process and deletes
 # nothing. Not installed (the script is absent) means nothing to be stalled.
 _CC_RW_RECLAIM_STALL_FIRE=""
 _cc_rw_reclaim_stall_limit() {
@@ -375,12 +376,26 @@ _cc_rw_reclaim_stall() {  # <now epoch>
     [[ "$mt" =~ ^[0-9]+$ ]] || return 0
     age=$(( now - mt )); [ "$age" -ge 0 ] || age=0; key=$mt
   else
-    # No stamp: a fresh install whose first sweep has not finished, or a stamp path that moved.
-    # Neither is a stall that has had its time, so no alert; said once, as info. A stamp that
-    # exists and is stale is what alerts.
+    # No stamp: a fresh install whose first sweep has not finished, or a reclaimer that never
+    # finishes one (the first sweep hangs, or every sweep fails) and so never writes a stamp.
+    # Silence forever is the failure this alert is for, so the age comes from a baseline: the
+    # mtime of the LaunchAgent plist (when the agent was installed), else of the script. Inside
+    # the line: one INFO, once. Over it: the same once-only alert as a stale stamp.
+    local base="${CC_RW_RECLAIM_PLIST:-$HOME/Library/LaunchAgents/com.cc-reaper.reclaim-byproducts.plist}" bmt
+    [ -r "$base" ] || base="$script"
+    bmt=$(stat -f %m "$base" 2>/dev/null || stat -c %Y "$base" 2>/dev/null)
+    if [[ "$bmt" =~ ^[0-9]+$ ]]; then
+      age=$(( now - bmt )); [ "$age" -ge 0 ] || age=0; key="nostamp:$bmt"
+      if [ "$age" -gt "$limit" ]; then
+        [ "$(cat "$marker" 2>/dev/null)" = "$key" ] && return 0
+        printf '%s\n' "$key" > "$marker" 2>/dev/null || true
+        _CC_RW_RECLAIM_STALL_FIRE="no finished-sweep stamp at $stamp, and the reclaimer was installed ${age}s ago (over ${limit}s)"
+        return 0
+      fi
+    fi
     if [ ! -e "${state_dir}/reclaim-stalled.nostamp" ]; then
       : > "${state_dir}/reclaim-stalled.nostamp" 2>/dev/null || true
-      _cc_rw_log_line "INFO reclaim-stalled: no finished-sweep stamp yet at $stamp (not alerting until one exists and goes stale)"
+      _cc_rw_log_line "INFO reclaim-stalled: no finished-sweep stamp yet at $stamp (alerting only if none appears within ${limit}s of the install)"
     fi
     return 0
   fi

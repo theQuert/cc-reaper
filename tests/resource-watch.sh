@@ -839,6 +839,36 @@ touch "$t19c/no-stamp"; touch -t "$(ago 40000)" "$t19c/no-stamp"
 guard_case "$t19c" 100 CC_RW_RECLAIM_STAMP="$t19c/no-stamp"
 expect_yes "T19h: the stamp appears and is stale: that alerts" test "$(t19_alerts "$t19c")" -eq 1
 
+# No stamp is judged from a baseline: the reclaim plist's mtime (the agent's install), else the
+# script's. A reclaimer whose first sweep hangs, or that always fails, never writes a stamp, and
+# silence forever is the failure this alert exists for.
+t19s=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkplist "$t19s/p.plist" '<key>StartInterval</key><integer>7200</integer>'
+guard_case "$t19s" 100 CC_RW_RECLAIM_STAMP="$t19s/no-stamp" CC_RW_RECLAIM_PLIST="$t19s/p.plist"
+expect_no "T19o: no stamp and a plist installed just now: no alert" grep -q 'ALERT:reclaim-stalled' "$t19s/resource-watch.log"
+expect_yes "T19o: one info line" test "$(grep -c 'INFO reclaim-stalled: no finished-sweep stamp yet' "$t19s/resource-watch.log")" -eq 1
+t19t=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); mkplist "$t19t/p.plist" '<key>StartInterval</key><integer>7200</integer>'
+touch -t "$(ago 15000)" "$t19t/p.plist"
+guard_case "$t19t" 100 CC_RW_RECLAIM_STAMP="$t19t/no-stamp" CC_RW_RECLAIM_PLIST="$t19t/p.plist"
+expect_yes "T19p: no stamp and a plist older than the line (15000s > 14400s): alert" test "$(t19_alerts "$t19t")" -eq 1
+expect_yes "T19p: the notification says no sweep has finished since the install" grep -q 'no finished-sweep stamp.*installed 150[0-9][0-9]s ago (over 14400s)' "$t19t/osascript"
+guard_case "$t19t" 100 CC_RW_RECLAIM_STAMP="$t19t/no-stamp" CC_RW_RECLAIM_PLIST="$t19t/p.plist"
+expect_yes "T19p: once, not every round" test "$(t19_alerts "$t19t")" -eq 1
+expect_yes "T19p: one notification" test "$(t19_notes "$t19t")" -eq 1
+touch "$t19t/stamp"
+guard_case "$t19t" 100 CC_RW_RECLAIM_STAMP="$t19t/stamp" CC_RW_RECLAIM_PLIST="$t19t/p.plist"
+expect_yes "T19q: a fresh stamp appearing re-arms (the marker is gone)" test ! -e "$t19t/state/reclaim-stalled.alerted"
+expect_yes "T19q: and alerts nothing more" test "$(t19_alerts "$t19t")" -eq 1
+rm -f "$t19t/stamp"
+guard_case "$t19t" 100 CC_RW_RECLAIM_STAMP="$t19t/no-stamp" CC_RW_RECLAIM_PLIST="$t19t/p.plist"
+expect_yes "T19q: the next stampless stall alerts again" test "$(t19_alerts "$t19t")" -eq 2
+# No readable plist: the script's mtime is the baseline.
+t19u=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); : > "$t19u/reclaim.sh"; touch -t "$(ago 8000)" "$t19u/reclaim.sh"
+guard_case "$t19u" 100 CC_RW_RECLAIM_STAMP="$t19u/no-stamp" CC_RW_RECLAIM_PLIST="$t19u/no-such.plist" CC_RW_RECLAIM_SCRIPT="$t19u/reclaim.sh"
+expect_yes "T19r: no stamp, no plist, a script older than the 7200s fallback line: alert" test "$(t19_alerts "$t19u")" -eq 1
+t19v=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); : > "$t19v/reclaim.sh"
+guard_case "$t19v" 100 CC_RW_RECLAIM_STAMP="$t19v/no-stamp" CC_RW_RECLAIM_PLIST="$t19v/no-such.plist" CC_RW_RECLAIM_SCRIPT="$t19v/reclaim.sh"
+expect_no "T19r: and a script installed just now is not" grep -q 'ALERT:reclaim-stalled' "$t19v/resource-watch.log"
+
 t19d=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); touch -t "$(ago 10800)" "$t19d/stamp"
 guard_case "$t19d" 100 CC_RW_RECLAIM_STAMP="$t19d/stamp" CC_RW_RECLAIM_SCRIPT=/nonexistent/reclaim-byproducts.sh
 expect_no "T19i: a reclaimer that is not installed cannot be stalled" grep -q 'ALERT:reclaim-stalled' "$t19d/resource-watch.log"
