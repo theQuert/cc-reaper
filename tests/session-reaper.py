@@ -355,6 +355,49 @@ class DoneCheckBy(unittest.TestCase):
         self.checkby = "UNKNOWN"
         self.assertEqual(self.keep(last_text="SESSION-DONE: shipped"), ["check-by-unknown"])
 
+    def shadow(self, **kw):
+        """DONE_INBOX off, DONE_INBOX_SHADOW on: (keep, inbox_done_shadow) for one decide."""
+        self.cfg = dict(CFG, DONE_INBOX="", DONE_INBOX_SHADOW=str(self.inbox))
+        kw.setdefault("last_text", "all good")
+        kw.setdefault("name", "ops-dispatch")
+        kw.setdefault("claims", [("o/r", "2")])
+        s = session(**kw)
+        with mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
+             mock.patch.object(reaper, "oracle_brief", return_value=None), \
+             mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.checkby), \
+             mock.patch.object(reaper, "claim_time", side_effect=lambda r, n, sid: self.claim), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]):
+            keep = reaper.decide(s, self.cfg, self.NOW)
+        return keep, s.get("inbox_done_shadow")
+
+    def test_shadow_marks_but_never_reaps_an_inbox_done_session(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
+        keep, marked = self.shadow()
+        self.assertEqual(keep, ["issue-unknown:#2"])
+        self.assertTrue(marked)
+        line = reaper.report_line(session(pid=1, descendants=0, claims=[("o/r", "2")], inbox_done_shadow=True), keep, "keep")
+        self.assertIn("would-close: inbox DONE (shadow)", line)
+
+    def test_shadow_does_not_mark_what_the_live_path_would_keep(self):
+        self.write("K1 DONE · 2026-10-25 21:30 TPE · ops-dispatch")  # too recent
+        self.assertEqual(self.shadow(), (["issue-unknown:#2"], False))
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
+        self.checkby = "OPEN"  # the shadow decide reads the check-by, as the live one would
+        self.assertEqual(self.shadow(), (["issue-unknown:#2"], False))
+
+    def test_shadow_is_off_when_the_live_path_is_on_or_unset(self):
+        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
+        self.cfg = dict(CFG, DONE_INBOX=str(self.inbox), DONE_INBOX_SHADOW=str(self.inbox))
+        s = session(name="ops-dispatch", claims=[("o/r", "2")])
+        with mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
+             mock.patch.object(reaper, "oracle_brief", return_value=None), \
+             mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.checkby), \
+             mock.patch.object(reaper, "claim_time", side_effect=lambda r, n, sid: self.claim), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]):
+            self.assertEqual(reaper.decide(s, self.cfg, self.NOW), [])
+        self.assertNotIn("inbox_done_shadow", s)
+        self.assertEqual(self.keep(claims=[]), ["claim-unknown"])
+
     def test_check_by_is_not_read_for_a_session_that_is_not_idle_long_enough(self):
         with mock.patch.object(reaper, "checkby_state", side_effect=AssertionError("fetched")), \
              mock.patch.object(reaper, "worktree_state", return_value=[]):
