@@ -38,6 +38,8 @@ jobs:
         run: bash tests/reclaim-byproducts-watchdog.sh
       - name: worktree-janitor-newrules
         run: bash tests/worktree-janitor-newrules.sh
+      - name: worktree-janitor-pushed-idle
+        run: bash tests/worktree-janitor-pushed-idle.sh
       - name: worktree-janitor-order
         run: bash tests/worktree-janitor-order.sh
       - name: worktree-janitor-unknown-session

@@ -74,6 +74,16 @@ Environment:
   CC_WJ_TRIM_DIRTY_IDLE_HOURS
                           A worktree with uncommitted files is trimmed only after this many
                           hours untouched (default: 168; 0 never trims a dirty worktree)
+  CC_WJ_TRIM_DIRTY_IDLE_HOURS_PRESSURE
+                          Under disk pressure a worktree with uncommitted files waits this long
+                          instead (default: 24; 0 disables; never longer than the knob above).
+                          A rule on probation: CC_WJ_NEW_RULES_MODE=spotcheck only logs
+                          rule=dirty-pressure, auto lets it decide
+  CC_WJ_PUSHED_IDLE_HOURS A clean worktree kept only as unlanded, whose HEAD a fetched
+                          refs/remotes/origin/* ref already contains, is removable after this
+                          many hours idle (default: 72; 0 disables). Needs CC_WJ_RECLAIM_PUSHED=1.
+                          A rule on probation: spotcheck logs rule=pushed-idle, auto decides;
+                          the checkout goes, the branch and its commits stay
   CC_WJ_PRESSURE_TRIM     1 (default): a scheduled apply under pressure also trims the
                           regenerable caches of the worktrees it kept
   CC_WJ_SWEEP_BUDGET_SECONDS
@@ -2573,6 +2583,8 @@ _cc_wj_list_worktrees() {
 # claim that losing the directory is safe, and the default for anything not named is
 # to keep the worktree, which is the direction that cannot lose work.
 CC_WJ_TRIM_DIRTY_IDLE_HOURS="${CC_WJ_TRIM_DIRTY_IDLE_HOURS:-168}"
+CC_WJ_TRIM_DIRTY_IDLE_HOURS_PRESSURE="${CC_WJ_TRIM_DIRTY_IDLE_HOURS_PRESSURE:-24}"
+CC_WJ_PUSHED_IDLE_HOURS="${CC_WJ_PUSHED_IDLE_HOURS:-72}"
 CC_WJ_REGENERABLE="${CC_WJ_REGENERABLE:-node_modules .next .turbo .parcel-cache .svelte-kit .nuxt .astro .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .gradle .nyc_output coverage playwright-report test-results .wrangler-dist}"
 # `.superpowers` is deliberately absent too: it holds brainstorm mockups, SDD
 # ledgers, briefs, reports and review packages - a record of decisions, which no
@@ -2948,6 +2960,35 @@ _cc_wj_new_rule() {
     case "$resolved" in "${dir%/}"/*) echo primary-skills-link; return 0 ;; esac
   done
   return 1
+}
+
+# Whole hours of knob value $1 (1-5 digits, base 10), printed; status 1 when unset, garbled or 0,
+# which turns the rule that reads it off.
+_cc_wj_rule_hours() {
+  local v="$1"
+  case "$v" in ''|*[!0-9]*|??????*) return 1 ;; esac
+  v=$((10#$v))
+  [ "$v" -gt 0 ] || return 1
+  printf '%s\n' "$v"
+}
+
+# pushed-idle: the window its rule uses, printed: CC_WJ_PUSHED_IDLE_HOURS, never shorter than the
+# ordinary idle window $1. Status 1 when the knob turns the rule off.
+_cc_wj_pushed_idle_window() { # <ordinary idle hours>
+  local h
+  h="$(_cc_wj_rule_hours "${CC_WJ_PUSHED_IDLE_HOURS:-72}")" || return 1
+  [ "$h" -ge "$1" ] || h="$1"
+  printf '%s\n' "$h"
+}
+
+# yes when HEAD of worktree $1 is contained in a remote-tracking ref of origin as this clone last
+# fetched it. No network: a stale ref counts, which is safe for a removal that takes the checkout
+# only, because the branch and its commits stay in this repository.
+_cc_wj_pushed_fetched() { # <worktree>
+  local ref
+  ref="$(git -C "$1" for-each-ref --count=1 --format='%(refname)' --contains HEAD refs/remotes/origin 2>/dev/null)" ||
+    { echo no; return; }
+  if [ -n "$ref" ]; then echo yes; else echo no; fi
 }
 
 _cc_wj_spotcheck_log() {
@@ -4569,6 +4610,8 @@ KEEP
   reclaim="$(_cc_wj_reclaim_pushed)"
   local trim_known active lease landed idle referenced classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes task_done wt_idle_hours
   local nr_rules="" nr_dirty="" nr_count nr_line nr_note="" nr_holder nr_active_ok nr_blind
+  local pi_rule="" pi_hours="" pi_idle="" pi_note="" pi_ok pi_rc pi_cls pi_bytes pi_would=0
+  local dp_rule="" dp_hours="" dp_normal="" dp_ok sv_active_ok sv_blind
   # Said once, because the absence is otherwise silent: every squash-merged worktree just
   # reads KEEP(unlanded). That is how the scheduled sweep went without landed=pr for weeks.
   if [ "$trim" -eq 0 ] && ! command -v gh >/dev/null 2>&1; then
@@ -4736,7 +4779,7 @@ KEEP
       # Spot check: a worktree kept only by entries a rule on probation would discount is
       # judged as the rule would judge it, and every decision that would act is logged instead
       # and reverts to what the existing rules decide (KEEP(unrebuildable=<n>)).
-      nr_rules=""; nr_dirty=""
+      nr_rules=""; nr_dirty=""; pi_rule=""; pi_note=""; pi_idle=""; dp_rule=""
       case "$dirty" in
         ''|0|*[!0-9]*) ;;
         *)
@@ -4850,9 +4893,23 @@ KEEP
         esac
         if [ "$dirty" != "0" ] && { [ "$CC_WJ_TRIM_DIRTY_IDLE_HOURS" -eq 0 ] ||
              [ "$(_cc_wj_idle "$wt_path" "$CC_WJ_TRIM_DIRTY_IDLE_HOURS")" != yes ]; }; then
-          printf "    classification: KEEP(unrebuildable=%s)\n" "$dirty"
-          total_kept=$((total_kept + 1))
-          continue
+          # dirty-pressure: under disk pressure the wait is the shorter
+          # CC_WJ_TRIM_DIRTY_IDLE_HOURS_PRESSURE, never longer than the ordinary one, and never
+          # for a knob of 0 (a dirty tree is never trimmed). Spot check judges it as the rule
+          # would and trims nothing; auto lets it decide.
+          dp_ok=no
+          if [ -n "$pressure" ] && [ "$CC_WJ_TRIM_DIRTY_IDLE_HOURS" -gt 0 ] &&
+             dp_hours="$(_cc_wj_rule_hours "$CC_WJ_TRIM_DIRTY_IDLE_HOURS_PRESSURE")" &&
+             [ "$dp_hours" -lt "$CC_WJ_TRIM_DIRTY_IDLE_HOURS" ] &&
+             [ "$(_cc_wj_idle "$wt_path" "$dp_hours")" = yes ]; then
+            if [ "$(_cc_wj_new_rules_mode)" = auto ]; then dp_ok=yes; else dp_ok=spotcheck; fi
+          fi
+          if [ "$dp_ok" = no ]; then
+            printf "    classification: KEEP(unrebuildable=%s)\n" "$dirty"
+            total_kept=$((total_kept + 1))
+            continue
+          fi
+          [ "$dp_ok" != spotcheck ] || dp_rule=dirty-pressure
         fi
         git_keep="$(_cc_wj_git_keep "$wt_path")"
         case "$git_keep" in
@@ -4868,9 +4925,11 @@ KEEP
             continue
             ;;
         esac
-        if [ -n "$nr_dirty" ]; then
+        if [ -n "$nr_dirty" ] || [ -n "$dp_rule" ]; then
           # Judged as the new rule would, with every gate, and trimmed by nothing: each
           # directory it would remove is logged, and the tree stays as the existing rules keep it.
+          sv_active_ok="$ACTIVE_OK"; sv_blind="$activity_blind"
+          [ -z "$dp_rule" ] || nr_rules="$dp_rule"
           trim_result="$(_cc_wj_trim_regenerable "$wt_path" "$work" 0 "$session_grace_hours" "$trim_idle_window")"
           nr_count=0
           while IFS= read -r nr_line; do
@@ -4884,11 +4943,15 @@ KEEP
           done <<NR_TRIM
 $trim_result
 NR_TRIM
-          printf "    classification: KEEP(unrebuildable=%s)\n" "$nr_dirty"
+          printf "    classification: KEEP(unrebuildable=%s)\n" "${nr_dirty:-$dirty}"
           [ "$nr_count" -eq 0 ] ||
             printf "    spotcheck: %s would trim %s director%s here; logged to %s, nothing trimmed\n" \
               "$nr_rules" "$nr_count" "$([ "$nr_count" -eq 1 ] && echo y || echo ies)" "$(_cc_wj_spotcheck_log)"
-          ACTIVE_OK="$nr_active_ok"; activity_blind="$nr_blind"
+          if [ -n "$nr_dirty" ]; then
+            ACTIVE_OK="$nr_active_ok"; activity_blind="$nr_blind"
+          else
+            ACTIVE_OK="$sv_active_ok"; activity_blind="$sv_blind"
+          fi
           total_kept=$((total_kept + 1))
           continue
         fi
@@ -4948,9 +5011,21 @@ NR_TRIM
           ancestor|content|pr) idle="$(_cc_wj_idle "$wt_path" "$wt_idle_hours")" ;;
           unfetched) ;;
           *)
+            # pushed-idle, auto: origin's tracking ref already holds HEAD and the tree has sat
+            # idle past its own, longer window. From here it is judged as pushed work, with
+            # every gate below and every recheck before the removal.
+            if [ "$pushed" != yes ] && [ "$wip" != yes ] && [ "$reclaim" = 1 ] &&
+               [ "$(_cc_wj_new_rules_mode)" = auto ] &&
+               pi_hours="$(_cc_wj_pushed_idle_window "$wt_idle_hours")" &&
+               [ "$(_cc_wj_pushed_fetched "$wt_path")" = yes ]; then
+              pi_idle="$(_cc_wj_idle "$wt_path" "$pi_hours")"
+              if [ "$pi_idle" = yes ]; then
+                pushed=yes; pi_rule=pushed-idle; wt_idle_hours="$pi_hours"
+              fi
+            fi
             if [ "$pushed" = yes ]; then
               # On origin already: only the ordinary idle window is left to ask.
-              idle="$(_cc_wj_idle "$wt_path" "$wt_idle_hours")"
+              if [ -n "$pi_rule" ]; then idle="$pi_idle"; else idle="$(_cc_wj_idle "$wt_path" "$wt_idle_hours")"; fi
               [ "$branch" = "(detached)" ] && referenced=yes
             elif [ "$wip" = yes ]; then
               :  # edits of work that is neither landed nor on origin stay put
@@ -5058,6 +5133,40 @@ KEEP
             fi ;;
         esac
       fi
+      # pushed-idle, spot check: a tree that stays KEEP(unlanded) only because origin's
+      # listing did not name its branch is asked the remaining gates as if it were pushed, and
+      # what would be removed is logged. The classification is not touched. Not asked of a tree
+      # with edits to snapshot, nor while a session record could not be read.
+      if [ "$trim" -eq 0 ] && [ "$classification" = "KEEP(unlanded)" ] && [ "$wip" != yes ] &&
+         [ "$dirty" = "0" ] && [ "$reclaim" = 1 ] && [ -z "$_CC_WJ_UNKNOWN" ] &&
+         [ "$(_cc_wj_new_rules_mode)" = spotcheck ] &&
+         pi_hours="$(_cc_wj_pushed_idle_window "$wt_idle_hours")" &&
+         [ "$(_cc_wj_pushed_fetched "$wt_path")" = yes ] &&
+         [ "$(_cc_wj_idle "$wt_path" "$pi_hours")" = yes ]; then
+        pi_ok=1
+        _cc_wj_live_claim "$task_done" "$wt_path" tool; pi_rc=$?
+        [ "$pi_rc" -eq 1 ] || pi_ok=0
+        if [ "$pi_ok" -eq 1 ] && [ "$task_done" != yes ]; then
+          _cc_wj_recent_claim "$wt_path" "$session_grace_hours" tool; pi_rc=$?
+          [ "$pi_rc" -eq 1 ] || pi_ok=0
+        fi
+        pi_cls=""
+        [ "$pi_ok" -eq 0 ] ||
+          pi_cls="$(_cc_wj_classify "$wt_path" 0 no "$LSOF_OK" "$branch" "$landed" yes no no yes yes no)"
+        case "$pi_cls" in
+          REMOVABLE|REMOVABLE\(*\))
+            [ -z "$(_cc_wj_launchd_keep "$work" "$wt_path" "$LAUNCHD_OK")" ] || pi_cls="" ;;
+          *) pi_cls="" ;;
+        esac
+        if [ -n "$pi_cls" ]; then
+          pi_bytes=$(du -sk "$wt_path" 2>/dev/null | awk '{print $1 * 1024}') || pi_bytes=0
+          _cc_wj_size_record "$wt_path" "$pi_bytes"
+          _cc_wj_spotcheck removal would-remove "pushed-idle${nr_rules:+,$nr_rules}" "$wt_path" "${pi_bytes:-0}" \
+            "none(sweep-snapshot)" "$wt_path"
+          pi_note="spotcheck: pushed-idle would make it $pi_cls; logged to $(_cc_wj_spotcheck_log), nothing removed"
+          pi_would=$((pi_would + 1))
+        fi
+      fi
       # Spot check: what the new rule would remove is logged, and the decision reverts to the
       # existing one. A keep the existing rules gave before the content gate stays as it was.
       nr_note=""
@@ -5086,8 +5195,14 @@ KEEP
       printf "    classification: %s\n" "$classification"
       [ -z "$nr_note" ] || printf "    %s\n" "$nr_note"
       [ -z "$uk_note" ] || printf "    %s\n" "$uk_note"
+      [ -z "$pi_note" ] || printf "    %s\n" "$pi_note"
       case "$classification" in
-        'REMOVABLE(pushed)') printf "    pushed: origin lists a branch that contains HEAD\n" ;;
+        'REMOVABLE(pushed)')
+          if [ -n "$pi_rule" ]; then
+            printf "    pushed: a fetched origin ref contains HEAD (pushed-idle, idle past %sh)\n" "$wt_idle_hours"
+          else
+            printf "    pushed: origin lists a branch that contains HEAD\n"
+          fi ;;
         'REMOVABLE(wip-pushed)')
           [ "$apply" -eq 1 ] || printf "    would push wip: %s entries to %s\n" "$wip_dirty" "$wip_ref" ;;
       esac
@@ -5212,6 +5327,7 @@ KEEP
                [ "$(_cc_wj_idle "$wt_path" "$wt_idle_hours")" != "yes" ] ||
                [ -z "$head0" ] ||
                [ "$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)" != "$head0" ] ||
+               { [ -n "$pi_rule" ] && [ "$(_cc_wj_pushed_fetched "$wt_path")" != yes ]; } ||
                [ -n "$(_cc_wj_git_keep "$wt_path")" ]; then
               printf "    → kept: it was entered or changed between the scan and the removal\n"
               total_kept=$((total_kept + 1))
@@ -5281,6 +5397,10 @@ KEEP
   if [ "$uk_would" -gt 0 ]; then
     echo "worktree-janitor: spotcheck: session-unknown-per-tree would free $uk_would worktree(s) the unreadable records kept; logged to $(_cc_wj_spotcheck_log), nothing removed" >&2
     _cc_wj_log_write "spotcheck: session-unknown-per-tree would free $uk_would worktree(s)"
+  fi
+  if [ "$pi_would" -gt 0 ]; then
+    echo "worktree-janitor: spotcheck: pushed-idle would free $pi_would worktree(s) kept as unlanded though a fetched origin ref holds them; logged to $(_cc_wj_spotcheck_log), nothing removed" >&2
+    _cc_wj_log_write "spotcheck: pushed-idle would free $pi_would worktree(s)"
   fi
   [ -z "$_CC_WJ_UNKNOWN_ERRORS" ] || activity_blind=1
   _cc_wj_remove_private_temp "$work"
