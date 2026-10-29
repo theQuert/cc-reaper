@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cc-reaper.gce-disk-watch</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>f="$HOME/.cc-reaper/logs/gce-disk-watch.log"; mkdir -p "${f%/*}"; [ "$(wc -c &lt;"$f" 2&gt;/dev/null || echo 0)" -gt 2000000 ] &amp;&amp; mv "$f" "$f.1"; exec /usr/bin/env python3 "$HOME/.cc-reaper/gce-disk-watch.py" &gt;/dev/null 2&gt;&gt;"$f"</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict></plist>

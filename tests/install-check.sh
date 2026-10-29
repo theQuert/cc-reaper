@@ -86,28 +86,32 @@ out="$(run --check 2>&1)"; rc=$?
 # The session reaper, stall watch and wip backup were copied in by hand, and reclaim-byproducts'
 # agent lived nowhere in the repository: --check could not see any of them drift.
 R="$H/.cc-reaper"; L="$H/Library/LaunchAgents"
-for f in session-reaper.py stall-watch.py wip-backup.sh; do
+for f in session-reaper.py stall-watch.py wip-backup.sh gce-disk-watch.py; do
   if [ -x "$R/$f" ] && cmp -s "$ROOT_DIR/shell/$f" "$R/$f"; then ok "the installer deploys $f"
   else bad "the installer did not deploy $f"; fi
 done
 # Each acts once loaded, and RunAtLoad runs it at once: a host where it is not loaded gets the
 # command, never a start and never a plist launchd would load at the next login.
-for a in session-reaper stall-watch reclaim-byproducts; do
+for a in session-reaper stall-watch reclaim-byproducts gce-disk-watch; do
   if [ ! -e "$L/com.cc-reaper.$a.plist" ] && [ ! -e "$S/com.cc-reaper.$a.loaded" ]; then ok "the installer leaves $a stopped where it is not loaded"
   else bad "the installer started $a on a host where it was not loaded"; fi
 done
 out="$(run --check 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q 'stopped  session-reaper has no LaunchAgent' \
   && ok "a stopped agent is named, not drift" || bad "stopped agent check: rc=$rc"
-for a in session-reaper stall-watch reclaim-byproducts; do : > "$S/com.cc-reaper.$a.loaded"; done
+for a in session-reaper stall-watch reclaim-byproducts gce-disk-watch; do : > "$S/com.cc-reaper.$a.loaded"; done
 run >/dev/null 2>&1
-for a in session-reaper stall-watch reclaim-byproducts; do
+for a in session-reaper stall-watch reclaim-byproducts gce-disk-watch; do
   if [ -e "$L/com.cc-reaper.$a.plist" ] && [ -e "$S/com.cc-reaper.$a.loaded" ]; then ok "the installer updates $a where it is loaded"
   else bad "the installer did not update loaded $a"; fi
 done
 if [ "$(stat -f %Lp "$R/session-reaper.conf" 2>/dev/null)" = 600 ] && cmp -s "$ROOT_DIR/config/session-reaper.conf" "$R/session-reaper.conf"; then
   ok "a missing session policy is installed, 600, report-only as the repository ships it"
 else bad "session policy not installed as the repository's"; fi
+if [ "$(stat -f %Lp "$R/gce-disk-watch.conf" 2>/dev/null)" = 600 ] && cmp -s "$ROOT_DIR/config/gce-disk-watch.conf" "$R/gce-disk-watch.conf" &&
+   grep -qx 'GDW_APPLY=0' "$R/gce-disk-watch.conf"; then
+  ok "a missing GCE disk policy is installed, 600, shadow as the repository ships it"
+else bad "GCE disk policy not installed as the repository's"; fi
 
 # wip-backup pushes untracked files to remotes: a host that did not opt in never gets it.
 out="$(run --check 2>&1)"; rc=$?

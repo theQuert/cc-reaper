@@ -27,6 +27,8 @@ jobs:
         run: python3 tests/stall-watch.py
       - name: session-reaper
         run: python3 tests/session-reaper.py
+      - name: gce-disk-watch
+        run: python3 tests/gce-disk-watch.py
       - name: disk-janitor
         run: bash tests/disk-janitor.sh
       - name: worktree-janitor

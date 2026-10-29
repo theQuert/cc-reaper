@@ -900,6 +900,46 @@ cp launchd/com.cc-reaper.stall-watch.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-reaper.stall-watch.plist
 ```
 
+## GCE disk watch (shadow until enabled)
+
+`shell/gce-disk-watch.py` reads the root disk of the GCE CI hosts from the Mac mini and tells a full
+or unreadable one once. It exists because stima-ci-ctl-1's `/` sat at 100% on 2026-10-30 with
+nothing alerting: every disk alarm lived on the watched host or went through its event gateway. This
+watch depends on neither. It runs every 10 minutes from `com.cc-reaper.gce-disk-watch`, calls no
+model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper/gce-disk-watch.conf`.
+
+- **Read:** per host (`GDW_HOSTS`, default `stima-ci-1 stima-ci-2 stima-ci-3 stima-ci-ctl-1
+  stima-ci-deploy-1`, project `stima-ci-runners`, zone `asia-east1-b`) one
+  `gcloud compute ssh <host> --tunnel-through-iap --command 'df -P / ; df -Pi /'` with `BatchMode=yes`.
+  That df is the only command that runs on a host. Hosts are read in parallel, each bounded by
+  `GDW_HOST_TIMEOUT_SECONDS` (90) and the run by `GDW_RUN_TIMEOUT_SECONDS` (240); on expiry only the
+  script's own gcloud child (its process group) is ended. Cloud Monitoring has no disk metric for
+  these hosts (no Ops Agent), so it is not used.
+- **Judge:** `disk-high` when `/` is at or over `GDW_USED_PCT` (90), has under `GDW_MIN_AVAIL_GB`
+  (2 GiB) free, or its inodes are at or over `GDW_INODE_PCT` (90). A read that fails, times out or
+  prints no `/` line is `unreadable`, with a fixed reason word (`exit-255`, `timeout`,
+  `no-df-output`, ...), never the command's output. One bad host never stops the others.
+- **Tell:** once per host per state change; while the state stays, again at most every
+  `GDW_REALERT_MINUTES` (120); one `recovered` line when it clears (only for a state that was told).
+  Shadow (`GDW_APPLY=0`): a `would alert <host> <kind> used=..% avail=..GB inodes=..%` line in
+  `~/.cc-reaper/logs/gce-disk-watch.log`, nothing else. Apply: one `## EL-T24-GCE-DISK <host>` block
+  in `GDW_INBOX` (state changes only, unless `GDW_REALERT_INBOX=1`), one
+  `<ts> P0 GCE-DISK <host> <kind> used=.. avail=.. inodes=..` line (`INFO ... recovered` on recovery)
+  in `GDW_EVENTS_LOG`, and a macOS notification. Every write is to a local path. A write that fails
+  is logged `ERROR` and stays pending in `~/.cc-reaper/state/gce-disk-watch.json`, so the next run
+  retries that channel alone. Shadow and apply keep separate state, so turning apply on tells a
+  standing state afresh.
+- **Record:** each run logs one line per host and one summary line
+  (`<n> hosts, <n> read, <n> high, <n> unreadable, <n> would-alert, <n> alerted, <n> recovered,
+  <n> failures`), the spot-check record.
+
+```bash
+./install.sh   # deploys the script and the shadow policy; never starts the agent unasked
+GDW_STATE=/tmp/gdw.json GDW_LOG=/tmp/gdw.log python3 ~/.cc-reaper/gce-disk-watch.py   # one shadow read
+sed 's|__HOME__|'"$HOME"'|g' launchd/com.cc-reaper.gce-disk-watch.plist > ~/Library/LaunchAgents/com.cc-reaper.gce-disk-watch.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-reaper.gce-disk-watch.plist
+```
+
 ## macOS Companion App (local)
 
 cc-reaper includes a native SwiftUI menu bar app for status visibility and safe manual actions. It reads the existing `cc-monitor --once --json` contract and delegates cleanup to the existing shell engine; process discovery, classification, and termination policy remain in the tested shell scripts.
