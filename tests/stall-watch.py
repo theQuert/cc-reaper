@@ -56,7 +56,10 @@ SENTENCE_LIMIT = screen("● Users who hit your weekly limit see a banner; the c
 READ_429 = screen("● Read(docs/log.txt)", "  ⎿  Read 429 lines")
 HASH_429 = screen("● Bash(gh pr view)", "  ⎿  #429 merged")
 RATE_FILE = screen("● Search(rate)", "  ⎿  …/rate_limit.go")
-FALSE_POSITIVES = {"quoted Remote Control disconnected": QUOTED_RC, "weekly limit inside a sentence": SENTENCE_LIMIT,
+TEST_STATUS = screen("● Bash(go test ./...)", "  ⎿  expected status 429, got 200")
+GREP_STATUS = screen("● Search(upstream)", "  ⎿  // upstream returned status 429")
+GREP_RC = screen("● Search(disconnected)", "  ⎿  Remote Control disconnected.")
+FALSE_POSITIVES = {"go test status 429": TEST_STATUS, "grep status 429": GREP_STATUS, "grep result Remote Control disconnected": GREP_RC, "quoted Remote Control disconnected": QUOTED_RC, "weekly limit inside a sentence": SENTENCE_LIMIT,
                    "Read 429 lines": READ_429, "#429 merged": HASH_429, "…/rate_limit.go": RATE_FILE}
 STATUS_429 = screen("● Agent(audit)", "  ⎿  Agent failed: request failed with status code 429")
 INTERRUPT_DRAFT = screen("[Request interrupted by user]", "", typed="continue with")

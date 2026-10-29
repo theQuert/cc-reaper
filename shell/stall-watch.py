@@ -9,18 +9,22 @@ until a person looks. This is the cheap detector for that, and it calls no model
           hashed per pane and a pane is re-scanned only when the hash changed. Fingerprints:
             weekly-limit      "hit your weekly limit" (any "<word> limit")
             remote-disconnected   "Remote Control disconnected", unless a later line says it is connected again
-            rate-limit-429    "429" or "rate_limit" on an agent result line (a `⎿` result or an `API Error`)
-            interrupted-idle  "[Request interrupted by user]" (or the "Interrupted · What should Claude do instead?" result) just above an idle, empty prompt, counted only
-                              when "Login successful" is on that screen or STALL_FLEET_MIN panes show it at
-                              once (a single Esc by a person is not an account switch)
+            rate-limit-429    "429" or "rate_limit_error" in an `API Error` line, or "status 429" in a `⎿` result
+                              that itself starts with `Agent failed`, `Error:` or `API Error` (not any result
+                              that merely contains the text, such as test or grep output)
+            interrupted-idle  "[Request interrupted by user]" (or the "Interrupted · What should Claude do
+                              instead?" result) just above an idle, empty prompt, counted only when "Login
+                              successful" is on that screen or STALL_FLEET_MIN panes show it at once (a single
+                              Esc by a person is not an account switch)
   report  once per event, deduped by (pane, fingerprint, session id): one block appended to STALL_INBOX under
           `## EL-T801-CI-HARDEN STALL <session-name>` with the exact `claude --resume <id> --remote-control
           <name>` a person or Neo runs. An event ends when its fingerprint leaves the screen, so a later
           stall in the same pane is a new event. Shadow by default: it prints what it would report and
           writes nothing to the inbox until STALL_APPLY=1 (or --apply).
-  mark    a file per stalled session id in STALL_MARK_DIR, refreshed every run while the stall lasts. The
-          session reaper reads it and keeps the session with the reason `stalled:<fingerprint>`. A mark only
-          ever keeps a session, so it is written in shadow mode too.
+  mark    only with STALL_APPLY=1 (a mark holds the reaper, so shadow never writes one): a file per stalled
+          session id in STALL_MARK_DIR, refreshed every run while the stall lasts and ignored by the session
+          reaper STALL_MARK_HOURS after its last refresh or STALL_MARK_MAX_HOURS after the event was first
+          seen. The reaper keeps the session with the reason `stalled:<fingerprint>`.
 
 HARD RULE (stima-api #5212): nothing here types into another agent's pane. The only tmux calls are `display`
 and `capture-pane`; `tmux_ro` refuses every other subcommand, send-keys included. Re-enabling Remote Control
@@ -56,17 +60,20 @@ READ_ONLY_TMUX = ("display", "capture-pane")  # #5212: nothing that types into a
 
 # Claude Code's own system and status lines only. Each pattern is anchored at the start of a line (after an optional
 # `⎿` result gutter or `⏺`/`●` message bullet) and has the exact shape of the line, so a sentence that quotes the words,
-# a file listing, or a `⎿` result that merely contains "429" or "rate_limit" is not a stall.
+# a file listing, or a `⎿` result that merely contains "429" or "rate_limit" is not a stall. The `⎿` gutter is a tool
+# result, whose content can be anything (grep, test output): only the weekly limit, `API Error`, an agent failure and
+# the interrupt result are Claude Code's own text there. The Remote Control lines are never a result (BULLET).
 LEAD = r"^\s*(?:⎿\s*)?(?:[⏺●]\s*)?"
+BULLET = r"^\s*(?:[⏺●]\s*)?"
 WEEKLY_RE = re.compile(LEAD + r"You(?:'|’)ve hit your (?:[\w-]+ )?limit\b\s*(?:[·∙]\s*resets\b|[.!]?\s*$)", re.I)
-REMOTE_RE = re.compile(LEAD + r"(?:Login successful\.\s*)?Remote Control disconnected\b\s*(?:—|-|\.|$)", re.I)
+REMOTE_RE = re.compile(BULLET + r"(?:Login successful\.\s*)?Remote Control disconnected\b\s*(?:—|-|\.|$)", re.I)
 REMOTE_OK_RE = re.compile(r"^\s*(?:[⏺●]\s*)?(?:Remote Control|/remote-control) (?:is )?(?:active|reconnected|(?<!dis)connected)\b", re.I)
 API_ERROR_RE = re.compile(LEAD + r"API Error\b")  # the error itself must carry 429 / rate_limit_error within its 3 lines
 API_ERROR_CODE_RE = re.compile(r"\b429\b|\brate_limit_error\b")
 STATUS_429_RE = re.compile(r"\bstatus(?: code)?\s*[:=]?\s*429\b", re.I)  # a failed agent result: "... with status 429 ..."
-RESULT_RE = re.compile(r"^\s*⎿")
+AGENT_FAILED_RE = re.compile(r"^\s*⎿\s*(?:Agent failed|Error:|API Error)")
 INTERRUPT_RE = re.compile(LEAD + r"(?:\[Request interrupted by user[^\]]*\]|Interrupted · What should Claude do instead\?)\s*$")
-LOGIN_RE = re.compile(LEAD + r"Login successful\b", re.I)
+LOGIN_RE = re.compile(BULLET + r"Login successful\b", re.I)
 INTERRUPT_MAX_GAP = 8  # lines between the marker and the prompt line (the prompt box's border and blank lines)
 
 
@@ -98,7 +105,7 @@ def scan(pane):
         fps.append("remote-disconnected")
     for i, l in enumerate(lines):
         window = " ".join(x.strip() for x in lines[i:i + 3])
-        if (API_ERROR_RE.search(l) and API_ERROR_CODE_RE.search(window)) or (RESULT_RE.search(l) and STATUS_429_RE.search(window)):
+        if (API_ERROR_RE.search(l) and API_ERROR_CODE_RE.search(window)) or (AGENT_FAILED_RE.search(l) and STATUS_429_RE.search(window)):
             fps.append("rate-limit-429")
             break
     marker = max((i for i, l in enumerate(lines) if INTERRUPT_RE.search(l)), default=None)
