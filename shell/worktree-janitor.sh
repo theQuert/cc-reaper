@@ -2404,11 +2404,17 @@ _cc_wj_idle() {
   #
   # HEAD moves on checkout, index on add/commit/status-with-changes; both are what "somebody
   # worked in this checkout" actually looks like.
+  #
+  # Regenerable trees are pruned: nobody works inside node_modules, .next or .venv, and
+  # walking them was most of the sweep. 115k files in web/next/node_modules made one call
+  # 1.2-3.1 s (0.21 s pruned), a clean candidate makes up to five, and the 1800 s removal
+  # phase left 75 of 153 trees unexamined (2026-10-29).
   set -- "$wt"
   for f in HEAD index; do
     [ -e "$gd/$f" ] && set -- "$@" "$gd/$f"
   done
-  if ! recent="$(find -H "$@" -mmin "-$((hours * 60))" -print -quit 2>/dev/null)"; then
+  if ! recent="$(find -H "$@" \( -name node_modules -o -name .next -o -name .venv \) -prune \
+      -o -mmin "-$((hours * 60))" -print -quit 2>/dev/null)"; then
     echo unknown
   elif [ -n "$recent" ]; then
     echo no

@@ -685,6 +685,18 @@ touch -t 202609010000 "$IDLE_GD/index" 2>/dev/null
 touch "$IDLE_W/somefile" 2>/dev/null
 expect_yes "a touched file in the checkout is activity" \
   idle_is no "$IDLE_W" 12
+touch -t 202609010000 "$IDLE_W/somefile" 2>/dev/null
+# Regenerable trees are not where anybody works, and walking them was most of the sweep:
+# 115k files in web/next/node_modules made each idle check 1.2-3.1 s, up to five per
+# worktree, and the 1800 s removal phase left 75 of 153 trees unexamined (2026-10-29).
+mkdir -p "$IDLE_W/web/node_modules/pkg" "$IDLE_W/.next/cache" "$IDLE_W/.venv/lib" 2>/dev/null
+touch "$IDLE_W/web/node_modules/pkg/index.js" "$IDLE_W/.next/cache/x" "$IDLE_W/.venv/lib/y" 2>/dev/null
+touch -t 202609010000 "$IDLE_W/web" "$IDLE_W/web/node_modules" "$IDLE_W/.next" "$IDLE_W/.venv" "$IDLE_W" 2>/dev/null
+expect_yes "a write inside node_modules, .next or .venv alone is not activity" \
+  idle_is yes "$IDLE_W" 12
+touch "$IDLE_W/web/package.json" 2>/dev/null
+expect_yes "a source file next to node_modules is still activity" \
+  idle_is no "$IDLE_W" 12
 rm -rf "$IDLE_M" "$IDLE_W"
 
 # The probe behind that ninth argument. Its whole value is its `yes`, so every way of
