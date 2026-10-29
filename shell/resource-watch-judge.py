@@ -114,16 +114,17 @@ def judge_line(line, cfg, ncpu, phys_gb):
     x = LINE.match(line)
     if not x:
         return [f"unparsable resource-watch line: {line[:80]}"]
-    misses = []
-    if x["fields"] is None:
+    misses, judged = [], JUDGED
+    if x["fields"] is None:  # a line from before EL-T24: one miss, and the rest judged without swap and rate
         misses.append(f"{x['ts']} carries no swap=/rate= fields, so ALERT:swap and ALERT:disk-rate cannot be judged")
-    have = set(re.findall(r"ALERT:([\w-]+)", x["rest"])) & JUDGED
-    want = implied(x, cfg, ncpu, phys_gb)
+        judged = JUDGED - {"swap", "disk-rate"}
+    have = set(re.findall(r"ALERT:([\w-]+)", x["rest"])) & judged
+    want = implied(x, cfg, ncpu, phys_gb) & judged
     if have != want:
         misses.append(f"{x['ts']} markers {sorted(have) or '-'} but its numbers imply {sorted(want) or '-'} "
                       f"(swap={x['swap'] or '?'} rate={x['rate'] or '?'})")
     rate_marker = re.search(r"\bdisk_rate=(-?[\d.]+)GB/h", x["rest"])
-    if rate_marker and rate_marker[1] != (x["rate"] or ""):
+    if rate_marker and x["fields"] is not None and rate_marker[1] != (x["rate"] or ""):
         misses.append(f"{x['ts']} rate={x['rate'] or '?'} but disk_rate={rate_marker[1]}GB/h")
     return misses
 

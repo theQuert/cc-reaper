@@ -110,8 +110,12 @@ class Line(unittest.TestCase):
     def test_unjudged_markers_are_left_alone(self):
         self.assertEqual(self.j(snap(markers="ALERT:disk-drop ALERT:reclaim-stalled ACT:running:12")), [])
 
-    def test_a_line_without_the_fields_is_a_miss(self):
+    def test_a_line_without_the_fields_is_one_miss(self):
+        self.assertEqual(len(self.j(snap(swap=None, markers="ALERT:swap disk_rate=4.5GB/h"))), 1)
         self.assertTrue(any("no swap=/rate=" in m for m in self.j(snap(swap=None))))
+
+    def test_a_line_without_the_fields_is_still_judged_on_the_rest(self):
+        self.assertEqual(len(self.j(snap(swap=None, free=50.0))), 2, "no fields, and no ALERT:disk-low at 50 GB")
 
     def test_other_lines_are_not_judged(self):
         self.assertEqual(self.j("2026-10-30T01:07:00 INFO reclaim-stalled: no finished-sweep stamp yet"), [])
