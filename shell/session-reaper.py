@@ -15,15 +15,18 @@ Shadow verdict (#6477): a kept session that a person would also call finished ge
 
 import argparse
 import calendar
+import faulthandler
 import fcntl
 import fnmatch
 import glob
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HOME = Path.home()
@@ -221,8 +224,29 @@ def worktrees(cfg):
     return out
 
 
+RUN_START = time.monotonic()
+WT_BUDGET = 900  # seconds of a run that may go to worktree git checks; the launchd interval is 1800
+# #6477, 2026-10-29: past WT_BUDGET a run still judged every session (gh, tmux, claude agents at about 30 s each
+# at load 120), ran past an hour, and wrote no report from 05:39 to 12:40 TPE. Past RUN_BUDGET the remaining sessions
+# are kept unjudged (fail-closed: nothing is reaped) so the run ends and the report is written.
+RUN_BUDGET = float(os.environ.get("REAPER_RUN_BUDGET", "1200"))
+IN_REAP = False
+_wt_seen = {}
+
+
 def worktree_state(wt, cfg):
-    """Problems that keep the worktree's owner alive: uncommitted or unpushed work."""
+    """Problems that keep the worktree's owner alive: uncommitted or unpushed work. Once per path per run, and
+    within WT_BUDGET: a run at load 130 called `worktree-janitor.sh --landed` (up to 120 s each) for the same
+    worktrees once per session and twice per verdict, ran for 4 h, and left the report 4 h stale (EL-GATEWAY-0852).
+    A worktree checked past the budget keeps its owner, so the run ends and the report is written."""
+    key = str(wt["path"])
+    if key not in _wt_seen:
+        _wt_seen[key] = (["unchecked:" + wt["path"].name] if time.monotonic() - RUN_START > WT_BUDGET
+                         else _worktree_state(wt, cfg))
+    return list(_wt_seen[key])
+
+
+def _worktree_state(wt, cfg):
     if not wt["path"].exists():
         return []
     problems = []
@@ -781,6 +805,23 @@ def _brief_kind(brief):
     return k.group(1) if k else ""
 
 
+def prefetch(sessions, cfg, now):
+    """Fill the oracle and claim caches for every claim at once. Serially, at load 100, decide() spent 160 s in
+    oracle_brief and the claim-time `gh issue view` calls alone outlasted RUN_BUDGET (#6477, EL-SESSION-CLOSE);
+    each call is still bounded by its own subprocess timeout. Failures leave the cache empty: decide() retries."""
+    jobs = []
+    for s in sessions:
+        for r, n in s.get("claims") or ():
+            jobs.append(lambda r=r, n=n: oracle_brief(r, n, cfg, now))
+            jobs.append(lambda r=r, n=n, sid=s["sid"]: claim_time(r, n, sid))
+    with ThreadPoolExecutor(max_workers=int(cfg.get("PREFETCH_WORKERS", "8"))) as pool:
+        for f in [pool.submit(j) for j in jobs]:
+            try:
+                f.result()
+            except Exception:
+                pass
+
+
 def claim_briefs(refs, cfg, now):
     return [(ref, oracle_brief(ref[0], ref[1], cfg, now)) for ref in refs]
 
@@ -855,6 +896,11 @@ def shadow_verdict(s, cfg, keep, now):
     if not claims:
         if DONE_RE.search(text) or DONE_PHRASE_RE.search(text) or CLOSE_LINE_RE.search(text):
             out["would_close"] = "no claim, close line"
+        elif keep == ["claim-unknown"] and s["idle_min"] >= float(cfg.get("NOCLAIM_IDLE_MINUTES", "480")):
+            # A session that finished without a close line never closes (founder 2026-10-29: 「session 如果已經都
+            # 完全做完, 該session就應該自己關掉」). Shadow first (SCRIPT-SAFE): nothing else keeps it, nothing is
+            # unpushed, no claim anywhere, and nobody typed to it for NOCLAIM_IDLE_MINUTES.
+            out["would_close"] = f"no claim, idle {s['idle_min'] / 60:.0f}h, no close line"
     elif all(m == "ended" for m in marks):
         out["would_close"] = "all claims ended"
     return out
@@ -1141,14 +1187,36 @@ def main(argv=None):
         return 0
     now = time.time()
     rows, failures, reaped, seen, stale, notes = [], [], 0, [], [], []
+    # #6477, 2026-10-29: RUN_BUDGET is checked between sessions, so a run blocked inside one call (pid 22262, 30 min
+    # at load 187) still wrote no report. A hard deadline raises in the sweep, whose handler records it, and the
+    # report is written; SIGUSR1 dumps the stack to the log to show where a run is blocked.
+    faulthandler.register(signal.SIGUSR1)
+    faulthandler.dump_traceback_later(max(1, int(RUN_BUDGET)))  # a run past its budget logs where it is, unasked
+
+    def _deadline(*_):
+        global RUN_BUDGET
+        RUN_BUDGET = -1  # every later session is kept unjudged
+        if IN_REAP:  # never interrupt a close half-way: the reap finishes, the loop then stops judging
+            return
+        raise TimeoutError(deadline_msg)
+    deadline_msg = f"run passed RUN_BUDGET+300 ({RUN_BUDGET + 300:.0f} s); remaining sessions unjudged, nothing more reaped"
+    signal.signal(signal.SIGALRM, _deadline)
+    signal.alarm(max(1, int(RUN_BUDGET + 300)))
     try:
         if apply and not args.only:
             stale = recover_exiting(cfg, now)
     except Exception as e:
         failures.append(f"recover exiting: {type(e).__name__}: {e}")
     try:
-        for s in gather(cfg, now):
+        sessions = list(gather(cfg, now))
+        if not args.only:
+            prefetch(sessions, cfg, now)
+        for s in sessions:
             if args.only and s["tmux"] != args.only:
+                continue
+            if time.monotonic() - RUN_START > RUN_BUDGET:
+                rows.append(report_line(s, ["unjudged:run-budget"], "keep"))
+                seen.append((s, ["unjudged:run-budget"], "keep"))
                 continue
             keep, outcome = [], "error"
             try:
@@ -1162,7 +1230,12 @@ def main(argv=None):
                     except Exception as e:  # a report-only verdict must not fail the sweep
                         notes.append(f"{s['tmux']} ({s['sid']}): shadow verdict: {type(e).__name__}: {e}")
                 if not keep and apply:
-                    outcome, fails = reap(s, cfg, now)
+                    global IN_REAP
+                    IN_REAP = True
+                    try:
+                        outcome, fails = reap(s, cfg, now)
+                    finally:
+                        IN_REAP = False
                     if s.get("record") and outcome != "skipped:close-unconfirmed":  # stays "exiting" for recovery
                         mark_record(s["record"], outcome)
                     reaped += outcome == "reaped"
@@ -1180,6 +1253,8 @@ def main(argv=None):
             idle_list(cfg, seen, now)
     except Exception as e:  # a report-only list must not stop the report
         failures.append(f"idle list: {type(e).__name__}: {e}")
+    signal.alarm(0)
+    faulthandler.cancel_dump_traceback_later()
     mode = "apply" if apply else "report-only"
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
     report = [f"# session-reaper {mode} {stamp}", "",
