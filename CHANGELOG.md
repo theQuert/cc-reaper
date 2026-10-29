@@ -10,6 +10,8 @@
   `df -P / ; df -Pi /` per host, bounded per host (90 s) and per run (240 s), and judges `disk-high`
   (used >= 90%, under 2 GiB free, inodes >= 90%, told on the first read) or `unreadable` (told after
   `GDW_UNREADABLE_ROUNDS`, 2, reads in a row; `no-ssh-key` without gcloud's key, which is then never called).
+  A host in `GDW_KNOWN_UNREADABLE` (shipped: stima-ci-1 and stima-ci-deploy-1, whose OS Login refuses the
+  Mac's key by design) is still read every round, but a failed read is logged `known-unreadable` and never told.
   A damaged state entry reads back as `ok` and never stops a round. One notice per host per state change, a
   re-alert at most every 120 minutes, one recovery line. `GDW_APPLY=0` logs `would alert` lines only;
   `GDW_APPLY=1` writes an `## EL-T24-GCE-DISK <host>` inbox block, a `P0 GCE-DISK` events.log line and a

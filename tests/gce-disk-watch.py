@@ -366,6 +366,47 @@ class Review(Base):
         self.run_once({"stima-ci-1": (255, "", None)}, GDW_APPLY="1", GDW_UNREADABLE_ROUNDS="1")
         self.assertEqual(len(self.events()), 1)
 
+    def test_a_known_unreadable_host_is_read_every_round_and_never_told_unreadable(self):
+        refused = {"stima-ci-1": (255, "", None)}
+        for _ in range(4):
+            _, lines, runner = self.run_once(refused, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
+            self.clock.t += 600
+        self.assertIn("stima-ci-1", [c[0] for c in runner.calls])  # still read
+        self.assertEqual(self.events(), [])
+        self.assertEqual(self.inbox(), "")
+        self.assertIn("host stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255 known-unreadable", "\n".join(lines))
+        self.assertIn("unreadable: stima-ci-1(exit-255 known)", self.summary(lines))
+        # Not every host: an unlisted one still tells after its rounds.
+        self.run_once({"stima-ci-2": (255, "", None)}, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
+        self.clock.t += 600
+        self.run_once({"stima-ci-2": (255, "", None)}, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
+        self.assertEqual(len(self.events()), 1)
+        self.assertIn("P0 GCE-DISK stima-ci-2 unreadable", self.events()[0])
+
+    def test_a_stored_unreadable_state_on_a_known_host_clears_without_a_recovery(self):
+        refused = {"stima-ci-1": (255, "", None)}
+        self.run_once(refused, GDW_APPLY="1")
+        self.clock.t += 600
+        self.run_once(refused, GDW_APPLY="1")
+        self.assertEqual(len(self.events()), 1)  # told before it was listed
+        self.clock.t += 600
+        self.run_once(refused, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
+        self.assertEqual(len(self.events()), 1)  # no `recovered`: nothing recovered
+        self.assertEqual(self.state()["apply"]["stima-ci-1"]["kind"], "ok")
+        self.clock.t += 7200
+        self.run_once(refused, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
+        self.assertEqual(len(self.events()), 1)  # and no re-alert
+
+    def test_a_known_unreadable_host_that_reads_full_still_alerts(self):
+        self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-ctl-1")
+        self.assertEqual(len(self.events()), 1)
+        self.assertIn("disk-high", self.events()[0])
+
+    def test_the_shipped_policy_lists_the_two_refused_hosts_and_the_default_lists_none(self):
+        self.assertEqual(self.cfg()["GDW_KNOWN_UNREADABLE"], "")
+        conf = gdw.load_config(Path(__file__).resolve().parent.parent / "config" / "gce-disk-watch.conf", env={})
+        self.assertEqual(conf["GDW_KNOWN_UNREADABLE"].split(), ["stima-ci-1", "stima-ci-deploy-1"])
+
     def test_a_damaged_entry_never_crashes_the_round_and_the_host_alerts_again(self):
         damaged = [{"kind": "disk-high", "sent": "yesterday", "todo": [], "notice": "alert", "told": True},
                    {"kind": "disk-high", "todo": ["inbox"], "told": True},  # todo without a notice

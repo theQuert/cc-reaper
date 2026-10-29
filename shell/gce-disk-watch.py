@@ -14,7 +14,8 @@ to local files (and a local notification).
   judge   `/` used >= GDW_USED_PCT (90) or available < GDW_MIN_AVAIL_GB (2 GiB) or inodes >= GDW_INODE_PCT (90)
           is `disk-high`; a read that fails, times out or prints no `/` line is `unreadable` (its own kind, with
           a fixed reason word, never the command's output), told only after GDW_UNREADABLE_ROUNDS (2) such reads in a
-          row (until then the host keeps its previous kind). Without GDW_SSH_KEY and its .pub every host is
+          row (until then the host keeps its previous kind); a host in GDW_KNOWN_UNREADABLE is never told `unreadable`
+          (logged `known-unreadable`), but a disk-high read on it still is. Without GDW_SSH_KEY and its .pub every host is
           `unreadable reason=no-ssh-key` and gcloud is never called. One bad host, or one damaged state entry (read
           back as `ok`, so the host is told again), never stops the others.
   tell    once per host per state change; while it stays, again at most every GDW_REALERT_MINUTES (120); one
@@ -62,6 +63,7 @@ DEFAULTS = {
     "GDW_LOG": "~/.cc-reaper/logs/gce-disk-watch.log",
     "GDW_NOTIFY": "1",  # 0: no macOS notification even with GDW_APPLY=1
     "GDW_UNREADABLE_ROUNDS": "2",  # consecutive unreadable reads before `unreadable` is told (one IAP blip is not)
+    "GDW_KNOWN_UNREADABLE": "",  # hosts read every round whose failed read is logged, never told (access refused by design)
     "GDW_SSH_KEY": "~/.ssh/google_compute_engine",  # must exist with its .pub: gcloud is never let generate one
 }
 CONFIG = Path.home() / ".cc-reaper" / "gce-disk-watch.conf"
@@ -321,12 +323,18 @@ class Watch:
                                                  "sent": None, "since": None}
         fails = prev["fails"] + 1 if read_kind == UNREADABLE else 0
         # An unreadable read is told only after `rounds` in a row; until then the host keeps its previous kind.
-        kind = read_kind if read_kind != UNREADABLE or fails >= rounds else prev["kind"]
-        held = f" fails={fails}/{rounds}" if read_kind == UNREADABLE else ""
+        # A known-unreadable host is never told `unreadable`: a stored one clears silently, a disk-high read still tells.
+        known = host in self.cfg["GDW_KNOWN_UNREADABLE"].split()
+        quiet = known and read_kind == UNREADABLE and prev["kind"] == UNREADABLE
+        if read_kind != UNREADABLE or (fails >= rounds and not known):
+            kind = read_kind
+        else:
+            kind = OK if quiet else prev["kind"]
+        held = (" known-unreadable" if known else f" fails={fails}/{rounds}") if read_kind == UNREADABLE else ""
         self.log(f"host {host} {read_kind} {numbers(r)}{held}")
         if kind != prev["kind"]:
             # A recovery is told only for a state something was told about; a never-told one just clears.
-            notice = "alert" if kind != OK else ("recover" if prev["told"] else None)
+            notice = "alert" if kind != OK else ("recover" if prev["told"] and not quiet else None)
             entry = {"kind": kind, "since": now, "notice": notice, "todo": self.channels(notice) if notice else [],
                      "sent": None, "told": False}
         else:
@@ -382,7 +390,8 @@ class Watch:
         for host in hosts:
             r = readings[host]
             if r["kind"] == UNREADABLE:
-                unread.append(f"{host}({r.get('reason') or 'unknown'})")
+                known = " known" if host in self.cfg["GDW_KNOWN_UNREADABLE"].split() else ""
+                unread.append(f"{host}({r.get('reason') or 'unknown'}{known})")
             try:
                 self.one_host(host, r, book, now, every, rounds, counts, failures)
             except Exception as e:  # noqa: BLE001 - one bad entry never aborts the round; the host starts afresh
