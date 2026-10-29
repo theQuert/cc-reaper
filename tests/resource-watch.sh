@@ -112,6 +112,9 @@ export CC_RW_RECLAIM_SCRIPT=/nonexistent/reclaim-byproducts.sh CC_RW_JANITOR_SCR
 touch "$TMPDIR_ROOT/fresh-stamp"
 export CC_RW_RECLAIM_PLIST=/nonexistent/com.cc-reaper.reclaim-byproducts.plist CC_RW_RECLAIM_STAMP="$TMPDIR_ROOT/fresh-stamp"
 
+# Nor the real events.log: a case that turns the pause chain on names its own.
+export CC_RW_EVENTS_LOG="$TMPDIR_ROOT/no-events/events.log"
+
 # Helper: run a fresh snapshot in a controlled environment
 # Usage: run_snapshot [extra env vars as VAR=val ...]
 run_snapshot() {
@@ -898,6 +901,90 @@ t19f=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
 touch -t "$(date -v+1H +%Y%m%d%H%M.%S)" "$t19f/stamp"
 guard_case "$t19f" 100 CC_RW_RECLAIM_STAMP="$t19f/stamp"
 expect_no "T19k: a stamp dated in the future is fresh, not a stall" grep -q 'ALERT:reclaim-stalled' "$t19f/resource-watch.log"
+
+# ---------------------------------------------------------------------------
+# T20: the pause chain (EL-T24): one line per change of the combined pause state, shadow by default
+# ---------------------------------------------------------------------------
+t20_events() { grep -c ' EVENT ' "$1/resource-watch.log" 2>/dev/null || true; }
+t20_lines() { if [ -f "$1" ]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
+t20_now=$(date +%s)
+
+t20a=$(rate_seed "$((t20_now - 3600)) $((80 * GB))")
+guard_case "$t20a" 100 CC_RW_SWAP_USED_GB=3.0
+expect_yes "T20a: nothing paused on a first round: no EVENT line" test "$(t20_events "$t20a")" -eq 0
+expect_yes "T20a: the shadow state starts as clear" grep -qx clear "$t20a/state/disk-pause.shadow.state"
+expect_no  "T20a: shadow writes no on-mode state" test -e "$t20a/state/disk-pause.state"
+expect_yes "T20a: the snapshot line carries swap= and rate=" \
+  grep -qE 'disk_free=100\.0GB/[0-9.]+% swap=3\.0GB rate=-20\.0GB/h( |$)' "$t20a/resource-watch.log"
+guard_case "$t20a" 100 CC_RW_SWAP_USED_GB=22.5
+expect_yes "T20b: swap over the line: one shadow EVENT" test "$(t20_events "$t20a")" -eq 1
+expect_yes "T20b: it names every flag present, in order, and the values" \
+  grep -qE "EVENT shadow \(CC_RW_PAUSE_EVENTS=shadow\): would emit to $CC_RW_EVENTS_LOG: DISK-PAUSE on: disk-rate-high,swap-high free=100\.0GB swap=22\.5GB rate=-?[0-9.]+GB/h$" "$t20a/resource-watch.log"
+expect_no  "T20b: shadow appends nothing to the events log" test -e "$CC_RW_EVENTS_LOG"
+expect_yes "T20b: the shadow state records the pause" grep -qx 'paused disk-rate-high,swap-high' "$t20a/state/disk-pause.shadow.state"
+guard_case "$t20a" 100 CC_RW_SWAP_USED_GB=22.5
+expect_yes "T20c: the same state next round tells nothing (deduped)" test "$(t20_events "$t20a")" -eq 1
+guard_case "$t20a" 100 CC_RW_SWAP_USED_GB=3.0
+expect_yes "T20d: every flag cleared: one DISK-RESUME" \
+  grep -qE 'would emit to .*: DISK-RESUME: all clear free=100\.0GB swap=3\.0GB rate=-?[0-9.]+GB/h$' "$t20a/resource-watch.log"
+guard_case "$t20a" 100 CC_RW_SWAP_USED_GB=3.0
+expect_yes "T20d: and nothing the round after" test "$(t20_events "$t20a")" -eq 2
+
+# on: the line goes to events.log, stamped as events.log stamps (diskwatch.py's %Y-%m-%dT%H:%M:%S%z)
+t20e=$(rate_seed "$((t20_now - 3600)) $((80 * GB))"); ev="$t20e/events.log"
+guard_case "$t20e" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$ev"
+expect_yes "T20e: on: one line in events.log" test "$(t20_lines "$ev")" -eq 1
+expect_yes "T20e: in the events.log shape" \
+  grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{4} DISK-PAUSE on: disk-rate-high,swap-high free=100\.0GB swap=22\.5GB rate=' "$ev"
+expect_yes "T20e: and the round's log says it was emitted" grep -q "EVENT emitted to $ev: DISK-PAUSE on:" "$t20e/resource-watch.log"
+guard_case "$t20e" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$ev"
+expect_yes "T20e: deduped across rounds" test "$(t20_lines "$ev")" -eq 1
+guard_case "$t20e" 100 CC_RW_SWAP_USED_GB=3.0 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$ev"
+guard_case "$t20e" 100 CC_RW_SWAP_USED_GB=3.0 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$ev"
+expect_yes "T20e: one DISK-RESUME, once" test "$(t20_lines "$ev")" -eq 2
+expect_yes "T20e: the second line is the resume" sh -c "tail -n 1 '$ev' | grep -q ' DISK-RESUME: all clear free=100.0GB swap=3.0GB rate='"
+
+t20f=$(rate_seed "$((t20_now - 3600)) $((80 * GB))"); echo "EL-X stop for a test" > "$t20f/state/disk-stop"
+guard_case "$t20f" 100 CC_RW_SWAP_USED_GB=3.0 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20f/events.log"
+expect_yes "T20f: a dispatched disk-stop alone is a pause" grep -q ' DISK-PAUSE on: disk-stop free=' "$t20f/events.log"
+
+t20g=$(rate_seed "$((t20_now - 3600)) $((5 * GB))")
+guard_case "$t20g" 15 CC_RW_SWAP_USED_GB=3.0 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20g/events.log" CC_RW_DISK_ACT_GB=0
+expect_yes "T20g: free under the emergency line is a pause" grep -q ' DISK-PAUSE on: disk-emergency free=15.0GB ' "$t20g/events.log"
+
+t20h=$(rate_seed "$((t20_now - 3600)) $((80 * GB))")
+guard_case "$t20h" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20h/no-such-dir/events.log"
+expect_yes "T20h: an append that fails is an ERROR line" grep -q 'ERROR pause chain: cannot append to' "$t20h/resource-watch.log"
+expect_no  "T20h: and leaves the state untold" test -e "$t20h/state/disk-pause.state"
+guard_case "$t20h" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20h/events.log"
+expect_yes "T20h: so the next round tells it" grep -q ' DISK-PAUSE on: ' "$t20h/events.log"
+
+t20i=$(rate_seed "$((t20_now - 3600)) $((80 * GB))")
+guard_case "$t20i" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=off CC_RW_EVENTS_LOG="$t20i/events.log"
+expect_yes "T20i: off: no EVENT line" test "$(t20_events "$t20i")" -eq 0
+expect_no  "T20i: no events.log" test -e "$t20i/events.log"
+expect_no  "T20i: and no state" sh -c "ls '$t20i/state' | grep -q disk-pause"
+
+t20j=$(rate_seed "$((t20_now - 3600)) $((80 * GB))")
+guard_case "$t20j" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=bogus CC_RW_EVENTS_LOG="$t20j/events.log"
+expect_yes "T20j: an unknown mode is shadow" grep -q 'EVENT shadow' "$t20j/resource-watch.log"
+expect_no  "T20j: and writes no events.log" test -e "$t20j/events.log"
+guard_case "$t20j" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20j/events.log"
+expect_yes "T20k: turned on mid-pause, on tells the pause it finds (its own state)" \
+  test "$(t20_lines "$t20j/events.log")" -eq 1
+
+t20u=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+guard_case "$t20u" 100
+expect_yes "T20l: unreadable swap and an unmeasured rate are ?" grep -qE 'GB/[0-9.]+% swap=\? rate=\?( |$)' "$t20u/resource-watch.log"
+
+# T21: the judge (shell/resource-watch-judge.py) agrees with what the script really wrote, and catches a change
+t21_judge() { PATH="$stub_dir:$PATH" python3 "$ROOT_DIR/shell/resource-watch-judge.py" --plist /nonexistent "$@" >/dev/null; }
+expect_yes "T21a: the judge passes the T20 shadow log (pause, resume, swap= and rate= lines)" t21_judge --log "$t20a/resource-watch.log"
+expect_yes "T21a: and the T20 on-mode log" t21_judge --log "$t20e/resource-watch.log"
+sed 's/ ALERT:swap//' "$t20a/resource-watch.log" > "$t20a/no-swap-marker.log"
+expect_no  "T21b: a swap line without ALERT:swap is a miss" t21_judge --log "$t20a/no-swap-marker.log"
+grep -v 'DISK-RESUME' "$t20a/resource-watch.log" > "$t20a/no-resume.log"; grep 'DISK-PAUSE' "$t20a/resource-watch.log" >> "$t20a/no-resume.log"
+expect_no  "T21c: a second DISK-PAUSE with no resume between is a miss" t21_judge --log "$t20a/no-resume.log"
 
 if [ "$failures" -gt 0 ]; then
   printf "%s test failure(s)\n" "$failures"
