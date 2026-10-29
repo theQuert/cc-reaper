@@ -87,6 +87,8 @@ _cc_reaper_never_kill() {
       for (d = 0; d < 512 && p > 1; d++) { if (p in keep) exit 0; if (!(p in parent)) exit 1; p = parent[p] }
       exit 1
     }'
+  # Only awk's own "not protected" (1) lets a signal through; awk failing to run protects.
+  [ "$?" -ne 1 ]
 }
 # END never-kill
 

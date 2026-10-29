@@ -36,7 +36,9 @@ export CC_RUNAWAY_GRACE_SEC="${CC_RUNAWAY_GRACE_SEC:-0}"
 # (claude-mem's worker, chroma in http mode) is shared by every session connected to it:
 # SIGTERM ended those sessions' tools with nobody at the terminal to see why. Only a server
 # no live session uses - reparented to launchd, with no agent client on its ports - is
-# still reaped here. claude-guard's _cc_guard_in_use_by_agent decides.
+# still reaped here. claude-guard's _cc_guard_in_use_by_agent decides, from one snapshot of
+# connections: a daemonized HTTP server whose clients only hold short requests (hooks) can show
+# none at that moment and is still signalled, as it was before this check.
 export CC_RUNAWAY_SPARE_IN_USE=1
 
 # Pids the operator never wants signalled (and their descendants) are honoured inside

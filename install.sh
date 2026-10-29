@@ -51,6 +51,11 @@ session-reaper stall-watch reclaim-byproducts"
 # policy file. wip-backup pushes snapshots that include untracked files to each repository's
 # remote under a host-specific label, so a fresh install must never start it.
 CC_OPTIN_AGENTS="wip-backup"
+# Agents this installer updates only where they are already loaded. Each acts once loaded
+# (session-reaper closes sessions under an APPLY=1 policy, reclaim-byproducts deletes, wip-backup
+# pushes untracked files, stall-watch alerts), and RunAtLoad runs them at once; an operator who
+# booted one out or disabled it, or a host that never ran it, gets the command, never a start.
+CC_NOSTART_AGENTS="session-reaper stall-watch reclaim-byproducts wip-backup"
 # Policies the operator owns: installed when absent, never overwritten, a difference reported.
 CC_POLICIES="worktree-janitor.conf disk-janitor.conf growth-targets.tsv session-reaper.conf"
 
@@ -131,6 +136,10 @@ if [ "${1:-}" = "--check" ]; then
         if ! _cc_opted_in "$AGENT" "$REAPER_DIR" "$PLIST_DIR"; then
           echo "opt-in   $AGENT is not enabled on this host"; continue
         fi ;;
+    esac
+    case " $CC_NOSTART_AGENTS " in
+      *" $AGENT "*)
+        if [ ! -e "$plist" ]; then echo "stopped  $AGENT has no LaunchAgent here; an install never starts it"; continue; fi ;;
     esac
     interval="$(plutil -extract StartInterval raw "$plist" 2>/dev/null || echo 3600)"
     _cc_render_agent "$AGENT" "$interval" > "$rendered"
@@ -581,8 +590,8 @@ done
 # /bin/bash needs Full Disk Access - which takes minutes, so on a host where the agent was never
 # loaded the proof is named here rather than run on every update.
 if ! launchctl print "$AGENT_UI/com.cc-reaper.reclaim-byproducts" >/dev/null 2>&1; then
-  echo "  byproducts reaper scheduled for the first time; prove launchd can run it with:"
-  echo "    launchctl kickstart $AGENT_UI/com.cc-reaper.reclaim-byproducts; tail $HOME_DIR/.claude/logs/reclaim-byproducts.log"
+  echo "  byproducts reaper is not scheduled here; its own installer schedules it and proves launchd can run it:"
+  echo "    $REAPER_DIR/reclaim-byproducts.sh --install-launchd 2h"
 fi
 mkdir -p "$HOME_DIR/.claude/logs"
 # Retired 2026-09-23: nothing ever called it, and the builder prune it gated now runs in
@@ -651,6 +660,15 @@ for AGENT in $CC_AGENTS $CC_OPTIN_AGENTS; do
   esac
   AGENT_LABEL="com.cc-reaper.$AGENT"
   AGENT_PLIST="$PLIST_DIR/$AGENT_LABEL.plist"
+  case " $CC_NOSTART_AGENTS " in
+    *" $AGENT "*)
+      # Not loaded: no plist is written either, since launchd loads one at the next login.
+      if ! launchctl print "$AGENT_UI/$AGENT_LABEL" >/dev/null 2>&1; then
+        echo "  $AGENT: not loaded on this host, left stopped; to start it after reading its README section:"
+        echo "    sed 's|__HOME__|$HOME_DIR|g' $SCRIPT_DIR/launchd/$AGENT_LABEL.plist > $AGENT_PLIST && launchctl bootstrap $AGENT_UI $AGENT_PLIST"
+        continue
+      fi ;;
+  esac
   _cc_render_agent "$AGENT" "$WORKTREE_INTERVAL_SECONDS" > "$AGENT_RENDERED"
   if [ -e "$AGENT_PLIST" ] && _cc_same_plist "$AGENT_RENDERED" "$AGENT_PLIST" &&
      launchctl print "$AGENT_UI/$AGENT_LABEL" >/dev/null 2>&1; then

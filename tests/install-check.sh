@@ -90,9 +90,20 @@ for f in session-reaper.py stall-watch.py wip-backup.sh; do
   if [ -x "$R/$f" ] && cmp -s "$ROOT_DIR/shell/$f" "$R/$f"; then ok "the installer deploys $f"
   else bad "the installer did not deploy $f"; fi
 done
+# Each acts once loaded, and RunAtLoad runs it at once: a host where it is not loaded gets the
+# command, never a start and never a plist launchd would load at the next login.
 for a in session-reaper stall-watch reclaim-byproducts; do
-  if [ -e "$L/com.cc-reaper.$a.plist" ] && [ -e "$S/com.cc-reaper.$a.loaded" ]; then ok "the installer schedules $a"
-  else bad "the installer did not schedule $a"; fi
+  if [ ! -e "$L/com.cc-reaper.$a.plist" ] && [ ! -e "$S/com.cc-reaper.$a.loaded" ]; then ok "the installer leaves $a stopped where it is not loaded"
+  else bad "the installer started $a on a host where it was not loaded"; fi
+done
+out="$(run --check 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q 'stopped  session-reaper has no LaunchAgent' \
+  && ok "a stopped agent is named, not drift" || bad "stopped agent check: rc=$rc"
+for a in session-reaper stall-watch reclaim-byproducts; do : > "$S/com.cc-reaper.$a.loaded"; done
+run >/dev/null 2>&1
+for a in session-reaper stall-watch reclaim-byproducts; do
+  if [ -e "$L/com.cc-reaper.$a.plist" ] && [ -e "$S/com.cc-reaper.$a.loaded" ]; then ok "the installer updates $a where it is loaded"
+  else bad "the installer did not update loaded $a"; fi
 done
 if [ "$(stat -f %Lp "$R/session-reaper.conf" 2>/dev/null)" = 600 ] && cmp -s "$ROOT_DIR/config/session-reaper.conf" "$R/session-reaper.conf"; then
   ok "a missing session policy is installed, 600, report-only as the repository ships it"
@@ -105,17 +116,18 @@ if [ ! -e "$L/com.cc-reaper.wip-backup.plist" ] && [ "$rc" -eq 0 ] &&
   ok "wip-backup is neither scheduled nor drift on a host that did not opt in"
 else bad "wip-backup on a fresh host: rc=$rc: $(printf '%s\n' "$out" | grep wip)"; fi
 : > "$R/wip-backup.conf"
+: > "$S/calls"
+run >/dev/null 2>&1
+if [ ! -e "$S/com.cc-reaper.wip-backup.loaded" ] && [ ! -e "$L/com.cc-reaper.wip-backup.plist" ] &&
+   ! grep -Eq '^(enable|bootstrap|load) .*wip-backup' "$S/calls"; then
+  ok "a policy file alone never starts or enables wip-backup"
+else bad "wip-backup started from its policy file: $(grep wip "$S/calls" | tr '\n' ';')"; fi
+: > "$S/com.cc-reaper.wip-backup.loaded"
 run >/dev/null 2>&1
 out="$(run --check 2>&1)"; rc=$?
-if [ -e "$S/com.cc-reaper.wip-backup.loaded" ] && [ "$rc" -eq 0 ] &&
-   printf '%s\n' "$out" | grep -q 'current  .*com.cc-reaper.wip-backup.plist'; then
-  ok "a host that opted in by its policy gets wip-backup scheduled and compared"
-else bad "opted-in wip-backup: rc=$rc: $(printf '%s\n' "$out" | grep wip)"; fi
-rm "$L/com.cc-reaper.wip-backup.plist"
-out="$(run --check 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'MISSING.*com.cc-reaper.wip-backup.plist' \
-  && ok "an opted-in host missing its wip-backup agent is drift" || bad "opted-in missing agent: rc=$rc"
-run >/dev/null 2>&1
+if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q 'current  .*com.cc-reaper.wip-backup.plist'; then
+  ok "a host where wip-backup is loaded gets it updated and compared"
+else bad "loaded wip-backup: rc=$rc: $(printf '%s\n' "$out" | grep wip)"; fi
 
 # A deployed script that lost its execute bit is drift, though its bytes match.
 chmod 644 "$R/host-temp-reaper.py"
