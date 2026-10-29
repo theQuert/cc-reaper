@@ -14,6 +14,21 @@
   line shapes, and a failed tmux read keeps the earlier state. It never types into a pane (#5212): only `display` and `capture-pane` are reachable.
 
 ### Fixed
+- **`worktree-janitor.sh` stops rescanning sessions before every removal, reads a dirty tree's status
+  once, and archives an ignored `*.log` instead of keeping its tree.** Each scheduled sweep spent its
+  1800 s removal budget with ~72 trees unexamined (~23 s a tree): before every candidate the removal
+  path took the session scan (which restarts the transcript cache) again. The session scan is now
+  reused while younger than `CC_WJ_RECHECK_FRESH_SECONDS` (120), as the trim path already did; the
+  claim checks stay per tree, and the machine-wide holder `lsof` scan (~0.2 s) and the launchd read
+  (~0.2 s) still run before every removal, matched by path prefix, so a process whose cwd is deep
+  inside a tree keeps it. A dirty tree's `git status --ignored` was read twice in a row (inventory,
+  then the wip check); the second reuses the first, while the read that decides the removal still
+  asks git again. A gitignored file named `*.log` (`.npm-ci.log`, `step0.log`, a hand-named tee log)
+  goes through the `archive:` path: it is copied to `CC_WJ_ARCHIVE_DIR` under
+  `CC_WJ_ARCHIVE_MAX_BYTES` and named in the removal log, and a log over the cap keeps the tree. An
+  untracked `*.log` that git does not ignore, any other ignored entry and a credential-shaped name
+  (`.env.log`) keep the tree. This ends the `top-level-log` rule on probation. Tests:
+  `tests/worktree-janitor-throughput.sh`.
 - **`resource-watch.sh` holds heavy leases while swap is high, and says so in its own `swap-high` flag.**
   Used swap over `CC_RW_SWAP_FLAG_GB` (default 18; swap is the disk writer behind the 2026-10-29 4-18 GB
   dips) writes `<state>/disk-rate-high` (now with `swap=<gb>`) and raises `ALERT:swap`; it also writes

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # worktree-janitor: the rules on probation (stima-api#5886) and the names nothing may touch.
-#   top-level-log        a top-level ignored *.log file no longer keeps a worktree
+#   (an ignored *.log file no longer keeps a worktree in any mode: tests/worktree-janitor-throughput.sh)
 #   primary-skills-link  nor does a .claude/skills or .claude/commands link into the primary checkout
 #   CC_WJ_NEW_RULES_MODE spotcheck (default) logs what they would trim or remove and changes nothing;
 #                        auto lets them decide
@@ -64,8 +64,10 @@ mkdir -p "$T/elsewhere/skills"
 mkwt linkout;      mkdir -p "$T/wt-linkout/.claude"; ln -s "$T/elsewhere/skills" "$T/wt-linkout/.claude/skills"
 mkwt nestedlog;    mkdir -p "$T/wt-nestedlog/sub"; echo x > "$T/wt-nestedlog/sub/run.log"
 mkwt logheld;      echo x > "$T/wt-logheld/api-1.log"
-mkwt trimme unlanded;  echo x > "$T/wt-trimme/.build-main.log"; cache trimme
-mkwt trimheld unlanded; echo x > "$T/wt-trimheld/.build-main.log"; cache trimheld
+# Kept only by a .claude/skills link into the primary checkout: the rule on probation the trim tests need.
+skills_only() { mkdir -p "$T/wt-$1/.claude"; ln -s "$PRIMARY/.claude/skills" "$T/wt-$1/.claude/skills"; }
+mkwt trimme unlanded;  skills_only trimme; cache trimme
+mkwt trimheld unlanded; skills_only trimheld; cache trimheld
 mkwt homepage-bento;  cache homepage-bento
 mkwt sessiondeny;     cache sessiondeny
 # stima-api: web/next/node_modules is a symlink into another worktree's node_modules.
@@ -145,14 +147,14 @@ spot_has() { grep -F -- "$1" "$SPOT" | grep -qF -- "$2"; }
 
 : > "$LSOF_LOG"
 CC_WJ_NEW_RULES_MODE=auto wj > "$T/report-auto.txt"
-check "auto: a top-level ignored *.log no longer keeps a landed tree" judged "$T/report-auto.txt" log REMOVABLE
+check "auto: an ignored *.log no longer keeps a landed tree" judged "$T/report-auto.txt" log REMOVABLE
 check "auto: an absolute .claude/skills link into the primary checkout no longer keeps it" \
   judged "$T/report-auto.txt" skillsabs REMOVABLE
 check "auto: nor does a relative .claude/commands link into it" judged "$T/report-auto.txt" skillsrel REMOVABLE
 check "auto: a .claude/skills link that points outside the primary checkout still keeps it" \
   judged "$T/report-auto.txt" linkout "KEEP(unrebuildable=1)"
-check "auto: a *.log below the top level still keeps it" judged "$T/report-auto.txt" nestedlog "KEEP(unrebuildable=1)"
-check "auto: a held tree whose only pin is a log is kept as held" judged "$T/report-auto.txt" logheld "KEEP(active-session)"
+check "auto: a *.log inside a wholly ignored directory still keeps it (the directory is the pin)" judged "$T/report-auto.txt" nestedlog "KEEP(unrebuildable=1)"
+check "auto: a held tree whose only leftover is a log is kept as held" judged "$T/report-auto.txt" logheld "KEEP(active-session)"
 check "auto: unlanded work stays kept for removal" judged "$T/report-auto.txt" trimme "KEEP(unlanded)"
 check "deny: a worktree whose name holds a deny-listed name is kept" \
   judged "$T/report-auto.txt" homepage-bento "KEEP(deny-listed:homepage)"
@@ -177,14 +179,15 @@ check "inbound: a failed scan keeps a tree that would be removable" \
 
 : > "$SPOT"
 wj > "$T/report-spot.txt"
-check "spotcheck (default): the log still keeps the tree as before" judged "$T/report-spot.txt" log "KEEP(unrebuildable=1)"
-check "  and the report names the pin as before" says "$T/report-spot.txt" log "kept by: !! next-manual.log"
-check "  and says the rule would make it removable" says "$T/report-spot.txt" log "spotcheck: top-level-log would make it REMOVABLE"
-check "  and the spot-check log records it with rule, size, holder and run id" \
-  spot_has "path=$T/wt-log " "phase=removal action=would-remove rule=top-level-log"
-check "  with a byte count and a run id" bash -c 'grep -F "path=$1 " "$2" | grep -Eq "run=[0-9TZ]+-[0-9]+ .* bytes=[0-9]+ holder=none"' _ "$T/wt-log" "$SPOT"
+check "spotcheck (default): an ignored log does not keep the tree, and is not a rule on probation" \
+  judged "$T/report-spot.txt" log REMOVABLE
+refute "  so nothing is logged for it" grep -qF "path=$T/wt-log " "$SPOT"
 check "spotcheck: the skills link tree is kept as before" judged "$T/report-spot.txt" skillsabs "KEEP(unrebuildable=1)"
-check "  and logged under its rule" spot_has "path=$T/wt-skillsabs " "rule=primary-skills-link"
+check "  and the report names the pin" says "$T/report-spot.txt" skillsabs "kept by: !! .claude/skills"
+check "  and says the rule would make it removable" says "$T/report-spot.txt" skillsabs "spotcheck: primary-skills-link would make it REMOVABLE"
+check "  and the spot-check log records it with rule, size, holder and run id" \
+  spot_has "path=$T/wt-skillsabs " "phase=removal action=would-remove rule=primary-skills-link"
+check "  with a byte count and a run id" bash -c 'grep -F "path=$1 " "$2" | grep -Eq "run=[0-9TZ]+-[0-9]+ .* bytes=[0-9]+ holder=none"' _ "$T/wt-skillsabs" "$SPOT"
 refute "spotcheck: a held tree is not logged as removable" grep -qF "path=$T/wt-logheld " "$SPOT"
 refute "spotcheck: a deny-listed tree is not logged" grep -qF "wt-homepage-bento" "$SPOT"
 
@@ -193,7 +196,7 @@ refute "spotcheck: a deny-listed tree is not logged" grep -qF "wt-homepage-bento
 : > "$SPOT"
 wj --trim-regenerable --apply > "$T/trim-spot.txt"
 check "spotcheck: an unlanded idle tree's node_modules is not trimmed" test -d "$T/wt-trimme/node_modules"
-check "  and the would-trim is logged with its path" spot_has "path=$T/wt-trimme/node_modules " "phase=trim action=would-trim rule=top-level-log"
+check "  and the would-trim is logged with its path" spot_has "path=$T/wt-trimme/node_modules " "phase=trim action=would-trim rule=primary-skills-link"
 check "  and the tree is kept as before" judged "$T/trim-spot.txt" trimme "KEEP(unrebuildable=1)"
 refute "spotcheck: a held tree's cache is not logged" grep -qF "wt-trimheld" "$SPOT"
 check "inbound: trim keeps the node_modules another worktree's link points into" \
@@ -202,9 +205,9 @@ check "  and says why" judged "$T/trim-spot.txt" donor "KEEP(inbound-symlink:wt-
 refute "  while a tree nothing links into is trimmed" test -e "$T/wt-lonely/node_modules"
 
 CC_WJ_NEW_RULES_MODE=auto wj --trim-regenerable --apply > "$T/trim-auto.txt"
-refute "auto: an unlanded idle tree whose only pin is a log has its node_modules trimmed" test -e "$T/wt-trimme/node_modules"
-check "  and keeps the worktree, its log and its own work" \
-  bash -c '[ -f "$1/.build-main.log" ] && [ -f "$1/trimme.txt" ] && git -C "$1" rev-parse -q --verify HEAD' _ "$T/wt-trimme"
+refute "auto: an unlanded idle tree whose only pin is a skills link has its node_modules trimmed" test -e "$T/wt-trimme/node_modules"
+check "  and keeps the worktree, its link and its own work" \
+  bash -c '[ -L "$1/.claude/skills" ] && [ -f "$1/trimme.txt" ] && git -C "$1" rev-parse -q --verify HEAD' _ "$T/wt-trimme"
 check "auto: a held tree keeps its node_modules" test -d "$T/wt-trimheld/node_modules"
 check "  and says it is held" says "$T/trim-auto.txt" trimheld "KEEP(active-session)"
 check "deny: a deny-listed tree keeps its node_modules" test -d "$T/wt-homepage-bento/node_modules"
@@ -222,10 +225,10 @@ check "  but still walks one that has" walked "$T/wt-trimme"
 
 wj --apply > "$T/apply-spot.txt"
 check "spotcheck --apply removes nothing the new rules reached" \
-  bash -c '[ -d "$1/wt-log" ] && [ -d "$1/wt-skillsabs" ] && [ -d "$1/wt-skillsrel" ]' _ "$T"
+  bash -c '[ -d "$1/wt-skillsabs" ] && [ -d "$1/wt-skillsrel" ]' _ "$T"
+check "  but removes the tree an ignored log alone kept, in the default mode too" test ! -e "$T/wt-log"
 
 CC_WJ_NEW_RULES_MODE=auto wj --apply > "$T/apply-auto.txt"
-check "auto --apply removes the tree a log alone kept" test ! -e "$T/wt-log"
 check "auto --apply removes the trees a skills link alone kept" test ! -e "$T/wt-skillsabs" -a ! -e "$T/wt-skillsrel"
 check "  and the primary checkout's skills are untouched" test -f "$PRIMARY/.claude/skills/one/SKILL.md"
 check "  and the branches remain" bash -c 'git -C "$1" show-ref -q --verify refs/heads/log && git -C "$1" show-ref -q --verify refs/heads/skillsabs' _ "$PRIMARY"
