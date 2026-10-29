@@ -837,16 +837,23 @@ a person's or Neo's step.
 
 - **Detect:** each live interactive session's screen is hashed (with the cursor) and re-scanned only
   when the hash changed. Fingerprints: `weekly-limit` (`hit your weekly limit`), `remote-disconnected`
-  (`Remote Control disconnected`, cleared by a later `/remote-control is active`), `rate-limit-429`
-  (`429` or `rate_limit` on a `⎿` result or `API Error` line), `interrupted-idle` (`[Request interrupted by
+  (a line that is `Remote Control disconnected` followed by `—` or the end, cleared by a later
+  `/remote-control is active`), `rate-limit-429` (`429` or `rate_limit_error` in an `API Error` line, or
+  `status 429` in a `⎿` result). Each pattern is anchored to the exact shape of Claude Code's own line, so
+  quoted text, `Read 429 lines`, `#429 merged` or `rate_limit.go` are not stalls; `interrupted-idle` (`[Request interrupted by
   user]` or `Interrupted · What should Claude do instead?` just above an empty prompt; it counts only with
   `Login successful` on that screen or `STALL_FLEET_MIN` panes at once, since one Esc is not a switch).
 - **Report:** once per event, keyed by (pane, fingerprint, session id), as a block under
   `## EL-T801-CI-HARDEN STALL <session-name>` in `STALL_INBOX` with
   `` `claude --resume <id> --remote-control <name>` ``. An event ends when its fingerprint leaves the
   screen. Written by Python, never a shell heredoc.
-- **Mark:** `STALL_MARK_DIR/<session id>.json`, refreshed each run; `session-reaper.py` then keeps the
-  session with `stalled:<fingerprint>`. A mark only keeps a session, so shadow mode writes it too.
+- **Mark:** only with `STALL_APPLY=1` (a mark holds the reaper, so shadow never writes one):
+  `STALL_MARK_DIR/<session id>.json`, refreshed each run; `session-reaper.py` then keeps the session with
+  `stalled:<fingerprint>`. A mark expires `STALL_MARK_HOURS` (12) after its last refresh and
+  `STALL_MARK_MAX_HOURS` (48) after the event was first seen, however often it is refreshed. Cleanup removes
+  only files with the mark schema, and a shared directory (`~/.claude/sessions`, `~/.cc-reaper`, ...) is
+  refused as `STALL_MARK_DIR`. A failed tmux read (timeout, empty capture) or a missing `ps` table keeps
+  the previous pane, event and mark and reports nothing.
 
 ```bash
 install -m 755 shell/stall-watch.py ~/.cc-reaper/stall-watch.py

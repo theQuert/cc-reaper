@@ -49,17 +49,24 @@ DEFAULTS = {
     "STALL_INBOX": "~/handoffs/neo-inbox.md",
     "STALL_STATE": "~/.cc-reaper/state/stall-watch.json",  # pane hashes and the events already seen
     "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # one <session id>.json per stalled session
+    "STALL_MARK_MAX_HOURS": "48",  # no mark past this long after the event was first seen, however often it is refreshed
     "STALL_FLEET_MIN": "2",  # panes showing interrupted-idle at once that stand in for "Login successful"
 }
 READ_ONLY_TMUX = ("display", "capture-pane")  # #5212: nothing that types into a pane
 
-WEEKLY_RE = re.compile(r"hit your (?:[\w-]+ )?limit", re.I)
-REMOTE_RE = re.compile(r"Remote Control disconnected", re.I)
-REMOTE_OK_RE = re.compile(r"(?:Remote Control|/remote-control) (?:is )?(?:active|reconnected|(?<!dis)connected)", re.I)
-RESULT_LINE_RE = re.compile(r"⎿|API Error")
-LIMIT_RE = re.compile(r"\b429\b|rate_limit")
-INTERRUPT_RE = re.compile(r"\[Request interrupted by user[^\]]*\]|Interrupted · What should Claude do instead\?")
-LOGIN_RE = re.compile(r"Login successful", re.I)
+# Claude Code's own system and status lines only. Each pattern is anchored at the start of a line (after an optional
+# `⎿` result gutter or `⏺`/`●` message bullet) and has the exact shape of the line, so a sentence that quotes the words,
+# a file listing, or a `⎿` result that merely contains "429" or "rate_limit" is not a stall.
+LEAD = r"^\s*(?:⎿\s*)?(?:[⏺●]\s*)?"
+WEEKLY_RE = re.compile(LEAD + r"You(?:'|’)ve hit your (?:[\w-]+ )?limit\b\s*(?:[·∙]\s*resets\b|[.!]?\s*$)", re.I)
+REMOTE_RE = re.compile(LEAD + r"(?:Login successful\.\s*)?Remote Control disconnected\b\s*(?:—|-|\.|$)", re.I)
+REMOTE_OK_RE = re.compile(r"^\s*(?:[⏺●]\s*)?(?:Remote Control|/remote-control) (?:is )?(?:active|reconnected|(?<!dis)connected)\b", re.I)
+API_ERROR_RE = re.compile(LEAD + r"API Error\b")  # the error itself must carry 429 / rate_limit_error within its 3 lines
+API_ERROR_CODE_RE = re.compile(r"\b429\b|\brate_limit_error\b")
+STATUS_429_RE = re.compile(r"\bstatus(?: code)?\s*[:=]?\s*429\b", re.I)  # a failed agent result: "... with status 429 ..."
+RESULT_RE = re.compile(r"^\s*⎿")
+INTERRUPT_RE = re.compile(LEAD + r"(?:\[Request interrupted by user[^\]]*\]|Interrupted · What should Claude do instead\?)\s*$")
+LOGIN_RE = re.compile(LEAD + r"Login successful\b", re.I)
 INTERRUPT_MAX_GAP = 8  # lines between the marker and the prompt line (the prompt box's border and blank lines)
 
 
@@ -84,20 +91,21 @@ def scan(pane):
     ({"screen", "cx", "cy"}); `interrupted-idle` is a candidate that main() still has to corroborate."""
     lines = pane["screen"].split("\n")
     fps = []
-    if WEEKLY_RE.search(pane["screen"]):
+    if any(WEEKLY_RE.search(l) for l in lines):
         fps.append("weekly-limit")
     last = max((i for i, l in enumerate(lines) if REMOTE_RE.search(l)), default=None)
     if last is not None and not any(REMOTE_OK_RE.search(l) for l in lines[last + 1:]):
         fps.append("remote-disconnected")
     for i, l in enumerate(lines):
-        if RESULT_LINE_RE.search(l) and LIMIT_RE.search(" ".join(lines[i:i + 3])):
+        window = " ".join(x.strip() for x in lines[i:i + 3])
+        if (API_ERROR_RE.search(l) and API_ERROR_CODE_RE.search(window)) or (RESULT_RE.search(l) and STATUS_429_RE.search(window)):
             fps.append("rate-limit-429")
             break
     marker = max((i for i, l in enumerate(lines) if INTERRUPT_RE.search(l)), default=None)
     if marker is not None and reaper.empty_prompt(pane) and 0 < pane["cy"] - marker <= INTERRUPT_MAX_GAP \
             and not any(l.strip() for l in lines[marker + 1:pane["cy"] - 1]):
         fps.append("interrupted-idle")
-    return {"fps": fps, "login": bool(LOGIN_RE.search(pane["screen"]))}
+    return {"fps": fps, "login": any(LOGIN_RE.search(l) for l in lines)}
 
 
 def screen_hash(pane):
@@ -107,9 +115,16 @@ def screen_hash(pane):
     return h.hexdigest()
 
 
+SID_RE = re.compile(r"[\w-]+")
+
+
 def live_sessions():
-    """Interactive tmux sessions whose pid and start time still match: [(file data, pane id, pane state)]."""
+    """Interactive tmux sessions whose pid and start time still match: [(file data, pane id, pane state)].
+    The state is None when the read failed (a tmux timeout under load, an empty capture): that session is still
+    live, so the caller keeps what it knew instead of treating the session as gone."""
     table = reaper.ps_table()
+    if not table:
+        return None  # ps failed: every session would look gone, which must not clear anything
     out = []
     for f in sorted(reaper.SESSIONS_DIR.glob("*.json")):
         try:
@@ -121,8 +136,14 @@ def live_sessions():
                 or " ".join(d.get("procStart", "").split()) != table[pid][1]:
             continue
         pane = d["tmux"].rsplit(".", 1)[-1]
+        if not SID_RE.fullmatch(str(d.get("sessionId") or "")):
+            continue  # the id goes into a file name, a shell command and the inbox: only [\w-]+
         state = reaper.pane_state(pane)
-        if state and reaper.is_ancestor(table, state["pane_pid"], pid) and d.get("sessionId"):
+        if state is not None and not state["screen"].strip():
+            state = None  # tmux answered `display` but the capture came back empty: not a reading
+        if state is None:
+            out.append((d, pane, None))
+        elif reaper.is_ancestor(table, state["pane_pid"], pid):
             out.append((d, pane, state))
     return out
 
@@ -135,7 +156,30 @@ def atomic_write(path, text):
 
 
 def one_line(text):
-    return re.sub(r"\s+", " ", text or "").strip()
+    """One line with no backtick: the name sits in a markdown code span (the recovery command) and a header."""
+    return re.sub(r"\s+", " ", (text or "").replace("`", "'")).strip()
+
+
+MARK_KEYS = {"sid", "tmux", "fingerprints", "pane", "since", "updated"}
+
+
+def is_mark(path):
+    """A file this script wrote: <sid>.json holding exactly the mark schema for that sid. Nothing else is deleted."""
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    return SID_RE.fullmatch(path.stem) is not None and isinstance(d, dict) and set(d) == MARK_KEYS \
+        and d["sid"] == path.stem and isinstance(d["fingerprints"], list)
+
+
+def shared_dir(path):
+    """Directories that hold other programs' files; a mark directory must never be one of them."""
+    p = path.resolve()
+    home = reaper.HOME.resolve()
+    return p in {Path("/"), home, home / ".claude", home / ".claude" / "projects", home / ".cc-reaper",
+                 home / ".cc-reaper" / "state", reaper.SESSIONS_DIR.resolve(), reaper.PROJECTS_DIR.resolve()} \
+        or reaper.SESSIONS_DIR.resolve() in p.parents or reaper.PROJECTS_DIR.resolve() in p.parents
 
 
 def resume_command(sid, name):
@@ -188,12 +232,24 @@ def main(argv=None):
 
 def sweep(cfg, apply, state_path, mark_dir, inbox):
     now = time.time()
+    failures = []
+    if mark_dir and shared_dir(mark_dir):
+        failures.append(f"STALL_MARK_DIR {mark_dir} is a shared directory: no marks written or removed")
+        mark_dir = None
     state = load_state(state_path)
-    old_panes, panes, rescanned = state["panes"], {}, 0
+    panes, rescanned, unread = {}, 0, set()
     live = live_sessions()
+    if live is None:
+        print("stall-watch: ERROR process table unavailable; nothing read, nothing changed")
+        return 1
     for d, pane, ps in live:
-        sid, h = d["sessionId"], screen_hash(ps)
-        prev = old_panes.get(pane)
+        sid, prev = d["sessionId"], state["panes"].get(pane)
+        if ps is None:  # failed read: what was known stays known (screen, events, mark), nothing is reported or cleared
+            unread.add(pane)
+            if prev and prev.get("sid") == sid:
+                panes[pane] = prev
+            continue
+        h = screen_hash(ps)
         if prev and prev.get("hash") == h and prev.get("sid") == sid:
             panes[pane] = prev  # unchanged screen: nothing to re-read
             continue
@@ -201,21 +257,31 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
         panes[pane] = {"hash": h, "sid": sid, **scan(ps)}
     fleet = sum("interrupted-idle" in p["fps"] for p in panes.values())
     fleet_min = max(1, int(cfg["STALL_FLEET_MIN"] or 2))
-    events, failures, would, stalled = {}, [], 0, {}
+    max_age = float(cfg["STALL_MARK_MAX_HOURS"] or 48) * 3600
+    events, would, stalled, kept = {}, 0, {}, set()
     for d, pane, ps in live:
-        sid, p = d["sessionId"], panes[pane]
+        sid = d["sessionId"]
+        if pane in unread:
+            kept.add(sid)  # its mark stays exactly as it is
+            events.update({k: v for k, v in state["events"].items() if k.startswith(f"{pane}|") and k.endswith(f"|{sid}")})
+            continue
+        p = panes[pane]
         name = one_line(ps["session"]) or one_line(d.get("name")) or sid[:8]
         confirmed = [f for f in p["fps"] if f != "interrupted-idle" or p["login"] or fleet >= fleet_min]
         if not confirmed:
             continue
-        stalled[sid] = {"sid": sid, "tmux": name, "fingerprints": confirmed, "pane": pane}
-        fresh = []
+        fresh, firsts = [], []
         for fp in confirmed:
             key = f"{pane}|{fp}|{sid}"
             ev = state["events"].get(key) or {"first": now, "reported": False}
             events[key] = ev
+            firsts.append(ev["first"])
             if not ev["reported"] and (apply or not ev.get("shadow_logged")):  # shadow logs an event once too
                 fresh.append(fp)
+        # A mark is a hold on the reaper, so it exists only when the report is live and only for a bounded time from
+        # the first sighting; refreshing an idle, unchanged screen cannot extend it.
+        if apply and now - min(firsts) <= max_age:
+            stalled[sid] = {"sid": sid, "tmux": name, "fingerprints": confirmed, "pane": pane, "since": min(firsts)}
         if not fresh:
             continue
         if apply:
@@ -234,14 +300,13 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
     if mark_dir:
         mark_dir.mkdir(parents=True, exist_ok=True)
         for sid, m in stalled.items():
-            if re.fullmatch(r"[\w-]+", sid):
-                atomic_write(mark_dir / f"{sid}.json", json.dumps({**m, "updated": now}) + "\n")
+            atomic_write(mark_dir / f"{sid}.json", json.dumps({**m, "updated": now}) + "\n")
         for f in mark_dir.glob("*.json"):
-            if f.stem not in stalled:
+            if f.stem not in stalled and f.stem not in kept and is_mark(f):
                 f.unlink(missing_ok=True)  # the stall cleared, or the session is gone
     atomic_write(state_path, json.dumps({"panes": panes, "events": events}) + "\n")
     print(f"stall-watch {'apply' if apply else 'shadow'}: {len(live)} sessions, {rescanned} rescanned, "
-          f"{len(stalled)} stalled, {would} would report, {len(failures)} failures")
+          f"{len(unread)} unread, {len(stalled)} marked, {would} would report, {len(failures)} failures")
     for f in failures:
         print(f"stall-watch: ERROR {f}")
     return 1 if failures else 0

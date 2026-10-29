@@ -5,6 +5,7 @@ only tmux calls are display and capture-pane, never send-keys. Every path is a t
 
 import importlib.util
 import json
+import time
 from pathlib import Path
 import shutil
 import tempfile
@@ -49,6 +50,15 @@ REAL_INTERRUPTED = screen("● Ran 1 shell command", "  ⎿  Interrupted · What
 CODE_429 = screen("  const retryAfter = 429", "  limiter := rate_limit.New(10)", "● Added a rate_limit test")
 PROSE_LIMIT = screen("● Users can see how close they are to their weekly usage cap.")
 INTERRUPT_THEN_WORK = screen("[Request interrupted by user]", "● Resuming: reading the file", "")
+# The five texts Opus measured as false positives of the first version (ordinary transcript content).
+QUOTED_RC = screen('● The log said "Remote Control disconnected" after the switch, which matches the bug report.')
+SENTENCE_LIMIT = screen("● Users who hit your weekly limit see a banner; the copy should say so.")
+READ_429 = screen("● Read(docs/log.txt)", "  ⎿  Read 429 lines")
+HASH_429 = screen("● Bash(gh pr view)", "  ⎿  #429 merged")
+RATE_FILE = screen("● Search(rate)", "  ⎿  …/rate_limit.go")
+FALSE_POSITIVES = {"quoted Remote Control disconnected": QUOTED_RC, "weekly limit inside a sentence": SENTENCE_LIMIT,
+                   "Read 429 lines": READ_429, "#429 merged": HASH_429, "…/rate_limit.go": RATE_FILE}
+STATUS_429 = screen("● Agent(audit)", "  ⎿  Agent failed: request failed with status code 429")
 INTERRUPT_DRAFT = screen("[Request interrupted by user]", "", typed="continue with")
 
 
@@ -72,6 +82,12 @@ class Fingerprints(unittest.TestCase):
             for i, spec_ in enumerate(specs):
                 with self.subTest(fp=fp, i=i):
                     self.assertIn(fp, self.fps(spec_))
+
+    def test_ordinary_transcript_text_is_not_a_fingerprint(self):
+        for name, spec_ in FALSE_POSITIVES.items():
+            with self.subTest(name):
+                self.assertEqual(self.fps(spec_), [])
+        self.assertIn("rate-limit-429", self.fps(STATUS_429))
 
     def test_a_healthy_pane_has_no_fingerprint(self):
         self.assertEqual(self.fps(HEALTHY), [])
@@ -97,7 +113,7 @@ class Fleet:
     """A fake tmux and process table: panes {%id: (tmux name, claude pid, screen spec)}; records every tmux argv."""
 
     def __init__(self, tmp, panes):
-        self.tmp, self.panes, self.calls = tmp, panes, []
+        self.tmp, self.panes, self.calls, self.fail, self.empty = tmp, panes, [], set(), set()
         (tmp / "sessions").mkdir(exist_ok=True)
         self.table = {}
         for n, (pid_pane, (name, spec_)) in enumerate(panes.items()):
@@ -119,6 +135,10 @@ class Fleet:
         sub, target = cmd[1], cmd[cmd.index("-t") + 1]
         name, (text, cx, cy) = self.panes[target]
         n = list(self.panes).index(target)
+        if target in self.fail:
+            return 1, ""  # a tmux timeout under load
+        if sub == "capture-pane" and target in self.empty:
+            return 0, ""
         if sub == "display":
             return 0, f"{target}\t{name}\t$1\t{100 + 10 * n}\t{cx}\t{cy}\t1\t1\n"
         if sub == "capture-pane":
@@ -127,6 +147,8 @@ class Fleet:
 
 
 class Runs(unittest.TestCase):
+    table = None
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
@@ -146,7 +168,7 @@ class Runs(unittest.TestCase):
     def run_once(self, *flags):
         f = self.fleet
         with mock.patch.object(reaper, "SESSIONS_DIR", self.tmp / "sessions"), \
-             mock.patch.object(reaper, "ps_table", return_value=f.table), \
+             mock.patch.object(reaper, "ps_table", return_value=f.table if self.table is None else self.table), \
              mock.patch.object(reaper, "run", side_effect=f.run), \
              mock.patch("builtins.print") as out:
             rc = stall.main(["--config", str(self.cfg), *flags])
@@ -175,7 +197,7 @@ class Runs(unittest.TestCase):
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(self.inbox_text(), "")
         self.assertEqual(list(self.marks.glob("*")), [])
-        self.assertIn("0 stalled", self.printed)
+        self.assertIn("0 marked", self.printed)
 
     def test_two_runs_report_an_event_once(self):
         self.start({"%1": ("work", WEEKLY)})
@@ -239,7 +261,7 @@ class Runs(unittest.TestCase):
         self.run_once()
         self.assertNotIn("would report work", self.printed)  # logged once for the event
         self.assertFalse(self.inbox.exists())
-        self.assertEqual(len(list(self.marks.glob("*.json"))), 1)  # the mark only ever keeps a session
+        self.assertFalse(self.marks.exists() and list(self.marks.glob("*")))  # a mark holds the reaper: never in shadow
 
     def test_apply_after_shadow_reports_the_stall_that_is_still_there(self):
         self.write_config(apply="0")
@@ -290,7 +312,11 @@ class Runs(unittest.TestCase):
         self.assertIn("fingerprint=remote-disconnected,interrupted-idle", self.inbox_text())
 
     def test_marks_follow_the_stall_and_the_session_reaper_shows_the_reason(self):
+        self.write_config(apply="0")
         f = self.start({"%1": ("work", WEEKLY), "%2": ("fine", HEALTHY)})
+        self.run_once()
+        self.assertFalse(self.marks.exists() and list(self.marks.glob("*")))  # shadow: no mark
+        self.write_config(apply="1")
         self.run_once()
         marks = list(self.marks.glob("*.json"))
         self.assertEqual([m.stem for m in marks], [f.sids["%1"]])
@@ -301,6 +327,96 @@ class Runs(unittest.TestCase):
         f.set("%1", HEALTHY)
         self.run_once()
         self.assertEqual(reaper.stall_mark(cfg, f.sids["%1"]), "")
+
+    def test_the_fingerprints_in_the_five_false_positive_texts_report_and_mark_nothing(self):
+        for name, spec_ in FALSE_POSITIVES.items():
+            with self.subTest(name):
+                self.start({"%1": ("work", spec_)})
+                self.run_once()
+                self.run_once()
+                self.assertEqual(self.inbox_text(), "")
+                self.assertEqual(list(self.marks.glob("*")), [])
+
+    def test_a_mark_does_not_outlive_its_first_sighting_however_often_it_is_refreshed(self):
+        f = self.start({"%1": ("work", WEEKLY)})
+        self.run_once()
+        sid = f.sids["%1"]
+        cfg = dict(reaper.DEFAULTS, STALL_MARK_DIR=str(self.marks))
+        self.assertEqual(reaper.stall_mark(cfg, sid), "weekly-limit")
+        st = json.loads((self.tmp / "state.json").read_text())
+        for ev in st["events"].values():
+            ev["first"] -= 49 * 3600
+        (self.tmp / "state.json").write_text(json.dumps(st))
+        self.run_once()  # unchanged idle screen: refreshed, but past the cap from its first sighting
+        self.assertFalse((self.marks / f"{sid}.json").exists())
+        self.assertEqual(reaper.stall_mark(cfg, sid), "")
+        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+
+    def test_a_failed_read_keeps_the_event_and_the_mark_and_reports_nothing_again(self):
+        f = self.start({"%1": ("work", WEEKLY)})
+        self.run_once()
+        sid = f.sids["%1"]
+        mark = self.marks / f"{sid}.json"
+        before = mark.read_text()
+        for failing in (f.fail, f.empty):
+            failing.add("%1")
+            self.assertEqual(self.run_once(), 0)
+            self.assertIn("1 unread", self.printed)
+            self.assertEqual(mark.read_text(), before)
+            failing.discard("%1")
+        self.run_once()
+        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+        self.assertEqual(mark.read_text().count(sid), 1)
+
+    def test_a_missing_process_table_changes_nothing(self):
+        f = self.start({"%1": ("work", WEEKLY)})
+        self.run_once()
+        state, marks = (self.tmp / "state.json").read_text(), sorted(p.name for p in self.marks.glob("*"))
+        self.table = {}
+        self.assertEqual(self.run_once(), 1)
+        self.assertEqual((self.tmp / "state.json").read_text(), state)
+        self.assertEqual(sorted(p.name for p in self.marks.glob("*")), marks)
+
+    def test_a_session_id_that_is_not_word_characters_is_skipped(self):
+        f = self.start({"%1": ("work", WEEKLY)})
+        p = next((self.tmp / "sessions").glob("*.json"))
+        d = json.loads(p.read_text())
+        d["sessionId"] = "abc`reboot`"
+        p.write_text(json.dumps(d))
+        self.run_once()
+        self.assertEqual(self.inbox_text(), "")
+
+    def test_a_backtick_in_the_name_cannot_close_the_code_span(self):
+        self.start({"%1": ("my`name", WEEKLY)})
+        self.run_once()
+        block = self.inbox_text()
+        self.assertEqual(block.count("`"), 2)
+        import shlex
+        command = block.split("`")[1]
+        self.assertEqual(shlex.split(command)[-2:], ["--remote-control", "my'name"])
+
+    def test_cleanup_deletes_only_mark_files_and_refuses_a_shared_directory(self):
+        f = self.start({"%1": ("work", HEALTHY)})
+        self.marks.mkdir()
+        other = self.marks / "notes.json"
+        other.write_text("{}")
+        session_like = self.marks / "abc.json"
+        session_like.write_text(json.dumps({"pid": 1, "sessionId": "abc"}))
+        gone = self.marks / "gone-sid.json"
+        gone.write_text(json.dumps({"sid": "gone-sid", "tmux": "x", "fingerprints": ["weekly-limit"], "pane": "%9",
+                                    "since": 1, "updated": 1}))
+        self.run_once()
+        self.assertTrue(other.exists() and session_like.exists())
+        self.assertFalse(gone.exists())
+        # the sessions directory itself as the mark directory: refused, nothing in it touched
+        sessions = self.tmp / "sessions"
+        before = sorted(p.name for p in sessions.glob("*"))
+        self.cfg.write_text(self.cfg.read_text().replace(f"STALL_MARK_DIR={self.marks}", f"STALL_MARK_DIR={sessions}"))
+        f.set("%1", WEEKLY)
+        with mock.patch.object(reaper, "PROJECTS_DIR", self.tmp / "projects"):
+            self.assertEqual(self.run_once(), 1)
+        self.assertIn("shared directory", self.printed)
+        self.assertEqual(sorted(p.name for p in sessions.glob("*")), before)
 
     def test_a_gone_session_loses_its_mark(self):
         f = self.start({"%1": ("work", WEEKLY)})
@@ -342,10 +458,29 @@ class ReaperKeepsStalledSessions(unittest.TestCase):
              "crons": 0, "scheduled": False, "asking": False, "last_text": "SESSION-DONE: shipped", "claims": [], "owned": []}
         self.assertEqual(reaper.decide(dict(s), cfg), [])
         mark = tmp / "abc-123.json"
-        mark.write_text(json.dumps({"fingerprints": ["weekly-limit", "rate-limit-429"]}))
+        now = time.time()
+
+        def write(**kw):
+            d = {"sid": "abc-123", "fingerprints": ["weekly-limit", "rate-limit-429"], "since": now - 60, "updated": now}
+            d.update(kw)
+            mark.write_text(json.dumps(d))
+            os.utime(mark, None)
+        write()
         self.assertEqual(reaper.decide(dict(s), cfg), ["stalled:weekly-limit,rate-limit-429"])
         old = mark.stat().st_mtime - 13 * 3600
         os.utime(mark, (old, old))
+        self.assertEqual(reaper.decide(dict(s), cfg), [])
+        write(since=now - 49 * 3600)  # refreshed just now, but first seen past the cap
+        self.assertEqual(reaper.decide(dict(s), cfg), [])
+        write(since=now + 30 * 86400, updated=now + 30 * 86400)  # a timestamp in the future still expires
+        self.assertEqual(reaper.decide(dict(s), cfg), [])
+        write()
+        future = now + 30 * 86400
+        os.utime(mark, (future, future))  # a future mtime never makes a mark immortal
+        self.assertEqual(reaper.decide(dict(s), cfg), [])
+        write(sid="other")  # a file that is not this session's mark
+        self.assertEqual(reaper.decide(dict(s), cfg), [])
+        mark.write_text(json.dumps({"pid": 1, "sessionId": "abc-123", "status": "idle"}))  # a session file, not a mark
         self.assertEqual(reaper.decide(dict(s), cfg), [])
         mark.write_text("not json")
         os.utime(mark, None)

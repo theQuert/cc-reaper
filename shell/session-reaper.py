@@ -57,6 +57,7 @@ DEFAULTS = {
     "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
     "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # stall-watch.py writes <session id>.json here; empty: off
     "STALL_MARK_HOURS": "12",  # a mark not refreshed for this long is stale and ignored
+    "STALL_MARK_MAX_HOURS": "48",  # a mark whose event was first seen longer ago is ignored however fresh it is
     "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
@@ -679,14 +680,24 @@ def decide(s, cfg, now=None):
 
 
 def stall_mark(cfg, sid, now=None):
-    """Fingerprints stall-watch.py currently sees on this session ("" when none, stale, or unreadable)."""
+    """Fingerprints stall-watch.py currently sees on this session ("" when none, stale, over its cap, or unreadable).
+
+    The mark must be refreshed within STALL_MARK_HOURS and must not be older than STALL_MARK_MAX_HOURS from the
+    event's first sighting (`since`); both ages are absolute values, so a timestamp in the future expires too."""
     if not cfg.get("STALL_MARK_DIR") or not re.fullmatch(r"[\w-]+", sid or ""):
         return ""
     f = Path(os.path.expanduser(cfg["STALL_MARK_DIR"])) / f"{sid}.json"
+    at = now if now is not None else time.time()
     try:
-        if (now if now is not None else time.time()) - f.stat().st_mtime > float(cfg["STALL_MARK_HOURS"]) * 3600:
+        d = json.loads(f.read_text())
+        fps = d.get("fingerprints")
+        if not isinstance(fps, list) or not fps or not all(isinstance(x, str) for x in fps) or d.get("sid") != sid:
+            return ""  # not a mark (for example a session file in a misconfigured directory)
+        refreshed = max(abs(at - f.stat().st_mtime), abs(at - float(d.get("updated", 0))))
+        if refreshed > float(cfg["STALL_MARK_HOURS"]) * 3600 \
+                or abs(at - float(d.get("since", 0))) > float(cfg["STALL_MARK_MAX_HOURS"]) * 3600:
             return ""
-        return ",".join(json.loads(f.read_text()).get("fingerprints") or ["stalled"])
+        return ",".join(fps)
     except (OSError, ValueError, AttributeError, TypeError):
         return ""
 
