@@ -826,6 +826,44 @@ launchctl bootout gui/$(id -u)/com.cc-reaper.session-reaper
 rm -f ~/Library/LaunchAgents/com.cc-reaper.session-reaper.plist ~/.cc-reaper/session-reaper.py
 ```
 
+### Stall watch (account switch / rate limit)
+
+`shell/stall-watch.py` finds sessions stalled by a `/login` account switch or a spent quota, reports
+each once, and marks them so the reaper keeps them. It runs every 2 minutes from
+`com.cc-reaper.stall-watch`, calls no model, and **only prints what it would report until the deployed
+config sets `STALL_APPLY=1`**. **It never types into a pane** (stima-api #5212): its only tmux calls are
+`display` and `capture-pane`, and `tmux_ro` raises on any other subcommand. Re-enabling Remote Control is
+a person's or Neo's step.
+
+- **Detect:** each live interactive session's screen is hashed (with the cursor) and re-scanned only
+  when the hash changed. Fingerprints: `weekly-limit` (`hit your weekly limit`), `remote-disconnected`
+  (a line that is `Remote Control disconnected` followed by `—` or the end, cleared by a later
+  `/remote-control is active`), `rate-limit-429` (`429` or `rate_limit_error` in an `API Error` line, or
+  `status 429` in a `⎿` result). Each pattern is anchored to the exact shape of Claude Code's own line, so
+  quoted text, `Read 429 lines`, `#429 merged` or `rate_limit.go` are not stalls; `interrupted-idle` (`[Request interrupted by
+  user]` or `Interrupted · What should Claude do instead?` just above an empty prompt; it counts only with
+  `Login successful` on that screen or `STALL_FLEET_MIN` panes at once, since one Esc is not a switch).
+- **Report:** once per event, keyed by (pane, fingerprint, session id), as a block under
+  `## EL-T801-CI-HARDEN STALL <session-name>` in `STALL_INBOX` with
+  `` `claude --resume <id> --remote-control <name>` ``. An event ends when its fingerprint leaves the
+  screen. Written by Python, never a shell heredoc.
+- **Mark:** only with `STALL_APPLY=1` (a mark holds the reaper, so shadow never writes one):
+  `STALL_MARK_DIR/<session id>.json`, refreshed each run; `session-reaper.py` then keeps the session with
+  `stalled:<fingerprint>`. A mark expires `STALL_MARK_HOURS` (12) after its last refresh and
+  `STALL_MARK_MAX_HOURS` (48) after the event was first seen, however often it is refreshed. Cleanup removes
+  only files with the mark schema, and a shared directory (`~/.claude/sessions`, `~/.cc-reaper`, ...) is
+  refused as `STALL_MARK_DIR`. A failed tmux read (timeout, empty capture) or a missing `ps` table keeps
+  the previous pane, event and mark and reports nothing.
+
+```bash
+install -m 755 shell/stall-watch.py ~/.cc-reaper/stall-watch.py
+install -m 755 shell/session-reaper.py ~/.cc-reaper/session-reaper.py   # reads the marks
+# append the STALL_* block of config/session-reaper.conf to ~/.cc-reaper/session-reaper.conf
+python3 ~/.cc-reaper/stall-watch.py                       # shadow; prints would-report lines
+cp launchd/com.cc-reaper.stall-watch.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-reaper.stall-watch.plist
+```
+
 ## macOS Companion App (local)
 
 cc-reaper includes a native SwiftUI menu bar app for status visibility and safe manual actions. It reads the existing `cc-monitor --once --json` contract and delegates cleanup to the existing shell engine; process discovery, classification, and termination policy remain in the tested shell scripts.

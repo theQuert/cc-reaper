@@ -55,6 +55,9 @@ DEFAULTS = {
     "ORACLE_CACHE_DIR": "~/.cc-reaper/state/oracle-brief",  # one brief per issue, reused for ORACLE_CACHE_MINUTES (GitHub REST budget)
     "ORACLE_CACHE_MINUTES": "10",
     "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
+    "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # stall-watch.py writes <session id>.json here; empty: off
+    "STALL_MARK_HOURS": "12",  # a mark not refreshed for this long is stale and ignored
+    "STALL_MARK_MAX_HOURS": "48",  # a mark whose event was first seen longer ago is ignored however fresh it is
     "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
@@ -676,8 +679,34 @@ def decide(s, cfg, now=None):
     return keep
 
 
+def stall_mark(cfg, sid, now=None):
+    """Fingerprints stall-watch.py currently sees on this session ("" when none, stale, over its cap, or unreadable).
+
+    The mark must be refreshed within STALL_MARK_HOURS and must not be older than STALL_MARK_MAX_HOURS from the
+    event's first sighting (`since`); both ages are absolute values, so a timestamp in the future expires too."""
+    if not cfg.get("STALL_MARK_DIR") or not re.fullmatch(r"[\w-]+", sid or ""):
+        return ""
+    f = Path(os.path.expanduser(cfg["STALL_MARK_DIR"])) / f"{sid}.json"
+    at = now if now is not None else time.time()
+    try:
+        d = json.loads(f.read_text())
+        fps = d.get("fingerprints")
+        if not isinstance(fps, list) or not fps or not all(isinstance(x, str) for x in fps) or d.get("sid") != sid:
+            return ""  # not a mark (for example a session file in a misconfigured directory)
+        refreshed = max(abs(at - f.stat().st_mtime), abs(at - float(d.get("updated", 0))))
+        if refreshed > float(cfg["STALL_MARK_HOURS"]) * 3600 \
+                or abs(at - float(d.get("since", 0))) > float(cfg["STALL_MARK_MAX_HOURS"]) * 3600:
+            return ""
+        return ",".join(fps)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ""
+
+
 def _decide(s, cfg, now=None):
     keep = []
+    stalled = stall_mark(cfg, s.get("sid"), now)
+    if stalled:  # an account switch or rate limit stalled it: not idle, not finished
+        keep.append("stalled:" + stalled)
     if protected(cfg, s["tmux"], s["name"]):
         keep.append("protected")
     if not s.get("fg", True):
