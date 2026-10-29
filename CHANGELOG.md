@@ -3,6 +3,22 @@
 ## [Unreleased]
 
 ### Added
+- **`gce-disk-watch.py` reads the GCE CI hosts' root disk from the Mac mini and tells a full or unreadable one
+  once (EL-T24, shadow by default).** stima-ci-ctl-1's `/` sat at 100% on 2026-10-30 with nothing alerting,
+  since every disk alarm lived on that host or went through its gateway. Every 10 minutes
+  (`com.cc-reaper.gce-disk-watch`, deployed by `install.sh` but never started unasked) it runs one IAP
+  `df -P / ; df -Pi /` per host, bounded per host (90 s) and per run (240 s), and judges `disk-high`
+  (used >= 90%, under 2 GiB free, inodes >= 90%, told on the first read) or `unreadable` (told after
+  `GDW_UNREADABLE_ROUNDS`, 2, reads in a row; `no-ssh-key` without gcloud's key, which is then never called).
+  A host in `GDW_KNOWN_UNREADABLE` (shipped: stima-ci-1 and stima-ci-deploy-1, whose OS Login refuses the
+  Mac's key by design) is still read every round, but a failed read is logged `known-unreadable` and never told
+  `unreadable`; a `disk-high` it last read stays and re-alerts until a read shows it clear. An existing
+  ~/.cc-reaper/gce-disk-watch.conf is kept by install.sh: add the `GDW_KNOWN_UNREADABLE` line to it by hand.
+  A damaged state entry reads back as `ok` and never stops a round. One notice per host per state change, a
+  re-alert at most every 120 minutes, one recovery line. `GDW_APPLY=0` logs `would alert` lines only;
+  `GDW_APPLY=1` writes an `## EL-T24-GCE-DISK <host>` inbox block, a `P0 GCE-DISK` events.log line and a
+  notification, all local, retrying a failed channel alone. Policy: `config/gce-disk-watch.conf`, installed
+  when absent. Tests: `tests/gce-disk-watch.py`, `tests/install-check.sh`.
 - **`CC_NEVER_KILL_PIDS` (default `70987 4565`): pids no cc-reaper path signals, nor any process
   descended from one** (EL-T24-STORAGE-LOAD-REAPER). Honoured at the one signal boundary of each
   path that ends other processes: `_cc_reaper_kill_pid` (`claude-cleanup`, `claude-guard`,

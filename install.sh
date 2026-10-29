@@ -41,23 +41,23 @@ CC_PAYLOAD="shell/resource-watch.sh shell/resource-watch-judge.py shell/disk-jan
 shell/cc-monitor.sh shell/claude-cleanup.sh shell/guard-runner.sh shell/chrome-clone-janitor.py
 shell/growth-watch.py shell/host-temp-reaper.py shell/dev-server-reaper.py shell/reclaim-byproducts.sh
 shell/orbstack-memory-trim.sh shell/session-reaper.py shell/stall-watch.py shell/wip-backup.sh
-hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
-# session-reaper and stall-watch ship report-only (APPLY=0, STALL_APPLY=0 in their policy), so
-# scheduling them changes nothing until the operator's policy says so. reclaim-byproducts' agent
+shell/gce-disk-watch.py hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
+# session-reaper, stall-watch and gce-disk-watch ship report-only (APPLY=0, STALL_APPLY=0,
+# GDW_APPLY=0 in their policy), so scheduling them changes nothing until the operator's policy says so. reclaim-byproducts' agent
 # is the one its own --install-launchd 2h writes, byte for byte.
 CC_AGENTS="resource-watch disk-check weekly-clean guard worktree-janitor orbstack-memory-trim
-session-reaper stall-watch reclaim-byproducts"
+session-reaper stall-watch reclaim-byproducts gce-disk-watch"
 # Opt-in agents: deployed and compared only on a host that opted in, by an installed agent or its
 # policy file. wip-backup pushes snapshots that include untracked files to each repository's
 # remote under a host-specific label, so a fresh install must never start it.
 CC_OPTIN_AGENTS="wip-backup"
 # Agents this installer updates only where they are already loaded. Each acts once loaded
 # (session-reaper closes sessions under an APPLY=1 policy, reclaim-byproducts deletes, wip-backup
-# pushes untracked files, stall-watch alerts), and RunAtLoad runs them at once; an operator who
+# pushes untracked files, stall-watch and gce-disk-watch alert), and RunAtLoad runs them at once; an operator who
 # booted one out or disabled it, or a host that never ran it, gets the command, never a start.
-CC_NOSTART_AGENTS="session-reaper stall-watch reclaim-byproducts wip-backup"
+CC_NOSTART_AGENTS="session-reaper stall-watch reclaim-byproducts wip-backup gce-disk-watch"
 # Policies the operator owns: installed when absent, never overwritten, a difference reported.
-CC_POLICIES="worktree-janitor.conf disk-janitor.conf growth-targets.tsv session-reaper.conf"
+CC_POLICIES="worktree-janitor.conf disk-janitor.conf growth-targets.tsv session-reaper.conf gce-disk-watch.conf"
 
 # Whether an opt-in agent is on this host: its LaunchAgent, or its policy, is there.
 _cc_opted_in() { # agent, reaper dir, plist dir
@@ -635,6 +635,18 @@ else
   echo "  session policy preserved at $SR_CONFIG (repository default differs; review with diff)"
 fi
 
+# The GCE disk watch's policy: shadow as shipped; a host that turned it on keeps its own copy.
+GDW_CONFIG="$REAPER_DIR/gce-disk-watch.conf"
+if [ ! -e "$GDW_CONFIG" ]; then
+  cp "$SCRIPT_DIR/config/gce-disk-watch.conf" "$GDW_CONFIG"
+  chmod 600 "$GDW_CONFIG"
+  echo "  GCE disk policy installed at $GDW_CONFIG (shadow)"
+elif cmp -s "$SCRIPT_DIR/config/gce-disk-watch.conf" "$GDW_CONFIG"; then
+  echo "  GCE disk policy already current at $GDW_CONFIG"
+else
+  echo "  GCE disk policy preserved at $GDW_CONFIG (repository default differs; review with diff)"
+fi
+
 # Growth targets are host-specific (which worktree roots, which Docker volumes), so an
 # operator-edited list survives updates exactly as the policies above do.
 GW_TARGETS="$REAPER_DIR/growth-targets.tsv"
@@ -705,6 +717,7 @@ echo "  orbstack-memory-trim: drops the OrbStack guest's caches every 15 min whe
 echo "  session-reaper: every 30 min, report-only until APPLY=1 in ~/.cc-reaper/session-reaper.conf"
 echo "  stall-watch:    every 2 min, shadow until STALL_APPLY=1 in the same policy"
 echo "  reclaim-byproducts: every 2h and at load, if the last reap is over an hour old"
+echo "  gce-disk-watch: every 10 min, reads the GCE CI hosts' root disk over IAP; shadow until GDW_APPLY=1 in ~/.cc-reaper/gce-disk-watch.conf"
 
 # Claude has one global hook file, so the installer can migrate it safely.  Codex hooks
 # are repository-owned; checked-in .codex/hooks.json files should invoke the same deployed
