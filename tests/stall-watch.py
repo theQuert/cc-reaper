@@ -679,8 +679,9 @@ class PromptRuns(unittest.TestCase):
         self.assertIn("kind=plan-approval", text)
 
     def test_malformed_stored_prompts_never_raise_and_are_seen_afresh(self):
-        f = self.start({"%1": ("ci", PERMISSION), "%2": ("security", ASK_USER)})
+        f = self.start({"%1": ("ci", PERMISSION), "%2": ("security", ASK_USER), "%3": ("work", WEEKLY)})
         self.run_once()
+        self.assertEqual(self.inbox_text().count("STALL work"), 1)
         path = self.tmp / "state.json"
         st = json.loads(path.read_text())
         (k1, good), (k2, _) = sorted(st["prompts"].items())
@@ -706,7 +707,9 @@ class PromptRuns(unittest.TestCase):
                 path.write_text(json.dumps(st))
                 self.assertEqual(self.run_once(), 0, self.printed)
                 self.assertIn("2 prompts on screen", self.printed)
-                self.assertTrue(json.loads(path.read_text())["panes"])  # a bad prompts section costs nothing else
+                # a bad prompts section costs nothing else: the pane hashes (no rescan) and the reported STALL event
+                self.assertIn("0 rescanned", self.printed)
+                self.assertEqual(self.inbox_text().count("STALL work"), 1)
                 st = json.loads(path.read_text())
 
     def test_a_malformed_pane_prompt_reading_never_raises(self):
