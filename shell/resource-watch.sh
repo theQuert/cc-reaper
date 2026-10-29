@@ -753,7 +753,8 @@ _cc_rw_pause_chain() {
   else
     _cc_rw_log_line "EVENT shadow (CC_RW_PAUSE_EVENTS=shadow): would emit to $events: $line"
   fi
-  { printf '%s\n' "$want" > "$state.tmp" && mv -f "$state.tmp" "$state"; } 2>/dev/null
+  { printf '%s\n' "$want" > "$state.tmp" && mv -f "$state.tmp" "$state"; } 2>/dev/null ||
+    _cc_rw_log_line "ERROR pause chain: cannot write $state; the next round tells it again: $line"
   _CC_RW_PAUSE_LINE=$line
   return 0
 }
