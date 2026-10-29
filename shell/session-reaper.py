@@ -62,6 +62,12 @@ DEFAULTS = {
     "STALL_MARK_HOURS": "12",  # a mark not refreshed for this long is stale and ignored
     "STALL_MARK_MAX_HOURS": "48",  # a mark whose event was first seen longer ago is ignored however fresh it is
     "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
+    # A claim-less session whose newest inbox header (DONE_INBOX, else DONE_INBOX_SHADOW) is DONE (EL-T24): `shadow`
+    # reports it `would-close` and closes nothing; `apply` counts it as done; `off` neither. See noclaim_done().
+    "NOCLAIM_DONE": "shadow",
+    # Space- or comma-separated pids: a session whose process tree holds one is kept (`never-kill:<pid>`) and its
+    # pane is never killed. The environment variable of the same name wins over this value.
+    "CC_NEVER_KILL_PIDS": "70987 4565",
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
@@ -146,6 +152,31 @@ def is_ancestor(table, anc, pid):
         seen.add(pid)
         pid = table[pid][0]
     return False
+
+
+def never_kill_pids(cfg):
+    """The never-kill pids: CC_NEVER_KILL_PIDS from the environment when it is set, else from the config (default
+    "70987 4565"). Tokens that are not pids are ignored: they cannot name a process."""
+    raw = os.environ.get("CC_NEVER_KILL_PIDS", cfg.get("CC_NEVER_KILL_PIDS", ""))
+    return {int(x) for x in re.split(r"[\s,]+", raw or "") if x.isdigit()}
+
+
+def session_tree(table, pane_pid, pid):
+    """Every pid a close could end: the pane's process and all below it, the chain from claude up to the pane, and
+    claude's own descendants (when the pane no longer holds it)."""
+    tree = {pane_pid, pid}
+    tree.update(p for p, _ in descendants(table, pane_pid))
+    tree.update(p for p, _ in descendants(table, pid))
+    seen, p = set(), pid
+    while p in table and p not in seen and p > 1 and p != pane_pid:
+        seen.add(p)
+        tree.add(p)
+        p = table[p][0]
+    return tree
+
+
+def never_kill_hit(table, pane_pid, pid, cfg):
+    return sorted(session_tree(table, pane_pid, pid) & never_kill_pids(cfg))
 
 
 def survivors(table, snapshot):
@@ -480,14 +511,12 @@ def claim_time(repo, num, sid):
 INBOX_HEADER_RE = re.compile(r"^## .*?(\w+) · (\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d) TPE · (.+?)\s*$")
 
 
-def inbox_done(cfg, names, now, claim_at=None):
-    """True when the newest inbox header written by one of `names` is DONE and old enough.
-    The header must be later than the newest claim (`claim_at()` -> epoch or None; None: not done).
-    Only header lines are examined; any read or parse failure means not done."""
-    path = cfg.get("DONE_INBOX")
+def inbox_done_header(path, names):
+    """(epoch, key) of the newest inbox header written by one of `names` when it is DONE; None otherwise.
+    Only header lines are examined; any read or parse failure is None."""
     names = {n for n in names if n}
     if not path or not names:
-        return False
+        return None
     newest = None
     try:
         with open(os.path.expanduser(path), errors="replace") as f:
@@ -495,15 +524,26 @@ def inbox_done(cfg, names, now, claim_at=None):
                 if line.startswith("## ") and " · " in line and line.rstrip().rsplit(" · ", 1)[1] in names:
                     newest = line.rstrip()
     except OSError:
-        return False
+        return None
     m = INBOX_HEADER_RE.match(newest or "")
     if not m or m.group(1) != "DONE":
-        return False
+        return None
     y, mo, d, h, mi = (int(x) for x in m.group(2, 3, 4, 5, 6))
     try:
         at = calendar.timegm((y, mo, d, h, mi, 0, 0, 0, 0)) - 8 * 3600  # Asia/Taipei is UTC+8
     except (ValueError, OverflowError):
+        return None
+    return at, newest[3:].split(None, 1)[0]
+
+
+def inbox_done(cfg, names, now, claim_at=None):
+    """True when the newest inbox header written by one of `names` is DONE and old enough.
+    The header must be later than the newest claim (`claim_at()` -> epoch or None; None: not done).
+    Only header lines are examined; any read or parse failure means not done."""
+    hit = inbox_done_header(cfg.get("DONE_INBOX"), names)
+    if not hit:
         return False
+    at = hit[0]
     if now - at < float(cfg["IDLE_MINUTES"]) * 60:
         return False
     claimed = claim_at() if claim_at else None
@@ -548,7 +588,7 @@ def ts(entry):
 
 
 def transcript_facts(path, now):
-    facts = {"loop": False, "crons": 0, "last_text": "", "asking": False}
+    facts = {"loop": False, "crons": 0, "last_text": "", "asking": False, "prompt_at": 0}
     if not path:
         return facts
     with open(path, "rb") as f:
@@ -581,6 +621,14 @@ def transcript_facts(path, now):
         try:
             e = json.loads(line)
         except ValueError:
+            continue
+        if e.get("type") == "user" and not e.get("isSidechain"):
+            # A prompt: a person's or a peer's message, anything but a tool result. Meta entries count too (a peer
+            # message is one), which only makes a prompt look newer: fail-closed for noclaim_done().
+            c = e.get("message", {}).get("content")
+            if isinstance(c, str) or any(isinstance(b, dict) and b.get("type") != "tool_result"
+                                         for b in (c if isinstance(c, list) else [])):
+                facts["prompt_at"] = max(facts["prompt_at"], ts(e))
             continue
         if e.get("type") != "assistant" or e.get("isSidechain"):
             continue
@@ -642,12 +690,30 @@ def missing_handoffs(cfg, text):
 # ---------- gather and decide ----------
 
 SKIPPED = []  # (label, reason, live) for every session file gather did not return; reset by each gather()
+SKIPPED_INFO = {}  # label -> {"name", "sid", "status", "idle_min" (None: unknown), "pid"}: the `unjudged` report rows
 
 
-def _skip(d, f, reason, live):
+def _skip(d, f, reason, live, now=None):
     label = " ".join(x for x in (d.get("name") or "", f"tmux={d.get('tmux')}" if d.get("tmux") else "",
                                  f"sid={str(d.get('sessionId') or f.stem)[:8]}", f"pid={d.get('pid')}") if x)
     SKIPPED.append((label, reason, live))
+    at = d.get("statusUpdatedAt")
+    idle = (now - at / 1000) / 60 if now is not None and isinstance(at, (int, float)) else None
+    tmux_name = str(d.get("tmux") or "").split(":", 1)[0]
+    SKIPPED_INFO[label] = {"name": d.get("name") or tmux_name or "-", "sid": str(d.get("sessionId") or f.stem)[:8],
+                           "status": d.get("status") or "-", "idle_min": idle, "pid": d.get("pid")}
+
+
+def claim_why(owned, repos):
+    """Why gather found no claim for a session ("" when it found one): the reaper's only claim source is the issue
+    number in the branch of a worktree the session owns (its marker, or the cwd inside it), on a GitHub repo."""
+    if not owned:
+        return "no-worktree"
+    if not any(ISSUE_RE.search(w["branch"]) for w in owned):
+        return "no-issue-branch:" + ",".join(w["path"].name for w in owned)
+    if not any(r for r in repos):
+        return "no-github-remote"
+    return ""
 
 
 def gather(cfg, now):
@@ -655,6 +721,7 @@ def gather(cfg, now):
     wts = worktrees(cfg)
     found = []
     SKIPPED.clear()
+    SKIPPED_INFO.clear()
     for f in sorted(SESSIONS_DIR.glob("*.json")):
         try:
             d = json.loads(f.read_text())
@@ -663,30 +730,31 @@ def gather(cfg, now):
         pid = d.get("pid")
         running = pid in table
         if d.get("kind") != "interactive":
-            _skip(d, f, f"kind:{d.get('kind')}", running)
+            _skip(d, f, f"kind:{d.get('kind')}", running, now)
             continue
         if not d.get("tmux"):
-            _skip(d, f, "no-tmux-field", running)
+            _skip(d, f, "no-tmux-field", running, now)
             continue
         alive = running and " ".join(d.get("procStart", "").split()) == table[pid][1]
         if not alive:
-            _skip(d, f, "procstart-mismatch" if running else "pid-gone", running)
+            _skip(d, f, "procstart-mismatch" if running else "pid-gone", running, now)
             continue
         pane = d["tmux"].rsplit(".", 1)[-1]
         state = pane_state(pane)
         if not state:
-            _skip(d, f, f"pane-missing:{pane}", True)
+            _skip(d, f, f"pane-missing:{pane}", True, now)
             continue
         if not is_ancestor(table, state["pane_pid"], pid):
-            _skip(d, f, f"pane-ancestor-mismatch:{pane}", True)
+            _skip(d, f, f"pane-ancestor-mismatch:{pane}", True, now)
             continue  # a pane that no longer holds this claude
         sid, cwd = d["sessionId"], d.get("cwd", "")
         owned = [w for w in wts if w["marker"] == sid
                  or (cwd + "/").startswith(str(w["path"]) + "/")]
-        claims = []
+        claims, repos = [], []
         for w in owned:
             m = ISSUE_RE.search(w["branch"])
-            repo = gh_repo(w["repo"])
+            repo = gh_repo(w["repo"]) if m else ""
+            repos.append(repo)
             if m and repo and (repo, m.group(1)) not in claims:
                 claims.append((repo, m.group(1)))
         found.append({
@@ -701,6 +769,8 @@ def gather(cfg, now):
             "sub_active": subagent_activity(sid, now, float(cfg["SUBAGENT_QUIET_MINUTES"])),
             "screen_tail": "\n".join(state["screen"].rstrip("\n").split("\n")[-15:]),
             "owned": owned, "claims": claims, "descendants": len(descendants(table, pid)),
+            "claim_why": "" if claims else claim_why(owned, repos),
+            "never_kill": never_kill_hit(table, state["pane_pid"], pid, cfg),
             **transcript_facts(transcript_path(sid), now),
         })
         found[-1]["relay_pending"] = relay_pending(cfg, claims, now)
@@ -767,7 +837,44 @@ def decide(s, cfg, now=None):
     shadow = cfg.get("DONE_INBOX_SHADOW")
     if keep and shadow and not cfg.get("DONE_INBOX") and s["claims"]:
         s["inbox_done_shadow"] = not _decide(dict(s), dict(cfg, DONE_INBOX=shadow), now)
+    # EL-T24: the same second decide for a claim-less session under NOCLAIM_DONE=shadow. It can change the verdict
+    # only where `claim-unknown` kept the session, so only those pay for it.
+    if keep and cfg.get("NOCLAIM_DONE") == "shadow" and not s["claims"] and "claim-unknown" in keep:
+        trial = dict(s)
+        if not _decide(trial, dict(cfg, NOCLAIM_DONE="apply"), now) and trial.get("noclaim_done"):
+            s["noclaim_done_shadow"] = trial["noclaim_done"]
     return keep
+
+
+def noclaim_done(s, cfg, now):
+    """Why a claim-less session counts as done, or "" (EL-T24). The idle dispatch, sec-p1 and apertis-ops sessions
+    work in the primary checkout with no worktree, so they have no claim and were kept by `claim-unknown` for good.
+
+    Done when the newest inbox header the session wrote (DONE_INBOX, else DONE_INBOX_SHADOW, matched on the tmux
+    and session names as inbox_done() does) is DONE, at least IDLE_MINUTES old and not older than the session's
+    newest prompt (a later task voids it); and nothing is left: no worktree claim, no issue its text names whose
+    oracle claimant is this session, no live child process, no background shell, loop or scheduled task, no
+    uncommitted or unpushed work in an owned worktree or the cwd, and not NEVER_CLOSE. Every other gate in
+    _decide() still applies; this only answers `claim-unknown`. Any failure to read is "" (kept)."""
+    names = [n for n in (s["tmux"], s.get("name")) if n]
+    if (s["claims"] or s.get("descendants") != 0 or s["bg_shells"] or s["loop"] or s["crons"] > 0 or s["scheduled"]
+            or any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in names)):
+        return ""
+    hit = inbox_done_header(cfg.get("DONE_INBOX") or cfg.get("DONE_INBOX_SHADOW"), names)
+    if not hit:
+        return ""
+    at, key = hit
+    prompt_at = s.get("prompt_at") or 0
+    # The header has minute precision: one written in the minute of the prompt still follows it.
+    if now - at < float(cfg["IDLE_MINUTES"]) * 60 or not prompt_at or at + 60 < prompt_at:
+        return ""
+    cwd = s.get("cwd")
+    extra = [{"path": Path(cwd)}] if cwd and not any(str(w["path"]) == cwd for w in s["owned"]) else []
+    if any(worktree_state(w, cfg) for w in [*s["owned"], *extra]):
+        return ""
+    if oracle_claims(s, cfg, now):
+        return ""
+    return f"inbox {key} DONE"
 
 
 def stall_mark(cfg, sid, now=None):
@@ -798,6 +905,8 @@ def _decide(s, cfg, now=None):
     stalled = stall_mark(cfg, s.get("sid"), now)
     if stalled:  # an account switch or rate limit stalled it: not idle, not finished
         keep.append("stalled:" + stalled)
+    if s.get("never_kill"):  # its process tree holds a pid on the never-kill list
+        keep.append("never-kill:" + ",".join(str(p) for p in s["never_kill"]))
     if protected(cfg, s["tmux"], s["name"]):
         keep.append("protected")
     if not s.get("fg", True):
@@ -830,6 +939,9 @@ def _decide(s, cfg, now=None):
     done = bool(DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])
                 or (s["claims"] and inbox_done(cfg, (s.get("name"), s["tmux"]), now if now is not None else time.time(),
                                             lambda: _newest_claim(s))))
+    if not done and not s["claims"] and cfg.get("NOCLAIM_DONE") == "apply":
+        s["noclaim_done"] = noclaim_done(s, cfg, now if now is not None else time.time())
+        done = bool(s["noclaim_done"])
     if done:
         if s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"]) and s["claims"]:
             cb = [checkby_state(r, n, cfg) for r, n in s["claims"]]
@@ -1159,6 +1271,9 @@ def recover_exiting(cfg, now):
             continue
         if pane and pane_exists(pane):
             st = pane_state(pane)
+            if st and never_kill_hit(table, st["pane_pid"], pid, cfg):
+                mark_record(path, "never-kill")  # finished, but its pane holds a never-kill pid: left open
+                continue
             if st and st["session"] == rec["tmux"] and st["session_id"] == rec.get("session_id"):
                 if st["alone"]:
                     tmux("kill-session", "-t", st["session_id"])
@@ -1185,6 +1300,8 @@ def reap(s, cfg, now):
         return "skipped:pane-changed", []
     if protected(cfg, state["session"], s["name"]):
         return "skipped:protected", []
+    if never_kill_hit(table, state["pane_pid"], s["pid"], cfg):
+        return "skipped:never-kill", []
     if not empty_prompt(state):
         return "skipped:prompt-not-empty", []
     s["tmux"], s["session_id"] = state["session"], state["session_id"]
@@ -1227,6 +1344,8 @@ def reap(s, cfg, now):
     still_alone = False
     if pane_exists(s["pane"]):
         state = pane_state(s["pane"])
+        if state and never_kill_hit(ps_table(), state["pane_pid"], s["pid"], cfg):
+            return "skipped:never-kill", [f"{s['tmux']}: claude exited, pane {s['pane']} left open: it holds a never-kill pid"]
         still_alone = alone and bool(state and state["alone"])
         tmux("kill-session", "-t", s["session_id"]) if still_alone else tmux("kill-pane", "-t", s["pane"])
     s["killed_session"] = still_alone
@@ -1253,9 +1372,20 @@ def report_line(s, keep, outcome):
     new_only = "yes" if keep and all(k.startswith(NEW_GATES) for k in keep) else "-"
     why = [f"would-close: {s['would_close']}"] if s.get("would_close") else []
     why += ["would-close: inbox DONE (shadow)"] if s.get("inbox_done_shadow") else []
+    why += [f"would-close: no claim, {s['noclaim_done_shadow']} (shadow)"] if s.get("noclaim_done_shadow") else []
+    if s.get("claim_why"):  # name why no claim was found
+        keep = [f"claim-unknown({s['claim_why']})" if k == "claim-unknown" else k for k in keep]
     blocked = [", ".join(f"blocked: #{n}" for n in s["blocked"])] if s.get("blocked") else []
     return (f"| {s['tmux']} | `{s['sid'][:8]}` | {s['status']} {s['idle_min']:.0f}m | {issues} | "
             f"{outcome} | {', '.join([*keep, *why, *blocked]) or '-'} | {background_only} | {new_only} | {plan} |")
+
+
+def unjudged_line(label, why):
+    """A live session gather did not return (a background session, a missing pane): listed, never acted on."""
+    i = SKIPPED_INFO.get(label) or {"name": label, "sid": "-", "status": "-", "idle_min": None, "pid": "-"}
+    idle = "?" if i["idle_min"] is None else f"{i['idle_min']:.0f}"
+    return (f"| {i['name']} | `{i['sid']}` | {i['status']} {idle}m | - | unjudged | {why} | - | - | "
+            f"pid {i['pid']}; never acted on |")
 
 
 def main(argv=None):
@@ -1318,7 +1448,7 @@ def main(argv=None):
                     try:
                         sv = shadow_verdict(s, cfg, keep, now)
                         s["blocked"], s["would_close"] = sv["blocked"], sv["would_close"]
-                        outcome = "would-close" if sv["would_close"] else outcome
+                        outcome = "would-close" if sv["would_close"] or s.get("noclaim_done_shadow") else outcome
                     except Exception as e:  # a report-only verdict must not fail the sweep
                         notes.append(f"{s['tmux']} ({s['sid']}): shadow verdict: {type(e).__name__}: {e}")
                 if not keep and apply:
@@ -1353,8 +1483,13 @@ def main(argv=None):
               f"idle threshold {cfg['IDLE_MINUTES']} min; protected: {cfg['PROTECT'] or '(none)'}", "",
               "| tmux | session | status idle | issues | outcome | keeps it | held only by background shells "
               "| kept only by new gates | verification target |",
-              "|---|---|---|---|---|---|---|---|---|", *rows]
-    live = [f"- {label}: {why}" for label, why, is_live in SKIPPED if is_live]
+              "|---|---|---|---|---|---|---|---|---|", *rows,
+              *[unjudged_line(label, why) for label, why, is_live in SKIPPED if is_live]]
+
+    def idle_of(label):
+        m = (SKIPPED_INFO.get(label) or {}).get("idle_min")
+        return "?" if m is None else f"{m:.0f}"
+    live = [f"- {label}: {why} (unjudged, idle {idle_of(label)}m)" for label, why, is_live in SKIPPED if is_live]
     dead = sum(1 for _, _, is_live in SKIPPED if not is_live)
     report += ["", "## Skipped live sessions (not judged)", *(live or ["none"]),
                f"({dead} session files with no live process not listed)"]
