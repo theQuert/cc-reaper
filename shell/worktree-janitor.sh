@@ -101,7 +101,8 @@ Environment:
                           scan, each retried once on a timeout (default: 120, 30)
   CC_WJ_RECHECK_FRESH_SECONDS
                           A trim reuses a holder/session snapshot younger than this before a
-                          later cache directory of the same worktree (default: 120)
+                          later cache directory of the same worktree, and a removal reuses the
+                          session scan (never the holder or launchd scans) (default: 120)
   CC_WJ_SESSION_LOG       --session log (default: ~/.cc-reaper/logs/worktree-janitor-session.log)
   CC_WJ_CLAUDE_SESSIONS  Claude live-session registry (default: ~/.claude/sessions)
   CC_WJ_CLAUDE_PROJECTS  Claude transcript registry (default: ~/.claude/projects)
@@ -520,31 +521,6 @@ _cc_wj_held() {
     LC_ALL=C grep -qF -- "$p/" "$dir/cwd" "$dir/open" 2>/dev/null && return 0
   done
   return 1
-}
-
-# Whether any process has worktree $2 itself open (its root as a cwd, or as a directory), asked
-# of lsof for that one path: a question about one name, not a listing of the machine, so it is
-# the per-tree half of a removal-time check whose machine-wide half is a reused snapshot.
-# Status 0 when held, and also when the answer is unknown (lsof missing, timed out or failed
-# with output unread): an unanswered question never shows a tree free. lsof exits 1 and prints
-# nothing when no process has the path open. Files and directories below the root are the
-# snapshot's to show; `+D` would walk the tree. Names are decoded as `_cc_wj_scan_holders` does.
-_cc_wj_tree_held() { # <work dir> <worktree>
-  local dir="$1/tree-held" wt="$2" secs rc=0
-  command -v lsof >/dev/null 2>&1 || return 0
-  secs="$(_cc_wj_lsof_timeout_seconds)" || return 0
-  rm -rf "$dir"; mkdir -p "$dir" || return 0
-  : > "$dir/cwd"
-  _cc_wj_with_timeout "$secs" env LC_ALL=C lsof -n -P -Fn -- "$wt" > "$dir/open.raw" 2>/dev/null || rc=$?
-  case "$rc" in 0|1) ;; *) return 0 ;; esac
-  if command -v perl >/dev/null 2>&1; then
-    LC_ALL=C perl -ne 'next unless s/^n//; s/\\(\\|x([0-9a-fA-F]{2}))/defined $2 ? chr(hex $2) : "\\"/ge; print' \
-      "$dir/open.raw" > "$dir/open" || return 0
-    : > "$dir/decoded"
-  else
-    sed -n 's/^n//p' "$dir/open.raw" > "$dir/open"
-  fi
-  _cc_wj_held "$dir" "$wt"
 }
 
 # ─── launchd targets ──────────────────────────────────────────────────────────
@@ -2837,9 +2813,16 @@ _cc_wj_declared() { _cc_wj_matches "$_CC_WJ_DECLARED" "$1"; }
 # past CC_WJ_ARCHIVE_MAX_BYTES, because the archive is for what a person wrote, and a
 # database copied out reclaims nothing.
 _cc_wj_archivable() {
+  _CC_WJ_ARCHIVE_WHY=""
+  _cc_wj_matches "$_CC_WJ_ARCHIVED" "$2" || return 1
+  _cc_wj_archive_ok "$1" "$2"
+}
+
+# The copy-out conditions alone, for an ignored file that needs no `archive:` line (an ignored
+# `*.log`): 0 may be copied, 2 may not (why in _CC_WJ_ARCHIVE_WHY).
+_cc_wj_archive_ok() {
   local wt="$1" rel="$2" max="${CC_WJ_ARCHIVE_MAX_BYTES:-1048576}" size=""
   _CC_WJ_ARCHIVE_WHY=""
-  _cc_wj_matches "$_CC_WJ_ARCHIVED" "$rel" || return 1
   if [ -L "$wt/$rel" ] || [ ! -f "$wt/$rel" ]; then
     _CC_WJ_ARCHIVE_WHY="not a regular file"
   elif _cc_wj_sensitive_name "${rel##*/}"; then
@@ -3273,13 +3256,22 @@ _cc_wj_pins() {
           continue
         fi
         # A gitignored file named *.log is output a command wrote - `.local-stack-up.log`,
-        # `.npm-ci.log`, `.build-main.log`, `budget.log` - and is discounted like a declared
-        # entry, at any depth. 50 worktrees (30.9 GB) were kept for such files on 2026-10-24.
-        # Only the ignored kind reaches this branch: an untracked *.log that git does not
-        # ignore is `??` above and stays work, a directory is judged by its own branch, and a
-        # credential-shaped name (`.env.log`) still keeps the tree.
+        # `.npm-ci.log`, `.build-main.log`, `budget.log` - and no longer keeps the tree (50
+        # worktrees, 30.9 GB, on 2026-10-24). But a hand-named tee log (`step0.log`,
+        # `routing-snapshot-redis.log`) can be the only copy of evidence, so it goes the way an
+        # `archive:` file does: copied out before the removal, under the same size cap, and a
+        # larger one keeps the tree. Only the ignored kind reaches this branch: an untracked *.log
+        # that git does not ignore is `??` above and stays work, a directory is judged by its own
+        # branch, and a credential-shaped name (`.env.log`) is never copied and keeps the tree.
         case "$base" in
-          *.log) _cc_wj_sensitive_name "$base" || continue ;;
+          *.log)
+            if _cc_wj_archive_ok "$wt" "$rest"; then
+              [ -z "$archive_to" ] || { printf '%s\n' "$rest" >> "$archive_to"; } 2>/dev/null ||
+                _cc_wj_pin '!!' "$rest (ignored log, but it could not be listed for the copy)"
+            else
+              _cc_wj_pin '!!' "$rest (ignored log, but $_CC_WJ_ARCHIVE_WHY)"
+            fi
+            continue ;;
         esac
         if nr="$(_cc_wj_new_rule "$wt" "$rest")"; then
           [ "$(_cc_wj_new_rules_mode)" = auto ] && continue
@@ -4666,11 +4658,12 @@ _cc_wj_run_inner() {
   local total_removable=0
   local total_kept=0
   local total_removed=0
-  # When the removal path last took each machine-wide scan (epoch seconds, empty = never or the
-  # last one failed). A scan younger than CC_WJ_RECHECK_FRESH_SECONDS is reused for the next
-  # candidate: each one costs a full pass over every session transcript on the machine, and 72
-  # trees stayed unexamined behind them in a 1800 s budget. What is per tree is asked per tree.
-  local rm_fresh rm_now rm_sess_at="" rm_hold_at="" rm_ld_at=""
+  # When the removal path last took the session scan (epoch seconds, empty = never or the last
+  # one failed). A scan younger than CC_WJ_RECHECK_FRESH_SECONDS is reused for the next
+  # candidate: it costs a full pass over every session transcript on the machine, and 72 trees
+  # stayed unexamined behind it in a 1800 s budget. The holder and launchd scans are cheap and
+  # are never reused. What is per tree is asked per tree.
+  local rm_fresh rm_now rm_sess_at=""
   rm_fresh="$(_cc_wj_recheck_fresh_seconds)" || rm_fresh=0
   local total_reclaimed=0
   local total_trim_candidates=0
@@ -5516,33 +5509,22 @@ KEEP
             # Everything above was decided from scans taken before the loop began, and
             # another session can have entered this worktree or written into it since.
             # Asked again against fresh scans, immediately before the one irreversible step.
-            if [ -z "$rm_hold_at" ] || [ $((rm_now - rm_hold_at)) -ge "$rm_fresh" ]; then
-              rm_hold_at=""
-              if ! _cc_wj_scan_holders "$work"; then
-                LSOF_OK="no"
-                printf "    → kept: the process scan failed right before removal\n"
-                total_kept=$((total_kept + 1))
-                continue
-              fi
-              rm_hold_at="$rm_now"
-            fi
-            # A snapshot reused from an earlier candidate cannot show a process that came after
-            # it, so the tree's own path is asked about now, whatever the snapshot's age.
-            if _cc_wj_tree_held "$work" "$wt_path"; then
-              printf "    → kept: it was entered or changed between the scan and the removal (a process holds it)\n"
+            # The holder scan (~0.2 s for the whole machine) and the plist read are cheap, so they
+            # are taken before EVERY removal and never reused: a cwd in a subdirectory
+            # (`next dev` started in web/next a minute ago) shows only in a machine-wide listing
+            # matched by prefix, and `lsof <tree>` does not list it. Only the session scan, which
+            # reads every transcript, is reused within CC_WJ_RECHECK_FRESH_SECONDS.
+            if ! _cc_wj_scan_holders "$work"; then
+              LSOF_OK="no"
+              printf "    → kept: the process scan failed right before removal\n"
               total_kept=$((total_kept + 1))
               continue
             fi
-            # Launchd plists are read again too: a job can be installed after the first scan.
-            if [ -z "$rm_ld_at" ] || [ $((rm_now - rm_ld_at)) -ge "$rm_fresh" ]; then
-              rm_ld_at=""
-              if ! _cc_wj_scan_launchd "$work"; then
-                LAUNCHD_OK="no"
-                printf "    → kept: %s, so launchd jobs are unknown\n" "$_CC_WJ_LAUNCHD_ERROR"
-                total_kept=$((total_kept + 1))
-                continue
-              fi
-              rm_ld_at="$rm_now"
+            if ! _cc_wj_scan_launchd "$work"; then
+              LAUNCHD_OK="no"
+              printf "    → kept: %s, so launchd jobs are unknown\n" "$_CC_WJ_LAUNCHD_ERROR"
+              total_kept=$((total_kept + 1))
+              continue
             fi
             LAUNCHD_OK="yes"
             ld_keep="$(_cc_wj_launchd_target "$work" "$wt_path")"
@@ -5585,6 +5567,7 @@ KEEP
               fi
               printf "    → archived %s file(s) to %s\n" \
                 "$(wc -l < "$work/archive-list" | tr -d ' ')" "$_CC_WJ_ARCHIVE_DEST"
+              _cc_wj_log_write "archived $(wc -l < "$work/archive-list" | tr -d ' ') file(s) of $wt_path to $_CC_WJ_ARCHIVE_DEST: $(awk '{ printf "%s%s", (NR > 1 ? "; " : ""), $0 }' "$work/archive-list")"
             fi
             if [ "$wip" = yes ]; then
               # Last step before the one irreversible one, and the only way a dirty tree is
