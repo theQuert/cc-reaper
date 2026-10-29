@@ -1,0 +1,3 @@
+session-reaper report-only: 17 sessions, 0 reaped, 0 verification failures; report /Users/stimaclaw/GitHub/cc-reaper-worktrees/fix-reaper-batch-issue-state/tmp/report-base.md
+wall 80.5 s rc 0
+python3 tmp/shadow.py tmp/session-reaper-base.py tmp/shadow.conf  14.30s user 35.64s system 62% cpu 1:20.54 total
