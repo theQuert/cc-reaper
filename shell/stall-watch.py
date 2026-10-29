@@ -25,6 +25,13 @@ until a person looks. This is the cheap detector for that, and it calls no model
           session id in STALL_MARK_DIR, refreshed every run while the stall lasts and ignored by the session
           reaper STALL_MARK_HOURS after its last refresh or STALL_MARK_MAX_HOURS after the event was first
           seen. The reaper keeps the session with the reason `stalled:<fingerprint>`.
+  prompt  (EL-T921-CI-CONFIRM-CLEAR) a permission prompt ("Do you want to proceed?" with "1. Yes" ... "N. No") or an
+          AskUserQuestion menu ("☐ <header>", options, "Enter to select · ↑/↓ to navigate") live at the bottom of a
+          pane is aged from its first sighting per (session id, prompt fingerprint) in the state file. Past
+          STALL_PROMPT_MINUTES (10) it is flagged with its age: with apply one `## EL-T921-PROMPT-STALL <session>`
+          block in STALL_INBOX, in shadow one `would alert prompt` line, and again at most every
+          STALL_PROMPT_REALERT_MINUTES (120) while the same prompt stays. No push channel to the founder's device
+          exists in cc-reaper or ~/.claude hooks, so that half is a log line only. The prompt is never answered.
 
 HARD RULE (stima-api #5212): nothing here types into another agent's pane. The only tmux calls are `display`
 and `capture-pane`; `tmux_ro` refuses every other subcommand, send-keys included. Re-enabling Remote Control
@@ -48,6 +55,7 @@ reaper = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(reaper)
 
 HEADER = "EL-T801-CI-HARDEN STALL"
+PROMPT_HEADER = "EL-T921-PROMPT-STALL"  # its own inbox key: not under the dispatch key, so it never reopens that one
 DEFAULTS = {
     "STALL_APPLY": "0",  # 0: shadow (print what would be reported). 1: append to STALL_INBOX
     "STALL_INBOX": "~/handoffs/neo-inbox.md",
@@ -55,6 +63,8 @@ DEFAULTS = {
     "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # one <session id>.json per stalled session
     "STALL_MARK_MAX_HOURS": "48",  # no mark past this long after the event was first seen, however often it is refreshed
     "STALL_FLEET_MIN": "2",  # panes showing interrupted-idle at once that stand in for "Login successful"
+    "STALL_PROMPT_MINUTES": "10",  # a permission prompt or AskUserQuestion menu on screen this long is flagged (0: off)
+    "STALL_PROMPT_REALERT_MINUTES": "120",  # the same prompt still on screen is flagged again at most this often
 }
 READ_ONLY_TMUX = ("display", "capture-pane")  # #5212: nothing that types into a pane
 
@@ -75,6 +85,63 @@ AGENT_FAILED_RE = re.compile(r"^\s*⎿\s*(?:Agent failed|Error:|API Error)")
 INTERRUPT_RE = re.compile(LEAD + r"(?:\[Request interrupted by user[^\]]*\]|Interrupted · What should Claude do instead\?)\s*$")
 LOGIN_RE = re.compile(BULLET + r"Login successful\b", re.I)
 INTERRUPT_MAX_GAP = 8  # lines between the marker and the prompt line (the prompt box's border and blank lines)
+
+# Interactive prompts nobody may answer (EL-T921-CI-CONFIRM-CLEAR). Both are matched only as the live menu at the bottom
+# of the screen: the question, its numbered options and at most PROMPT_TAIL non-blank lines below the last of them (the
+# footer and Claude Code's bottom rule), so a transcript that quotes the words is not a prompt.
+#   permission         "Do you want to proceed?" (or "... make this edit to x?") followed by "❯ 1. Yes" ... "N. No"
+#   ask-user-question  the AskUserQuestion menu: a "☐ <header>" tab line, the question, numbered options, and the
+#                      footer "Enter to select · ↑/↓ to navigate · ... · Esc to cancel"
+RULE_RE = re.compile(r"^\s*[─━]{20,}")
+PERM_Q_RE = re.compile(r"^\s*Do you want to [^\n]{1,200}\?\s*$")
+OPT_YES_RE = re.compile(r"^\s*(?:❯\s*)?1\.\s+Yes\b")
+OPT_NO_RE = re.compile(r"^\s*(?:❯\s*)?\d\.\s+No\b")
+OPT_RE = re.compile(r"^\s*(?:❯\s*)?\d+\.\s+\S")
+ASK_FOOTER_RE = re.compile(r"^\s*Enter to select\b.*\bto navigate\b")
+ASK_TAB_RE = re.compile(r"^\s*(?:←\s*)?[☐☒✔✓]\s+\S")
+PROMPT_TAIL = 4  # non-blank lines allowed below a prompt's last option or footer
+PROMPT_SPAN = 60  # lines searched upward from the anchor for the start of the prompt
+PROMPT_NOISE_RE = re.compile(r"[\s❯│╌─━]+")  # wrap, cursor and box characters do not change a prompt's identity
+
+
+def _tail_ok(lines, last):
+    return sum(1 for l in lines[last + 1:] if l.strip()) <= PROMPT_TAIL
+
+
+def _fingerprint(kind, region):
+    """A prompt instance's identity: its title, text and question, without the option cursor, the preview box or the
+    wrap width, so the same prompt keeps one fingerprint while it waits and a different prompt gets another."""
+    text = PROMPT_NOISE_RE.sub("", "".join(region))
+    return hashlib.sha256(f"{kind}\n{text}".encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def scan_prompt(lines):
+    """The interactive prompt on screen, as {"kind", "fp"}, or None. Pure over the screen lines."""
+    for i in range(len(lines) - 1, -1, -1):
+        if not PERM_Q_RE.search(lines[i]):
+            continue
+        yes = next((j for j in range(i + 1, min(i + 4, len(lines))) if OPT_YES_RE.search(lines[j])), None)
+        if yes is None:
+            break  # the newest question is not a live permission menu
+        no = next((j for j in range(yes + 1, min(yes + 6, len(lines))) if OPT_NO_RE.search(lines[j])), None)
+        if no is None:
+            break
+        last = max(j for j in range(yes, min(no + 6, len(lines))) if OPT_RE.search(lines[j]))
+        if not _tail_ok(lines, last):
+            break
+        start = next((j for j in range(i - 1, max(-1, i - PROMPT_SPAN), -1) if RULE_RE.search(lines[j])), max(-1, i - 12))
+        return {"kind": "permission", "fp": _fingerprint("permission", lines[start + 1:i + 1])}
+    foot = max((i for i, l in enumerate(lines) if ASK_FOOTER_RE.search(l)), default=None)
+    if foot is None or not _tail_ok(lines, foot):
+        return None
+    lo = max(0, foot - PROMPT_SPAN)
+    first_opt = next((j for j in range(lo, foot) if OPT_RE.search(lines[j])), None)
+    if first_opt is None:
+        return None
+    tab = next((j for j in range(first_opt - 1, lo - 1, -1) if ASK_TAB_RE.search(lines[j])), None)
+    if tab is None:
+        tab = next((j + 1 for j in range(first_opt - 1, lo - 1, -1) if RULE_RE.search(lines[j])), first_opt)
+    return {"kind": "ask-user-question", "fp": _fingerprint("ask-user-question", lines[tab:first_opt])}
 
 
 def tmux_ro(*args):
@@ -112,7 +179,7 @@ def scan(pane):
     if marker is not None and reaper.empty_prompt(pane) and 0 < pane["cy"] - marker <= INTERRUPT_MAX_GAP \
             and not any(l.strip() for l in lines[marker + 1:pane["cy"] - 1]):
         fps.append("interrupted-idle")
-    return {"fps": fps, "login": any(LOGIN_RE.search(l) for l in lines)}
+    return {"fps": fps, "login": any(LOGIN_RE.search(l) for l in lines), "prompt": scan_prompt(lines)}
 
 
 def screen_hash(pane):
@@ -200,6 +267,17 @@ def inbox_block(name, sid, fps, now):
             f"recover (a person or Neo runs it; the detector types nothing): `{resume_command(sid, name)}`\n")
 
 
+def prompt_block(name, sid, pane, ev, now):
+    """Numbers, the session name and a fixed kind only: no screen text (a command line can carry a secret, and text a
+    session wrote must not steer the reader)."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(ev["first"]))
+    again = f" re-alert={ev['alerts']}" if ev.get("alerts") else ""
+    return (f"\n## {PROMPT_HEADER} {name}\n\n"
+            f"PROMPT session={name} id={sid} pane={pane} kind={ev['kind']} prompt={ev['fp']} "
+            f"on-screen={int((now - ev['first']) // 60)}m since={stamp}{again}; "
+            f"a person answers it at the pane (the detector never answers, types nothing)\n")
+
+
 def append_inbox(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
@@ -209,9 +287,10 @@ def append_inbox(path, text):
 def load_state(path):
     try:
         st = json.loads(path.read_text())
-        return {"panes": dict(st.get("panes", {})), "events": dict(st.get("events", {}))}
+        return {"panes": dict(st.get("panes", {})), "events": dict(st.get("events", {})),
+                "prompts": dict(st.get("prompts", {}))}
     except (OSError, ValueError, AttributeError, TypeError):
-        return {"panes": {}, "events": {}}
+        return {"panes": {}, "events": {}, "prompts": {}}
 
 
 def main(argv=None):
@@ -257,15 +336,15 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
                 panes[pane] = prev
             continue
         h = screen_hash(ps)
-        if prev and prev.get("hash") == h and prev.get("sid") == sid:
-            panes[pane] = prev  # unchanged screen: nothing to re-read
+        if prev and prev.get("hash") == h and prev.get("sid") == sid and "prompt" in prev:
+            panes[pane] = prev  # unchanged screen: nothing to re-read (a state from before prompt detection is re-read)
             continue
         rescanned += 1
         panes[pane] = {"hash": h, "sid": sid, **scan(ps)}
     fleet = sum("interrupted-idle" in p["fps"] for p in panes.values())
     fleet_min = max(1, int(cfg["STALL_FLEET_MIN"] or 2))
     max_age = float(cfg["STALL_MARK_MAX_HOURS"] or 48) * 3600
-    events, would, stalled, kept = {}, 0, {}, set()
+    events, would, stalled, kept, prompts = {}, 0, {}, set(), []
     for d, pane, ps in live:
         sid = d["sessionId"]
         if pane in unread:
@@ -274,6 +353,8 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
             continue
         p = panes[pane]
         name = one_line(ps["session"]) or one_line(d.get("name")) or sid[:8]
+        if p.get("prompt"):
+            prompts.append((d, pane, name, p["prompt"]))
         confirmed = [f for f in p["fps"] if f != "interrupted-idle" or p["login"] or fleet >= fleet_min]
         if not confirmed:
             continue
@@ -304,6 +385,7 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
             for fp in fresh:
                 events[f"{pane}|{fp}|{sid}"]["shadow_logged"] = True
             print(f"stall-watch shadow: would report {name} ({sid[:8]}) {','.join(fresh)} -> {resume_command(sid, name)}")
+    prompt_events, seen, flagged, pwould = prompt_sweep(cfg, apply, state, prompts, kept, inbox, now, failures)
     if mark_dir:
         mark_dir.mkdir(parents=True, exist_ok=True)
         for sid, m in stalled.items():
@@ -311,12 +393,63 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
         for f in mark_dir.glob("*.json"):
             if f.stem not in stalled and f.stem not in kept and is_mark(f):
                 f.unlink(missing_ok=True)  # the stall cleared, or the session is gone
-    atomic_write(state_path, json.dumps({"panes": panes, "events": events}) + "\n")
+    atomic_write(state_path, json.dumps({"panes": panes, "events": events, "prompts": prompt_events}) + "\n")
     print(f"stall-watch {'apply' if apply else 'shadow'}: {len(live)} sessions, {rescanned} rescanned, "
-          f"{len(unread)} unread, {len(stalled)} marked, {would} would report, {len(failures)} failures")
+          f"{len(unread)} unread, {len(stalled)} marked, {would} would report, {seen} prompts on screen, "
+          f"{flagged} prompts flagged, {pwould} would alert, {len(failures)} failures")
     for f in failures:
         print(f"stall-watch: ERROR {f}")
     return 1 if failures else 0
+
+
+def _minutes(cfg, key):
+    try:
+        return float(cfg[key] or DEFAULTS[key])
+    except ValueError:
+        return float(DEFAULTS[key])
+
+
+def prompt_sweep(cfg, apply, state, prompts, kept, inbox, now, failures):
+    """Age each on-screen prompt from its first sighting per (session id, fingerprint) and flag one on screen longer than
+    STALL_PROMPT_MINUTES: an inbox block with apply, a `would alert` line in shadow, again at most every
+    STALL_PROMPT_REALERT_MINUTES while it stays. A prompt that left the screen is forgotten (a later one is a new
+    instance); an unread session keeps what was known. Returns (events, on screen, flagged, would alert)."""
+    after = _minutes(cfg, "STALL_PROMPT_MINUTES") * 60
+    every = max(1.0, _minutes(cfg, "STALL_PROMPT_REALERT_MINUTES")) * 60
+    out = {k: v for k, v in state["prompts"].items() if k.split("|", 1)[0] in kept}
+    if after <= 0:
+        return out, 0, 0, 0
+    flagged = would = 0
+    for d, pane, name, pr in prompts:
+        sid = d["sessionId"]
+        key = f"{sid}|{pr['fp']}"
+        ev = state["prompts"].get(key) or {"first": now, "kind": pr["kind"], "fp": pr["fp"], "alerts": 0,
+                                           "alerted": None, "shadow_at": None}
+        ev["pane"] = pane
+        out[key] = ev
+        age = now - ev["first"]
+        if age < after:
+            continue
+        flagged += 1
+        last = ev["alerted"] if apply else ev["shadow_at"]
+        if last is not None and now - last < every:
+            continue
+        line = (f"{name} ({sid[:8]}) pane={pane} kind={ev['kind']} prompt={ev['fp']} on-screen={int(age // 60)}m"
+                f"{' re-alert' if last is not None else ''}")
+        if apply:
+            try:
+                append_inbox(inbox, prompt_block(name, sid, pane, ev, now))
+            except OSError as e:
+                failures.append(f"{name} ({sid}): prompt alert inbox write failed: {e}")
+                continue
+            ev["alerted"], ev["alerts"] = now, ev["alerts"] + 1
+            print(f"stall-watch: prompt alert {line} -> {inbox}")
+        else:
+            would += 1
+            ev["shadow_at"] = now
+            print(f"stall-watch shadow: would alert prompt {line} -> {inbox}")
+        print(f"stall-watch: push: no founder-device channel in cc-reaper or ~/.claude hooks; logged only ({name})")
+    return out, len(prompts), flagged, would
 
 
 if __name__ == "__main__":

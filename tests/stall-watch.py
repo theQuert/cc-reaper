@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Isolated tests for stall-watch: each fingerprint on a fixture pane text, a healthy pane stays silent, one report
-per event across runs, the hash skip, shadow vs apply, the marks the session reaper shows, and the #5212 wall: the
-only tmux calls are display and capture-pane, never send-keys. Every path is a temp path; nothing real is touched."""
+per event across runs, the hash skip, shadow vs apply, the marks the session reaper shows, the interactive prompt
+aging and alerts (EL-T921), and the #5212 wall: the only tmux calls are display and capture-pane, never send-keys. Every path is a temp path; nothing real is touched."""
 
 import importlib.util
 import json
@@ -65,6 +65,41 @@ STATUS_429 = screen("● Agent(audit)", "  ⎿  Agent failed: request failed wit
 INTERRUPT_DRAFT = screen("[Request interrupted by user]", "", typed="continue with")
 
 
+# Interactive prompts (EL-T921-CI-CONFIRM-CLEAR), in the shape the `ci` and `security` panes showed on 2026-10-29.
+def bottom(*lines):
+    """A pane whose bottom is a live menu (no input box): (text, cx, cy) with the cursor on the last line."""
+    text = "\n".join(lines) + "\n"
+    return text, 1, len(lines) - 1
+
+
+DASH = "╌" * 40
+PERMISSION = bottom("● Ran the backup test", "✻ Waiting for 2 background agents to finish", "", RULE,
+                    " Bash command · from the worker-high agent", " Run shell command", DASH,
+                    " │ cd /tmp/bk && rm -rf bs r.git && git init -q --bare r.git", DASH,
+                    " This shell -c script runs rm and could not be checked", "", " Do you want to proceed?",
+                    " ❯ 1. Yes", "   2. No", "", " Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents")
+PERMISSION_OTHER = bottom(*PERMISSION[0].split("\n")[:7], " │ make clean", *PERMISSION[0].split("\n")[8:-1])
+PERMISSION_MOVED = bottom(*[l.replace(" ❯ 1. Yes", "   1. Yes").replace("   2. No", " ❯ 2. No") for l in PERMISSION[0].split("\n")[:-1]])
+EDIT_PERMISSION = bottom(RULE, " Edit file", " web/next/app/page.tsx", " Do you want to make this edit to page.tsx?",
+                         " ❯ 1. Yes", "   2. Yes, allow all edits during this session (shift+tab)",
+                         "   3. No, and tell Claude what to do differently (esc)", "", " Esc to cancel")
+ASK_USER = bottom("⏺ The build is green; one decision is left.", "", RULE, " ☐ #6169 boundary", "",
+                  "│ Approve the boundary and merge once merge-gate is green?", "",
+                  "❯ 1. Approve and ship (Recommended)     ┌──────────────────────┐",
+                  "  2. Approve, do not ship yet         │ write_set: lockfile  │",
+                  "  3. Do not do it                     └──────────────────────┘", "",
+                  "                                  Notes: press n to add notes", "", RULE, "  Chat about this", "",
+                  "Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel", RULE + " security ─")
+ASK_MOVED = bottom(*[l.replace("❯ 1. Approve", "  1. Approve").replace("  2. Approve,", "❯ 2. Approve,")
+                     .replace("write_set: lockfile ", "rollback: revert PR ") for l in ASK_USER[0].split("\n")[:-1]])
+BUSY = screen("● Bash(go test ./...)", "  ⎿  Running…", "", "✻ Compiling… (2m 3s · esc to interrupt)")
+# The words of a prompt in ordinary transcript text, with the idle input box below: not a live prompt.
+QUOTED_PROMPT = screen("● The hook printed:", "  Do you want to proceed?", "  ❯ 1. Yes", "    2. No",
+                       "● I answered nothing; the session that owns it must decide.", "● Done.")
+QUOTED_ASK = screen("● Its footer reads", "  1. first", "  Enter to select · ↑/↓ to navigate · Esc to cancel",
+                    "● and that is the menu shape.", "● Done.")
+
+
 def pane(spec_):
     text, cx, cy = spec_
     return {"screen": text, "cx": cx, "cy": cy}
@@ -110,6 +145,35 @@ class Fingerprints(unittest.TestCase):
         self.assertEqual(stall.screen_hash(a), stall.screen_hash(dict(a)))
         self.assertNotEqual(stall.screen_hash(a), stall.screen_hash(b))
         self.assertNotEqual(stall.screen_hash(a), stall.screen_hash(dict(a, cx=a["cx"] + 1)))
+
+
+class Prompts(unittest.TestCase):
+    def prompt(self, spec_):
+        return stall.scan(pane(spec_))["prompt"]
+
+    def test_a_permission_prompt_is_detected(self):
+        for name, spec_ in {"proceed": PERMISSION, "edit": EDIT_PERMISSION}.items():
+            with self.subTest(name):
+                self.assertEqual(self.prompt(spec_)["kind"], "permission")
+
+    def test_an_ask_user_question_menu_is_detected(self):
+        self.assertEqual(self.prompt(ASK_USER)["kind"], "ask-user-question")
+
+    def test_an_idle_or_busy_pane_and_quoted_prompt_text_are_not_prompts(self):
+        for name, spec_ in {"idle": HEALTHY, "busy": BUSY, "quoted permission": QUOTED_PROMPT,
+                            "quoted menu": QUOTED_ASK, "interrupted": INTERRUPTED, "weekly": WEEKLY}.items():
+            with self.subTest(name):
+                self.assertIsNone(self.prompt(spec_))
+
+    def test_the_fingerprint_is_one_prompt_instance(self):
+        fp = self.prompt(PERMISSION)["fp"]
+        self.assertEqual(self.prompt(PERMISSION_MOVED)["fp"], fp)  # the option cursor moved: same prompt
+        self.assertNotEqual(self.prompt(PERMISSION_OTHER)["fp"], fp)  # another command: another prompt
+        self.assertEqual(self.prompt(ASK_MOVED)["fp"], self.prompt(ASK_USER)["fp"])  # cursor and preview moved
+        self.assertNotEqual(self.prompt(ASK_USER)["fp"], fp)
+        lines = PERMISSION[0].split("\n")[:-1]
+        wrapped = bottom(*lines[:9], " This shell -c script runs rm and", " could not be checked", *lines[10:])
+        self.assertEqual(self.prompt(wrapped)["fp"], fp)  # a narrower pane wraps the text: same prompt
 
 
 class Fleet:
@@ -159,10 +223,10 @@ class Runs(unittest.TestCase):
         self.marks = self.tmp / "stalled"
         self.write_config()
 
-    def write_config(self, apply="1", fleet_min="2"):
+    def write_config(self, apply="1", fleet_min="2", extra=""):
         self.cfg = self.tmp / "conf"
         self.cfg.write_text(f"STALL_APPLY={apply}\nSTALL_INBOX={self.inbox}\nSTALL_STATE={self.tmp / 'state.json'}\n"
-                            f"STALL_MARK_DIR={self.marks}\nSTALL_FLEET_MIN={fleet_min}\n")
+                            f"STALL_MARK_DIR={self.marks}\nSTALL_FLEET_MIN={fleet_min}\n{extra}")
 
     def start(self, panes):
         self.fleet = Fleet(self.tmp, panes)
@@ -449,6 +513,154 @@ class Runs(unittest.TestCase):
         with mock.patch.object(reaper, "run", return_value=(0, "")) as run:
             stall.tmux_ro("capture-pane", "-p", "-t", "%1")
             run.assert_called_once_with(["tmux", "capture-pane", "-p", "-t", "%1"], timeout=10)
+
+
+class PromptRuns(unittest.TestCase):
+    """A prompt on screen is aged from its first sighting and flagged past STALL_PROMPT_MINUTES, once per instance."""
+    table = None
+    setUp, write_config, start, run_once, inbox_text = Runs.setUp, Runs.write_config, Runs.start, Runs.run_once, Runs.inbox_text
+
+    def age(self, minutes, field="first"):
+        """Move every prompt event's `field` back by `minutes`, as if that much time had passed."""
+        path = self.tmp / "state.json"
+        st = json.loads(path.read_text())
+        for ev in st["prompts"].values():
+            if ev.get(field) is not None:
+                ev[field] -= minutes * 60
+        path.write_text(json.dumps(st))
+
+    def prompt_blocks(self, name):
+        return self.inbox_text().count(f"## EL-T921-PROMPT-STALL {name}\n")
+
+    def test_a_permission_prompt_is_flagged_with_its_age_after_the_threshold(self):
+        f = self.start({"%1": ("ci", PERMISSION), "%2": ("fine", HEALTHY)})
+        self.assertEqual(self.run_once(), 0)
+        self.assertIn("1 prompts on screen, 0 prompts flagged", self.printed)
+        self.assertEqual(self.inbox_text(), "")
+        self.age(11)
+        self.assertEqual(self.run_once(), 0)
+        text = self.inbox_text()
+        self.assertEqual(self.prompt_blocks("ci"), 1)
+        self.assertIn(f"id={f.sids['%1']} pane=%1 kind=permission", text)
+        self.assertIn("on-screen=11m", text)
+        self.assertNotIn("r.git", text)  # no screen text reaches the inbox
+        self.assertNotIn("fine", text)
+        self.assertIn("push: no founder-device channel", self.printed)
+        self.assertEqual({c[1] for c in f.calls}, {"display", "capture-pane"})  # never answered, never typed
+
+    def test_an_ask_user_question_menu_is_flagged(self):
+        self.start({"%1": ("security", ASK_USER)})
+        self.run_once()
+        self.age(30)
+        self.run_once()
+        self.assertEqual(self.prompt_blocks("security"), 1)
+        self.assertIn("kind=ask-user-question", self.inbox_text())
+        self.assertIn("on-screen=30m", self.inbox_text())
+
+    def test_below_the_threshold_nothing_is_flagged(self):
+        self.start({"%1": ("ci", PERMISSION)})
+        self.run_once()
+        self.age(9)
+        self.run_once()
+        self.assertEqual(self.inbox_text(), "")
+        self.assertIn("0 prompts flagged", self.printed)
+        self.write_config(extra="STALL_PROMPT_MINUTES=5\n")
+        self.run_once()
+        self.assertEqual(self.prompt_blocks("ci"), 1)
+
+    def test_an_idle_or_busy_pane_is_never_flagged(self):
+        self.start({"%1": ("idle", HEALTHY), "%2": ("busy", BUSY), "%3": ("quoted", QUOTED_PROMPT)})
+        self.run_once()
+        self.age(600)
+        self.run_once()
+        self.assertEqual(self.inbox_text(), "")
+        self.assertIn("0 prompts on screen", self.printed)
+
+    def test_one_alert_per_prompt_and_a_re_alert_only_after_the_longer_interval(self):
+        f = self.start({"%1": ("ci", PERMISSION)})
+        self.run_once()
+        self.age(11)
+        self.run_once()
+        f.set("%1", PERMISSION_MOVED)  # the screen changed, the prompt did not
+        self.run_once()
+        self.age(60, "alerted")
+        self.run_once()
+        self.assertEqual(self.prompt_blocks("ci"), 1)
+        self.age(61, "alerted")  # 121 minutes since the alert
+        self.run_once()
+        self.assertEqual(self.prompt_blocks("ci"), 2)
+        self.assertIn("re-alert=1", self.inbox_text())
+
+    def test_a_prompt_that_leaves_the_screen_and_comes_back_is_a_new_instance(self):
+        f = self.start({"%1": ("ci", PERMISSION)})
+        self.run_once()
+        self.age(11)
+        self.run_once()
+        f.set("%1", HEALTHY)
+        self.run_once()
+        self.assertEqual(json.loads((self.tmp / "state.json").read_text())["prompts"], {})
+        f.set("%1", PERMISSION)
+        self.run_once()  # first sighting again: not aged
+        self.assertEqual(self.prompt_blocks("ci"), 1)
+        f.set("%1", PERMISSION_OTHER)  # a different prompt on the same session is its own instance
+        self.run_once()
+        self.assertEqual(len(json.loads((self.tmp / "state.json").read_text())["prompts"]), 1)
+
+    def test_shadow_logs_what_it_would_alert_once_and_sends_nothing(self):
+        self.write_config(apply="0")
+        self.start({"%1": ("ci", PERMISSION)})
+        self.run_once()
+        self.age(11)
+        self.run_once()
+        self.assertIn("shadow: would alert prompt ci", self.printed)
+        self.assertIn("kind=permission", self.printed)
+        self.assertIn("1 would alert", self.printed)
+        self.run_once()
+        self.assertNotIn("would alert prompt", self.printed)
+        self.assertFalse(self.inbox.exists())
+        self.write_config(apply="1")
+        self.run_once()  # apply after shadow still alerts the prompt that is there
+        self.assertEqual(self.prompt_blocks("ci"), 1)
+
+    def test_a_state_from_before_prompt_detection_is_rescanned(self):
+        self.start({"%1": ("ci", PERMISSION)})
+        self.run_once()
+        path = self.tmp / "state.json"
+        st = json.loads(path.read_text())
+        for p in st["panes"].values():
+            del p["prompt"]
+        st.pop("prompts")
+        path.write_text(json.dumps(st))
+        self.run_once()
+        self.assertIn("1 rescanned", self.printed)
+        self.assertIn("1 prompts on screen", self.printed)
+
+    def test_a_failed_read_keeps_the_prompt_first_sighting(self):
+        f = self.start({"%1": ("ci", PERMISSION)})
+        self.run_once()
+        first = json.loads((self.tmp / "state.json").read_text())["prompts"]
+        self.assertEqual(len(first), 1)
+        f.fail.add("%1")
+        self.run_once()
+        self.assertEqual(json.loads((self.tmp / "state.json").read_text())["prompts"], first)
+
+    def test_zero_minutes_turns_prompt_detection_off(self):
+        self.write_config(extra="STALL_PROMPT_MINUTES=0\n")
+        self.start({"%1": ("ci", PERMISSION)})
+        self.run_once()
+        self.run_once()
+        self.assertEqual(self.inbox_text(), "")
+        self.assertIn("0 prompts on screen", self.printed)
+
+    def test_a_failed_alert_write_is_retried_next_run(self):
+        self.start({"%1": ("ci", PERMISSION)})
+        self.run_once()
+        self.age(11)
+        with mock.patch.object(stall, "append_inbox", side_effect=OSError("disk")):
+            self.assertEqual(self.run_once(), 1)
+        self.assertIn("prompt alert inbox write failed", self.printed)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.prompt_blocks("ci"), 1)
 
 
 class ReaperKeepsStalledSessions(unittest.TestCase):
