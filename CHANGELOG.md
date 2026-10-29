@@ -14,6 +14,19 @@
   line shapes, and a failed tmux read keeps the earlier state. It never types into a pane (#5212): only `display` and `capture-pane` are reachable.
 
 ### Fixed
+- **`worktree-janitor.sh` examines worktrees within its budget again, and one applying sweep runs
+  per scope at a time.** On 2026-10-29 every apply run logged `budget exhausted ... removed=0`: the
+  inventory read `git status --ignored` for all ~143 stima-api worktrees before the budgeted loop
+  (41-58 s each under the LaunchAgent's Background policy at load 46), so the budget was gone
+  before the first worktree was judged. Each worktree's status is now read when the loop examines
+  it, after the budget check; every gate reads the same line it did. Applying sweeps (scheduled,
+  SessionEnd, `--apply`, disk-janitor's trim) take a sweep lock before any scan and end with
+  status 0 when a live sweep holds it, instead of up to 8 of them each paying the machine-wide
+  lsof and session scan (about 7 minutes) to defer at the repository lock. The lock is per scope:
+  a run over every repository takes `<state>/worktree-janitor-sweep.lock`, a run given `--repo`
+  takes `<state>/worktree-janitor-sweep-<cksum of its repositories>.lock`. One machine-wide lock
+  let the per-repository SessionEnd sweeps hold it about 79% of the day, so the hourly sweep and
+  its pressure trim never ran.
 - **A stuck or stopped reclaim can no longer silence the disk guard (stima-api #5886).**
   `resource-watch.sh` writes `<state>/resource-watch.heartbeat` first in every round, ends a round
   past `CC_RW_ROUND_MAX_SECONDS` (240) by its own tree (never the detached act, `ALERT:round-overrun`),

@@ -2588,6 +2588,11 @@ _cc_wj_emit_wt_block() {
   esac
   if [ ! -d "$wt" ]; then
     printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$wt" "${br:-?}" "MISSING" "?" "no_remote" "-"
+  elif [ "${_CC_WJ_LIST_DEFER:-}" = 1 ]; then
+    # The sweep reads the status when it examines this worktree, inside its budget
+    # (`_cc_wj_run_inner`). `DEFERRED` is never judged: the loop replaces the whole line
+    # with this function's full answer first.
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$wt" "${br:-?}" "DEFERRED" "?" "?" "-"
   else
     # `--ignored`, because a removal deletes ignored content along with the checkout and
     # plain `--porcelain` cannot see any of it. The entries are named, not only counted:
@@ -4210,8 +4215,8 @@ _cc_wj_lock_write() {
   ps -o command= -p "${_CC_WJ_RUN_PID:-$$}" > "$1/cmd" 2>/dev/null
 }
 
-_cc_wj_lock() {
-  local lock="$1" holder recorded live=0
+_cc_wj_lock() { # <lock dir> [scope, default "in this repository"]
+  local lock="$1" scope="${2:-in this repository}" holder recorded live=0
   if mkdir "$lock" 2>/dev/null; then
     _cc_wj_lock_write "$lock"
     return 0
@@ -4239,13 +4244,13 @@ _cc_wj_lock() {
   # leaves the repository to it and to the next sweep rather than failing. Counting the
   # deferral as a failure put 14 false `status=1` lines in one day's session log (2026-09-23).
   if [ "$live" -eq 1 ]; then
-    echo "worktree-janitor: another worktree-janitor sweep${holder:+ (pid $holder)} holds $lock; deferred to it and removed nothing in this repository"
+    echo "worktree-janitor: another worktree-janitor sweep${holder:+ (pid $holder)} holds $lock; deferred to it and removed nothing $scope"
     return 2
   fi
   rm -f "$lock/pid" "$lock/cmd" 2>/dev/null
   rmdir "$lock" 2>/dev/null
   if ! mkdir "$lock" 2>/dev/null; then
-    echo "worktree-janitor: the sweep lock $lock could not be taken; removed nothing in this repository"
+    echo "worktree-janitor: the sweep lock $lock could not be taken; removed nothing $scope"
     return 1
   fi
   _cc_wj_lock_write "$lock"
@@ -4695,6 +4700,7 @@ KEEP
   local nr_rules="" nr_dirty="" nr_count nr_line nr_note="" nr_holder nr_active_ok nr_blind
   local pi_rule="" pi_hours="" pi_idle="" pi_note="" pi_ok pi_rc pi_cls pi_bytes pi_would=0
   local dp_rule="" dp_hours="" dp_normal="" dp_ok sv_active_ok sv_blind
+  local st_path st_branch st_dirty st_ahead st_push st_pins
   # Said once, because the absence is otherwise silent: every squash-merged worktree just
   # reads KEEP(unlanded). That is how the scheduled sweep went without landed=pr for weeks.
   if [ "$trim" -eq 0 ] && ! command -v gh >/dev/null 2>&1; then
@@ -4766,10 +4772,15 @@ KEEP
     # Collected to completion before anything is judged. Read as it is produced, the
     # producer runs `git -C <next worktree> status` while the loop scans for holders, and
     # the janitor's own git then holds the next worktree it is about to judge.
-    # In spot-check mode the listing also records, per worktree, each entry that kept it only
+    # Paths and branches only: each worktree's status (`git status --ignored`, its pins,
+    # ahead and push state) is read when the loop examines it, after the budget check. Read
+    # here for every worktree, the listing was outside the budget: on 2026-10-29, at load
+    # 46 under the agent's Background policy, 58 s a worktree over 143 worktrees, about
+    # 2.3 hours before the first was judged, so every apply run examined one and removed none.
+    # In spot-check mode that read also records, per worktree, each entry that kept it only
     # because a rule on probation is not yet allowed to discount it.
     : > "$work/newrule"
-    if ! _CC_WJ_NEWRULE_LOG="$work/newrule" _cc_wj_list_worktrees "$repo" > "$work/inventory"; then
+    if ! _CC_WJ_LIST_DEFER=1 _cc_wj_list_worktrees "$repo" > "$work/inventory"; then
       echo "worktree-janitor: could not list the worktrees of $repo (git 2.36 or newer is required); judged nothing in it"
       skipped=1
       [ -n "$lock" ] && _cc_wj_unlock "$lock"
@@ -4823,6 +4834,7 @@ KEEP
         fi
         # The heartbeat: a sweep that is still deciding is not a dead holder.
         [ -n "$lock" ] && touch "$lock" 2>/dev/null
+        [ -z "${_CC_WJ_SWEEP_LOCK:-}" ] || touch "$_CC_WJ_SWEEP_LOCK" 2>/dev/null
         if [ "$_CC_WJ_ORDER" = largest ]; then
           [ -z "$cursor_file" ] || printf '%s\n' "$wt_path" >> "$cursor_file" 2>/dev/null || :
         else
@@ -4832,6 +4844,19 @@ KEEP
         progress_common="$common"
       fi
       wt_index=$((wt_index + 1))
+      # Its status, read now that this worktree is examined (see the listing above). The
+      # same line the eager listing printed, so every gate below reads what it always read.
+      if [ "$dirty" = DEFERRED ]; then
+        dirty="?"; ahead="?"; push_state="no_remote"; pins="-"
+        IFS=$'\t' read -r st_path st_branch st_dirty st_ahead st_push st_pins <<DEFERRED_LINE
+$(_CC_WJ_NEWRULE_LOG="$work/newrule" _cc_wj_emit_wt_block "$wt_path" "$branch" 1 < /dev/null)
+DEFERRED_LINE
+        # Anything but this worktree's own line is an unread status, and `?` keeps the tree.
+        if [ "$st_path" = "$wt_path" ] && [ "$st_branch" = "$branch" ] && [ -n "$st_dirty" ] &&
+           [ "$st_dirty" != DEFERRED ]; then
+          dirty="$st_dirty"; ahead="$st_ahead"; push_state="$st_push"; pins="$st_pins"
+        fi
+      fi
 
       if [ "$dirty" = "UNSAFE-PATH" ]; then
         printf "  WORKTREE  %s\n" "$wt_path"
@@ -5586,10 +5611,14 @@ KEEP
 # discovery failure. The wrapper owns only scheduled evidence; manual reports retain their
 # established output shape for callers and tests.
 _cc_wj_run() {
-  local arg scheduled=0 started rc
+  local arg scheduled=0 applying=0 started rc sweep_lock lock_rc
   for arg in "$@"; do
-    [ "$arg" = --scheduled ] && scheduled=1
+    case "$arg" in
+      --scheduled) scheduled=1 ;;
+      --apply) applying=1 ;;
+    esac
   done
+  [ "$scheduled" -eq 1 ] && [ "${CC_WJ_SCHEDULE_APPLY-}" = 1 ] && applying=1
   # One id for both phases of a sweep, so spot-check records of one run can be read together.
   _CC_WJ_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   if [ "$scheduled" -eq 1 ]; then
@@ -5598,6 +5627,40 @@ _cc_wj_run() {
     started="$(date +%s)"
     printf '== worktree-janitor scheduled sweep started %s pid=%s\n' \
       "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$$"
+  fi
+  # One applying sweep on the host at a time, decided before any scan. The launchd hour, every
+  # SessionEnd, resource-watch's act and disk-janitor's trim each start one; each paid the
+  # machine-wide lsof and the session scan (52 s and 360 s at load 46 on 2026-10-29), then
+  # most deferred at the repository lock anyway, and up to 8 ran at once. A live holder means
+  # this run would only repeat its work, so it ends here with status 0, as the repository
+  # lock's deferral does. The repository lock still stands behind this one; a lock that cannot
+  # be taken (an unwritable state directory) only loses the de-duplication, so the run goes on.
+  # The lock is per scope: a run given --repo yields only to another run over the same
+  # repositories, and a run over every repository only to another such run. One machine-wide
+  # lock let the per-repository SessionEnd sweeps hold it about 79% of the day, so the hourly
+  # sweep, its pressure trim and disk-janitor's trim all ended without running.
+  _CC_WJ_SWEEP_LOCK=""
+  if [ "$applying" -eq 1 ]; then
+    local scope="" prev=""
+    for arg in "$@"; do
+      [ "$prev" = --repo ] && scope="$scope $arg"
+      prev="$arg"
+    done
+    sweep_lock="$(_cc_wj_state_dir)/worktree-janitor-sweep.lock"
+    [ -z "$scope" ] || sweep_lock="$(_cc_wj_state_dir)/worktree-janitor-sweep-$(printf '%s' "$scope" | cksum | cut -d' ' -f1).lock"
+    mkdir -p "$(_cc_wj_state_dir)" 2>/dev/null
+    _cc_wj_capture_run_pid || _CC_WJ_RUN_PID=""
+    lock_rc=0
+    _cc_wj_lock "$sweep_lock" "on this host" || lock_rc=$?
+    case "$lock_rc" in
+      0) _CC_WJ_SWEEP_LOCK="$sweep_lock" ;;
+      2)
+        if [ "$scheduled" -eq 1 ]; then
+          printf '== worktree-janitor scheduled sweep ended %s elapsed=%ss status=0\n' \
+            "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$(( $(date +%s) - started ))"
+        fi
+        return 0 ;;
+    esac
   fi
   _cc_wj_run_inner "$@"; rc=$?
   # Under disk pressure the scheduled sweep also trims the regenerable caches
@@ -5615,6 +5678,10 @@ _cc_wj_run() {
     # Its own status is printed; the sweep's is the one the run reports.
     _cc_wj_run_inner --trim-regenerable --apply ${trim_args[@]+"${trim_args[@]}"} ||
       echo "== worktree-janitor pressure trim ended with status $?"
+  fi
+  if [ -n "$_CC_WJ_SWEEP_LOCK" ]; then
+    _cc_wj_unlock "$_CC_WJ_SWEEP_LOCK"
+    _CC_WJ_SWEEP_LOCK=""
   fi
   if [ "$scheduled" -eq 1 ]; then
     printf '== worktree-janitor scheduled sweep ended %s elapsed=%ss status=%s\n' \

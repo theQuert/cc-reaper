@@ -367,6 +367,16 @@ whatever `CC_WJ_NEW_RULES_MODE` says.
   current-two-turn tool paths. The move does not pin unrelated worktrees.
 - **Under a per-repository lock**, so a session-end sweep and a manual run do not race. Record
   the holder's full command line with its pid; a name match mistakes a recycled pid for a sweep.
+- **One applying sweep per scope at a time**, decided before any scan: the launchd hour, every
+  SessionEnd, resource-watch's act and disk-janitor's trim each start one, and each paid the
+  machine-wide `lsof` and the session scan (52 s and 360 s at load 46) before most deferred at the
+  repository lock; up to 8 ran at once (2026-10-29). A live holder of the run's sweep lock (same
+  pid and command rule, same 60-minute takeover, refreshed at every worktree) ends an applying run
+  at once with status 0. A run over every repository takes
+  `<CC_WJ_STATE_DIR>/worktree-janitor-sweep.lock`; a run given `--repo` takes
+  `worktree-janitor-sweep-<cksum of its repositories>.lock`, so a SessionEnd sweep never stops
+  the hourly sweep or its pressure trim (one shared lock was held about 79% of the day). Report
+  runs take no lock. The repository lock stays behind it and orders runs over the same repository.
 - **Keeping the session's own checkout** - `CODEX_PROJECT_DIR`/`CLAUDE_PROJECT_DIR` and the
   `cwd` in the hook's JSON input, since a session that worked in a linked worktree may report either. Bound the
   read, but not with bash 3.2's `read -t -d ''`, which discards everything it read when it
@@ -390,7 +400,11 @@ whatever `CC_WJ_NEW_RULES_MODE` says.
   cursor makes it start with the repository after the last one in which it examined a
   worktree before the budget ran out, so a large
   first repository cannot starve the rest; report runs neither read nor write either. The
-  lock is refreshed at every worktree boundary.
+  lock is refreshed at every worktree boundary. The budget has to bound the per-worktree work,
+  so the listing before it holds paths and branches only and each worktree's `git status
+  --ignored` is read when the loop examines it: read up front for all 143 worktrees it took
+  41-58 s each under the LaunchAgent's Background policy at load 46 (0.3 s in a terminal), about
+  2 hours before the first was judged, and every apply run examined one and removed none.
 - **Largest first** (`CC_WJ_ORDER=largest`, the default; stima-api #5886). Within a
   repository the worktrees are examined by their last known size, largest first, so a sweep
   the budget cuts short has spent it where the bytes are. Nothing is measured for the order:

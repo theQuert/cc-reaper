@@ -2737,6 +2737,122 @@ expect_yes "budget: the lock is refreshed at every worktree boundary" \
 expect_no "budget: a malformed budget fails the run" \
   env CC_WJ_SWEEP_BUDGET_SECONDS=x PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$B_ROOT/primary" --apply
 
+# The status of a worktree (`git status --ignored`, seconds a tree at load) is read when the
+# sweep examines it, inside the budget. Read for every worktree before the first was judged,
+# it took 2.3 hours on 2026-10-29 and every apply run examined one tree and removed none.
+STATUS_LOG="$TMPDIR_ROOT/status-reads.log"; : > "$STATUS_LOG"
+STATUS_STUBS="$TMPDIR_ROOT/stubs-status"; mkdir -p "$STATUS_STUBS"
+cat > "$STATUS_STUBS/git" <<STUB
+#!/usr/bin/env bash
+case " \$* " in *" status --porcelain --ignored "*) printf '%s\n' "\$*" >> "$STATUS_LOG" ;; esac
+exec "$(command -v git)" "\$@"
+STUB
+chmod +x "$STATUS_STUBS/git"
+OUT_B_LAZY="$TMPDIR_ROOT/out-budget-lazy.txt"
+CC_WJ_STATE_DIR="$B_STATE" CC_WJ_SWEEP_BUDGET_SECONDS=1 \
+  PATH="$STATUS_STUBS:$BUDGET_STUBS:$STUBS_IDLE:$PATH" bash "$WJ" --repo "$B_ROOT/primary" --apply > "$OUT_B_LAZY" 2>&1
+expect_yes "budget: a run that examined one worktree read one status, not all four" \
+  test "$(examined "$OUT_B_LAZY" | wc -w | tr -d ' '):$(wc -l < "$STATUS_LOG" | tr -d ' ')" = "1:1"
+expect_yes "budget: and judged it by that status (clean, a commit of its own: KEEP(unlanded))" \
+  bash -c 'b="$(grep -A2 "^  WORKTREE  " "$1")"; printf "%s\n" "$b" | grep -q " dirty=0 " &&
+    printf "%s\n" "$b" | grep -q "classification: KEEP(unlanded)$"' _ "$OUT_B_LAZY"
+
+# One applying sweep on the host: a live holder of the state directory's sweep lock means
+# this run ends before any scan, with status 0, and removes nothing.
+SW_ROOT="$TMPDIR_ROOT/sweep-lock"; mkdir -p "$SW_ROOT"
+SW_STATE="$TMPDIR_ROOT/sweep-lock-state"; mkdir -p "$SW_STATE"
+git init -q --bare "$SW_ROOT/origin.git" -b main
+git clone -q "$SW_ROOT/origin.git" "$SW_ROOT/primary" 2>/dev/null
+swgit() { git -C "$SW_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$SW_ROOT/primary/README"; swgit add README; swgit commit -qm base; swgit push -q origin main
+swgit worktree add -q "$SW_ROOT/wt-landed" -b landed origin/main 2>/dev/null
+# A run given --repo takes the lock for exactly those repositories.
+SW_LOCK="$SW_STATE/worktree-janitor-sweep-$(printf ' %s' "$SW_ROOT/primary" | cksum | cut -d' ' -f1).lock"
+SW_ALL_LOCK="$SW_STATE/worktree-janitor-sweep.lock"
+SW_LSOF_LOG="$TMPDIR_ROOT/sweep-lock-lsof.log"; : > "$SW_LSOF_LOG"
+SW_STUBS="$TMPDIR_ROOT/stubs-sweep-lock"; mkdir -p "$SW_STUBS"
+cat > "$SW_STUBS/lsof" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$SW_LSOF_LOG"
+exec "$STUBS_IDLE/lsof" "\$@"
+STUB
+chmod +x "$SW_STUBS/lsof"
+bash -c 'exec -a worktree-janitor-sweep-holder sleep 30' &
+SW_HOLDER=$!
+sleep 0.3
+mkdir -p "$SW_LOCK"; echo "$SW_HOLDER" > "$SW_LOCK/pid"; ps -o command= -p "$SW_HOLDER" > "$SW_LOCK/cmd"
+OUT_SW="$TMPDIR_ROOT/out-sweep-lock.txt"
+SW_RC=0
+CC_WJ_STATE_DIR="$SW_STATE" PATH="$SW_STUBS:$STUBS_IDLE:$PATH" \
+  bash "$WJ" --repo "$SW_ROOT/primary" --apply > "$OUT_SW" 2>&1 || SW_RC=$?
+expect_yes "sweep lock: a run that deferred to a live applying sweep exits 0" test "$SW_RC" -eq 0
+expect_yes "sweep lock: says so, and removes nothing" \
+  bash -c 'grep -q "holds .*worktree-janitor-sweep-[0-9]*.lock; deferred to it and removed nothing on this host" "$1" && [ -d "$2" ]' \
+    _ "$OUT_SW" "$SW_ROOT/wt-landed"
+expect_yes "sweep lock: and deferred before the machine-wide process scan" test ! -s "$SW_LSOF_LOG"
+OUT_SW_SCHED="$TMPDIR_ROOT/out-sweep-lock-scheduled.txt"
+SW_SRC=0
+CC_WJ_STATE_DIR="$SW_STATE" CC_WJ_SCHEDULE_APPLY=1 PATH="$SW_STUBS:$STUBS_IDLE:$PATH" \
+  bash "$WJ" --scheduled --repo "$SW_ROOT/primary" > "$OUT_SW_SCHED" 2>&1 || SW_SRC=$?
+expect_yes "sweep lock: the scheduled applying run defers the same way, ending its record with status=0" \
+  bash -c '[ "$2" -eq 0 ] && grep -q "deferred to it and removed nothing on this host" "$1" &&
+    grep -q "scheduled sweep ended .* status=0" "$1" && [ -d "$3" ] && [ ! -s "$4" ]' \
+    _ "$OUT_SW_SCHED" "$SW_SRC" "$SW_ROOT/wt-landed" "$SW_LSOF_LOG"
+expect_yes "sweep lock: a report run is not held by it" \
+  bash -c 'CC_WJ_STATE_DIR="$1" PATH="$2" bash "$3" --repo "$4" | grep -q "classification: REMOVABLE"' \
+    _ "$SW_STATE" "$SW_STUBS:$STUBS_IDLE:$PATH" "$WJ" "$SW_ROOT/primary"
+kill "$SW_HOLDER" 2>/dev/null; wait "$SW_HOLDER" 2>/dev/null
+# A live sweep over every repository holds its own lock; a run over one repository does not
+# yield to it (the repository lock orders the two), so the hourly sweep and a SessionEnd
+# sweep never starve each other.
+bash -c 'exec -a worktree-janitor-sweep-holder sleep 30' &
+SW_ALL_HOLDER=$!
+sleep 0.3
+mkdir -p "$SW_ALL_LOCK"; echo "$SW_ALL_HOLDER" > "$SW_ALL_LOCK/pid"; ps -o command= -p "$SW_ALL_HOLDER" > "$SW_ALL_LOCK/cmd"
+OUT_SW2="$TMPDIR_ROOT/out-sweep-lock2.txt"
+CC_WJ_STATE_DIR="$SW_STATE" PATH="$SW_STUBS:$STUBS_IDLE:$PATH" \
+  bash "$WJ" --repo "$SW_ROOT/primary" --apply > "$OUT_SW2" 2>&1
+expect_no "sweep lock: a dead holder's lock is taken over and the sweep removes, beside a live all-repository sweep" test -d "$SW_ROOT/wt-landed"
+expect_no "sweep lock: and released afterwards" test -e "$SW_LOCK"
+expect_yes "sweep lock: the all-repository holder's lock is left alone" test -e "$SW_ALL_LOCK/pid"
+kill "$SW_ALL_HOLDER" 2>/dev/null; wait "$SW_ALL_HOLDER" 2>/dev/null
+
+# Removal is not starved by a slow scan. Four landed worktrees and a 1 s budget that the
+# 1.2 s lsof stub always outruns, so the run examines exactly one: the progress floor. Each
+# `git status --ignored` is logged. Read for all four before the first was judged (41-58 s a
+# tree at load on 2026-10-29), the scan was outside the budget and spent it before any tree
+# was removed; read when a worktree is examined, the work done is bounded by the budget: one
+# tree scanned, that tree removed, the other three never scanned and kept for the next run.
+# Counts, not wall-clock thresholds, so a loaded host cannot move the result.
+SV_ROOT="$TMPDIR_ROOT/slow-scan"; mkdir -p "$SV_ROOT"
+SV_STATE="$TMPDIR_ROOT/slow-scan-state"
+SV_READS="$TMPDIR_ROOT/slow-scan-reads.log"; : > "$SV_READS"
+git init -q --bare "$SV_ROOT/origin.git" -b main
+git clone -q "$SV_ROOT/origin.git" "$SV_ROOT/primary" 2>/dev/null
+svgit() { git -C "$SV_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
+echo x > "$SV_ROOT/primary/README"; svgit add README; svgit commit -qm base; svgit push -q origin main
+for n in 1 2 3 4; do svgit worktree add -q "$SV_ROOT/wt-$n" -b "slow-$n" origin/main 2>/dev/null; done
+SV_STUBS="$TMPDIR_ROOT/stubs-slow-scan"; mkdir -p "$SV_STUBS"
+cat > "$SV_STUBS/git" <<STUB
+#!/usr/bin/env bash
+case " \$* " in *" status --porcelain --ignored "*) printf '%s\n' "\$PWD \$*" >> "$SV_READS" ;; esac
+exec "$(command -v git)" "\$@"
+STUB
+chmod +x "$SV_STUBS/git"
+OUT_SV="$TMPDIR_ROOT/out-slow-scan.txt"
+SV_RC=0
+CC_WJ_STATE_DIR="$SV_STATE" CC_WJ_SWEEP_BUDGET_SECONDS=1 PATH="$SV_STUBS:$BUDGET_STUBS:$STUBS_IDLE:$PATH" \
+  bash "$WJ" --repo "$SV_ROOT/primary" --apply > "$OUT_SV" 2>&1 || SV_RC=$?
+SV_LEFT=0; for n in 1 2 3 4; do [ -d "$SV_ROOT/wt-$n" ] && SV_LEFT=$((SV_LEFT + 1)); done
+expect_yes "slow scan: a scan that runs out of budget has removed the tree it examined" \
+  test "$(examined "$OUT_SV" | wc -w | tr -d ' '):$SV_LEFT" = "1:3"
+expect_yes "slow scan: and read the status of that one tree only, not of all four first" \
+  test "$(sed -n 's/.* -C \([^ ]*\) status .*/\1/p' "$SV_READS" | sed 's|.*/||' | sort -u | paste -sd' ' -)" = "wt-1"
+expect_yes "slow scan: yielding on the budget for the other three, exiting 0" \
+  bash -c 'grep -q "budget exhausted: .* unexamined=3" "$1" && [ "$2" -eq 0 ]' _ "$OUT_SV" "$SV_RC"
+expect_yes "slow scan: the removed tree's branch is kept, and so are the others" \
+  bash -c 'for n in 1 2 3 4; do git -C "$1" rev-parse --verify -q "refs/heads/slow-$n" >/dev/null || exit 1; done' _ "$SV_ROOT/primary"
+
 # The removal phase: past its budget it removes none of the worktrees left, and a session
 # sweep started afterwards takes the lock instead of deferring.
 BR_ROOT="$TMPDIR_ROOT/budget-removal"; mkdir -p "$BR_ROOT"
