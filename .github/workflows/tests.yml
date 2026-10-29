@@ -50,5 +50,7 @@ jobs:
         run: bash tests/worktree-active-sessions.sh
       - name: resource-watch
         run: bash tests/resource-watch.sh
+      - name: resource-watch-judge
+        run: python3 tests/resource-watch-judge.py
       - name: resource-watch-watchdog
         run: bash tests/resource-watch-watchdog.sh

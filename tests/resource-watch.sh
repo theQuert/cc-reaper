@@ -977,6 +977,15 @@ t20u=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
 guard_case "$t20u" 100
 expect_yes "T20l: unreadable swap and an unmeasured rate are ?" grep -qE 'GB/[0-9.]+% swap=\? rate=\?( |$)' "$t20u/resource-watch.log"
 
+# T21: the judge (shell/resource-watch-judge.py) agrees with what the script really wrote, and catches a change
+t21_judge() { PATH="$stub_dir:$PATH" python3 "$ROOT_DIR/shell/resource-watch-judge.py" --plist /nonexistent "$@" >/dev/null; }
+expect_yes "T21a: the judge passes the T20 shadow log (pause, resume, swap= and rate= lines)" t21_judge --log "$t20a/resource-watch.log"
+expect_yes "T21a: and the T20 on-mode log" t21_judge --log "$t20e/resource-watch.log"
+sed 's/ ALERT:swap//' "$t20a/resource-watch.log" > "$t20a/no-swap-marker.log"
+expect_no  "T21b: a swap line without ALERT:swap is a miss" t21_judge --log "$t20a/no-swap-marker.log"
+grep -v 'DISK-RESUME' "$t20a/resource-watch.log" > "$t20a/no-resume.log"; grep 'DISK-PAUSE' "$t20a/resource-watch.log" >> "$t20a/no-resume.log"
+expect_no  "T21c: a second DISK-PAUSE with no resume between is a miss" t21_judge --log "$t20a/no-resume.log"
+
 if [ "$failures" -gt 0 ]; then
   printf "%s test failure(s)\n" "$failures"
   exit 1
