@@ -283,10 +283,43 @@ _cc_reaper_is_agent_cleanup_candidate() {
   return 1
 }
 
+# BEGIN never-kill (byte-identical in shell/claude-cleanup.sh, launchd/cc-reaper-monitor.sh and
+# hooks/stop-cleanup-orphans.sh; tests/never-kill.sh compares them)
+# CC_NEVER_KILL_PIDS names processes cc-reaper never signals, nor any process descended from
+# one. Unset, the host's default list applies; set it empty to protect no pid. Exit 0 means
+# "never signal this pid". An unreadable process table cannot prove the ancestry, so it
+# protects too: the two mistakes are not symmetric, and a skipped kill is retried next run.
+# CC_NEVER_KILL_PPID_FILE (pid ppid rows) replaces the process table for tests.
+_cc_reaper_never_kill() {
+  local list="${CC_NEVER_KILL_PIDS-70987 4565}" table=""
+  case "$list" in *[0-9]*) ;; *) return 1 ;; esac
+  if [ -n "${CC_NEVER_KILL_PPID_FILE:-}" ]; then
+    table=$(cat "$CC_NEVER_KILL_PPID_FILE" 2>/dev/null)
+  else
+    table=$(command ps -axo pid=,ppid= 2>/dev/null)
+  fi
+  printf '%s\n' "$table" | command awk -v pid="$1" -v list="$list" '
+    BEGIN { n = split(list, l, /[^0-9]+/); for (i = 1; i <= n; i++) if (l[i] != "") keep[l[i] + 0] = 1 }
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { parent[$1 + 0] = $2 + 0; rows++ }
+    END {
+      p = pid + 0
+      if (p in keep || !rows) exit 0
+      for (d = 0; d < 512 && p > 1; d++) { if (p in keep) exit 0; if (!(p in parent)) exit 1; p = parent[p] }
+      exit 1
+    }'
+}
+# END never-kill
+
 # Route every cleanup signal through one helper so --dry-run exercises the same
 # candidate and protection paths as normal cleanup without sending a signal.
+# A pid on the never-kill list, or descended from one, is never signalled, dry run or not:
+# the refusal is logged on stderr (callers capture stdout) and counts as not delivered.
 _cc_reaper_kill_pid() {
   local pid=$1
+  if _cc_reaper_never_kill "$pid"; then
+    echo "never-kill $pid" >&2
+    return 1
+  fi
   if [ "${_CC_REAPER_DRY_RUN:-0}" = "1" ]; then
     echo "  [DRY-RUN] Would kill PID $pid" >&2
     return 0
@@ -901,6 +934,81 @@ _cc_guard_runaway_eligible() {
   printf '%s\n' "$cmd" | awk "$(_cc_reaper_mcp_server_program)"
 }
 
+# Whether a command line is a Claude Code or Codex CLI: by its executable, or by the script a
+# node or bun runs, never by a later argument. `claude mcp-server` and `codex mcp-server` are
+# servers, not clients.
+_cc_reaper_is_agent_cli_cmd() {
+  printf '%s\n' "$1" | awk '
+    NR == 1 {
+      w = $1; nxt = $2
+      b = w; sub(/.*\//, "", b)
+      if (b ~ /^(node|bun)$/) { w = $2; nxt = $3; b = w; sub(/.*\//, "", b) }
+      if (nxt == "mcp-server") exit 1
+      if (b == "claude" || b == "codex") exit 0
+      if (w ~ /\/@anthropic-ai\/claude-code\// || w ~ /\/@openai\/codex\//) exit 0
+      exit 1
+    }
+    END { if (NR == 0) exit 1 }'
+}
+
+# The nearest Claude or Codex CLI among a process's ancestors (the process itself too, with a
+# second argument of "self"), printed; exit 1 when there is none.
+_cc_guard_agent_ancestor() {
+  local p=$1 d=0 cmd=""
+  [ "${2:-}" = self ] || p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$d" -lt 64 ]; do
+    cmd=$(ps -o command= -p "$p" 2>/dev/null)
+    if _cc_reaper_is_agent_cli_cmd "$cmd"; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    d=$((d + 1))
+  done
+  return 1
+}
+
+# Whether a live Claude or Codex session is using a process the runaway phase selected, so the
+# unattended guard leaves it alone and only logs it. Two ways a session uses an MCP server:
+#   - stdio: the server is the session's child, so a CLI is among its ancestors;
+#   - TCP: an HTTP MCP server or a shared worker (claude-mem's, chroma in http mode) listens,
+#     and a CLI, or a hook or subagent descended from one, holds a connection to that port.
+# Prints "session <pid>" or "client <pid>" for the log. An lsof that cannot answer (missing,
+# or failing with more than "nothing found") counts as in use: signalling a server a live
+# session depends on ends that session's tools, and a stall is still reported by cc-monitor.
+# CC_REAPER_LSOF names the lsof to run (tests).
+_cc_guard_in_use_by_agent() {
+  local pid=$1 who="" out="" rc=0 port="" clients="" client="" lsof_bin="${CC_REAPER_LSOF:-lsof}"
+  if who=$(_cc_guard_agent_ancestor "$pid"); then
+    printf 'session %s\n' "$who"
+    return 0
+  fi
+  out=$("$lsof_bin" -nP -a -p "$pid" -iTCP -sTCP:LISTEN -Fn 2>/dev/null) || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    printf 'unknown (lsof exited %s)\n' "$rc"
+    return 0
+  fi
+  out=$(printf '%s\n' "$out" | awk '/^n/ { sub(/.*:/, ""); if ($0 ~ /^[0-9]+$/) print }' | sort -u)
+  while IFS= read -r port; do
+    [ -n "$port" ] || continue
+    rc=0
+    clients=$("$lsof_bin" -nP -iTCP:"$port" -sTCP:ESTABLISHED -Fp 2>/dev/null) || rc=$?
+    if [ "$rc" -gt 1 ]; then
+      printf 'unknown (lsof exited %s)\n' "$rc"
+      return 0
+    fi
+    while IFS= read -r client; do
+      client=${client#p}
+      [ -n "$client" ] && [ "$client" != "$pid" ] || continue
+      if who=$(_cc_guard_agent_ancestor "$client" self); then
+        printf 'client %s of session %s on port %s\n' "$client" "$who" "$port"
+        return 0
+      fi
+    done <<< "$(printf '%s\n' "$clients" | grep '^p')"
+  done <<< "$out"
+  return 1
+}
+
 # The samples file this host records to. The phase and the report claude-guard prints both name
 # it, so the default has one owner.
 _cc_guard_samples_path() {
@@ -1029,6 +1137,7 @@ claude-guard() {
   local runaway_min=${CC_RUNAWAY_MIN:-60}
   local runaway_grace=${CC_RUNAWAY_GRACE_SEC:-5}
   local runaway_disable=${CC_RUNAWAY_DISABLE:-0}
+  local runaway_spare_in_use=${CC_RUNAWAY_SPARE_IN_USE:-1}
 
   # Validate numeric configs
   if ! echo "$max_rss_mb" | grep -qE '^[0-9]+$'; then
@@ -1071,7 +1180,7 @@ claude-guard() {
         { printf "  PID %-7s  CPU %6s%%  ETIME %-14s  %s\n", $1, $2, $3, substr($5, 1, 80) }
       '
       if $dry_run; then
-        echo "  [DRY-RUN] Would SIGTERM each PID above alone, if still hot on a re-check."
+        echo "  [DRY-RUN] Would SIGTERM each PID above alone, if still hot on a re-check and no live session uses it."
       else
         # The grace period and the re-check pause are both spent before any signal, so the
         # number a person reads has to be the sum.
@@ -1081,7 +1190,7 @@ claude-guard() {
         # signalled only if it still runs the command it was selected for, is still eligible,
         # and is still over the threshold now.
         sleep 3
-        local rkilled=0 rfreed_kb=0 rnow_cmd="" rnow_cpu="" rrss="" rstart="" rnow_start=""
+        local rkilled=0 rfreed_kb=0 rnow_cmd="" rnow_cpu="" rrss="" rstart="" rnow_start="" rin_use=""
         while IFS=$'\t' read -r rpid rcpu retime rstart rrest; do
           [ -z "$rpid" ] && continue
           rnow_cmd=$(ps -o command= -p "$rpid" 2>/dev/null | tr '\n' ' ')
@@ -1105,6 +1214,13 @@ claude-guard() {
           rnow_start=$(LC_ALL=C TZ=UTC ps -o lstart= -p "$rpid" 2>/dev/null | awk '{$1=$1} 1')
           if [ -z "$rnow_start" ] || [ "$rnow_start" != "$rstart" ]; then
             echo "  PID $rpid start identity changed or is unavailable; not signalled."
+            continue
+          fi
+          # A server a live session is using is left alone and named (CC_RUNAWAY_SPARE_IN_USE,
+          # default 1; guard-runner.sh always sets it): signalling it ends that session's tools,
+          # and nobody watches the unattended guard. cc-monitor still reports the stall.
+          if [ "$runaway_spare_in_use" = 1 ] && rin_use=$(_cc_guard_in_use_by_agent "$rpid"); then
+            echo "  PID $rpid is in use by a live session ($rin_use); not signalled."
             continue
           fi
           # This PID alone. A shared MCP server started by a Claude CLI is in that CLI's

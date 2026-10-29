@@ -31,4 +31,16 @@ _cc_reaper_bound_log "$HOME/.cc-reaper/logs/launchd-guard-stderr.log"
 export CC_MAX_SESSIONS=99999 CC_MAX_RSS_MB=99999999 CC_MAX_FD=99999999
 export CC_RUNAWAY_GRACE_SEC="${CC_RUNAWAY_GRACE_SEC:-0}"
 
+# A runaway MCP server a live Claude or Codex session is using is logged, never signalled,
+# whatever the environment says. A stdio server is its session's child, and an HTTP one
+# (claude-mem's worker, chroma in http mode) is shared by every session connected to it:
+# SIGTERM ended those sessions' tools with nobody at the terminal to see why. Only a server
+# no live session uses - reparented to launchd, with no agent client on its ports - is
+# still reaped here. claude-guard's _cc_guard_in_use_by_agent decides.
+export CC_RUNAWAY_SPARE_IN_USE=1
+
+# Pids the operator never wants signalled (and their descendants) are honoured inside
+# _cc_reaper_kill_pid, which every signal claude-guard sends goes through; an unset
+# CC_NEVER_KILL_PIDS takes the default list there.
+
 claude-guard

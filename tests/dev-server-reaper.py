@@ -3,6 +3,7 @@
 
 import calendar
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -250,6 +251,35 @@ class ReaperTest(Fixture):
                              send=send, sleep=lambda s: None, state_dir=self.state)
         self.assertEqual(reaped, (2, 2))
         self.assertEqual(self.terms(), [100, 102, 200, 201, 202])
+
+    def test_a_never_kill_pid_and_its_descendants_are_not_signalled(self):
+        # The tree's middle member is listed, so it and its child stay; the root, which is
+        # not descended from it, is still stopped, and each refusal is named.
+        self.server(100)
+        self.server(200)
+        with mock.patch.dict(os.environ, {"CC_NEVER_KILL_PIDS": "101"}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.run_reap()
+        self.assertEqual(self.terms(), [100, 200, 201, 202])
+        self.assertIn("never-kill 101\n", out.getvalue())
+        self.assertIn("never-kill 102\n", out.getvalue())
+
+    def test_the_never_kill_rule(self):
+        parents = {10: 1, 11: 10, 12: 11, 20: 1, 30: 99}
+        keep = {10}
+        self.assertTrue(reaper.never_kill(10, parents, keep))
+        self.assertTrue(reaper.never_kill(12, parents, keep))
+        self.assertFalse(reaper.never_kill(20, parents, keep))
+        self.assertFalse(reaper.never_kill(30, parents, keep))
+        self.assertTrue(reaper.never_kill(20, {}, keep), "an unreadable table protects")
+        self.assertFalse(reaper.never_kill(20, {}, set()), "an empty list protects nothing")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CC_NEVER_KILL_PIDS", None)
+            self.assertEqual(reaper.never_kill_pids(), {70987, 4565})
+        with mock.patch.dict(os.environ, {"CC_NEVER_KILL_PIDS": ""}):
+            self.assertEqual(reaper.never_kill_pids(), set())
+        with mock.patch.dict(os.environ, {"CC_NEVER_KILL_PIDS": "5, 6 7"}):
+            self.assertEqual(reaper.never_kill_pids(), {5, 6, 7})
 
     def cra(self, root, port=3633):
         self.server(root, cmd="node ./node_modules/.bin/react-scripts start")

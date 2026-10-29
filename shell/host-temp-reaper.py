@@ -101,6 +101,36 @@ JOB_TMP_IDLE_SECONDS = 72 * 3600
 CHROME_BINARY = re.compile(r"/\S.*/Google Chrome\.app/Contents/MacOS/Google Chrome(?= --)")
 
 
+# Processes this reaper never signals, nor any process descended from one: CC_NEVER_KILL_PIDS,
+# separated by spaces or commas. Unset, the host's default list applies; empty protects no pid.
+# The same rule, and the same default, as _cc_reaper_never_kill in the shell scripts.
+NEVER_KILL_DEFAULT = "70987 4565"
+
+
+def never_kill_pids():
+    raw = os.environ.get("CC_NEVER_KILL_PIDS")
+    raw = NEVER_KILL_DEFAULT if raw is None else raw
+    return {int(t) for t in re.split(r"[^0-9]+", raw) if t}
+
+
+def never_kill(pid, parents, keep=None):
+    """True when pid, or one of its ancestors in parents ({pid: ppid}), is on the list. An
+    empty table cannot prove the ancestry, so it protects: a skipped signal is retried next run."""
+    keep = never_kill_pids() if keep is None else keep
+    if not keep:
+        return False
+    if pid in keep or not parents:
+        return True
+    p = pid
+    for _ in range(512):
+        if p in keep:
+            return True
+        if p <= 1 or p not in parents:
+            return False
+        p = parents[p]
+    return False
+
+
 def temp_root():
     """This user's own temp directory, whatever TMPDIR says: launchd jobs may have none."""
     try:
@@ -289,9 +319,13 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
             print(f"CANDIDATE chrome pid={row[0]}")
             continue
         # Recheck the same pid right before signalling: a reused pid fails closed.
-        again = [r for r in (processes() or []) if r[0] == row[0]]
+        fresh = processes() or []
+        again = [r for r in fresh if r[0] == row[0]]
         if not again or again[0][3] != row[3] or not orphan_chrome(again[0], root, idle_seconds):
             print(f"KEEP chrome pid={row[0]} (changed)")
+            continue
+        if never_kill(row[0], {r[0]: r[1] for r in fresh}):
+            print(f"never-kill {row[0]}")
             continue
         send(row[0], signal.SIGTERM)
         counts["chrome"][1] += 1

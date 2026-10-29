@@ -113,7 +113,9 @@ bash tests/cc-monitor-runaway.sh       # Validate runaway protected process dete
 bash tests/guard-session-detect.sh     # Validate session detection + guard phases under bash and zsh
 bash tests/protection-classes.sh       # Validate protection classes, runaway selection/signalling, tree RSS
 bash tests/monitor-selection.sh        # LaunchAgent monitor body: what it signals (no CPU-based selection)
-bash tests/guard-runaway.sh            # claude-guard runaway phase run whole under bash and zsh: known MCP servers, CPU sampled across runs, each re-checked PID alone
+bash tests/guard-runaway.sh            # claude-guard runaway phase run whole under bash and zsh: known MCP servers, CPU sampled across runs, each re-checked PID alone, servers a live session uses spared
+bash tests/never-kill.sh               # CC_NEVER_KILL_PIDS on every signal path (bash and zsh), guard-runner's in-use rule, the agent CLI matcher
+bash tests/install-check.sh            # install.sh --check: scripts, modes, LaunchAgents as property lists, opt-in wip-backup, no reload of current agents
 bash tests/install-rc-source.sh        # install.sh rc lines source the deployed copies; a stale one is repaired only when nothing else names the script
 bash tests/disk-guard.sh             # go cache LRU cap, session-temp reaper (task outputs, finished job tmp/)
 bash tests/worktree-janitor.sh         # Validate worktree gates, landing proofs, declarations, session mode, lock
@@ -141,6 +143,8 @@ zsh -n shell/claude-cleanup.sh         # zsh reaches code paths bash-only checks
 | `CC_RUNAWAY_MIN` | 60 | Minutes a process must stay hot across claude-guard runs before it is runaway |
 | `CC_RUNAWAY_GRACE_SEC` | 5 | Seconds claude-guard waits before the re-check, which adds three more; the banner prints the sum |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip claude-guard's runaway phase |
+| `CC_RUNAWAY_SPARE_IN_USE` | 1 | A runaway MCP server a live Claude/Codex session uses (CLI ancestor, or a CLI-descended TCP client of a port it listens on) is logged, not signalled; `guard-runner.sh` always sets 1 |
+| `CC_NEVER_KILL_PIDS` | `70987 4565` | Pids no cc-reaper path signals, nor their descendants; logged `never-kill <pid>`. Empty protects none; an unreadable process table protects all. `_cc_reaper_never_kill` is byte-identical in `claude-cleanup.sh`, `cc-reaper-monitor.sh` and the Stop hook (`tests/never-kill.sh`) |
 | `CC_RUNAWAY_SAMPLES_FILE` | `~/.cc-reaper/state/runaway-samples.tsv` | CPU-time samples `claude-guard`'s runaway phase measures streaks from; losing the file only restarts streaks, a path with no directory part is a file in the directory the guard runs from, and a recording run (not `--dry-run`) that cannot record this run's samples says so, on stderr and in claude-guard's report, and selects nothing |
 
 ### Stop hook

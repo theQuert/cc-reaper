@@ -39,6 +39,8 @@ case "\$args" in
   "-o command= -p "*) col 4 ;;
   "-eo pid,pgid")     echo "  PID  PGID"; awk -F'|' '{print \$1, \$3}' "\$TABLE" ;;
   "-eo pid=,ppid=,command=") awk -F'|' '{print \$1, \$2, \$4}' "\$TABLE" ;;
+  # The never-kill ancestry read; NK_TABLE_EMPTY=1 makes it answer nothing, as a failed ps does.
+  "-axo pid=,ppid=") [ "\${NK_TABLE_EMPTY:-0}" = 1 ] || awk -F'|' '{print \$1, \$2}' "\$TABLE" ;;
   *) exit 0 ;;   # e.g. the Linux \`systemd --user\` probe: no match, empty set
 esac
 EOS
@@ -133,7 +135,41 @@ case_plain_orphan_is_killed() {
   teardown
 }
 
-for c in case_ancestor_matching_the_fallback_pattern_is_spared \
+# ─── Never-kill list (CC_NEVER_KILL_PIDS) ──────────────────────────────────────
+# A listed pid, and anything descended from one, is named on stderr and never signalled,
+# in both loops and in aggressive mode, where members with a live parent are reachable.
+case_never_kill_pid_and_its_descendants_are_spared() {
+  setup
+  proc 9000010 1 "$PGID" "node keeper.js"
+  proc 9000011 9000010 "$PGID" "node keeper-child.js"
+  proc 9000013 1 9000777 "claude --output-format stream-json --input-format stream-json"
+  proc 9000012 1 "$PGID" "node other.js"
+  export CC_NEVER_KILL_PIDS="9000010 9000013" CC_STOP_HOOK_AGGRESSIVE=1
+  out="$(run_hook)"
+  unset CC_NEVER_KILL_PIDS CC_STOP_HOOK_AGGRESSIVE
+  was_killed 9000010 && fail "a never-kill pid was signalled: $out"
+  was_killed 9000011 && fail "a never-kill pid's child was signalled: $out"
+  was_killed 9000013 && fail "a never-kill pid was signalled by the fallback: $out"
+  printf '%s\n' "$out" | grep -qx 'never-kill 9000010' || fail "the refusal is not named: $out"
+  printf '%s\n' "$out" | grep -qx 'never-kill 9000013' || fail "the fallback refusal is not named: $out"
+  was_killed 9000012 || fail "an unlisted orphan beside them survived: $out"
+  teardown
+}
+
+# A process table that cannot be read cannot prove a pid is not descended from a listed one.
+case_never_kill_unreadable_table_spares_everything() {
+  setup
+  proc 9000015 1 "$PGID" "node orphan.js"
+  export NK_TABLE_EMPTY=1
+  out="$(run_hook)"
+  unset NK_TABLE_EMPTY
+  was_killed 9000015 && fail "a pid was signalled while the ancestry could not be read: $out"
+  teardown
+}
+
+for c in case_never_kill_pid_and_its_descendants_are_spared \
+         case_never_kill_unreadable_table_spares_everything \
+         case_ancestor_matching_the_fallback_pattern_is_spared \
          case_non_ancestor_matching_the_fallback_pattern_is_killed \
          case_unidentifiable_process_is_spared \
          case_ancestor_in_the_session_group_is_spared \

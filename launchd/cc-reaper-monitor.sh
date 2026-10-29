@@ -63,12 +63,45 @@ is_protected_cmd() {
   echo "$cmd" | grep -qE "$(protected_pattern)" || has_user_rule protect "$cmd"
 }
 
+# BEGIN never-kill (byte-identical in shell/claude-cleanup.sh, launchd/cc-reaper-monitor.sh and
+# hooks/stop-cleanup-orphans.sh; tests/never-kill.sh compares them)
+# CC_NEVER_KILL_PIDS names processes cc-reaper never signals, nor any process descended from
+# one. Unset, the host's default list applies; set it empty to protect no pid. Exit 0 means
+# "never signal this pid". An unreadable process table cannot prove the ancestry, so it
+# protects too: the two mistakes are not symmetric, and a skipped kill is retried next run.
+# CC_NEVER_KILL_PPID_FILE (pid ppid rows) replaces the process table for tests.
+_cc_reaper_never_kill() {
+  local list="${CC_NEVER_KILL_PIDS-70987 4565}" table=""
+  case "$list" in *[0-9]*) ;; *) return 1 ;; esac
+  if [ -n "${CC_NEVER_KILL_PPID_FILE:-}" ]; then
+    table=$(cat "$CC_NEVER_KILL_PPID_FILE" 2>/dev/null)
+  else
+    table=$(command ps -axo pid=,ppid= 2>/dev/null)
+  fi
+  printf '%s\n' "$table" | command awk -v pid="$1" -v list="$list" '
+    BEGIN { n = split(list, l, /[^0-9]+/); for (i = 1; i <= n; i++) if (l[i] != "") keep[l[i] + 0] = 1 }
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { parent[$1 + 0] = $2 + 0; rows++ }
+    END {
+      p = pid + 0
+      if (p in keep || !rows) exit 0
+      for (d = 0; d < 512 && p > 1; d++) { if (p in keep) exit 0; if (!(p in parent)) exit 1; p = parent[p] }
+      exit 1
+    }'
+}
+# END never-kill
+
 # Re-check user policy at the signal boundary so scheduled cleanup cannot race
-# a rule edit or bypass protection through a later fallback/SIGKILL path.
+# a rule edit or bypass protection through a later fallback/SIGKILL path. Every
+# signal this monitor sends, group, pattern and SIGKILL alike, comes through here,
+# so the never-kill list is honoured once, at the boundary.
 terminate_unless_user_protected() {
   local pid=$1
   local signal=${2:-}
   local cmd=""
+  if _cc_reaper_never_kill "$pid"; then
+    log "never-kill $pid"
+    return 1
+  fi
   cmd=$(ps -o command= -p "$pid" 2>/dev/null)
   has_user_rule protect "$cmd" && return 1
   if [ -n "$signal" ]; then
