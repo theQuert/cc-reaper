@@ -62,6 +62,15 @@ Environment:
                        is not installed
   CC_RW_RECLAIM_STAMP  That stamp (default: ~/.claude/logs/reclaim-byproducts.last, BYPRODUCT_STAMP's default)
   CC_RW_RECLAIM_PLIST  The reclaimer's LaunchAgent (default: ~/Library/LaunchAgents/com.cc-reaper.reclaim-byproducts.plist)
+  CC_RW_PAUSE_EVENTS   The pause chain (EL-T24): shadow (default), on or off. On a change of the combined pause state
+                       (any of <state>/disk-emergency, disk-rate-high, swap-high, disk-stop present, against none)
+                       one line, `DISK-PAUSE on: <flag,...> free=<gb>GB swap=<gb>GB rate=<gbh>GB/h` or
+                       `DISK-RESUME: all clear free=... swap=... rate=...`. `on` appends it, stamped like every
+                       events.log line, to CC_RW_EVENTS_LOG; `shadow` only logs `EVENT shadow: would emit ...`.
+                       Each mode keeps its own last state (<state>/disk-pause.state, disk-pause.shadow.state), so
+                       a transition is told once, and a new mode starts by telling the state it finds
+  CC_RW_EVENTS_LOG     The event log the gateway and the event router read (default: ~/handoffs/ops-dispatch/events.log)
+Every snapshot line carries `swap=<gb>GB rate=<gbh>GB/h` after disk_free (`?` when unreadable or unmeasured).
 Reclaim output goes to resource-watch-act.log beside CC_RW_LOG. Each round appends
 `<epoch>\t<free KB>` to <state>/disk-free-samples.tsv (last 48 hours kept), and first of all
 writes its start epoch to <state>/resource-watch.heartbeat. A detached reclaim that is stopped
@@ -671,6 +680,86 @@ _cc_rw_run_bounded() {
 }
 
 # ---------------------------------------------------------------------------
+# The pause chain (EL-T24): one events.log line when heavy work is paused or resumed
+# ---------------------------------------------------------------------------
+#
+# stima-api scripts/ci/with_local_resource.py refuses a heavy lease (exit 76) while any of these
+# flags exists in the state dir: the three this script writes, and disk-stop, which a dispatch
+# writes. Pausing and resuming sessions used to be fanned out by hand. Here the combined state
+# (any flag against none) is compared with the last one told, and only a change is told, as one
+# line in the REPORT-CHAIN shape: on change only, nothing when nothing changed.
+_CC_RW_PAUSE_FLAGS="disk-emergency disk-rate-high swap-high disk-stop"
+
+_cc_rw_pause_mode() {
+  case "${CC_RW_PAUSE_EVENTS:-shadow}" in
+    on|off|shadow) echo "${CC_RW_PAUSE_EVENTS:-shadow}" ;;
+    *) echo shadow ;;   # an unknown value never turns the writes on
+  esac
+}
+
+_cc_rw_events_log() {
+  echo "${CC_RW_EVENTS_LOG:-${HOME}/handoffs/ops-dispatch/events.log}"
+}
+
+# The pause flags present now, comma-separated in a fixed order; empty when none.
+_cc_rw_pause_flags() {
+  local dir f out=""
+  dir=$(_cc_rw_state_dir)
+  for f in $_CC_RW_PAUSE_FLAGS; do [ -e "$dir/$f" ] && out="$out,$f"; done
+  echo "${out#,}"
+}
+
+# A number with its unit, or `?` when there is none. Args: <value> <unit>
+_cc_rw_val() {
+  if [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then echo "$1$2"; else echo "?"; fi
+}
+
+# Tell a change of the pause state once. Runs after this round wrote or removed its flags.
+# Sets _CC_RW_PAUSE_LINE to the line told this round (empty when none). In `on` mode a failed
+# append leaves the state as it was, so the next round tries again. Args: <free GB> <swap GB> <rate GB/h>
+_CC_RW_PAUSE_LINE=""
+_cc_rw_pause_chain() {
+  local free=$1 swap=$2 rate=$3 mode dir state flags prev want line events vals
+  _CC_RW_PAUSE_LINE=""
+  mode=$(_cc_rw_pause_mode)
+  [ "$mode" = off ] && return 0
+  dir=$(_cc_rw_state_dir)
+  state="$dir/disk-pause.state"
+  [ "$mode" = shadow ] && state="$dir/disk-pause.shadow.state"
+  flags=$(_cc_rw_pause_flags)
+  prev=$(head -n 1 "$state" 2>/dev/null)
+  case "$prev" in paused*) prev=paused ;; clear) ;; *) prev="" ;; esac
+  vals="free=$(_cc_rw_val "$free" GB) swap=$(_cc_rw_val "$swap" GB) rate=$(_cc_rw_val "$rate" GB/h)"
+  if [ -n "$flags" ]; then
+    [ "$prev" = paused ] && return 0
+    want="paused $flags"
+    line="DISK-PAUSE on: $flags $vals"
+  else
+    [ "$prev" = clear ] && return 0
+    if [ -z "$prev" ]; then   # first round in this mode, nothing paused: nothing to tell
+      { printf 'clear\n' > "$state.tmp" && mv -f "$state.tmp" "$state"; } 2>/dev/null
+      return 0
+    fi
+    want=clear
+    line="DISK-RESUME: all clear $vals"
+  fi
+  events=$(_cc_rw_events_log)
+  if [ "$mode" = on ]; then
+    if ! printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$line" >> "$events" 2>/dev/null; then
+      _cc_rw_log_line "ERROR pause chain: cannot append to $events; told next round: $line"
+      return 0
+    fi
+    _cc_rw_log_line "EVENT emitted to $events: $line"
+  else
+    _cc_rw_log_line "EVENT shadow (CC_RW_PAUSE_EVENTS=shadow): would emit to $events: $line"
+  fi
+  { printf '%s\n' "$want" > "$state.tmp" && mv -f "$state.tmp" "$state"; } 2>/dev/null ||
+    _cc_rw_log_line "ERROR pause chain: cannot write $state; the next round tells it again: $line"
+  _CC_RW_PAUSE_LINE=$line
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Round watchdog: the heartbeat and the whole-round deadline (stima-api #5886)
 # ---------------------------------------------------------------------------
 #
@@ -879,6 +968,8 @@ _cc_rw_snapshot() {
   elif [[ "$disk_free_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     rm -f "${state_dir}/disk-emergency" 2>/dev/null
   fi
+  # Every flag of this round is written: tell a change of the pause state, once.
+  _cc_rw_pause_chain "$disk_free_gb" "$swap_gb" "$rate_gbh"
   # Started here rather than after the log line, so the line says what this round did.
   local act_started=false
   if [ "$disk_act" = "true" ] && [ "$_CC_RW_ACT_STATE" = "idle" ] \
@@ -900,10 +991,11 @@ _cc_rw_snapshot() {
   # --- write log line ---
   local ts
   ts=$(date '+%Y-%m-%dT%H:%M:%S')
-  printf '%s load=%s/%s/%s cpu_idle=%s%% mem_free=%s%% compressor=%sGB disk_free=%sGB/%s%%%s\n' \
+  printf '%s load=%s/%s/%s cpu_idle=%s%% mem_free=%s%% compressor=%sGB disk_free=%sGB/%s%% swap=%s rate=%s%s\n' \
     "$ts" "$load1" "$load5" "$load15" \
     "$cpu_idle" "$mem_free_pct" "$compressor_gb" \
     "$disk_free_gb" "$disk_free_pct" \
+    "$(_cc_rw_val "$swap_gb" GB)" "$(_cc_rw_val "$rate_gbh" GB/h)" \
     "${markers:+ ${markers}}" \
     >> "$log_file" 2>/dev/null || true
 

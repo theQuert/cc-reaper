@@ -37,7 +37,7 @@ fi
 
 # What step 5 deploys under ~/.cc-reaper, and the LaunchAgents it renders: one list, read by
 # the deploy and by --check, so the check can never compare a different set than was shipped.
-CC_PAYLOAD="shell/resource-watch.sh shell/disk-janitor.sh shell/worktree-janitor.sh
+CC_PAYLOAD="shell/resource-watch.sh shell/resource-watch-judge.py shell/disk-janitor.sh shell/worktree-janitor.sh
 shell/cc-monitor.sh shell/claude-cleanup.sh shell/guard-runner.sh shell/chrome-clone-janitor.py
 shell/growth-watch.py shell/host-temp-reaper.py shell/dev-server-reaper.py shell/reclaim-byproducts.sh
 shell/orbstack-memory-trim.sh hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"

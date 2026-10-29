@@ -3,6 +3,25 @@
 ## [Unreleased]
 
 ### Added
+- **`resource-watch.sh` tells a pause or a resume of heavy work once, as an events.log line (shadow by
+  default), and its snapshot line carries swap and rate (EL-T24).** After a round writes its flags, the
+  combined pause state (any of `disk-emergency`, `disk-rate-high`, `swap-high`, or a dispatch's
+  `disk-stop`, against none; the flags stima-api `with_local_resource.py` refuses a heavy lease on) is
+  compared with the last state told, in `<state>/disk-pause.state` (`disk-pause.shadow.state` in shadow).
+  A change is told once: `DISK-PAUSE on: <flag,...> free=<gb>GB swap=<gb>GB rate=<gbh>GB/h` or
+  `DISK-RESUME: all clear free=... swap=... rate=...`; nothing when nothing changed. `CC_RW_PAUSE_EVENTS`
+  is `shadow` (default: an `EVENT shadow: would emit to <path>: <line>` line in resource-watch.log
+  only), `on` (appended to `CC_RW_EVENTS_LOG`, default `~/handoffs/ops-dispatch/events.log`, stamped
+  `%Y-%m-%dT%H:%M:%S%z` as diskwatch stamps it; a failed append is an ERROR line and is told again next
+  round) or `off`. Every snapshot line now has `swap=<gb>GB rate=<gbh>GB/h` (`?` when unreadable or
+  unmeasured) after `disk_free`. Tests: T20, T21.
+- **`resource-watch-judge.py`: one judge of resource-watch's log, reading the thresholds the script runs
+  with.** The ops-dispatch spot-check carried its own copy (disk-low under 40 GB against the script's 60)
+  and could not check `ALERT:swap`. The judge takes the script's defaults (pinned to the script by
+  `tests/resource-watch-judge.py`) overridden by the installed LaunchAgent's `EnvironmentVariables`,
+  checks each line's load, disk, disk-low, disk-emergency, mem, swap and disk-rate markers against its
+  own numbers, and the pause chain (no two pauses or resumes in a row in one mode, no lease-holding
+  numbers after a DISK-RESUME). Installed beside the script; `--log/--plist/--lines` for a hand check.
 - **`stall-watch.py` flags a permission prompt, plan approval, folder trust or AskUserQuestion menu nobody
   answered (EL-T921, shadow by default).** A `Do you want to proceed?` prompt with its numbered Yes/No
   options, a plan approval, a folder-trust dialog or an AskUserQuestion menu, live at the bottom of a pane
