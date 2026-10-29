@@ -35,9 +35,9 @@ Six kinds, each proved abandoned before it is touched:
   Nothing anywhere under it changed for that name's idle limit, no open file or cwd of
   this user's processes is inside it, and no command line names it. Each tool removes its
   own on a clean exit, so what is left is a killed or failed run: 442,337 entries, 16.4 GB
-  on 2026-10-05, 10.3 GB of it untouched for a day. A day for the build tools; three for
-  the generic `tmp` names, the age macOS itself clears them at boot, because any program
-  may use one.
+  on 2026-10-05, 10.3 GB of it untouched for a day. A day for the build tools and,
+  since 2026-10-29, for the generic `tmp` names too: 115k test sandboxes 1-3 days old held
+  most of $TMPDIR, and the holder check (open files, cwd, command lines) guards a live one.
 
 Every probe that fails or cannot decide keeps the item. Chrome is sent SIGTERM only, so
 it shuts down on its own terms. Tests drive the seams (`processes`, `listening_ports`,
@@ -63,8 +63,9 @@ WRANGLER_LOG = re.compile(r"wrangler-[0-9_-]+\.log$")
 BUILD_COPY = re.compile(r"nimbus-articles-build-[A-Za-z0-9]{6}$")
 BUILD_COPY_IDLE_SECONDS = 24 * 3600
 # (name, idle seconds, directories only): a tool's own temp name, and how long it must be
-# untouched. The generic names are directories only and must hold a digit, so a person's
-# `tmp_scratch` or a file another program was handed by name is not one.
+# untouched. The generic names are directories only and must look random (a digit, an upper-case
+# letter, or for Python exactly 8 of [a-z0-9]), so a person's `tmp_scratch` or a file
+# another program was handed by name is not one.
 LEFTOVERS = (
     # Python mkdtemp (tmp + 8 of [a-z0-9_]) and mktemp(1) (tmp. + 10 mixed case). A digit, or for Python no underscore,
     # or for mktemp an upper-case letter, separates them from a person's `tmp_scratch`. 2026-10-29: ~46k such dirs older
@@ -79,7 +80,7 @@ LEFTOVERS = (
      24 * 3600, False),
     # Node mkdtempSync leftovers of this repo's tests (route-origins in cloudflare/apertis-router, the rest from
     # node suites): 26,629 hold- and 18,417 preview-unpack- dirs in $TMPDIR on 2026-10-29, never removed.
-    (re.compile(r"(hold|preview-unpack|edge-key|neo-rot|route-origins(-[a-z]+)?)-[A-Za-z0-9]{6}"), 24 * 3600, True),
+    (re.compile(r"(hold|preview-unpack|edge-key|neo-rot|route-origins(-[a-z]+)?)-(?=[A-Za-z0-9]*[0-9A-Z])[A-Za-z0-9]{6}"), 24 * 3600, True),
 )
 # Any of those names, wherever it appears in a command line: `$TMPDIR/x` expands to `T//x`,
 # and a relative path names no directory at all.

@@ -216,6 +216,7 @@ class ReaperTest(unittest.TestCase):
         kept = [self.leftover("tmpab_cd125", DAY - HOUR),          # generic name: a day not yet up
                 self.leftover("go-build778", HOUR),                 # go WORK dir younger than two hours
                 self.leftover("hold-Ab12Ce", DAY - HOUR),
+                self.leftover("hold-canary", 4 * DAY),               # an English word, not a random suffix
                 self.leftover("pip-unpack-6pi0dsfx", DAY - HOUR),   # a day not yet up
                 self.leftover("go-build1", DAY + HOUR, inner_age=HOUR),  # changed deep inside
                 self.leftover("tmpheld0001", 4 * DAY),
