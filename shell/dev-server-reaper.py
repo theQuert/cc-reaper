@@ -93,6 +93,36 @@ STATE_DIR = Path.home() / ".cc-reaper" / "state" / "dev-server-idle"
 ESBUILD = re.compile(r"/node_modules/(?:\.bin|(?:.+/)?@esbuild/[^/]+/bin)/esbuild$")
 
 
+# Processes this reaper never signals, nor any process descended from one: CC_NEVER_KILL_PIDS,
+# separated by spaces or commas. Unset, the host's default list applies; empty protects no pid.
+# The same rule, and the same default, as _cc_reaper_never_kill in the shell scripts.
+NEVER_KILL_DEFAULT = "70987 4565"
+
+
+def never_kill_pids():
+    raw = os.environ.get("CC_NEVER_KILL_PIDS")
+    raw = NEVER_KILL_DEFAULT if raw is None else raw
+    return {int(t) for t in re.split(r"[^0-9]+", raw) if t}
+
+
+def never_kill(pid, parents, keep=None):
+    """True when pid, or one of its ancestors in parents ({pid: ppid}), is on the list. An
+    empty table cannot prove the ancestry, so it protects: a skipped signal is retried next run."""
+    keep = never_kill_pids() if keep is None else keep
+    if not keep:
+        return False
+    if pid in keep or not parents:
+        return True
+    p = pid
+    for _ in range(512):
+        if p in keep:
+            return True
+        if p <= 1 or p not in parents:
+            return False
+        p = parents[p]
+    return False
+
+
 def launcher(command):
     """The port a dev-server launcher names (0 for none); None when command is not one.
 
@@ -527,12 +557,26 @@ def stop(members, snapshot, grace, send=os.kill, sleep=time.sleep):
     """TERM then KILL members whose start time still matches.
 
     Returns (signalled, denied): a member this user may not signal is left alone and named.
+    A member on the never-kill list, or descended from one, is never signalled: it is named
+    with a `never-kill <pid>` line, read from the same listing the start times come from.
     """
     denied = set()
+    spared = set()
 
     def alive_same():
         now = processes() or {}
-        return [p for p in members if p in now and now[p][3] == snapshot[p] and p not in denied]
+        parents = {p: row[0] for p, row in now.items()}
+        chosen = []
+        for p in members:
+            if p not in now or now[p][3] != snapshot[p] or p in denied:
+                continue
+            if never_kill(p, parents):
+                if p not in spared:
+                    spared.add(p)
+                    print(f"never-kill {p}")
+                continue
+            chosen.append(p)
+        return chosen
 
     def signal_all(pids, sig):
         done = []

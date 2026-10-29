@@ -11,16 +11,22 @@
         <string>__HOME__/.cc-reaper/resource-watch.sh</string>
     </array>
 
-    <!-- Run every 600 seconds (10 minutes) -->
+    <!-- Run every 180 seconds (3 minutes), the cadence deployed on 2026-10-29 -->
     <key>StartInterval</key>
-    <integer>600</integer>
+    <integer>180</integer>
 
     <key>RunAtLoad</key>
     <true/>
 
-    <!-- The disk guard runs reclaim-byproducts.sh, which calls go and docker -->
+    <!-- The disk guard runs reclaim-byproducts.sh, which calls go and docker. The two
+         thresholds are the values deployed on 2026-10-29, taken into the repository so the
+         installer stops reverting them (script defaults: 20 GB and 20 GB/h) -->
     <key>EnvironmentVariables</key>
     <dict>
+        <key>CC_RW_DISK_EMERGENCY_GB</key>
+        <string>25</string>
+        <key>CC_RW_RATE_FLAG_GBH</key>
+        <string>12</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

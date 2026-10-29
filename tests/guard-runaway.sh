@@ -11,7 +11,12 @@
 # wrong both ways: CPU time sums threads, so a multi-threaded server busy early qualified on
 # a later burst, and a stall late in a long life was never caught.
 #
-# `ps`, `kill`, `sleep`, `date` and `osascript` are functions, and every PID is above PID_MAX.
+# `ps`, `kill`, `sleep`, `date`, `osascript` and `lsof` are functions, and every PID is above PID_MAX.
+#
+# Since 2026-10-30 the guard LaunchAgent spares a runaway server a live session is using
+# (CC_RUNAWAY_SPARE_IN_USE=1, set by guard-runner.sh): 960002, the chroma-mcp child of session
+# 960001, is now named and left running, and only servers no session uses are signalled. The
+# interactive opt-out (CC_RUNAWAY_SPARE_IN_USE=0) keeps the phase's old reach, tested below.
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -43,6 +48,7 @@ cat > "$T" <<'EOF'
 960003 960001 960001 ?? 0.1 S 04:59:00 0:30.00 90000 0.1 node /Users/me/.npm/_npx/abc/node_modules/.bin/mcp-server-github
 960004 960001 960001 ?? 0.0 S 04:58:00 0:10.00 50000 0.0 claude --output-format stream-json --input-format stream-json --verbose
 960005 960001 960001 ?? 0.0 S 04:58:00 0:05.00 40000 0.0 npm exec @upstash/context7-mcp
+960006 960001 960001 ?? 0.1 S 00:00:05 0:00.10 30000 0.1 node /Users/me/.claude/plugins/claude-mem/scripts/save-hook.js
 970001 1 970001 ?? 99.0 S 03:00:00 170:00.00 100000 99.0 node /repo/node_modules/.bin/next dev-server --port 3000
 970002 1 970002 ?? 99.0 S 03:00:00 170:00.00 60000 99.0 pm2 God Daemon
 970003 970010 970010 ?? 111.7 S 23:52:37 1500:00.00 900000 111.0 /Applications/ChatGPT.app/Contents/Resources/codex -c features.x=true
@@ -151,6 +157,7 @@ ps() {
       esac ;;
     "-o %cpu= -p "*) awk -v p="$(last_arg "$@")" '$1 == p { print $10 }' "$T" ;;
     "-o pgid= -p "*) awk -v p="$(last_arg "$@")" '$1 == p { print $3 }' "$T" ;;
+    "-o ppid= -p "*) awk -v p="$(last_arg "$@")" '$1 == p { print $2 }' "$T" ;;
     "-eo pid,pgid") awk 'BEGIN { print "  PID  PGID" } { print $1, $3 }' "$T" ;;
     "-o rss= -p "*) awk -v p="$(last_arg "$@")" '$1 == p { print $9 }' "$T" ;;
     *) printf '%s\n' "$*" >> "$tmp/unstubbed"; return 0 ;;
@@ -190,10 +197,27 @@ mv() {
   command mv "$@"
 }
 osascript() { :; }
+# CC_TEST_LSOF: none (no server listens), fail (lsof cannot answer), client (990007 listens on
+# 54321 and 960006, a hook of session 960001, is connected) or other (only a pm2 is connected).
+lsof() {
+  case "${CC_TEST_LSOF:-none}" in
+    fail) return 2 ;;
+    client|other)
+      case " $* " in
+        *" -p 990007 -iTCP -sTCP:LISTEN "*) printf 'p990007\nf12\nn127.0.0.1:54321\n'; return 0 ;;
+        *" -iTCP:54321 -sTCP:ESTABLISHED "*)
+          if [ "$CC_TEST_LSOF" = client ]; then printf 'p990007\nf13\np960006\nf20\n'
+          else printf 'p990007\nf13\np970002\nf20\n'; fi
+          return 0 ;;
+      esac ;;
+  esac
+  return 1
+}
 # shellcheck disable=SC1090
 . "$CLEANUP"
 # guard-runner.sh's environment
 export CC_MAX_SESSIONS=99999 CC_MAX_RSS_MB=99999999 CC_MAX_FD=99999999 CC_RUNAWAY_GRACE_SEC=0
+export CC_RUNAWAY_SPARE_IN_USE="${CC_RUNAWAY_SPARE_IN_USE:-1}"
 claude-guard "$@"
 HARNESS
 
@@ -206,11 +230,12 @@ guard() {
   # shell does. `/etc/zshenv` is the one no flag turns off.
   [ "${sh##*/}" = zsh ] && opt=-f
   CC_TEST_AWK_FAIL="${CC_TEST_AWK_FAIL:-0}" CC_TEST_MV_FAIL="${CC_TEST_MV_FAIL:-0}" \
+    CC_TEST_LSOF="${CC_TEST_LSOF:-none}" CC_RUNAWAY_SPARE_IN_USE="${CC_RUNAWAY_SPARE_IN_USE:-}" \
     CC_RUNAWAY_CPU="${CC_RUNAWAY_CPU:-}" \
     CC_RUNAWAY_MIN="${CC_RUNAWAY_MIN:-}" CC_RUNAWAY_SAMPLES_FILE="${CC_RUNAWAY_SAMPLES_FILE:-}" \
     env -u BASH_ENV -u ENV "$sh" ${opt:+"$opt"} "$tmp/harness.sh" "$@"
   rc=$?
-  unset CC_TEST_AWK_FAIL CC_TEST_MV_FAIL CC_RUNAWAY_CPU CC_RUNAWAY_MIN CC_RUNAWAY_SAMPLES_FILE GUARD_SHELL
+  unset CC_TEST_AWK_FAIL CC_TEST_MV_FAIL CC_TEST_LSOF CC_RUNAWAY_SPARE_IN_USE CC_RUNAWAY_CPU CC_RUNAWAY_MIN CC_RUNAWAY_SAMPLES_FILE GUARD_SHELL
   return $rc
 }
 
@@ -221,11 +246,11 @@ guard > "$tmp/guard.out" 2>&1
 signalled() { grep -qx "$1" "$tmp/signalled" 2>/dev/null; }
 expect_signalled()     { if signalled "$1"; then ok "$2"; else bad "$2"; fi; }
 expect_not_signalled() { if signalled "$1"; then bad "$2"; else ok "$2"; fi; }
-# Every PID this scenario signals, for the runs that repeat it elsewhere. Two of the three are
-# delivered - 980004's signal fails - so the summary below counts two.
-SIGNALLED="960002 980004 990007 "
+# Every PID this scenario signals, for the runs that repeat it elsewhere. One of the two is
+# delivered - 980004's signal fails - so the summary below counts one.
+SIGNALLED="980004 990007 "
 signalled_set() { sort -un "$tmp/signalled" 2>/dev/null | tr '\n' ' '; }
-SUMMARY='Reaped 2 runaway protected process(es), freed ~341 MB'
+SUMMARY='Reaped 1 runaway protected process(es), freed ~146 MB'
 # Both streams carry a run that could not record: the warning names the path on stderr, for
 # somebody reading the agent's error log, and the report a person reads says the phase selected
 # nothing because of it - under the LaunchAgent the two streams go to different files.
@@ -238,7 +263,12 @@ expect_warned() {
   fi
 }
 
-expect_signalled     960002 "the runaway MCP server itself is signalled"
+expect_not_signalled 960002 "a runaway MCP server its live session is using is not signalled"
+if grep -qF 'PID 960002 is in use by a live session (session 960001); not signalled.' "$tmp/guard.out"; then
+  ok "and the guard names it and the session using it"
+else
+  bad "and the guard names it and the session using it: $(grep 960002 "$tmp/guard.out" | tr '\n' ';')"
+fi
 expect_not_signalled 960001 "the Claude CLI that launched it is not signalled"
 expect_not_signalled 960004 "its stream-json subagent is not signalled"
 expect_not_signalled 960003 "its sibling MCP server is not signalled"
@@ -354,6 +384,47 @@ if ! grep -q '^  PID ' "$tmp/dryfail.out" && [ ! -s "$tmp/signalled" ] &&
   ok "a dry run whose sampling fails lists nothing"
 else
   bad "a dry run whose sampling fails lists nothing: $(grep -c '^  PID ' "$tmp/dryfail.out") listed"
+fi
+
+# The interactive opt-out keeps the phase's old reach: the session's runaway child is signalled.
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+cp "$tmp/samples.before" "$tmp/samples.tsv"
+CC_RUNAWAY_SPARE_IN_USE=0 guard > "$tmp/optout.out" 2>&1
+if [ "$(signalled_set)" = "960002 980004 990007 " ] &&
+   grep -qF 'Reaped 2 runaway protected process(es), freed ~341 MB' "$tmp/optout.out"; then
+  ok "CC_RUNAWAY_SPARE_IN_USE=0 signals the session's runaway server as before"
+else
+  bad "CC_RUNAWAY_SPARE_IN_USE=0 signals the session's runaway server as before: [$(signalled_set)]"
+fi
+
+# A TCP server: 990007 is reparented to launchd, but a hook of live session 960001 is connected
+# to the port it listens on, so a session is using it.
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+cp "$tmp/samples.before" "$tmp/samples.tsv"
+CC_TEST_LSOF=client guard > "$tmp/tcp.out" 2>&1
+if [ "$(signalled_set)" = "980004 " ] &&
+   grep -qF 'PID 990007 is in use by a live session (client 960006 of session 960001 on port 54321); not signalled.' "$tmp/tcp.out"; then
+  ok "a server a session's hook is connected to is not signalled, and the client is named"
+else
+  bad "a server a session's hook is connected to is not signalled: [$(signalled_set)] $(grep 990007 "$tmp/tcp.out" | tr '\n' ';')"
+fi
+# Connected only by a process no session started: nobody's tools depend on it.
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+cp "$tmp/samples.before" "$tmp/samples.tsv"
+CC_TEST_LSOF=other guard > "$tmp/tcp-other.out" 2>&1
+if [ "$(signalled_set)" = "$SIGNALLED" ]; then
+  ok "a server whose only client is not a session's is still signalled"
+else
+  bad "a server whose only client is not a session's is still signalled: [$(signalled_set)]"
+fi
+# An lsof that cannot answer cannot prove nobody uses the server.
+: > "$tmp/rules.tsv"; : > "$tmp/now-cmd"; rm -f "$tmp/signalled"
+cp "$tmp/samples.before" "$tmp/samples.tsv"
+CC_TEST_LSOF=fail guard > "$tmp/lsof-fail.out" 2>&1
+if [ ! -s "$tmp/signalled" ] && grep -qF 'in use by a live session (unknown (lsof exited 2))' "$tmp/lsof-fail.out"; then
+  ok "a failing lsof spares every server and says why"
+else
+  bad "a failing lsof spares every server and says why: [$(signalled_set)]"
 fi
 
 # The same scenario under zsh, the shell the installer sources these functions into. `status` is

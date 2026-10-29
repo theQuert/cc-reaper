@@ -40,8 +40,54 @@ fi
 CC_PAYLOAD="shell/resource-watch.sh shell/resource-watch-judge.py shell/disk-janitor.sh shell/worktree-janitor.sh
 shell/cc-monitor.sh shell/claude-cleanup.sh shell/guard-runner.sh shell/chrome-clone-janitor.py
 shell/growth-watch.py shell/host-temp-reaper.py shell/dev-server-reaper.py shell/reclaim-byproducts.sh
-shell/orbstack-memory-trim.sh hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
-CC_AGENTS="resource-watch disk-check weekly-clean guard worktree-janitor orbstack-memory-trim"
+shell/orbstack-memory-trim.sh shell/session-reaper.py shell/stall-watch.py shell/wip-backup.sh
+hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
+# session-reaper and stall-watch ship report-only (APPLY=0, STALL_APPLY=0 in their policy), so
+# scheduling them changes nothing until the operator's policy says so. reclaim-byproducts' agent
+# is the one its own --install-launchd 2h writes, byte for byte.
+CC_AGENTS="resource-watch disk-check weekly-clean guard worktree-janitor orbstack-memory-trim
+session-reaper stall-watch reclaim-byproducts"
+# Opt-in agents: deployed and compared only on a host that opted in, by an installed agent or its
+# policy file. wip-backup pushes snapshots that include untracked files to each repository's
+# remote under a host-specific label, so a fresh install must never start it.
+CC_OPTIN_AGENTS="wip-backup"
+# Agents this installer updates only where they are already loaded. Each acts once loaded
+# (session-reaper closes sessions under an APPLY=1 policy, reclaim-byproducts deletes, wip-backup
+# pushes untracked files, stall-watch alerts), and RunAtLoad runs them at once; an operator who
+# booted one out or disabled it, or a host that never ran it, gets the command, never a start.
+CC_NOSTART_AGENTS="session-reaper stall-watch reclaim-byproducts wip-backup"
+# Policies the operator owns: installed when absent, never overwritten, a difference reported.
+CC_POLICIES="worktree-janitor.conf disk-janitor.conf growth-targets.tsv session-reaper.conf"
+
+# Whether an opt-in agent is on this host: its LaunchAgent, or its policy, is there.
+_cc_opted_in() { # agent, reaper dir, plist dir
+  [ -e "$3/com.cc-reaper.$1.plist" ] || [ -e "$2/$1.conf" ]
+}
+
+# Render one LaunchAgent from this checkout to stdout. The worktree interval is chosen at
+# install time (CC_REAPER_WORKTREE_INTERVAL_SECONDS), so it is rendered with the one given.
+_cc_render_agent() { # agent, worktree interval
+  if [ "$1" = worktree-janitor ]; then
+    sed -e "s|__HOME__|$HOME_DIR|g" -e "s|<integer>3600</integer>|<integer>$2</integer>|" \
+      "$SCRIPT_DIR/launchd/com.cc-reaper.$1.plist"
+  else
+    sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/com.cc-reaper.$1.plist"
+  fi
+}
+
+# Whether two LaunchAgent files say the same thing. launchd reads the property list, not the
+# bytes: a plist rewritten by plutil or PlistBuddy sorts its keys and drops the comments, and
+# is still the same agent. Without plutil, only identical bytes count.
+_cc_same_plist() {
+  local a b
+  if command -v plutil >/dev/null 2>&1; then
+    a="$(plutil -convert xml1 -o - "$1" 2>/dev/null)" || return 1
+    b="$(plutil -convert xml1 -o - "$2" 2>/dev/null)" || return 1
+    [ "$a" = "$b" ]
+  else
+    cmp -s "$1" "$2"
+  fi
+}
 
 # --check: compare the deployed copies with this checkout and change nothing. A deployed
 # script or LaunchAgent that differs, or is missing, is drift (exit 1). The policies and the
@@ -58,20 +104,46 @@ if [ "${1:-}" = "--check" ]; then
     else echo "DRIFT    $2 (differs from ${1#"$SCRIPT_DIR"/})"; drift=1
     fi
   }
-  for f in $CC_PAYLOAD; do _cc_cmp "$SCRIPT_DIR/$f" "$REAPER_DIR/$(basename "$f")"; done
-  _cc_cmp "$SCRIPT_DIR/launchd/cc-reaper-monitor.sh" "$REAPER_DIR/cc-reaper-monitor.sh" optional
-  rendered="$(mktemp)"
-  for AGENT in $CC_AGENTS orphan-monitor; do
-    plist="$PLIST_DIR/com.cc-reaper.$AGENT.plist"
-    # The worktree interval is chosen at install time; render with the installed one.
-    if [ "$AGENT" = worktree-janitor ]; then
-      interval="$(plutil -extract StartInterval raw "$plist" 2>/dev/null || echo 3600)"
-      sed -e "s|__HOME__|$HOME_DIR|g" -e "s|<integer>3600</integer>|<integer>$interval</integer>|" \
-        "$SCRIPT_DIR/launchd/com.cc-reaper.$AGENT.plist" > "$rendered"
-    else
-      sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/com.cc-reaper.$AGENT.plist" > "$rendered"
+  # The installer deploys every script 755; a copy put in place by hand can lose the bit, and
+  # an agent that execs it then fails with "permission denied".
+  _cc_mode() { # deployed
+    local mode
+    [ -e "$1" ] || return 0
+    mode="$(stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null)"
+    [ "$mode" = 755 ] || { echo "MODE     $1 is ${mode:-unreadable}, the installer deploys 755"; drift=1; }
+  }
+  _cc_cmp_plist() { # rendered, deployed, optional
+    if [ ! -e "$2" ]; then
+      [ "${3:-}" = optional ] && return 0
+      echo "MISSING  $2"; drift=1
+    elif _cc_same_plist "$1" "$2"; then echo "current  $2"
+    else echo "DRIFT    $2 (differs from launchd/${2##*/})"; drift=1
     fi
-    _cc_cmp "$rendered" "$plist" "$( [ "$AGENT" = orphan-monitor ] && echo optional)"
+  }
+  for f in $CC_PAYLOAD; do
+    _cc_cmp "$SCRIPT_DIR/$f" "$REAPER_DIR/$(basename "$f")"
+    _cc_mode "$REAPER_DIR/$(basename "$f")"
+  done
+  _cc_cmp "$SCRIPT_DIR/launchd/cc-reaper-monitor.sh" "$REAPER_DIR/cc-reaper-monitor.sh" optional
+  _cc_mode "$REAPER_DIR/cc-reaper-monitor.sh"
+  rendered="$(mktemp)"
+  for AGENT in $CC_AGENTS orphan-monitor $CC_OPTIN_AGENTS; do
+    plist="$PLIST_DIR/com.cc-reaper.$AGENT.plist"
+    optional=""
+    [ "$AGENT" = orphan-monitor ] && optional=optional
+    case " $CC_OPTIN_AGENTS " in
+      *" $AGENT "*)
+        if ! _cc_opted_in "$AGENT" "$REAPER_DIR" "$PLIST_DIR"; then
+          echo "opt-in   $AGENT is not enabled on this host"; continue
+        fi ;;
+    esac
+    case " $CC_NOSTART_AGENTS " in
+      *" $AGENT "*)
+        if [ ! -e "$plist" ]; then echo "stopped  $AGENT has no LaunchAgent here; an install never starts it"; continue; fi ;;
+    esac
+    interval="$(plutil -extract StartInterval raw "$plist" 2>/dev/null || echo 3600)"
+    _cc_render_agent "$AGENT" "$interval" > "$rendered"
+    _cc_cmp_plist "$rendered" "$plist" "$optional"
   done
   rm -f "$rendered"
   # What an install retires: still present means it was never re-run, and the retired
@@ -79,12 +151,16 @@ if [ "${1:-}" = "--check" ]; then
   for f in "$REAPER_DIR/lifecycle-reclaim.sh" "$PLIST_DIR/com.claude.worktree-inventory.plist"; do
     [ ! -e "$f" ] || { echo "RETIRED  $f is still installed"; drift=1; }
   done
-  for f in worktree-janitor.conf disk-janitor.conf growth-targets.tsv; do
+  for f in $CC_POLICIES; do
     if [ ! -e "$REAPER_DIR/$f" ]; then echo "MISSING  $REAPER_DIR/$f"; drift=1
     elif cmp -s "$SCRIPT_DIR/config/$f" "$REAPER_DIR/$f"; then echo "current  $REAPER_DIR/$f"
     else echo "policy   $REAPER_DIR/$f differs from config/$f (operator-owned; review with diff)"
     fi
   done
+  # Copies left by deploying by hand. Reported, never drift and never removed here: whether one
+  # is still needed as a way back is the operator's call.
+  baks="$(find "$REAPER_DIR" "$PLIST_DIR" -maxdepth 1 -name '*.bak-*' 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${baks:-0}" -eq 0 ] || echo "note     $baks hand-deploy backups (*.bak-*) under $REAPER_DIR or $PLIST_DIR"
   [ "$drift" -eq 0 ] && echo "cc-reaper: deployed copies match this checkout" \
     || echo "cc-reaper: DRIFT - re-run ./install.sh to deploy this checkout"
   exit "$drift"
@@ -509,13 +585,15 @@ mkdir -p "$PLIST_DIR"
 for f in $CC_PAYLOAD; do
   _cc_deploy "$SCRIPT_DIR/$f" "$REAPER_DIR/$(basename "$f")"
 done
-# The byproducts reaper schedules itself: its installer fires the real agent once as a dry
-# run and refuses an agent that cannot start (launchd's /bin/bash needs Full Disk Access),
-# which takes minutes, so it is a step of its own rather than part of every update.
+# The byproducts reaper is scheduled below like every other agent, from launchd/ (the plist its
+# own `--install-launchd 2h` writes). That installer also proves the agent can run - launchd's
+# /bin/bash needs Full Disk Access - which takes minutes, so on a host where the agent was never
+# loaded the proof is named here rather than run on every update.
 if ! launchctl print "$AGENT_UI/com.cc-reaper.reclaim-byproducts" >/dev/null 2>&1; then
-  echo "  byproducts reaper not scheduled; install it with:"
-  echo "    $REAPER_DIR/reclaim-byproducts.sh --install-launchd 3h"
+  echo "  byproducts reaper is not scheduled here; its own installer schedules it and proves launchd can run it:"
+  echo "    $REAPER_DIR/reclaim-byproducts.sh --install-launchd 2h"
 fi
+mkdir -p "$HOME_DIR/.claude/logs"
 # Retired 2026-09-23: nothing ever called it, and the builder prune it gated now runs in
 # `disk-janitor --clean`. A stale copy would still name the removed --orbstack-clean mode.
 rm -f "$REAPER_DIR/lifecycle-reclaim.sh"
@@ -544,6 +622,19 @@ else
   echo "  disk policy preserved at $DJ_CONFIG (repository default differs; review with diff)"
 fi
 
+# The session reaper's and stall watch's policy: both ship report-only, and a host that turned
+# either on keeps its own copy.
+SR_CONFIG="$REAPER_DIR/session-reaper.conf"
+if [ ! -e "$SR_CONFIG" ]; then
+  cp "$SCRIPT_DIR/config/session-reaper.conf" "$SR_CONFIG"
+  chmod 600 "$SR_CONFIG"
+  echo "  session policy installed at $SR_CONFIG (report-only)"
+elif cmp -s "$SCRIPT_DIR/config/session-reaper.conf" "$SR_CONFIG"; then
+  echo "  session policy already current at $SR_CONFIG"
+else
+  echo "  session policy preserved at $SR_CONFIG (repository default differs; review with diff)"
+fi
+
 # Growth targets are host-specific (which worktree roots, which Docker volumes), so an
 # operator-edited list survives updates exactly as the policies above do.
 GW_TARGETS="$REAPER_DIR/growth-targets.tsv"
@@ -556,18 +647,37 @@ else
   echo "  growth targets preserved at $GW_TARGETS (repository default differs; review with diff)"
 fi
 
-for AGENT in $CC_AGENTS; do
+# An agent whose installed plist already says what this checkout says, and is loaded, is left
+# alone: booting it out and back in resets launchd's run counter and last exit status, the only
+# record that its schedule fires (reclaim-byproducts' installer learned this on 2026-09-13).
+AGENT_RENDERED="$(mktemp)"
+for AGENT in $CC_AGENTS $CC_OPTIN_AGENTS; do
+  case " $CC_OPTIN_AGENTS " in
+    *" $AGENT "*)
+      if ! _cc_opted_in "$AGENT" "$REAPER_DIR" "$PLIST_DIR"; then
+        echo "  $AGENT: opt-in, not enabled on this host (README)"; continue
+      fi ;;
+  esac
   AGENT_LABEL="com.cc-reaper.$AGENT"
   AGENT_PLIST="$PLIST_DIR/$AGENT_LABEL.plist"
-  if [ "$AGENT" = "worktree-janitor" ]; then
-    sed -e "s|__HOME__|$HOME_DIR|g" \
-      -e "s|<integer>3600</integer>|<integer>$WORKTREE_INTERVAL_SECONDS</integer>|" \
-      "$SCRIPT_DIR/launchd/$AGENT_LABEL.plist" > "$AGENT_PLIST"
-  else
-    sed "s|__HOME__|$HOME_DIR|g" "$SCRIPT_DIR/launchd/$AGENT_LABEL.plist" > "$AGENT_PLIST"
+  case " $CC_NOSTART_AGENTS " in
+    *" $AGENT "*)
+      # Not loaded: no plist is written either, since launchd loads one at the next login.
+      if ! launchctl print "$AGENT_UI/$AGENT_LABEL" >/dev/null 2>&1; then
+        echo "  $AGENT: not loaded on this host, left stopped; to start it after reading its README section:"
+        echo "    sed 's|__HOME__|$HOME_DIR|g' $SCRIPT_DIR/launchd/$AGENT_LABEL.plist > $AGENT_PLIST && launchctl bootstrap $AGENT_UI $AGENT_PLIST"
+        continue
+      fi ;;
+  esac
+  _cc_render_agent "$AGENT" "$WORKTREE_INTERVAL_SECONDS" > "$AGENT_RENDERED"
+  if [ -e "$AGENT_PLIST" ] && _cc_same_plist "$AGENT_RENDERED" "$AGENT_PLIST" &&
+     launchctl print "$AGENT_UI/$AGENT_LABEL" >/dev/null 2>&1; then
+    continue
   fi
+  cat "$AGENT_RENDERED" > "$AGENT_PLIST"
   _cc_install_agent "$AGENT_LABEL" "$AGENT_PLIST" || true
 done
+rm -f "$AGENT_RENDERED"
 _cc_report_failed_agents
 
 # One destructive policy owner. Leaving the old Claude inventory agent loaded would run
@@ -585,13 +695,16 @@ if [ -e "$LEGACY_WORKTREE_AGENT" ]; then
   echo "  retired legacy Claude worktree agent; backup: $MIGRATION_COPY"
 fi
 
-echo "  resource-watch: snapshot every 10 min (alerts on load/disk/memory thresholds)"
+echo "  resource-watch: snapshot every 3 min (alerts on load/disk/memory thresholds)"
 echo "  disk-check:     read-only disk + TM-snapshot check every hour"
 echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
 echo "  worktree-janitor: every $WORKTREE_INTERVAL_SECONDS seconds + at load; 48h idle policy from ~/.cc-reaper/worktree-janitor.conf"
 echo "                    SessionEnd trigger: ~/.cc-reaper/worktree-session-end.sh <claude|codex>"
 echo "  guard:          runaway-MCP reaper every 10 min (60+ minutes of sustained CPU samples; re-checks and signals each known MCP PID alone)"
 echo "  orbstack-memory-trim: drops the OrbStack guest's caches every 15 min when its VM holds over a quarter of RAM (no-op without OrbStack)"
+echo "  session-reaper: every 30 min, report-only until APPLY=1 in ~/.cc-reaper/session-reaper.conf"
+echo "  stall-watch:    every 2 min, shadow until STALL_APPLY=1 in the same policy"
+echo "  reclaim-byproducts: every 2h and at load, if the last reap is over an hour old"
 
 # Claude has one global hook file, so the installer can migrate it safely.  Codex hooks
 # are repository-owned; checked-in .codex/hooks.json files should invoke the same deployed

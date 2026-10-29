@@ -121,6 +121,45 @@ MCP_WHITELIST="supabase|npm exec @stripe|@stripe/mcp|mcp-server-stripe|stripe.*m
 # cannot tell one session's server from another live session's, and would kill
 # the one still in use.
 
+# BEGIN never-kill (byte-identical in shell/claude-cleanup.sh, launchd/cc-reaper-monitor.sh and
+# hooks/stop-cleanup-orphans.sh; tests/never-kill.sh compares them)
+# CC_NEVER_KILL_PIDS names processes cc-reaper never signals, nor any process descended from
+# one. Unset, the host's default list applies; set it empty to protect no pid. Exit 0 means
+# "never signal this pid". An unreadable process table cannot prove the ancestry, so it
+# protects too: the two mistakes are not symmetric, and a skipped kill is retried next run.
+# CC_NEVER_KILL_PPID_FILE (pid ppid rows) replaces the process table for tests.
+_cc_reaper_never_kill() {
+  local list="${CC_NEVER_KILL_PIDS-70987 4565}" table=""
+  case "$list" in *[0-9]*) ;; *) return 1 ;; esac
+  if [ -n "${CC_NEVER_KILL_PPID_FILE:-}" ]; then
+    table=$(cat "$CC_NEVER_KILL_PPID_FILE" 2>/dev/null)
+  else
+    table=$(command ps -axo pid=,ppid= 2>/dev/null)
+  fi
+  printf '%s\n' "$table" | command awk -v pid="$1" -v list="$list" '
+    BEGIN { n = split(list, l, /[^0-9]+/); for (i = 1; i <= n; i++) if (l[i] != "") keep[l[i] + 0] = 1 }
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { parent[$1 + 0] = $2 + 0; rows++ }
+    END {
+      p = pid + 0
+      if (p in keep || !rows) exit 0
+      for (d = 0; d < 512 && p > 1; d++) { if (p in keep) exit 0; if (!(p in parent)) exit 1; p = parent[p] }
+      exit 1
+    }'
+  # Only awk's own "not protected" (1) lets a signal through; awk failing to run protects.
+  [ "$?" -ne 1 ]
+}
+# END never-kill
+
+# The one signal path of this hook: a pid on the never-kill list, or descended from one,
+# is named on stderr and left alone.
+_cc_stop_kill() {
+  if _cc_reaper_never_kill "$1"; then
+    echo "never-kill $1" >&2
+    return 1
+  fi
+  kill "$1" 2>/dev/null
+}
+
 SESSION_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
 if [ -n "$SESSION_PGID" ] && [ "$SESSION_PGID" != "0" ] && [ "$SESSION_PGID" != "1" ]; then
   while IFS= read -r pid; do
@@ -151,7 +190,7 @@ if [ -n "$SESSION_PGID" ] && [ "$SESSION_PGID" != "0" ] && [ "$SESSION_PGID" != 
       continue
     fi
 
-    kill "$pid" 2>/dev/null
+    _cc_stop_kill "$pid"
   done < <(ps -eo pid,pgid 2>/dev/null | awk -v pgid="$SESSION_PGID" '$2 == pgid {print $1}')
 fi
 
@@ -180,7 +219,7 @@ ps -eo pid=,ppid=,command= 2>/dev/null | awk -v set="$ORPHAN_PPIDS" 'index(set, 
   is_ancestor "$_pid" && continue
   if echo "$_cmd" | grep -qE "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"; then
     echo "$_cmd" | grep -qE "$MCP_WHITELIST" && continue
-    kill "$_pid" 2>/dev/null
+    _cc_stop_kill "$_pid"
   fi
 done
 

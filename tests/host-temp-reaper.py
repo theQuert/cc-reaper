@@ -3,6 +3,7 @@
 
 from datetime import datetime, timezone
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -90,6 +91,16 @@ class ReaperTest(unittest.TestCase):
         counts = self.run_clean()
         self.assertEqual(self.sent, [(10, signal.SIGTERM)])
         self.assertEqual(counts["chrome"], [1, 1])
+
+    def test_a_never_kill_chrome_is_not_signalled(self):
+        self.chrome(30, self.root / "cdp-Listed")
+        self.chrome(31, self.root / "cdp-Other")
+        with mock.patch.dict(os.environ, {"CC_NEVER_KILL_PIDS": "30"}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            counts = self.run_clean()
+        self.assertEqual(self.sent, [(31, signal.SIGTERM)])
+        self.assertEqual(counts["chrome"], [2, 1])
+        self.assertIn("never-kill 30\n", out.getvalue())
 
     def test_a_reused_pid_is_not_signalled(self):
         self.chrome(20, self.root / "cdp-Orphan")

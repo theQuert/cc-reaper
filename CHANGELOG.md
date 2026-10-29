@@ -3,6 +3,29 @@
 ## [Unreleased]
 
 ### Added
+- **`CC_NEVER_KILL_PIDS` (default `70987 4565`): pids no cc-reaper path signals, nor any process
+  descended from one** (EL-T24-STORAGE-LOAD-REAPER). Honoured at the one signal boundary of each
+  path that ends other processes: `_cc_reaper_kill_pid` (`claude-cleanup`, `claude-guard`,
+  guard-runner), the orphan monitor's `terminate_unless_user_protected`, the Stop hook, and
+  `dev-server-reaper.py` and `host-temp-reaper.py`. Each refusal logs `never-kill <pid>`; an
+  unreadable process table protects every pid. Not covered here: `resource-watch.sh` (ends its own
+  overrun reclaim's tree) and the timeouts that end a script's own child. Tests: `tests/never-kill.sh`,
+  `tests/stop-cleanup-orphans.sh`, the two Python suites.
+- **The guard LaunchAgent no longer signals a runaway MCP server a live session is using**
+  (`CC_RUNAWAY_SPARE_IN_USE`, default 1, forced to 1 by `guard-runner.sh`). In use means a Claude or
+  Codex CLI among its ancestors (a stdio server is its session's child) or connected, itself or
+  through a process it started, to a TCP port the server listens on (claude-mem's worker, chroma in
+  http mode). It is named in the guard's log instead; an lsof that cannot answer spares it. Only a
+  hot server no session uses is still reaped. Test: `tests/guard-runaway.sh`.
+- **The repository is the source of truth for every deployed agent, and `install.sh --check` sees
+  them all.** The installer now deploys `session-reaper.py`, `stall-watch.py` and `wip-backup.sh`
+  and schedules session-reaper, stall-watch and reclaim-byproducts (its plist, the one
+  `--install-launchd 2h` writes, is now in `launchd/`); wip-backup stays opt-in, installed and
+  compared only where its plist or `wip-backup.conf` exists. The resource-watch plist takes the
+  deployed 180 s cadence and its two thresholds. `session-reaper.conf` is installed when absent and
+  reported like the other policies. `--check` adds a `MODE` line for a deployed script that is not
+  755, compares LaunchAgents as property lists, and counts `*.bak-*` hand-deploy backups. An update
+  leaves an agent that is current and loaded alone. Test: `tests/install-check.sh`.
 - **`session-reaper.py` judges the claim-less sessions it kept for good (EL-T24, shadow by default).** Sessions in
   the primary checkout with no worktree (dispatch, sec-p1, apertis-ops idle 283-419 min) had no claim, so only
   a `SESSION-DONE:` line could close them. Under `NOCLAIM_DONE=shadow` one whose newest neo-inbox header is DONE
