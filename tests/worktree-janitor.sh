@@ -3160,7 +3160,9 @@ $LD_ROOT/wt-plain/x"
 
   # The scan is taken again right before the removal: a job installed meanwhile still keeps it.
   # The holder scans are the run's (1), the removal of wt-1 (2) and the removal of wt-late (3),
-  # in path order; the plist appears with the third, after wt-late was judged removable.
+  # in path order; the plist appears with the third, after wt-late was judged removable. A scan
+  # younger than CC_WJ_RECHECK_FRESH_SECONDS is reused for the next candidate, so this run asks for
+  # a rescan before every removal with a window of 0 (the default window: worktree-janitor-throughput.sh).
   LD_STUBS="$TMPDIR_ROOT/stubs-launchd"; mkdir -p "$LD_STUBS"; LD_CALLS="$TMPDIR_ROOT/ld-lsof-calls"; : > "$LD_CALLS"
   cat > "$LD_STUBS/lsof" <<STUB
 #!/usr/bin/env bash
@@ -3176,7 +3178,7 @@ exec "$STUBS_IDLE/lsof" "\$@"
 STUB
   chmod +x "$LD_STUBS/lsof"
   OUT_LD_APPLY="$TMPDIR_ROOT/out-ld-apply.txt"
-  PATH="$LD_STUBS:$STUBS_IDLE:$PATH" CC_WJ_LAUNCHAGENTS_DIRS="$LD_AGENTS" \
+  PATH="$LD_STUBS:$STUBS_IDLE:$PATH" CC_WJ_LAUNCHAGENTS_DIRS="$LD_AGENTS" CC_WJ_RECHECK_FRESH_SECONDS=0 \
     bash "$WJ" --repo "$LD_ROOT/primary" --apply > "$OUT_LD_APPLY" 2>&1
   expect_no "launchd: --apply removes an unreferenced worktree" test -d "$LD_ROOT/wt-plain"
   expect_no "launchd: --apply removes wt-1, which only a wt-10 reference could have kept" test -d "$LD_ROOT/wt-1"

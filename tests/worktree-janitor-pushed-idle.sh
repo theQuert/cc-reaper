@@ -130,8 +130,8 @@ check "  with a byte count, a holder note and a run id" \
 check "  and is still kept for removal as before" judged "$T/report-spot.txt" pi-clean "KEEP(unlanded)"
 check "  and the report says the rule would make it removable" \
   bash -c 'grep -qF "spotcheck: pushed-idle would make it" <(awk -v tail="/wt-pi-clean" "/^  WORKTREE  / { on = (substr(\$0, length(\$0) - length(tail) + 1) == tail) } on" "$1")' _ "$T/report-spot.txt"
-check "pushed-idle: a tree whose only extra pin is a top-level log is logged under both rules" \
-  spot_has "path=$T/wt-pi-log " "rule=pushed-idle,top-level-log"
+check "pushed-idle: a tree whose only extra leftover is an ignored log is logged under pushed-idle alone" \
+  spot_has "path=$T/wt-pi-log " "rule=pushed-idle path="
 refute "pushed-idle: an unpushed commit is not logged" logged pi-unpushed
 refute "pushed-idle: a tree a process stands in is not logged" logged pi-held
 refute "pushed-idle: a tree a live session stands in is not logged" logged pi-session
