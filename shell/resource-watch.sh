@@ -45,8 +45,9 @@ Environment:
                        removed once a measured rate is at or below it (default: 20); 0 disables
   CC_RW_SWAP_FLAG_GB   Swap used above this many GB (vm.swapusage) also writes <state>/disk-rate-high
                        (with swap=<gb>, so heavy leases hold) and <state>/swap-high (`<epoch> swap=<gb>
-                       limit=<gb>`), and raises ALERT:swap; both removed once swap is read at or below it,
-                       left alone when swap cannot be read (default: 18)
+                       limit=<gb>`), and raises ALERT:swap. swap-high is removed once swap is read at or below
+                       it and left alone when swap cannot be read; disk-rate-high then follows the rate
+                       alone (default: 18; 0 disables)
   CC_RW_SWAP_USED_GB   Test seam: used swap in GB, replacing the sysctl read; set but empty = unreadable
   CC_RW_GO_CAP_MAX_SECONDS The go cache cap is ended, by pid, past this many seconds (default: 120); 0 = no bound
   CC_RW_ROUND_MAX_SECONDS  A whole round past this many seconds ends its own process tree (never a detached
@@ -842,7 +843,7 @@ _cc_rw_snapshot() {
   if [ "${CC_RW_SWAP_USED_GB+x}" = "x" ]; then
     swap_gb=$CC_RW_SWAP_USED_GB
   else
-    swap_gb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="used") {v=$(i+2); sub(/M$/,"",v); printf "%.1f", v/1024}}')
+    swap_gb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="used") {v=$(i+2); if (sub(/M$/,"",v)) printf "%.1f", v/1024}}')  # no M suffix: unreadable, not 0
   fi
   swap_limit=$(_cc_rw_num CC_RW_SWAP_FLAG_GB 18)
   _cc_rw_above "$swap_gb" "$swap_limit" && swap_flag=true
