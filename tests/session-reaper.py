@@ -452,6 +452,7 @@ class CheckByState(unittest.TestCase):
 class ClaimTime(unittest.TestCase):
     def test_newest_claim_comment_for_the_session(self):
         reaper._claim_cache.clear()
+        reaper._comments_cache.clear()
         out = json.dumps([
             {"body": "Claimed by x session abc", "createdAt": "2026-10-25T10:00:00Z"},
             {"body": "Claimed by x session abc", "createdAt": "2026-10-25T11:00:00Z"},
@@ -460,8 +461,164 @@ class ClaimTime(unittest.TestCase):
             self.assertEqual(reaper.claim_time("o/r", "9", "abc"),
                              reaper.calendar.timegm((2026, 10, 25, 11, 0, 0, 0, 0, 0)))
         reaper._claim_cache.clear()
+        reaper._comments_cache.clear()
         with mock.patch.object(reaper, "run", return_value=(1, "")):
             self.assertIsNone(reaper.claim_time("o/r", "9", "abc"))
+
+
+class BatchIssueState(unittest.TestCase):
+    """One GraphQL call per repo answers every claimed issue (stima-api #6477); a failure falls back, bounded."""
+
+    def setUp(self):
+        for c in (reaper._issue_cache, reaper._issue_tried, reaper._comments_cache, reaper._claim_cache):
+            c.clear()
+        reaper._issue_fallbacks[0] = 0
+
+    @staticmethod
+    def answer(states):
+        return json.dumps({"data": {"repository": {f"i{n}": (None if st is None else {"state": st})
+                                                    for n, st in states.items()}}})
+
+    def test_one_call_answers_open_closed_and_unknown_without_a_call_per_issue(self):
+        calls = []
+
+        def fake(cmd, timeout=30, cwd=None):
+            calls.append(cmd)
+            return 0, self.answer({"1": "CLOSED", "2": "OPEN", "3": None, "4": "MERGED"})
+        with mock.patch.object(reaper, "run", side_effect=fake):
+            reaper.batch_issue_states([("o/r", "1"), ("o/r", "2"), ("o/r", "3"), ("o/r", "4"), ("o/r", "2")])
+            got = [reaper.issue_state("o/r", n) for n in "1234"]
+        self.assertEqual(got, ["CLOSED", "OPEN", "UNKNOWN", "MERGED"])  # not CLOSED keeps the session
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:3], ["gh", "api", "graphql"])
+        self.assertNotIn("issue", calls[0][1:2])
+
+    def test_one_call_per_repo(self):
+        calls = []
+
+        def fake(cmd, timeout=30, cwd=None):
+            calls.append(cmd)
+            return 0, self.answer({"1": "OPEN"})
+        with mock.patch.object(reaper, "run", side_effect=fake):
+            reaper.batch_issue_states([("o/a", "1"), ("o/b", "1")])
+        self.assertEqual(len(calls), 2)
+
+    def test_numbers_beyond_the_chunk_size_take_another_call(self):
+        calls = []
+
+        def fake(cmd, timeout=30, cwd=None):
+            calls.append(cmd)
+            return 0, self.answer({str(n): "OPEN" for n in range(100, 100 + reaper.ISSUE_BATCH)})
+        with mock.patch.object(reaper, "run", side_effect=fake):
+            reaper.batch_issue_states([("o/r", str(n)) for n in range(100, 100 + reaper.ISSUE_BATCH + 1)])
+        self.assertEqual(len(calls), 2)
+
+    def test_a_failed_batch_falls_back_to_the_single_call_and_keeps_when_that_fails(self):
+        calls = []
+
+        def fake(cmd, timeout=30, cwd=None):
+            calls.append(cmd[:3])
+            return (0, "CLOSED\n") if cmd[1] == "issue" and cmd[3] == "1" else (1, "")
+        with mock.patch.object(reaper, "run", side_effect=fake):
+            reaper.batch_issue_states([("o/r", "1"), ("o/r", "2")])
+            self.assertEqual(reaper.issue_state("o/r", "1"), "CLOSED")
+            self.assertEqual(reaper.issue_state("o/r", "2"), "UNKNOWN")
+        self.assertEqual(calls, [["gh", "api", "graphql"], ["gh", "issue", "view"], ["gh", "issue", "view"]])
+
+    def test_an_answer_in_the_wrong_shape_is_a_failure_not_closed(self):
+        for out in ("", "not json", json.dumps({"data": {"repository": None}}), json.dumps({"data": None}),
+                    json.dumps({"errors": [{"type": "RATE_LIMITED"}]}), json.dumps({"data": {"repository": {"i1": {}}}})):
+            reaper._issue_cache.clear()
+            reaper._issue_tried.clear()
+            reaper._issue_fallbacks[0] = 0
+            with self.subTest(out=out), mock.patch.object(reaper, "run", return_value=(1, out)):
+                reaper.batch_issue_states([("o/r", "1")])
+                self.assertEqual(reaper.issue_state("o/r", "1"), "UNKNOWN")
+
+    def test_the_fallback_is_bounded(self):
+        calls = []
+
+        def fake(cmd, timeout=30, cwd=None):
+            calls.append(cmd[:3])
+            return 1, ""
+        with mock.patch.object(reaper, "run", side_effect=fake):
+            for n in range(1, 21):
+                self.assertEqual(reaper.issue_state("o/r", str(n)), "UNKNOWN")
+        self.assertEqual(sum(c == ["gh", "issue", "view"] for c in calls), reaper.ISSUE_FALLBACKS)
+
+    def test_an_unbatched_ask_makes_one_batch_call_not_a_view(self):
+        with mock.patch.object(reaper, "run", return_value=(0, self.answer({"7": "CLOSED"}))) as r:
+            self.assertEqual(reaper.issue_state("o/r", "7"), "CLOSED")
+            self.assertEqual(reaper.issue_state("o/r", "7"), "CLOSED")
+        self.assertEqual(r.call_count, 1)
+
+    def test_a_repo_name_that_is_not_one_is_never_put_in_a_query(self):
+        with mock.patch.object(reaper, "run", return_value=(1, "")) as r:
+            reaper.batch_issue_states([('o/r") { x', "1"), ("o/r", "1; drop")])
+        r.assert_not_called()
+
+    def test_comments_are_read_once_per_issue_however_many_sessions_ask(self):
+        out = json.dumps([{"body": "Claimed by x session aaa", "createdAt": "2026-10-25T10:00:00Z"},
+                          {"body": "Claimed by x session bbb", "createdAt": "2026-10-25T11:00:00Z"}])
+        with mock.patch.object(reaper, "run", return_value=(0, out)) as r:
+            a, b = reaper.claim_time("o/r", "9", "aaa"), reaper.claim_time("o/r", "9", "bbb")
+        self.assertEqual(r.call_count, 1)
+        self.assertLess(a, b)
+
+    def test_prefetch_asks_once_for_all_issues_and_decide_adds_no_issue_view(self):
+        calls = []
+
+        def fake(cmd, timeout=30, cwd=None):
+            calls.append(cmd[:3])
+            return 0, self.answer({"1": "CLOSED", "2": "OPEN"})
+        busy = [session(sid=f"s{i}", status="busy", last_text="", claims=[("o/r", "1"), ("o/r", "2")])
+                for i in range(5)]
+        with mock.patch.object(reaper, "run", side_effect=fake), \
+             mock.patch.object(reaper, "oracle_brief", return_value=None), \
+             mock.patch.object(reaper, "claim_time", return_value=None), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]):
+            reaper.prefetch(busy, CFG, time.time())
+            keeps = [reaper.decide(s, CFG) for s in busy]
+        self.assertEqual(calls, [["gh", "api", "graphql"]])
+        self.assertTrue(all("issue-open:#2" in k for k in keeps))
+
+
+class JudgeOrder(unittest.TestCase):
+    def test_longest_idle_without_issues_first_busy_and_protected_last(self):
+        sessions = [session(tmux="busy", name="busy", status="busy", idle_min=1, claims=[("o/r", "1")]),
+                    session(tmux="keep-me", name="keep-me", idle_min=500),
+                    session(tmux="issues", name="issues", idle_min=300, claims=[("o/r", "1"), ("o/r", "2")]),
+                    session(tmux="young", name="young", idle_min=10),
+                    session(tmux="old", name="old", idle_min=200),
+                    session(tmux="oldest", name="oldest", idle_min=400),
+                    session(tmux="one", name="one", idle_min=100, claims=[("o/r", "3")])]
+        got = [s["tmux"] for s in sorted(sessions, key=lambda x: reaper.judge_order(x, CFG))]
+        self.assertEqual(got, ["oldest", "old", "one", "issues", "young", "busy", "keep-me"])
+
+    def test_a_budget_cut_leaves_the_busy_sessions_unjudged(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        cfgfile = tmp / "conf"
+        cfgfile.write_text(f"APPLY=0\nDONE_INBOX=\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+        extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
+                     fg=True, sub_active=0, relay_pending=[], screen_tail="")
+        sessions = [session(tmux="busy", name="busy", status="busy", idle_min=1, sid="b" * 10, **extra),
+                    session(tmux="done", name="done", idle_min=300, sid="d" * 10, **extra)]
+        judged = []
+
+        def decide(s, cfg, now=None):
+            judged.append(s["tmux"])
+            reaper.RUN_BUDGET = -1  # the budget is spent after the first session
+            return []
+        with mock.patch.object(reaper, "HOME", tmp), mock.patch.object(reaper, "gather", return_value=sessions), \
+             mock.patch.object(reaper, "prefetch"), mock.patch.object(reaper, "decide", side_effect=decide), \
+             mock.patch.object(reaper, "recover_exiting", return_value=[]), mock.patch.object(reaper, "alert"), \
+             mock.patch.object(reaper, "RUN_BUDGET", 1200.0):
+            reaper.main(["--config", str(cfgfile)])
+            reaper.RUN_BUDGET = 1200.0
+        self.assertEqual(judged, ["done"])
+        report = (tmp / "report.md").read_text()
+        self.assertIn("unjudged:run-budget", [l for l in report.splitlines() if l.startswith("| busy")][0])
 
 
 class Transcript(unittest.TestCase):
