@@ -15,7 +15,7 @@ to local files (and a local notification).
           is `disk-high`; a read that fails, times out or prints no `/` line is `unreadable` (its own kind, with
           a fixed reason word, never the command's output), told only after GDW_UNREADABLE_ROUNDS (2) such reads in a
           row (until then the host keeps its previous kind); a host in GDW_KNOWN_UNREADABLE is never told `unreadable`
-          (logged `known-unreadable`), but a disk-high read on it still is. Without GDW_SSH_KEY and its .pub every host is
+          (logged `known-unreadable`); a disk-high read on it still is, and stays until a read shows it clear. Without GDW_SSH_KEY and its .pub every host is
           `unreadable reason=no-ssh-key` and gcloud is never called. One bad host, or one damaged state entry (read
           back as `ok`, so the host is told again), never stops the others.
   tell    once per host per state change; while it stays, again at most every GDW_REALERT_MINUTES (120); one
