@@ -79,6 +79,7 @@ CLOSE_LINE_RE = re.compile(r"(?i:no open scope|reaper can close|safe to close)|(
 BLOCKED_RE = re.compile(r"BLOCKED:#(\d{3,6})")
 NAMED_RE = re.compile(r"(?<![\w/])#(\d{3,6})\b")
 SOFT_KEEP = ("claim-unknown", "waiting")  # `waiting-keyword` also starts with `waiting`
+ISSUE_FALLBACKS = 6  # single `gh issue view` calls a run may make after a batch failed
 ISSUE_RE = re.compile(r"(?:^|/)(\d{3,6})(?:-|$)")
 PATH_RE = re.compile(r"(?:~|/)[\w./@+-]+")
 # Keep reasons added after the first 48 h of live reaping: a row kept only by these is one the
@@ -269,12 +270,59 @@ def gh_repo(repo):
 
 
 _issue_cache = {}
+_issue_tried = set()
+_issue_fallbacks = [0]
+ISSUE_BATCH = 50  # aliases per GraphQL request
+REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")
+
+
+def batch_issue_states(refs):
+    """Fill `_issue_cache` with one `gh api graphql` call per repo (and 50 numbers) instead of one `gh issue view`
+    per issue. At host load 100 each `gh issue view` took 30 s and more, serially, enough to spend RUN_BUDGET
+    before the first session was judged (stima-api #6477). The value per number is what `gh issue view` printed:
+    the state of the issue or pull request, and UNKNOWN for a number GitHub does not know (the old call failed
+    there too). A call that fails or answers in a shape not understood caches nothing, so issue_state falls back
+    to the single call and fails closed (UNKNOWN keeps the session)."""
+    by_repo = {}
+    for repo, num in refs:
+        _issue_tried.add((repo, str(num)))
+        if REPO_RE.fullmatch(repo or "") and str(num).isdigit() and (repo, str(num)) not in _issue_cache:
+            by_repo.setdefault(repo, [])
+            if str(num) not in by_repo[repo]:
+                by_repo[repo].append(str(num))
+    for repo, nums in by_repo.items():
+        owner, name = repo.split("/")
+        for i in range(0, len(nums), ISSUE_BATCH):
+            chunk = nums[i:i + ISSUE_BATCH]
+            fields = " ".join(f"i{n}: issueOrPullRequest(number: {n}) {{ ... on Issue {{ state }} "
+                              f"... on PullRequest {{ state }} }}" for n in chunk)
+            query = f"query($o: String!, $n: String!) {{ repository(owner: $o, name: $n) {{ {fields} }} }}"
+            rc, out = run(["gh", "api", "graphql", "-f", "o=" + owner, "-f", "n=" + name, "-f", "query=" + query], 90)
+            try:
+                got = json.loads(out)["data"]["repository"]
+                if not isinstance(got, dict):
+                    raise ValueError("shape")  # a null repository: no access, or the call failed
+            except (ValueError, TypeError, KeyError):
+                continue
+            for n in chunk:
+                if f"i{n}" not in got:
+                    continue
+                v = got[f"i{n}"]
+                if isinstance(v, dict) and isinstance(v.get("state"), str):
+                    _issue_cache[(repo, n)] = v["state"]
+                elif v is None:
+                    _issue_cache[(repo, n)] = "UNKNOWN"  # GitHub has no such issue or pull request
 
 
 def issue_state(repo, num):
-    key = (repo, num)
-    if key not in _issue_cache:
-        rc, out = run(["gh", "issue", "view", num, "-R", repo, "--json", "state", "-q", ".state"])
+    key = (repo, str(num))
+    if key not in _issue_cache and key not in _issue_tried:
+        batch_issue_states([key])
+    if key not in _issue_cache:  # the batch failed or was not understood: the old call, a few times a run
+        if _issue_fallbacks[0] >= ISSUE_FALLBACKS:
+            return "UNKNOWN"  # not cached: it keeps the session now, and a later call may still succeed
+        _issue_fallbacks[0] += 1
+        rc, out = run(["gh", "issue", "view", str(num), "-R", repo, "--json", "state", "-q", ".state"])
         _issue_cache[key] = out.strip() if rc == 0 else "UNKNOWN"
     return _issue_cache[key]
 
@@ -388,19 +436,38 @@ def classify_claim(brief, sid, now, others=(), mine=()):
 
 
 _claim_cache = {}
+_comments_cache = {}
+
+
+def issue_comments(repo, num):
+    """The issue's comments from one `gh issue view` per issue and run, however many sessions ask; None when gh
+    could not say."""
+    key = (repo, num)
+    if key not in _comments_cache:
+        rc, out = run(["gh", "issue", "view", str(num), "-R", repo, "--json", "comments",
+                       "-q", ".comments"], 60)
+        try:
+            if rc != 0:
+                raise ValueError(rc)
+            comments = json.loads(out)
+            if not isinstance(comments, list):
+                raise ValueError("shape")
+        except (ValueError, TypeError):
+            return None  # not cached: a later ask retries
+        _comments_cache[key] = comments
+    return _comments_cache[key]
 
 
 def claim_time(repo, num, sid):
     """Epoch of the newest `Claimed by ... session <sid>` comment on the issue; None when unknown."""
     key = (repo, num, sid)
     if key not in _claim_cache:
-        rc, out = run(["gh", "issue", "view", str(num), "-R", repo, "--json", "comments",
-                       "-q", ".comments"], 60)
         at = None
         try:
-            if rc != 0:
-                raise ValueError(rc)
-            for c in json.loads(out):
+            comments = issue_comments(repo, num)
+            if comments is None:
+                raise ValueError("no comments")
+            for c in comments:
                 if re.search(r"Claimed by[^\n]*session\s+" + re.escape(sid), c.get("body") or ""):
                     t = calendar.timegm(time.strptime(c["createdAt"], "%Y-%m-%dT%H:%M:%SZ"))
                     at = t if at is None or t > at else at
@@ -805,21 +872,46 @@ def _brief_kind(brief):
     return k.group(1) if k else ""
 
 
+def judge_order(s, cfg):
+    """Sort key: the sessions most likely to close come first, so a budget cut leaves only the busy ones unjudged
+    (#6477: 13 of 18 ended `unjudged:run-budget`, so nothing was ever reaped). Idle past the threshold before the
+    rest, protected last (they never close), fewer claims first (an issue each costs a lookup), longest idle first."""
+    idle = s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"])
+    names = [n for n in (s["tmux"], s.get("name")) if n]
+    return (2 if protected(cfg, *names) else 0 if idle else 1, len(s["claims"]), -s["idle_min"])
+
+
 def prefetch(sessions, cfg, now):
-    """Fill the oracle and claim caches for every claim at once. Serially, at load 100, decide() spent 160 s in
-    oracle_brief and the claim-time `gh issue view` calls alone outlasted RUN_BUDGET (#6477, EL-SESSION-CLOSE);
-    each call is still bounded by its own subprocess timeout. Failures leave the cache empty: decide() retries."""
+    """Fill the caches for every session at once, in judging order: all claimed issue states in one GraphQL call per
+    repo, then the oracle briefs, comments and check-by reads, then the worktree checks, 8 at a time. Serially, at
+    load 100, decide() spent 160 s in oracle_brief and the claim-time `gh issue view` calls alone outlasted
+    RUN_BUDGET (#6477, EL-SESSION-CLOSE); each call is still bounded by its own subprocess timeout. A job not
+    started by PREFETCH_BUDGET is dropped. Failures leave the cache empty: decide() retries."""
+    batch_issue_states([ref for s in sessions for ref in s.get("claims") or ()])
     jobs = []
     for s in sessions:
+        done = DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])
+        idle = s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"])
         for r, n in s.get("claims") or ():
             jobs.append(lambda r=r, n=n: oracle_brief(r, n, cfg, now))
             jobs.append(lambda r=r, n=n, sid=s["sid"]: claim_time(r, n, sid))
-    with ThreadPoolExecutor(max_workers=int(cfg.get("PREFETCH_WORKERS", "8"))) as pool:
-        for f in [pool.submit(j) for j in jobs]:
+            if done and idle:
+                jobs.append(lambda r=r, n=n: checkby_state(r, n, cfg))
+        jobs.extend(lambda w=w: worktree_state(w, cfg) for w in s.get("owned") or ())
+    budget = float(cfg.get("PREFETCH_BUDGET", "600"))
+
+    def job(j):
+        if time.monotonic() - RUN_START <= budget:
             try:
-                f.result()
+                j()
             except Exception:
-                pass
+                pass  # the cache stays empty and decide() asks again
+    pool = ThreadPoolExecutor(max_workers=int(cfg.get("PREFETCH_WORKERS", "8")))
+    try:
+        for f in [pool.submit(job, j) for j in jobs]:
+            f.result()  # a job never raises; the run deadline (SIGALRM) does, and it ends the sweep
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def claim_briefs(refs, cfg, now):
@@ -1208,7 +1300,7 @@ def main(argv=None):
     except Exception as e:
         failures.append(f"recover exiting: {type(e).__name__}: {e}")
     try:
-        sessions = list(gather(cfg, now))
+        sessions = sorted(gather(cfg, now), key=lambda x: judge_order(x, cfg))
         if not args.only:
             prefetch(sessions, cfg, now)
         for s in sessions:
