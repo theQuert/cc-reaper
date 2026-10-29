@@ -26,6 +26,14 @@
   reported like the other policies. `--check` adds a `MODE` line for a deployed script that is not
   755, compares LaunchAgents as property lists, and counts `*.bak-*` hand-deploy backups. An update
   leaves an agent that is current and loaded alone. Test: `tests/install-check.sh`.
+- **`session-reaper.py` judges the claim-less sessions it kept for good (EL-T24, shadow by default).** Sessions in
+  the primary checkout with no worktree (dispatch, sec-p1, apertis-ops idle 283-419 min) had no claim, so only
+  a `SESSION-DONE:` line could close them. Under `NOCLAIM_DONE=shadow` one whose newest neo-inbox header is DONE
+  (older than `IDLE_MINUTES` and its newest prompt), with no child process, background shell, loop, schedule,
+  dirty or unpushed worktree or cwd, and no oracle claim, is reported `would-close`; `apply` closes it through
+  every existing gate. `claim-unknown` names its cause (`no-worktree`, `no-issue-branch`, `no-github-remote`);
+  background and pane-missing sessions are `unjudged` rows with idle minutes; `CC_NEVER_KILL_PIDS` (default
+  `70987 4565`) keeps a session whose pane tree holds one, re-checked before `/exit` and before a kill.
 - **`resource-watch.sh` tells a pause or a resume of heavy work once, as an events.log line (shadow by
   default), and its snapshot line carries swap and rate (EL-T24).** After a round writes its flags, the
   combined pause state (any of `disk-emergency`, `disk-rate-high`, `swap-high`, or a dispatch's

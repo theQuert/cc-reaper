@@ -25,6 +25,8 @@ jobs:
           zsh -n shell/claude-cleanup.sh
       - name: stall-watch
         run: python3 tests/stall-watch.py
+      - name: session-reaper
+        run: python3 tests/session-reaper.py
       - name: disk-janitor
         run: bash tests/disk-janitor.sh
       - name: worktree-janitor

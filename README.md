@@ -801,10 +801,25 @@ every 30 minutes from `com.cc-reaper.session-reaper` and calls no model. **It on
 the deployed config sets `APPLY=1`.**
 
 - **Considered:** sessions in `~/.claude/sessions/*.json` with `kind: interactive` and a `tmux`
-  pane that still holds the same pid and start time. Background sessions are never touched.
+  pane that still holds the same pid and start time. Background sessions are never touched: every
+  live session it does not judge (`kind:bg`, `pane-missing`, ...) is an `unjudged` row with its idle
+  minutes and the reason.
 - **Kept** when any gate holds; the report names it: `protected`, `status:<busy|shell>`,
   `idle:<n><threshold`, `shell-child`, `loop-pending`, `scheduled-task`, `waiting`,
-  `claim-unknown`, `issue-open:#n`, `uncommitted:<worktree>`, `unpushed:<worktree>`.
+  `claim-unknown`, `issue-open:#n`, `uncommitted:<worktree>`, `unpushed:<worktree>`,
+  `never-kill:<pid>`. The report names why no claim was found: `claim-unknown(no-worktree)` (no
+  worktree carries the session's marker and its cwd is in none), `no-issue-branch:<worktrees>` or
+  `no-github-remote`. A claim is read only from an owned worktree's branch.
+- **Never kill:** `CC_NEVER_KILL_PIDS` (environment, else the config; default `70987 4565`). A session
+  whose pane tree (the pane's process, everything below it, and claude's own descendants) holds one is
+  kept, and reap and the recovery of an `exiting` record re-check it before typing or killing.
+- **Claim-less inbox DONE (`NOCLAIM_DONE`, default `shadow`):** a session with no claim whose newest
+  header in `DONE_INBOX` (else `DONE_INBOX_SHADOW`) is `DONE`, at least `IDLE_MINUTES` old and not older
+  than its newest prompt, with no child process, background shell, loop, schedule, uncommitted or
+  unpushed work in an owned worktree or its cwd, no issue its text names that the oracle says it claims,
+  and not `NEVER_CLOSE`, is reported `would-close: no claim, inbox <KEY> DONE (shadow)`. `apply` counts
+  it as done (every other gate still applies); `off` drops it. A `SESSION-DONE:` line already closes a
+  claim-less session.
 - **Done** means the latest assistant text has a `SESSION-DONE: <summary>` line or says the topic
   is finished, or every issue the session claimed is closed. Claims come from worktrees whose
   `claude-task-worktree` marker names the session; the issue number is read from the branch.
