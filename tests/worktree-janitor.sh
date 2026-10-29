@@ -2766,7 +2766,9 @@ git clone -q "$SW_ROOT/origin.git" "$SW_ROOT/primary" 2>/dev/null
 swgit() { git -C "$SW_ROOT/primary" -c user.email=t@t -c user.name=t "$@"; }
 echo x > "$SW_ROOT/primary/README"; swgit add README; swgit commit -qm base; swgit push -q origin main
 swgit worktree add -q "$SW_ROOT/wt-landed" -b landed origin/main 2>/dev/null
-SW_LOCK="$SW_STATE/worktree-janitor-sweep.lock"
+# A run given --repo takes the lock for exactly those repositories.
+SW_LOCK="$SW_STATE/worktree-janitor-sweep-$(printf ' %s' "$SW_ROOT/primary" | cksum | cut -d' ' -f1).lock"
+SW_ALL_LOCK="$SW_STATE/worktree-janitor-sweep.lock"
 SW_LSOF_LOG="$TMPDIR_ROOT/sweep-lock-lsof.log"; : > "$SW_LSOF_LOG"
 SW_STUBS="$TMPDIR_ROOT/stubs-sweep-lock"; mkdir -p "$SW_STUBS"
 cat > "$SW_STUBS/lsof" <<STUB
@@ -2785,7 +2787,7 @@ CC_WJ_STATE_DIR="$SW_STATE" PATH="$SW_STUBS:$STUBS_IDLE:$PATH" \
   bash "$WJ" --repo "$SW_ROOT/primary" --apply > "$OUT_SW" 2>&1 || SW_RC=$?
 expect_yes "sweep lock: a run that deferred to a live applying sweep exits 0" test "$SW_RC" -eq 0
 expect_yes "sweep lock: says so, and removes nothing" \
-  bash -c 'grep -q "holds .*worktree-janitor-sweep.lock; deferred to it and removed nothing on this host" "$1" && [ -d "$2" ]' \
+  bash -c 'grep -q "holds .*worktree-janitor-sweep-[0-9]*.lock; deferred to it and removed nothing on this host" "$1" && [ -d "$2" ]' \
     _ "$OUT_SW" "$SW_ROOT/wt-landed"
 expect_yes "sweep lock: and deferred before the machine-wide process scan" test ! -s "$SW_LSOF_LOG"
 OUT_SW_SCHED="$TMPDIR_ROOT/out-sweep-lock-scheduled.txt"
@@ -2800,11 +2802,20 @@ expect_yes "sweep lock: a report run is not held by it" \
   bash -c 'CC_WJ_STATE_DIR="$1" PATH="$2" bash "$3" --repo "$4" | grep -q "classification: REMOVABLE"' \
     _ "$SW_STATE" "$SW_STUBS:$STUBS_IDLE:$PATH" "$WJ" "$SW_ROOT/primary"
 kill "$SW_HOLDER" 2>/dev/null; wait "$SW_HOLDER" 2>/dev/null
+# A live sweep over every repository holds its own lock; a run over one repository does not
+# yield to it (the repository lock orders the two), so the hourly sweep and a SessionEnd
+# sweep never starve each other.
+bash -c 'exec -a worktree-janitor-sweep-holder sleep 30' &
+SW_ALL_HOLDER=$!
+sleep 0.3
+mkdir -p "$SW_ALL_LOCK"; echo "$SW_ALL_HOLDER" > "$SW_ALL_LOCK/pid"; ps -o command= -p "$SW_ALL_HOLDER" > "$SW_ALL_LOCK/cmd"
 OUT_SW2="$TMPDIR_ROOT/out-sweep-lock2.txt"
 CC_WJ_STATE_DIR="$SW_STATE" PATH="$SW_STUBS:$STUBS_IDLE:$PATH" \
   bash "$WJ" --repo "$SW_ROOT/primary" --apply > "$OUT_SW2" 2>&1
-expect_no "sweep lock: a dead holder's lock is taken over and the sweep removes" test -d "$SW_ROOT/wt-landed"
+expect_no "sweep lock: a dead holder's lock is taken over and the sweep removes, beside a live all-repository sweep" test -d "$SW_ROOT/wt-landed"
 expect_no "sweep lock: and released afterwards" test -e "$SW_LOCK"
+expect_yes "sweep lock: the all-repository holder's lock is left alone" test -e "$SW_ALL_LOCK/pid"
+kill "$SW_ALL_HOLDER" 2>/dev/null; wait "$SW_ALL_HOLDER" 2>/dev/null
 
 # Removal is not starved by a slow scan. Four landed worktrees and a 1 s budget that the
 # 1.2 s lsof stub always outruns, so the run examines exactly one: the progress floor. Each

@@ -5635,9 +5635,19 @@ _cc_wj_run() {
   # this run would only repeat its work, so it ends here with status 0, as the repository
   # lock's deferral does. The repository lock still stands behind this one; a lock that cannot
   # be taken (an unwritable state directory) only loses the de-duplication, so the run goes on.
+  # The lock is per scope: a run given --repo yields only to another run over the same
+  # repositories, and a run over every repository only to another such run. One machine-wide
+  # lock let the per-repository SessionEnd sweeps hold it about 79% of the day, so the hourly
+  # sweep, its pressure trim and disk-janitor's trim all ended without running.
   _CC_WJ_SWEEP_LOCK=""
   if [ "$applying" -eq 1 ]; then
+    local scope="" prev=""
+    for arg in "$@"; do
+      [ "$prev" = --repo ] && scope="$scope $arg"
+      prev="$arg"
+    done
     sweep_lock="$(_cc_wj_state_dir)/worktree-janitor-sweep.lock"
+    [ -z "$scope" ] || sweep_lock="$(_cc_wj_state_dir)/worktree-janitor-sweep-$(printf '%s' "$scope" | cksum | cut -d' ' -f1).lock"
     mkdir -p "$(_cc_wj_state_dir)" 2>/dev/null
     _cc_wj_capture_run_pid || _CC_WJ_RUN_PID=""
     lock_rc=0
