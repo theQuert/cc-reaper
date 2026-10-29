@@ -22,6 +22,16 @@
   checks each line's load, disk, disk-low, disk-emergency, mem, swap and disk-rate markers against its
   own numbers, and the pause chain (no two pauses or resumes in a row in one mode, no lease-holding
   numbers after a DISK-RESUME). Installed beside the script; `--log/--plist/--lines` for a hand check.
+- **`stall-watch.py` flags a permission prompt, plan approval, folder trust or AskUserQuestion menu nobody
+  answered (EL-T921, shadow by default).** A `Do you want to proceed?` prompt with its numbered Yes/No
+  options, a plan approval, a folder-trust dialog or an AskUserQuestion menu, live at the bottom of a pane
+  with no input box below it, is aged per (session id, prompt fingerprint) from its first sighting; past
+  `STALL_PROMPT_MINUTES` (10) it is flagged with its age, once per prompt instance: a
+  `## EL-T921-PROMPT-STALL <session>` block in `STALL_INBOX` with `STALL_APPLY=1`, a `would alert prompt`
+  line in shadow. While it stays, a `still on screen` log line at most every `STALL_PROMPT_REALERT_MINUTES`
+  (120), never a second inbox entry. Malformed stored prompt entries are dropped, never raised on. No founder-device push channel exists, so
+  that is logged only. A state written before this change is re-read once, so a prompt whose screen never
+  changes is still seen. It never answers or types.
 - **`stall-watch.py` detects sessions stalled by an account switch or rate limit (shadow by default).**
   Every 2 minutes (`com.cc-reaper.stall-watch`) it hashes each live session's pane and re-scans only a
   changed one for `hit your weekly limit`, `Remote Control disconnected`, `429`/`rate_limit` on an agent
