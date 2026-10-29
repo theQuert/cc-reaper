@@ -156,9 +156,13 @@ def is_ancestor(table, anc, pid):
 
 def never_kill_pids(cfg):
     """The never-kill pids: CC_NEVER_KILL_PIDS from the environment when it is set, else from the config (default
-    "70987 4565"). Tokens that are not pids are ignored: they cannot name a process."""
+    "70987 4565"). A token that is not an ASCII pid is reported on stderr, never silently dropped."""
     raw = os.environ.get("CC_NEVER_KILL_PIDS", cfg.get("CC_NEVER_KILL_PIDS", ""))
-    return {int(x) for x in re.split(r"[\s,]+", raw or "") if x.isdigit()}
+    toks = [x for x in re.split(r"[\s,]+", raw or "") if x]
+    bad = [x for x in toks if not re.fullmatch(r"[0-9]+", x)]
+    if bad:
+        print(f"session-reaper: CC_NEVER_KILL_PIDS: not a pid, ignored: {' '.join(bad)}", file=sys.stderr)
+    return {int(x) for x in toks if x not in bad}
 
 
 def session_tree(table, pane_pid, pid):
@@ -841,8 +845,11 @@ def decide(s, cfg, now=None):
     # only where `claim-unknown` kept the session, so only those pay for it.
     if keep and cfg.get("NOCLAIM_DONE") == "shadow" and not s["claims"] and "claim-unknown" in keep:
         trial = dict(s)
-        if not _decide(trial, dict(cfg, NOCLAIM_DONE="apply"), now) and trial.get("noclaim_done"):
-            s["noclaim_done_shadow"] = trial["noclaim_done"]
+        try:
+            if not _decide(trial, dict(cfg, NOCLAIM_DONE="apply"), now) and trial.get("noclaim_done"):
+                s["noclaim_done_shadow"] = trial["noclaim_done"]
+        except Exception as e:  # a report-only trial must not turn a kept session into an error
+            s["noclaim_shadow_error"] = f"{type(e).__name__}: {e}"
     return keep
 
 
@@ -865,8 +872,8 @@ def noclaim_done(s, cfg, now):
         return ""
     at, key = hit
     prompt_at = s.get("prompt_at") or 0
-    # The header has minute precision: one written in the minute of the prompt still follows it.
-    if now - at < float(cfg["IDLE_MINUTES"]) * 60 or not prompt_at or at + 60 < prompt_at:
+    # The header has minute precision: a prompt in the header's own minute may have come after it, so it keeps.
+    if now - at < float(cfg["IDLE_MINUTES"]) * 60 or not prompt_at or prompt_at >= at:
         return ""
     cwd = s.get("cwd")
     extra = [{"path": Path(cwd)}] if cwd and not any(str(w["path"]) == cwd for w in s["owned"]) else []
@@ -1443,6 +1450,8 @@ def main(argv=None):
             keep, outcome = [], "error"
             try:
                 keep = decide(s, cfg)
+                if s.get("noclaim_shadow_error"):
+                    notes.append(f"{s['tmux']} ({s['sid']}): NOCLAIM_DONE shadow: {s['noclaim_shadow_error']}")
                 outcome = "keep" if keep else ("reap" if apply else "would-reap")
                 if keep:  # shadow only: the outcome label changes, nothing below acts on it
                     try:

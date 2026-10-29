@@ -2,7 +2,9 @@
 """Isolated tests for the session reaper: every keep gate, transcript reading, the prompt
 check, and a verifier calibrated against a real surviving process, tmux session and lock."""
 
+from contextlib import redirect_stderr
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -1361,9 +1363,9 @@ class NoClaimDone(unittest.TestCase):
         self.inbox.unlink()
         self.assertEqual(self.run_decide(mode="apply")[0], ["claim-unknown"])
 
-    def test_a_header_in_the_minute_of_the_prompt_still_counts(self):
+    def test_a_prompt_in_the_minute_of_the_header_keeps_it(self):
         keep, _, _ = self.run_decide(mode="apply", prompt_at=reaper.calendar.timegm((2026, 10, 25, 12, 0, 40, 0, 0, 0)))
-        self.assertEqual(keep, [])
+        self.assertEqual(keep, ["claim-unknown"])
 
     def test_an_issue_its_text_names_with_this_session_as_claimant_keeps_it(self):
         self.briefs = {"6200": MINE.replace("#9", "#6200")}
@@ -1432,6 +1434,10 @@ class NeverKill(unittest.TestCase):
             self.assertEqual(reaper.never_kill_pids(CFG), {12})
         with mock.patch.dict(os.environ, {"CC_NEVER_KILL_PIDS": ""}):
             self.assertEqual(reaper.never_kill_pids(CFG), set())
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"CC_NEVER_KILL_PIDS": "7;8 \u00b2 9"}), redirect_stderr(err):
+            self.assertEqual(reaper.never_kill_pids(CFG), {9})  # no ValueError on a non-ASCII digit
+        self.assertIn("not a pid, ignored: 7;8 \u00b2", err.getvalue())
 
     def test_the_tree_is_the_pane_and_everything_below_it_never_the_server_or_another_pane(self):
         tree = reaper.session_tree(self.TABLE, 100, 10)
