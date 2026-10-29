@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- **`session-reaper.py` judges the claim-less sessions it kept for good (EL-T24, shadow by default).** Sessions in
+  the primary checkout with no worktree (dispatch, sec-p1, apertis-ops idle 283-419 min) had no claim, so only
+  a `SESSION-DONE:` line could close them. Under `NOCLAIM_DONE=shadow` one whose newest neo-inbox header is DONE
+  (older than `IDLE_MINUTES` and its newest prompt), with no child process, background shell, loop, schedule,
+  dirty or unpushed worktree or cwd, and no oracle claim, is reported `would-close`; `apply` closes it through
+  every existing gate. `claim-unknown` names its cause (`no-worktree`, `no-issue-branch`, `no-github-remote`);
+  background and pane-missing sessions are `unjudged` rows with idle minutes; `CC_NEVER_KILL_PIDS` (default
+  `70987 4565`) keeps a session whose pane tree holds one, re-checked before `/exit` and before a kill.
 - **`stall-watch.py` detects sessions stalled by an account switch or rate limit (shadow by default).**
   Every 2 minutes (`com.cc-reaper.stall-watch`) it hashes each live session's pane and re-scans only a
   changed one for `hit your weekly limit`, `Remote Control disconnected`, `429`/`rate_limit` on an agent
