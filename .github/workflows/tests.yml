@@ -23,6 +23,8 @@ jobs:
         run: |
           for f in shell/*.sh hooks/*.sh; do bash -n "$f"; done
           zsh -n shell/claude-cleanup.sh
+      - name: stall-watch
+        run: python3 tests/stall-watch.py
       - name: disk-janitor
         run: bash tests/disk-janitor.sh
       - name: worktree-janitor

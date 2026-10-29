@@ -55,6 +55,8 @@ DEFAULTS = {
     "ORACLE_CACHE_DIR": "~/.cc-reaper/state/oracle-brief",  # one brief per issue, reused for ORACLE_CACHE_MINUTES (GitHub REST budget)
     "ORACLE_CACHE_MINUTES": "10",
     "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
+    "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # stall-watch.py writes <session id>.json here; empty: off
+    "STALL_MARK_HOURS": "12",  # a mark not refreshed for this long is stale and ignored
     "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
@@ -676,8 +678,24 @@ def decide(s, cfg, now=None):
     return keep
 
 
+def stall_mark(cfg, sid, now=None):
+    """Fingerprints stall-watch.py currently sees on this session ("" when none, stale, or unreadable)."""
+    if not cfg.get("STALL_MARK_DIR") or not re.fullmatch(r"[\w-]+", sid or ""):
+        return ""
+    f = Path(os.path.expanduser(cfg["STALL_MARK_DIR"])) / f"{sid}.json"
+    try:
+        if (now if now is not None else time.time()) - f.stat().st_mtime > float(cfg["STALL_MARK_HOURS"]) * 3600:
+            return ""
+        return ",".join(json.loads(f.read_text()).get("fingerprints") or ["stalled"])
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ""
+
+
 def _decide(s, cfg, now=None):
     keep = []
+    stalled = stall_mark(cfg, s.get("sid"), now)
+    if stalled:  # an account switch or rate limit stalled it: not idle, not finished
+        keep.append("stalled:" + stalled)
     if protected(cfg, s["tmux"], s["name"]):
         keep.append("protected")
     if not s.get("fg", True):

@@ -18,7 +18,7 @@ spec = importlib.util.spec_from_file_location("session_reaper", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
 
-CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", DONE_INBOX="")
+CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", DONE_INBOX="", STALL_MARK_DIR="")
 
 
 def session(**kw):

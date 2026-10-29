@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+- **`stall-watch.py` detects sessions stalled by an account switch or rate limit (shadow by default).**
+  Every 2 minutes (`com.cc-reaper.stall-watch`) it hashes each live session's pane and re-scans only a
+  changed one for `hit your weekly limit`, `Remote Control disconnected`, `429`/`rate_limit` on an agent
+  result, and an interrupt at an idle prompt (corroborated by `Login successful` or a fleet of them).
+  With `STALL_APPLY=1` it appends one `## EL-T801-CI-HARDEN STALL <session>` block per (pane,
+  fingerprint, session id) event to the inbox with the `claude --resume <id> --remote-control <name>`
+  recovery command; it writes a mark that `session-reaper.py` shows as `stalled:<fingerprint>` and
+  keeps. It never types into a pane (#5212): only `display` and `capture-pane` are reachable.
+
 ### Fixed
 - **A stuck or stopped reclaim can no longer silence the disk guard (stima-api #5886).**
   `resource-watch.sh` writes `<state>/resource-watch.heartbeat` first in every round, ends a round
