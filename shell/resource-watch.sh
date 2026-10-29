@@ -43,6 +43,11 @@ Environment:
   CC_RW_RATE_ALERT_GBH     Disk free falling faster than this many GB/h raises ALERT:disk-rate (default: 10); 0 disables
   CC_RW_RATE_FLAG_GBH      Falling faster than this many GB/h also writes <state>/disk-rate-high,
                        removed once a measured rate is at or below it (default: 20); 0 disables
+  CC_RW_SWAP_FLAG_GB   Swap used above this many GB (vm.swapusage) also writes <state>/disk-rate-high
+                       (with swap=<gb>, so heavy leases hold) and <state>/swap-high (`<epoch> swap=<gb>
+                       limit=<gb>`), and raises ALERT:swap; both removed once swap is read at or below it,
+                       left alone when swap cannot be read (default: 18)
+  CC_RW_SWAP_USED_GB   Test seam: used swap in GB, replacing the sysctl read; set but empty = unreadable
   CC_RW_GO_CAP_MAX_SECONDS The go cache cap is ended, by pid, past this many seconds (default: 120); 0 = no bound
   CC_RW_ROUND_MAX_SECONDS  A whole round past this many seconds ends its own process tree (never a detached
                        act), with ERROR and ALERT:round-overrun, so launchd can start the next (default: 240); 0 = no bound
@@ -828,8 +833,26 @@ _cc_rw_snapshot() {
   rate_flag_gbh=$(_cc_rw_num CC_RW_RATE_FLAG_GBH 20)
   _cc_rw_above "$rate_gbh" "$rate_alert_gbh" && rate_alert=true
   _cc_rw_above "$rate_gbh" "$rate_flag_gbh" && rate_flag=true
-  if [ "$rate_flag" = "true" ]; then
-    printf '%s %s %s\n' "$now" "$rate_gbh" "$disk_free_gb" > "${state_dir}/disk-rate-high" 2>/dev/null
+  # Swap is the disk writer behind the 4-18 GB dips (2026-10-29 root cause: memory pressure grows
+  # /System/Volumes/VM swapfiles 20 -> 26). Over CC_RW_SWAP_FLAG_GB the same disk-rate-high flag holds
+  # heavy leases (with_local_resource.py), so no new next build / test suite adds memory while swap is
+  # high; <state>/swap-high says which cause it is. CC_RW_SWAP_USED_GB, when set, replaces the sysctl
+  # read (empty = unreadable), for tests.
+  local swap_gb swap_flag=false swap_limit
+  if [ "${CC_RW_SWAP_USED_GB+x}" = "x" ]; then
+    swap_gb=$CC_RW_SWAP_USED_GB
+  else
+    swap_gb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="used") {v=$(i+2); sub(/M$/,"",v); printf "%.1f", v/1024}}')
+  fi
+  swap_limit=$(_cc_rw_num CC_RW_SWAP_FLAG_GB 18)
+  _cc_rw_above "$swap_gb" "$swap_limit" && swap_flag=true
+  if [ "$swap_flag" = "true" ]; then
+    printf '%s swap=%s limit=%s\n' "$now" "$swap_gb" "$swap_limit" > "${state_dir}/swap-high" 2>/dev/null
+  elif [[ "$swap_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    rm -f "${state_dir}/swap-high" 2>/dev/null
+  fi
+  if [ "$rate_flag" = "true" ] || [ "$swap_flag" = "true" ]; then
+    printf '%s %s %s swap=%s\n' "$now" "${rate_gbh:-0}" "$disk_free_gb" "${swap_gb:-?}" > "${state_dir}/disk-rate-high" 2>/dev/null
   elif [ -n "$rate_gbh" ]; then
     rm -f "${state_dir}/disk-rate-high" 2>/dev/null
   fi
@@ -843,6 +866,7 @@ _cc_rw_snapshot() {
   [ "$load_breach" = "true" ] && markers="${markers} ALERT:load"
   [ "$disk_breach" = "true" ] && markers="${markers} ALERT:disk"
   [ -n "$drop_gb" ]           && markers="${markers} ALERT:disk-drop"
+  [ "$swap_flag" = "true" ]   && markers="${markers} ALERT:swap"
   local alert_gb act_gb emerg_gb disk_low=false disk_act=false disk_emerg=false
   alert_gb=$(_cc_rw_num CC_RW_DISK_ALERT_GB 60); act_gb=$(_cc_rw_num CC_RW_DISK_ACT_GB 40)
   emerg_gb=$(_cc_rw_num CC_RW_DISK_EMERGENCY_GB 20)

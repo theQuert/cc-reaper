@@ -516,6 +516,7 @@ guard_case() {
     export CC_RW_OSASCRIPT_LOG="$dir/osascript" CC_RW_TEST_CALLS="$dir/calls" CC_RW_TEST_PIDS="$dir/pids"
     export CC_RW_TEST_DF_KB=$(( free_gb * GB ))
     export CC_RW_JANITOR_SCRIPT="$guard_dir/janitor.sh" CC_RW_RECLAIM_SCRIPT="$guard_dir/reclaim.sh"
+    export CC_RW_SWAP_USED_GB=""   # unreadable unless a case sets it: the host's real swap must not decide
     for pair in "$@"; do export "$pair"; done
     /bin/bash "$ROOT_DIR/shell/resource-watch.sh"
   ) || true
@@ -744,6 +745,24 @@ t17h=$(rate_seed "$((t17_now - 3600)) $((130 * GB))")
 guard_case "$t17h" 100 CC_RW_RATE_ALERT_GBH=0 CC_RW_RATE_FLAG_GBH=0
 expect_no  "T17h: CC_RW_RATE_*_GBH=0 disable alert and flag" \
   sh -c "grep -q 'ALERT:disk-rate' '$t17h/resource-watch.log' || test -e '$t17h/state/disk-rate-high'"
+
+# T17s: swap over CC_RW_SWAP_FLAG_GB holds heavy leases and says so in its own flag
+t17s=$(rate_seed "$((t17_now - 3600)) $((80 * GB))")
+guard_case "$t17s" 100 CC_RW_SWAP_USED_GB=22.5
+expect_yes "T17s: swap 22.5 > 18 writes swap-high" test -f "$t17s/state/swap-high"
+expect_yes "T17s: swap-high is <epoch> swap=<gb> limit=<gb>" grep -qE '^[0-9]+ swap=22\.5 limit=18$' "$t17s/state/swap-high"
+expect_yes "T17s: and disk-rate-high with swap=" grep -q 'swap=22.5' "$t17s/state/disk-rate-high"
+expect_yes "T17s: and ALERT:swap" grep -q 'ALERT:swap' "$t17s/resource-watch.log"
+guard_case "$t17s" 100 CC_RW_SWAP_USED_GB=3.0
+expect_no  "T17s: swap back under the limit removes swap-high" test -e "$t17s/state/swap-high"
+expect_no  "T17s: and disk-rate-high" test -e "$t17s/state/disk-rate-high"
+t17u=$(rate_seed "$((t17_now - 3600)) $((80 * GB))")
+echo "1 swap=30 limit=18" > "$t17u/state/swap-high"
+guard_case "$t17u" 100 CC_RW_SWAP_USED_GB=
+expect_yes "T17u: unreadable swap leaves swap-high alone" test -f "$t17u/state/swap-high"
+t17v=$(rate_seed "$((t17_now - 3600)) $((80 * GB))")
+guard_case "$t17v" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_SWAP_FLAG_GB=30
+expect_no  "T17v: CC_RW_SWAP_FLAG_GB raises the limit" test -e "$t17v/state/swap-high"
 
 # ---------------------------------------------------------------------------
 # T18: the go cache cap is bounded, so a hung cap cannot hold the round

@@ -14,6 +14,12 @@
   line shapes, and a failed tmux read keeps the earlier state. It never types into a pane (#5212): only `display` and `capture-pane` are reachable.
 
 ### Fixed
+- **`resource-watch.sh` holds heavy leases while swap is high, and says so in its own `swap-high` flag.**
+  Used swap over `CC_RW_SWAP_FLAG_GB` (default 18; swap is the disk writer behind the 2026-10-29 4-18 GB
+  dips) writes `<state>/disk-rate-high` (now with `swap=<gb>`) and raises `ALERT:swap`; it also writes
+  `<state>/swap-high` (`<epoch> swap=<gb> limit=<gb>`), removed once swap is read at or below the limit
+  and left alone when swap cannot be read, so a consumer need not read "disk-rate-high" as falling disk free.
+  `CC_RW_SWAP_USED_GB` replaces the sysctl read for tests.
 - **`worktree-janitor.sh` examines worktrees within its budget again, and one applying sweep runs
   per scope at a time.** On 2026-10-29 every apply run logged `budget exhausted ... removed=0`: the
   inventory read `git status --ignored` for all ~143 stima-api worktrees before the budgeted loop
