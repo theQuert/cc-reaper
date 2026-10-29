@@ -8,7 +8,9 @@
   since every disk alarm lived on that host or went through its gateway. Every 10 minutes
   (`com.cc-reaper.gce-disk-watch`, deployed by `install.sh` but never started unasked) it runs one IAP
   `df -P / ; df -Pi /` per host, bounded per host (90 s) and per run (240 s), and judges `disk-high`
-  (used >= 90%, under 2 GiB free, inodes >= 90%) or `unreadable`. One notice per host per state change, a
+  (used >= 90%, under 2 GiB free, inodes >= 90%, told on the first read) or `unreadable` (told after
+  `GDW_UNREADABLE_ROUNDS`, 2, reads in a row; `no-ssh-key` without gcloud's key, which is then never called).
+  A damaged state entry reads back as `ok` and never stops a round. One notice per host per state change, a
   re-alert at most every 120 minutes, one recovery line. `GDW_APPLY=0` logs `would alert` lines only;
   `GDW_APPLY=1` writes an `## EL-T24-GCE-DISK <host>` inbox block, a `P0 GCE-DISK` events.log line and a
   notification, all local, retrying a failed channel alone. Policy: `config/gce-disk-watch.conf`, installed

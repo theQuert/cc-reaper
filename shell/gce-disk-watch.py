@@ -13,7 +13,10 @@ to local files (and a local notification).
           ssh included) is ended. No other process is signalled.
   judge   `/` used >= GDW_USED_PCT (90) or available < GDW_MIN_AVAIL_GB (2 GiB) or inodes >= GDW_INODE_PCT (90)
           is `disk-high`; a read that fails, times out or prints no `/` line is `unreadable` (its own kind, with
-          a fixed reason word, never the command's output). One bad host never stops the others.
+          a fixed reason word, never the command's output), told only after GDW_UNREADABLE_ROUNDS (2) such reads in a
+          row (until then the host keeps its previous kind). Without GDW_SSH_KEY and its .pub every host is
+          `unreadable reason=no-ssh-key` and gcloud is never called. One bad host, or one damaged state entry (read
+          back as `ok`, so the host is told again), never stops the others.
   tell    once per host per state change; while it stays, again at most every GDW_REALERT_MINUTES (120); one
           `recovered` line when it clears. Shadow by default (GDW_APPLY=0): a `would alert` line in the log and
           nothing else. GDW_APPLY=1: one `## EL-T24-GCE-DISK <host>` block in GDW_INBOX (state changes only,
@@ -58,12 +61,17 @@ DEFAULTS = {
     "GDW_STATE": "~/.cc-reaper/state/gce-disk-watch.json",
     "GDW_LOG": "~/.cc-reaper/logs/gce-disk-watch.log",
     "GDW_NOTIFY": "1",  # 0: no macOS notification even with GDW_APPLY=1
+    "GDW_UNREADABLE_ROUNDS": "2",  # consecutive unreadable reads before `unreadable` is told (one IAP blip is not)
+    "GDW_SSH_KEY": "~/.ssh/google_compute_engine",  # must exist with its .pub: gcloud is never let generate one
 }
 CONFIG = Path.home() / ".cc-reaper" / "gce-disk-watch.conf"
 DF_COMMAND = "df -P / ; df -Pi /"  # the only command that ever runs on a host
 NAME_RE = re.compile(r"[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?")  # GCE instance, project and zone names
 GIB = 1 << 30
 OK, HIGH, UNREADABLE = "ok", "disk-high", "unreadable"
+KINDS = (OK, HIGH, UNREADABLE)
+NOTICES = (None, "alert", "recover", "realert")
+CHANNELS = ("shadow", "inbox", "events", "notify")
 
 
 # ---------- config ----------
@@ -101,7 +109,8 @@ def path_of(cfg, key):
 
 def gcloud_argv(cfg, host):
     return [cfg["GDW_GCLOUD"], "compute", "ssh", host, "--project", cfg["GDW_PROJECT"], "--zone", cfg["GDW_ZONE"],
-            "--tunnel-through-iap", "--quiet", "--command", DF_COMMAND,
+            "--tunnel-through-iap", "--quiet", "--ssh-key-file", os.path.expanduser(cfg["GDW_SSH_KEY"]),
+            "--command", DF_COMMAND,
             "--", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes"]
 
 
@@ -284,6 +293,12 @@ class Watch:
             ch.append("notify")
         return ch
 
+    def has_ssh_key(self):
+        """--quiet would let gcloud generate a key and write it into project or instance metadata: a missing key
+        (or its .pub) is reported, and gcloud is never called."""
+        key = Path(os.path.expanduser(self.cfg["GDW_SSH_KEY"]))
+        return key.is_file() and key.with_name(key.name + ".pub").is_file()
+
     def deliver(self, channel, host, entry, r, now):
         notice, kind = entry["notice"], entry["kind"]
         if channel == "shadow":
@@ -296,6 +311,51 @@ class Watch:
         elif channel == "notify":
             word = "recovered" if notice == "recover" else kind
             self.notifier("GCE disk", f"{host} {word} {numbers(r)}")
+
+    def one_host(self, host, r, book, now, every, rounds, counts, failures):
+        read_kind = r["kind"]
+        counts["read"] += r["metrics"] is not None
+        counts[HIGH] += read_kind == HIGH
+        counts[UNREADABLE] += read_kind == UNREADABLE
+        prev = valid_entry(book.get(host)) or {"kind": OK, "todo": [], "told": False, "fails": 0, "notice": None,
+                                                 "sent": None, "since": None}
+        fails = prev["fails"] + 1 if read_kind == UNREADABLE else 0
+        # An unreadable read is told only after `rounds` in a row; until then the host keeps its previous kind.
+        kind = read_kind if read_kind != UNREADABLE or fails >= rounds else prev["kind"]
+        held = f" fails={fails}/{rounds}" if read_kind == UNREADABLE else ""
+        self.log(f"host {host} {read_kind} {numbers(r)}{held}")
+        if kind != prev["kind"]:
+            # A recovery is told only for a state something was told about; a never-told one just clears.
+            notice = "alert" if kind != OK else ("recover" if prev["told"] else None)
+            entry = {"kind": kind, "since": now, "notice": notice, "todo": self.channels(notice) if notice else [],
+                     "sent": None, "told": False}
+        else:
+            entry = prev
+            if kind != OK and not entry["todo"] and entry["sent"] is not None and now - entry["sent"] >= every:
+                entry.update(notice="realert", todo=self.channels("realert"))
+        entry["fails"] = fails
+        # Only this mode's channels: a stored todo (a hand edit, the other mode's) never reaches another channel.
+        allowed = set(self.channels(entry["notice"])) if entry["notice"] else set()
+        entry["todo"] = [c for c in entry["todo"] if c in allowed]
+        book[host] = entry
+        todo = list(entry["todo"])
+        for ch in todo:
+            try:
+                self.deliver(ch, host, entry, r, now)
+            except (OSError, subprocess.SubprocessError) as e:
+                failures.append(f"{host}: {ch} write failed ({type(e).__name__}): kept pending, retried next run")
+                continue
+            entry["todo"].remove(ch)
+            entry["told"] = True
+        if todo and not entry["todo"]:
+            entry["sent"] = now
+            if entry["notice"] == "recover":
+                counts["recovered"] += 1
+            elif self.apply:
+                counts["alerted"] += 1
+                self.log(f"alerted {host} {kind} {numbers(r)} ({entry['notice']})")
+            else:
+                counts["would"] += 1
 
     def run(self, hosts):
         now = self.clock()
@@ -312,47 +372,22 @@ class Watch:
             if not NAME_RE.fullmatch(self.cfg[key]):
                 failures.append(f"{key} refused: {self.cfg[key]!r}")
                 hosts = []
-        readings = read_hosts(self.cfg, hosts, self.runner) if hosts else {}
+        if hosts and not self.has_ssh_key():
+            readings = {h: {"kind": UNREADABLE, "metrics": None, "reason": "no-ssh-key"} for h in hosts}
+        else:
+            readings = read_hosts(self.cfg, hosts, self.runner) if hosts else {}
+        rounds = max(1, int(number(self.cfg, "GDW_UNREADABLE_ROUNDS")))
         every = max(1.0, number(self.cfg, "GDW_REALERT_MINUTES")) * 60
+        unread = []
         for host in hosts:
             r = readings[host]
-            kind = r["kind"]
-            counts["read"] += r["metrics"] is not None
-            counts[HIGH] += kind == HIGH
-            counts[UNREADABLE] += kind == UNREADABLE
-            self.log(f"host {host} {kind} {numbers(r)}")
-            prev = book.get(host) if isinstance(book.get(host), dict) else {"kind": OK}
-            if not isinstance(prev.get("todo"), list):
-                prev["todo"] = []
-            if kind != prev.get("kind"):
-                # A recovery is told only for a state something was told about; a never-told one just clears.
-                notice = "alert" if kind != OK else ("recover" if prev.get("told") else None)
-                entry = {"kind": kind, "since": now, "notice": notice, "todo": self.channels(notice) if notice else [],
-                         "sent": None, "told": False}
-                book[host] = entry
-            else:
-                entry = prev
-                if kind != OK and not entry.get("todo") and entry.get("sent") is not None and now - entry["sent"] >= every:
-                    entry.update(notice="realert", todo=self.channels("realert"))
-            todo = list(entry.get("todo") or [])
-            for ch in todo:
-                try:
-                    self.deliver(ch, host, entry, r, now)
-                except (OSError, subprocess.SubprocessError) as e:
-                    failures.append(f"{host}: {ch} write failed ({type(e).__name__}): kept pending, retried next run")
-                    continue
-                entry["todo"].remove(ch)
-                entry["told"] = True
-            if todo and not entry["todo"]:
-                entry["sent"] = now
-                if entry["notice"] == "recover":
-                    counts["recovered"] += 1
-                elif self.apply:
-                    counts["alerted"] += 1
-                    self.log(f"alerted {host} {kind} {numbers(r)} ({entry['notice']})")
-                else:
-                    counts["would"] += 1
-            book[host] = entry
+            if r["kind"] == UNREADABLE:
+                unread.append(f"{host}({r.get('reason') or 'unknown'})")
+            try:
+                self.one_host(host, r, book, now, every, rounds, counts, failures)
+            except Exception as e:  # noqa: BLE001 - one bad entry never aborts the round; the host starts afresh
+                book.pop(host, None)
+                failures.append(f"{host}: round failed ({type(e).__name__}): state reset for this host")
         for host in list(book):
             if host not in hosts:
                 del book[host]  # a host no longer watched is forgotten
@@ -362,10 +397,29 @@ class Watch:
             failures.append(f"state write failed: {e}")
         self.log(f"{mode}: {len(hosts)} hosts, {counts['read']} read, {counts[HIGH]} high, {counts[UNREADABLE]} unreadable, "
                  f"{counts['would']} would-alert, {counts['alerted']} alerted, {counts['recovered']} recovered, "
-                 f"{len(failures)} failures")
+                 f"{len(failures)} failures" + (f"; unreadable: {' '.join(unread)}" if unread else ""))
         for f in failures:
             self.log(f"ERROR {f}")
         return 1 if failures else 0
+
+
+def valid_entry(e):
+    """A stored host entry exactly as one_host writes it, or None (a hand edit, an older or damaged file)."""
+    def num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    if not isinstance(e, dict) or e.get("kind") not in KINDS or e.get("notice") not in NOTICES:
+        return None
+    todo = e.get("todo", [])
+    if not isinstance(todo, list) or not all(isinstance(c, str) and c in CHANNELS for c in todo) \
+            or (todo and e.get("notice") is None):
+        return None
+    if not (e.get("sent") is None or num(e.get("sent"))) or not (e.get("since") is None or num(e.get("since"))):
+        return None
+    fails = e.get("fails", 0)
+    if not isinstance(fails, int) or isinstance(fails, bool) or fails < 0 or not isinstance(e.get("told", False), bool):
+        return None
+    return {"kind": e["kind"], "since": e.get("since"), "notice": e.get("notice"), "todo": list(todo),
+            "sent": e.get("sent"), "told": e.get("told", False), "fails": fails}
 
 
 def load_state(path):

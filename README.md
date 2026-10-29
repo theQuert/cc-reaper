@@ -918,7 +918,11 @@ model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper
 - **Judge:** `disk-high` when `/` is at or over `GDW_USED_PCT` (90), has under `GDW_MIN_AVAIL_GB`
   (2 GiB) free, or its inodes are at or over `GDW_INODE_PCT` (90). A read that fails, times out or
   prints no `/` line is `unreadable`, with a fixed reason word (`exit-255`, `timeout`,
-  `no-df-output`, ...), never the command's output. One bad host never stops the others.
+  `no-df-output`, `no-ssh-key`, ...), never the command's output, told only after
+  `GDW_UNREADABLE_ROUNDS` (2) such reads in a row; until then the host keeps its previous kind and the
+  log shows `fails=<n>/<rounds>`. gcloud runs only when `GDW_SSH_KEY` (`~/.ssh/google_compute_engine`)
+  and its `.pub` exist, so it never generates a key or writes metadata. One bad host, or one damaged
+  state entry (read back as `ok`, so the host is told again), never stops the others.
 - **Tell:** once per host per state change; while the state stays, again at most every
   `GDW_REALERT_MINUTES` (120); one `recovered` line when it clears (only for a state that was told).
   Shadow (`GDW_APPLY=0`): a `would alert <host> <kind> used=..% avail=..GB inodes=..%` line in
@@ -931,7 +935,7 @@ model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper
   standing state afresh.
 - **Record:** each run logs one line per host and one summary line
   (`<n> hosts, <n> read, <n> high, <n> unreadable, <n> would-alert, <n> alerted, <n> recovered,
-  <n> failures`), the spot-check record.
+  <n> failures; unreadable: <host>(<reason>) ...`), the spot-check record.
 
 ```bash
 ./install.sh   # deploys the script and the shadow policy; never starts the agent unasked

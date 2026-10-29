@@ -65,7 +65,13 @@ class Base(unittest.TestCase):
 
     def cfg(self, **over):
         cfg = gdw.load_config(self.tmp / "absent.conf", env={})
-        cfg.update(GDW_INBOX=str(self.tmp / "handoffs" / "neo-inbox.md"),
+        key = self.tmp / "ssh" / "google_compute_engine"
+        if not key.parent.exists():
+            key.parent.mkdir()
+            key.write_text("k")
+            key.with_name(key.name + ".pub").write_text("k.pub")
+        cfg.update(GDW_SSH_KEY=str(key),
+                   GDW_INBOX=str(self.tmp / "handoffs" / "neo-inbox.md"),
                    GDW_EVENTS_LOG=str(self.tmp / "handoffs" / "ops-dispatch" / "events.log"),
                    GDW_STATE=str(self.tmp / "state" / "gce-disk-watch.json"),
                    GDW_LOG=str(self.tmp / "logs" / "gce-disk-watch.log"))
@@ -145,8 +151,16 @@ class Runs(Base):
                       self.summary(lines))
 
     def test_unreadable_and_timeout_are_their_own_kind_and_never_stop_the_others(self):
-        rc, lines, _ = self.run_once({"stima-ci-1": (255, "", None), "stima-ci-2": (None, "", "timeout"),
-                                      "stima-ci-3": RuntimeError("boom"), "stima-ci-deploy-1": (0, "garbage\n", None)})
+        bad = {"stima-ci-1": (255, "", None), "stima-ci-2": (None, "", "timeout"),
+               "stima-ci-3": RuntimeError("boom"), "stima-ci-deploy-1": (0, "garbage\n", None)}
+        rc, lines, _ = self.run_once(bad)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("would alert", "\n".join(lines))  # one unreadable round is not told
+        self.assertIn("host stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255 fails=1/2", "\n".join(lines))
+        self.assertIn("unreadable: stima-ci-1(exit-255) stima-ci-2(timeout) stima-ci-3(runner-RuntimeError) "
+                      "stima-ci-deploy-1(no-df-output)", self.summary(lines))
+        self.clock.t += 600
+        rc, lines, _ = self.run_once(bad)
         self.assertEqual(rc, 0)
         self.assertIn("would alert stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255", "\n".join(lines))
         self.assertIn("would alert stima-ci-2 unreadable used=? avail=? inodes=? reason=timeout", "\n".join(lines))
@@ -176,6 +190,9 @@ class Runs(Base):
         self.assertEqual(len(self.events()), 1)
         self.assertEqual(len(self.notes), 1)
         self.clock.t += 600  # a different bad state is a new state change
+        self.run_once({"stima-ci-ctl-1": (255, "", None)}, GDW_APPLY="1")
+        self.assertEqual(self.inbox().count("## EL-T24-GCE-DISK stima-ci-ctl-1"), 1)  # held at disk-high for one round
+        self.clock.t += 600
         self.run_once({"stima-ci-ctl-1": (255, "", None)}, GDW_APPLY="1")
         self.assertEqual(self.inbox().count("## EL-T24-GCE-DISK stima-ci-ctl-1"), 2)
         self.assertIn("kind=unreadable", self.inbox())
@@ -220,7 +237,8 @@ class Runs(Base):
         _, lines, _ = self.run_once({})
         self.assertIn("would recover stima-ci-ctl-1 recovered", "\n".join(lines))
         self.assertEqual(self.notes, [])
-        written = sorted(str(p.relative_to(self.tmp)) for p in self.tmp.rglob("*") if p.is_file())
+        written = sorted(str(p.relative_to(self.tmp)) for p in self.tmp.rglob("*")
+                         if p.is_file() and p.parent.name != "ssh")  # ssh/: the test's own key fixture
         self.assertEqual(written, ["logs/gce-disk-watch.log", "state/gce-disk-watch.json"])
         self.assertIn("would alert stima-ci-ctl-1 disk-high", (self.tmp / "logs" / "gce-disk-watch.log").read_text())
 
@@ -296,7 +314,7 @@ class Runs(Base):
                 gate.wait(30)
             return 0, HEALTHY, None
 
-        w = gdw.Watch(self.cfg(GDW_RUN_TIMEOUT_SECONDS="1"), stuck, self.notifier, self.clock)
+        w = gdw.Watch(self.cfg(GDW_RUN_TIMEOUT_SECONDS="1", GDW_UNREADABLE_ROUNDS="1"), stuck, self.notifier, self.clock)
         orig = gdw.concurrent.futures.wait
         gdw.concurrent.futures.wait = lambda fs, timeout: orig(fs, timeout=min(timeout, 2))
         try:
@@ -307,6 +325,111 @@ class Runs(Base):
         self.assertEqual(rc, 0)
         self.assertIn("would alert stima-ci-2 unreadable used=? avail=? inodes=? reason=run-timeout", "\n".join(w.lines))
         self.assertIn("4 read", self.summary(w.lines))
+
+
+class Review(Base):
+    """The Opus review of f2d6096: unreadable rounds, damaged state, shadow channels, the ssh key."""
+
+    def state(self):
+        return json.loads((self.tmp / "state" / "gce-disk-watch.json").read_text())
+
+    def write_state(self, st):
+        (self.tmp / "state").mkdir(exist_ok=True)
+        (self.tmp / "state" / "gce-disk-watch.json").write_text(json.dumps(st))
+
+    def test_one_transient_unreadable_read_is_not_told_and_a_second_is(self):
+        blip = {"stima-ci-1": (255, "", None)}
+        _, lines, _ = self.run_once(blip, GDW_APPLY="1")
+        self.assertEqual(self.events(), [])
+        self.assertEqual(self.state()["apply"]["stima-ci-1"]["fails"], 1)
+        self.clock.t += 600
+        self.run_once({}, GDW_APPLY="1")  # it read fine: the counter resets, nothing was told, nothing recovers
+        self.assertEqual(self.state()["apply"]["stima-ci-1"]["fails"], 0)
+        self.clock.t += 600
+        self.run_once(blip, GDW_APPLY="1")
+        self.assertEqual(self.events(), [])  # 1, 0, 1: never two in a row
+        self.clock.t += 600
+        _, lines, _ = self.run_once(blip, GDW_APPLY="1")
+        self.assertEqual(len(self.events()), 1)
+        self.assertIn("P0 GCE-DISK stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255", self.events()[0])
+        self.assertIn("host stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255 fails=2/2", "\n".join(lines))
+
+    def test_disk_high_still_alerts_on_the_first_read_and_a_blip_does_not_recover_it(self):
+        self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
+        self.assertEqual(len(self.events()), 1)
+        self.clock.t += 600
+        self.run_once({"stima-ci-ctl-1": (None, "", "timeout")}, GDW_APPLY="1")
+        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(self.state()["apply"]["stima-ci-ctl-1"]["kind"], "disk-high")
+
+    def test_rounds_of_one_tells_the_first_unreadable_read(self):
+        self.run_once({"stima-ci-1": (255, "", None)}, GDW_APPLY="1", GDW_UNREADABLE_ROUNDS="1")
+        self.assertEqual(len(self.events()), 1)
+
+    def test_a_damaged_entry_never_crashes_the_round_and_the_host_alerts_again(self):
+        damaged = [{"kind": "disk-high", "sent": "yesterday", "todo": [], "notice": "alert", "told": True},
+                   {"kind": "disk-high", "todo": ["inbox"], "told": True},  # todo without a notice
+                   {"kind": "disk-high", "todo": ["rm -rf"], "notice": "alert"},
+                   {"kind": "full", "notice": "alert"}, {"kind": "disk-high", "fails": "2"}, "not a dict", [1, 2]]
+        for bad in damaged:
+            with self.subTest(bad=bad):
+                for f in (self.tmp / "handoffs").glob("**/*"):
+                    if f.is_file():
+                        f.unlink()
+                self.write_state({"apply": {"stima-ci-ctl-1": bad}})
+                self.clock.t += 600
+                rc, lines, _ = self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(self.events()), 1)
+                self.assertIn("GCE-DISK ALERT host=stima-ci-ctl-1 kind=disk-high", self.inbox())
+                self.assertEqual(self.state()["apply"]["stima-ci-ctl-1"]["todo"], [])
+
+    def test_an_error_in_one_host_is_a_counted_failure_not_an_aborted_round(self):
+        orig = gdw.Watch.one_host
+
+        def flaky(w, host, *a):
+            if host == "stima-ci-2":
+                raise TypeError("bad entry")
+            return orig(w, host, *a)
+
+        gdw.Watch.one_host = flaky
+        try:
+            rc, lines, _ = self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
+        finally:
+            gdw.Watch.one_host = orig
+        self.assertEqual(rc, 1)
+        self.assertIn("1 alerted", self.summary(lines))
+        self.assertIn("1 failures", self.summary(lines))
+        self.assertIn("ERROR stima-ci-2: round failed (TypeError): state reset for this host", "\n".join(lines))
+        self.assertNotIn("stima-ci-2", self.state()["apply"])
+
+    def test_shadow_never_delivers_a_stored_apply_channel(self):
+        self.write_state({"shadow": {"stima-ci-ctl-1": {"kind": "disk-high", "since": 1.0, "notice": "alert",
+                                                         "todo": ["inbox", "events", "notify"], "sent": None,
+                                                         "told": False, "fails": 0}}})
+        rc, lines, _ = self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)})
+        self.assertEqual(rc, 0)
+        self.assertFalse((self.tmp / "handoffs").exists())
+        self.assertEqual(self.notes, [])
+        self.assertEqual(self.state()["shadow"]["stima-ci-ctl-1"]["todo"], [])
+
+    def test_no_ssh_key_means_no_gcloud_call(self):
+        key = self.tmp / "ssh" / "google_compute_engine"
+        for missing in (key.with_name(key.name + ".pub"), key):
+            with self.subTest(missing=missing.name):
+                self.cfg()  # creates both
+                missing.unlink()
+                rc, lines, runner = self.run_once({}, GDW_UNREADABLE_ROUNDS="1")
+                self.assertEqual(runner.calls, [])
+                self.assertIn("would alert stima-ci-ctl-1 unreadable used=? avail=? inodes=? reason=no-ssh-key",
+                              "\n".join(lines))
+                self.assertIn("unreadable: stima-ci-1(no-ssh-key)", self.summary(lines))
+                shutil.rmtree(key.parent)
+                (self.tmp / "state" / "gce-disk-watch.json").unlink()
+
+    def test_gcloud_is_given_the_checked_key(self):
+        argv = gdw.gcloud_argv(self.cfg(), "stima-ci-1")
+        self.assertEqual(argv[argv.index("--ssh-key-file") + 1], str(self.tmp / "ssh" / "google_compute_engine"))
 
 
 if __name__ == "__main__":
