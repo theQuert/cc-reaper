@@ -135,12 +135,17 @@ def scan_prompt(lines):
     if foot is None or not _tail_ok(lines, foot):
         return None
     lo = max(0, foot - PROMPT_SPAN)
-    first_opt = next((j for j in range(lo, foot) if OPT_RE.search(lines[j])), None)
+    # The menu starts at its nearest "☐ <header>" tab line (else just below the nearest rule above its options), never
+    # at a numbered list higher up in the transcript.
+    tab = next((j for j in range(foot - 1, lo - 1, -1) if ASK_TAB_RE.search(lines[j])), None)
+    if tab is None:
+        last_opt = next((j for j in range(foot - 1, lo - 1, -1) if OPT_RE.search(lines[j])), None)
+        if last_opt is None:
+            return None
+        tab = next((j + 1 for j in range(last_opt - 1, lo - 1, -1) if RULE_RE.search(lines[j])), last_opt)
+    first_opt = next((j for j in range(tab, foot) if OPT_RE.search(lines[j])), None)
     if first_opt is None:
         return None
-    tab = next((j for j in range(first_opt - 1, lo - 1, -1) if ASK_TAB_RE.search(lines[j])), None)
-    if tab is None:
-        tab = next((j + 1 for j in range(first_opt - 1, lo - 1, -1) if RULE_RE.search(lines[j])), first_opt)
     return {"kind": "ask-user-question", "fp": _fingerprint("ask-user-question", lines[tab:first_opt])}
 
 

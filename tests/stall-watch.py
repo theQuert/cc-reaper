@@ -170,6 +170,11 @@ class Prompts(unittest.TestCase):
         self.assertEqual(self.prompt(PERMISSION_MOVED)["fp"], fp)  # the option cursor moved: same prompt
         self.assertNotEqual(self.prompt(PERMISSION_OTHER)["fp"], fp)  # another command: another prompt
         self.assertEqual(self.prompt(ASK_MOVED)["fp"], self.prompt(ASK_USER)["fp"])  # cursor and preview moved
+        listed = bottom("● Plan:", "  1. bump the lockfile", "  2. run the audit", *ASK_USER[0].split("\n")[:-1])
+        self.assertEqual(self.prompt(listed)["fp"], self.prompt(ASK_USER)["fp"])  # a numbered list above is not the menu
+        untabbed = bottom("  1. an earlier list", *[l for l in ASK_USER[0].split("\n")[:-1] if "☐" not in l])
+        self.assertEqual(self.prompt(untabbed)["kind"], "ask-user-question")
+        self.assertEqual(self.prompt(untabbed)["fp"], self.prompt(bottom(*untabbed[0].split("\n")[1:-1]))["fp"])
         self.assertNotEqual(self.prompt(ASK_USER)["fp"], fp)
         lines = PERMISSION[0].split("\n")[:-1]
         wrapped = bottom(*lines[:9], " This shell -c script runs rm and", " could not be checked", *lines[10:])
