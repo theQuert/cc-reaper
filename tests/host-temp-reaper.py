@@ -206,8 +206,16 @@ class ReaperTest(unittest.TestCase):
                 self.leftover("tmp.AbCdEf123x", 3 * DAY + HOUR),
                 self.leftover("pip-unpack-6pi0dsfu", DAY + HOUR),
                 self.leftover("go-build535115792", DAY + HOUR),
-                self.leftover("nimbus-m2-build-Ab12Cd", DAY + HOUR)]
-        kept = [self.leftover("tmpab_cd124", 2 * DAY),             # generic name: three days
+                self.leftover("nimbus-m2-build-Ab12Cd", DAY + HOUR),
+                self.leftover("tmpab_cd124", 2 * DAY),             # generic name: a day (was three)
+                self.leftover("tmpabcdefgh", DAY + HOUR),          # mkdtemp with no digit, no underscore
+                self.leftover("tmp.AbCdEfGhIj", DAY + HOUR),       # mktemp with an upper-case letter, no digit
+                self.leftover("go-build777", 3 * HOUR),            # go WORK dir: two hours
+                self.leftover("hold-Ab12Cd", DAY + HOUR),          # node mkdtempSync leftovers of the router tests
+                self.leftover("preview-unpack-xYz9Qa", DAY + HOUR)]
+        kept = [self.leftover("tmpab_cd125", DAY - HOUR),          # generic name: a day not yet up
+                self.leftover("go-build778", HOUR),                 # go WORK dir younger than two hours
+                self.leftover("hold-Ab12Ce", DAY - HOUR),
                 self.leftover("pip-unpack-6pi0dsfx", DAY - HOUR),   # a day not yet up
                 self.leftover("go-build1", DAY + HOUR, inner_age=HOUR),  # changed deep inside
                 self.leftover("tmpheld0001", 4 * DAY),
@@ -222,7 +230,7 @@ class ReaperTest(unittest.TestCase):
             self.assertFalse(path.exists(), path)
         for path in kept:
             self.assertTrue(path.exists(), path)
-        self.assertEqual(counts["leftover"], [5, 5])
+        self.assertEqual(counts["leftover"], [11, 11])
 
     def test_a_leftover_reaching_another_filesystem_is_kept(self):
         path = self.leftover("go-build79", DAY + HOUR)

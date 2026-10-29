@@ -66,18 +66,28 @@ BUILD_COPY_IDLE_SECONDS = 24 * 3600
 # untouched. The generic names are directories only and must hold a digit, so a person's
 # `tmp_scratch` or a file another program was handed by name is not one.
 LEFTOVERS = (
-    (re.compile(r"tmp(?=[a-z0-9_]*[0-9])[a-z0-9_]{8}"), 72 * 3600, True),
-    (re.compile(r"tmp\.(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{10}"), 72 * 3600, True),
+    # Python mkdtemp (tmp + 8 of [a-z0-9_]) and mktemp(1) (tmp. + 10 mixed case). A digit, or for Python no underscore,
+    # or for mktemp an upper-case letter, separates them from a person's `tmp_scratch`. 2026-10-29: ~46k such dirs older
+    # than 72 h had no digit and were never reaped, and the bulk of $TMPDIR's 23 GiB was 1-3 days old test sandboxes.
+    (re.compile(r"tmp(?=[a-z0-9_]*[0-9]|[a-z0-9]{8}$)[a-z0-9_]{8}"), 24 * 3600, True),
+    (re.compile(r"tmp\.(?=[A-Za-z0-9]*[0-9A-Z])[A-Za-z0-9]{10}"), 24 * 3600, True),
     (re.compile(r"pip-[a-z]+(-[a-z]+)*-[a-z0-9_]{8}"), 24 * 3600, False),
-    (re.compile(r"go-(build|link-)\d+"), 24 * 3600, False),
+    # go removes its own WORK dir unless the build is killed (a lease or step timeout under load); nothing reads one
+    # after its go process exits, so 2 h untouched and unheld is dead. 2026-10-29: 20 such dirs held ~2.5 GiB at 25 GiB free.
+    (re.compile(r"go-(build|link-)\d+"), 2 * 3600, False),
     (re.compile(r"nimbus-(acceptance|articles|env|m2|m2-build|m3r|m8|manifest|static)-[A-Za-z0-9_]{6}"),
      24 * 3600, False),
+    # Node mkdtempSync leftovers of this repo's tests (route-origins in cloudflare/apertis-router, the rest from
+    # node suites): 26,629 hold- and 18,417 preview-unpack- dirs in $TMPDIR on 2026-10-29, never removed.
+    (re.compile(r"(hold|preview-unpack|edge-key|neo-rot|route-origins(-[a-z]+)?)-[A-Za-z0-9]{6}"), 24 * 3600, True),
 )
 # Any of those names, wherever it appears in a command line: `$TMPDIR/x` expands to `T//x`,
 # and a relative path names no directory at all.
 LEFTOVER_MENTION = re.compile(r"(?<![A-Za-z0-9_.-])(tmp[a-z0-9_]{8}|tmp\.[A-Za-z0-9]{10}"
                               r"|pip-[a-z]+(?:-[a-z]+)*-[a-z0-9_]{8}|go-(?:build|link-)\d+"
-                              r"|nimbus-[a-z0-9-]+-[A-Za-z0-9_]{6})(?![A-Za-z0-9_])")
+                              r"|nimbus-[a-z0-9-]+-[A-Za-z0-9_]{6}"
+                              r"|(?:hold|preview-unpack|edge-key|neo-rot|route-origins(?:-[a-z]+)?)-[A-Za-z0-9]{6})"
+                              r"(?![A-Za-z0-9_])")
 # The per-user temp directory is the only root this rule may sweep: /tmp is shared with
 # other users and root, whose processes neither lsof -u nor this user's ps can vouch for.
 USER_TEMP_PREFIX = "/private/var/folders/"
