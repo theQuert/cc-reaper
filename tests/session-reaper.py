@@ -1004,6 +1004,63 @@ class NewKeepGates(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text())["status"], "reaped")
 
 
+class Nudge(unittest.TestCase):
+    """EL-T2482: an idle session at an empty prompt kept only by its own open work gets one ROUTE nudge per fingerprint."""
+    SEP = "─" * 20
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.cfg = dict(CFG, NUDGE_EVENTS=str(self.tmp / "events.log"), NUDGE_STATE=str(self.tmp / "nudged.json"))
+        self.now = time.mktime((2026, 10, 30, 15, 0, 0, 0, 0, -1))
+        self.screen = f"{self.SEP}\n❯ \n{self.SEP}"
+        p = mock.patch.object(reaper, "pane_state", lambda pane: {"screen": self.screen, "cx": 2, "cy": 1})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_once(self, keep, **kw):
+        s = session(sid="abcdef0123", pane="%1", **kw)
+        return reaper.nudge_events(self.cfg, [(s, keep, "keep")], self.now)
+
+    def events(self):
+        f = self.tmp / "events.log"
+        return f.read_text().splitlines() if f.exists() else []
+
+    def test_open_work_at_an_empty_prompt_routes_once(self):
+        self.assertEqual(self.run_once(["owed-step:#6702", "unpushed:wt"]), ["abcdef01:owed-step:#6702,unpushed:wt"])
+        self.assertRegex(self.events()[0], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} ROUTE nudge work abcdef01:owed-step:#6702,unpushed:wt$")
+        self.assertEqual(self.run_once(["owed-step:#6702", "unpushed:wt"]), [], "same fingerprint: no second nudge")
+        self.assertEqual(len(self.events()), 1)
+
+    def test_a_fingerprint_that_clears_nudges_again_when_it_returns(self):
+        self.run_once(["check-by-open"])
+        reaper.nudge_events(self.cfg, [], self.now)
+        self.assertEqual(self.run_once(["check-by-open"]), ["abcdef01:check-by-open"])
+
+    def test_any_other_keep_reason_is_not_a_nudge(self):
+        for keep in (["owed-step:#1", "waiting"], ["uncommitted:wt", "protected"], ["subagent-active"], [],
+                     ["owed-step:#1", "loop-pending"], ["claim-unknown"]):
+            self.assertEqual(self.run_once(keep), [], keep)
+
+    def test_not_idle_long_enough_or_not_idle_is_not_a_nudge(self):
+        self.assertEqual(self.run_once(["owed-step:#1"], idle_min=30), [])
+        self.assertEqual(self.run_once(["owed-step:#1"], status="busy"), [])
+
+    def test_uiux_and_homepage_are_never_nudged(self):
+        for name in ("uiux", "homepage", "UIUX-2"):
+            self.assertEqual(self.run_once(["owed-step:#1"], tmux=name, name=name), [], name)
+
+    def test_a_draft_or_a_menu_on_screen_is_not_idle_at_the_prompt(self):
+        self.screen = f"{self.SEP}\n❯ #24 head 9ccc7b4 待 merge\n{self.SEP}"
+        with mock.patch.object(reaper, "pane_state", lambda pane: {"screen": self.screen, "cx": 30, "cy": 1}):
+            self.assertEqual(self.run_once(["owed-step:#1"]), [])
+
+    def test_off_by_default(self):
+        self.cfg["NUDGE_EVENTS"] = ""
+        self.assertEqual(self.run_once(["owed-step:#1"]), [])
+        self.assertEqual(self.events(), [])
+
+
 class IdleList(unittest.TestCase):
     """The idle list is a report: who is listed, once-a-day inbox posting, off by default."""
 

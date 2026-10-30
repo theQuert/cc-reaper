@@ -61,7 +61,11 @@ DEFAULTS = {
     "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # stall-watch.py writes <session id>.json here; empty: off
     "STALL_MARK_HOURS": "12",  # a mark not refreshed for this long is stale and ignored
     "STALL_MARK_MAX_HOURS": "48",  # a mark whose event was first seen longer ago is ignored however fresh it is
-    "IDLE_LIST_EXCLUDE": "",  # space-separated fnmatch patterns over tmux and session names never listed
+    "IDLE_LIST_EXCLUDE": "",
+    # EL-T2482: a path (ops-dispatch's events.log) that gets `ROUTE nudge <tmux> <fingerprint>` for an idle session kept
+    # only by its own open work; ops-dispatch sends the message. Empty: off. NUDGE_STATE dedups. See nudge_events().
+    "NUDGE_EVENTS": "",
+    "NUDGE_STATE": "~/.cc-reaper/state/nudged.json",  # space-separated fnmatch patterns over tmux and session names never listed
     # A claim-less session whose newest inbox header (DONE_INBOX, else DONE_INBOX_SHADOW) is DONE (EL-T24): `shadow`
     # reports it `would-close` and closes nothing; `apply` counts it as done; `off` neither. See noclaim_done().
     "NOCLAIM_DONE": "shadow",
@@ -787,6 +791,49 @@ def protected(cfg, *names):
     return any(fnmatch.fnmatch(n, p) for p in cfg["PROTECT"].split() for n in names if n)
 
 
+OPEN_WORK = ("owed-step:", "uncommitted:", "unpushed:", "check-by-open")  # decide()/worktree_state() keep reasons
+
+
+def nudge_events(cfg, seen, now):
+    """EL-T2482: an idle session at an empty prompt kept ONLY by open work of its own (an owed oracle step, an
+    uncommitted or unpushed worktree, an open check-by) gets one `ROUTE nudge <tmux> <fingerprint>` line in
+    NUDGE_EVENTS, and ops-dispatch sends it a message. Once per fingerprint (session id + reasons); one no longer
+    seen is forgotten, so it nudges again if it returns. Never PROTECT or NEVER_CLOSE (uiux, homepage: Leo's own).
+    Types nothing into any pane. Returns the fingerprints it routed."""
+    if not cfg["NUDGE_EVENTS"]:
+        return []
+    st = Path(os.path.expanduser(cfg["NUDGE_STATE"]))
+    try:
+        sent = set(json.loads(st.read_text()))
+    except (OSError, ValueError, TypeError):
+        sent = set()
+    cur, new = set(), []
+    for s, keep, outcome in seen:
+        names = [n for n in (s["tmux"], s.get("name")) if n]
+        if (not keep or not all(k.startswith(OPEN_WORK) for k in keep) or s["status"] != "idle"
+                or s["idle_min"] < float(cfg["IDLE_MINUTES"]) or protected(cfg, *names)
+                or any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in names)):
+            continue
+        state = pane_state(s["pane"]) if s.get("pane") else None
+        if not state or not empty_prompt(state):  # working, a menu, or a draft in the input: not idle at ❯
+            continue
+        fp = f"{s['sid'][:8]}:" + ",".join(sorted(keep))
+        cur.add(fp)
+        if fp not in sent:
+            new.append((s["tmux"], fp))
+    if new:
+        path = Path(os.path.expanduser(cfg["NUDGE_EVENTS"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
+        with open(path, "a") as f:
+            f.writelines(f"{stamp} ROUTE nudge {t} {fp}\n" for t, fp in new)
+    st.parent.mkdir(parents=True, exist_ok=True)
+    tmp = st.with_name(st.name + ".tmp")
+    tmp.write_text(json.dumps(sorted(cur)))
+    os.replace(tmp, st)
+    return [fp for _, fp in new]
+
+
 def idle_list(cfg, seen, now):
     """Report-only list of long-idle sessions without a claim (for a person); decides nothing."""
     hours = float(cfg["IDLE_LIST_HOURS"])
@@ -1484,6 +1531,12 @@ def main(argv=None):
             idle_list(cfg, seen, now)
     except Exception as e:  # a report-only list must not stop the report
         failures.append(f"idle list: {type(e).__name__}: {e}")
+    try:
+        if not args.only and not any("unjudged:run-budget" in k for _, k, _ in seen):  # partial: would forget fingerprints
+            for fp in nudge_events(cfg, seen, now):
+                notes.append(f"nudge routed: {fp}")
+    except Exception as e:  # a nudge must not stop the report
+        failures.append(f"nudge: {type(e).__name__}: {e}")
     signal.alarm(0)
     faulthandler.cancel_dump_traceback_later()
     mode = "apply" if apply else "report-only"
