@@ -613,6 +613,55 @@ class PromptRuns(unittest.TestCase):
         self.assertIn("kind=ask-user-question", self.inbox_text())
         self.assertIn("on-screen=30m", self.inbox_text())
 
+    def test_prompt_apply_alone_alerts_once_per_menu_names_its_question_and_leaves_marks_in_shadow(self):
+        # cc-reaper #128: sre and ci sat on a menu for hours while STALL_APPLY=0 kept the prompt half in shadow.
+        self.write_config(apply="0", extra="STALL_PROMPT_APPLY=1\n")
+        f = self.start({"%1": ("sre", ASK_USER), "%2": ("lost", DISCONNECTED)})
+        self.run_once()
+        self.age(10)
+        self.run_once()  # the first tick past the threshold alerts
+        text = self.inbox_text()
+        self.assertEqual(self.prompt_blocks("sre"), 1)
+        self.assertIn('menu="Approve the boundary and merge once merge-gate is green?"', text)
+        self.assertNotIn("## EL-T801-CI-HARDEN STALL", text)  # the stall half stays shadow
+        self.assertFalse(self.marks.exists() and list(self.marks.glob("*")))  # and writes no mark
+        self.run_once()  # the same screen hash: silent
+        f.set("%1", ASK_MOVED)  # the cursor moved, the menu did not: still silent
+        self.run_once()
+        self.assertEqual(self.prompt_blocks("sre"), 1)
+        f.set("%1", HEALTHY)  # answered: the alert clears
+        self.run_once()
+        self.assertEqual(json.loads((self.tmp / "state.json").read_text())["prompts"], {})
+        f.set("%1", ASK_USER)  # the same menu again is a new instance, alerted again past the threshold
+        self.run_once()
+        self.assertEqual(self.prompt_blocks("sre"), 1)
+        self.age(10)
+        self.run_once()
+        self.assertEqual(self.prompt_blocks("sre"), 2)
+        self.assertEqual({c[1] for c in f.calls}, {"display", "capture-pane"})  # never answered, never typed
+
+    def test_a_menu_read_before_the_question_was_kept_is_read_again(self):
+        self.write_config(apply="0", extra="STALL_PROMPT_APPLY=1\n")
+        self.start({"%1": ("ci", ASK_USER)})
+        self.run_once()
+        path = self.tmp / "state.json"
+        st = json.loads(path.read_text())
+        for p in st["panes"].values():
+            p["prompt"].pop("head")
+        path.write_text(json.dumps(st))
+        self.age(10)
+        self.run_once()
+        self.assertIn('menu="Approve the boundary', self.inbox_text())
+
+    def test_a_permission_prompt_carries_no_menu_text(self):
+        self.write_config(apply="0", extra="STALL_PROMPT_APPLY=1\n")
+        self.start({"%1": ("ci", PERMISSION)})
+        self.run_once()
+        self.age(11)
+        self.run_once()
+        self.assertEqual(self.prompt_blocks("ci"), 1)
+        self.assertNotIn("menu=", self.inbox_text())
+
     def test_below_the_threshold_nothing_is_flagged(self):
         self.start({"%1": ("ci", PERMISSION)})
         self.run_once()
