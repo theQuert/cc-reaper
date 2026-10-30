@@ -1062,8 +1062,11 @@ def _decide(s, cfg, now=None):
             # session's check-by, not this one's (EL-T2512: homepage kept by #6515 after pr-drain claimed it).
             at = now if now is not None else time.time()
             mine = [w["marker"] for w in s["owned"] if w.get("marker")]
-            cb = [checkby_state(r, n, cfg) for r, n in s["claims"]
-                  if classify_claim(oracle_brief(r, n, cfg, at), s["sid"], at, s.get("other_sids", ()), mine)[0]
+            # Check-bys exist only on CHECKBY_REPO issues (the oracle reads no other repo), so a claim elsewhere has
+            # none to keep it: homepage's docs worktree `claude/6361-…` was read as apertis-ai/docs#6361, which does
+            # not exist, and kept it as check-by-unknown for good.
+            cb = [checkby_state(r, n, cfg) for r, n in s["claims"] if r == cfg["CHECKBY_REPO"]
+                  and classify_claim(oracle_brief(r, n, cfg, at), s["sid"], at, s.get("other_sids", ()), mine)[0]
                   != "ended"]
             if "OPEN" in cb:
                 keep.append("check-by-open")

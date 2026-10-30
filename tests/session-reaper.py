@@ -285,7 +285,7 @@ class DoneCheckBy(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         self.inbox = Path(d) / "neo-inbox.md"
-        self.cfg = dict(CFG, DONE_INBOX=str(self.inbox))
+        self.cfg = dict(CFG, DONE_INBOX=str(self.inbox), CHECKBY_REPO="o/r")
         self.checkby = "CLEAR"
         self.claim = reaper.calendar.timegm((2026, 10, 25, 10, 0, 0, 0, 0, 0))  # 18:00 TPE
 
@@ -359,7 +359,7 @@ class DoneCheckBy(unittest.TestCase):
 
     def shadow(self, **kw):
         """DONE_INBOX off, DONE_INBOX_SHADOW on: (keep, inbox_done_shadow) for one decide."""
-        self.cfg = dict(CFG, DONE_INBOX="", DONE_INBOX_SHADOW=str(self.inbox))
+        self.cfg = dict(CFG, DONE_INBOX="", DONE_INBOX_SHADOW=str(self.inbox), CHECKBY_REPO="o/r")
         kw.setdefault("last_text", "all good")
         kw.setdefault("name", "ops-dispatch")
         kw.setdefault("claims", [("o/r", "2")])
@@ -1015,7 +1015,7 @@ class DoneGrace(unittest.TestCase):
         kw.setdefault("text_at", 2000)
         kw.setdefault("prompt_at", 1000)
         self.s = session(**kw)
-        cfg = dict(CFG, DONE_GRACE=mode, NOCLAIM_DONE="off")
+        cfg = dict(CFG, DONE_GRACE=mode, NOCLAIM_DONE="off", CHECKBY_REPO="o/r")
         brief = lambda r, n, c, now: self.brief
         with mock.patch.object(reaper, "issue_state", side_effect=lambda r, n: self.states[n]), \
              mock.patch.object(reaper, "oracle_brief", side_effect=brief), \
@@ -1058,7 +1058,7 @@ class DoneGrace(unittest.TestCase):
              mock.patch.object(reaper, "oracle_brief", return_value=handed), \
              mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.checkby), \
              mock.patch.object(reaper, "worktree_state", return_value=[]):
-            cfg = dict(CFG, NOCLAIM_DONE="off")
+            cfg = dict(CFG, NOCLAIM_DONE="off", CHECKBY_REPO="o/r")
             live = session(claims=[("o/r", "1")], other_sids=("pr-drain-1",))
             gone = session(claims=[("o/r", "1")], other_sids=())
             self.assertEqual(reaper.decide(live, cfg, 3000), [])
@@ -1066,6 +1066,13 @@ class DoneGrace(unittest.TestCase):
             own = session(claims=[("o/r", "1")], other_sids=("pr-drain-1",),
                           owned=[{"path": Path("/x/wt"), "marker": "pr-drain-1"}])
             self.assertEqual(reaper.decide(own, cfg, 3000), ["check-by-open"])  # its own marker: its check-by
+
+    def test_a_claim_outside_the_checkby_repo_has_no_check_by(self):
+        self.states["7"] = "OPEN"
+        self.checkby = "UNKNOWN"
+        self.assertEqual(self.run_decide("apply", claims=[("o/docs", "7")]), [])
+        self.brief = "delivery #7: pr -> agent x\n  claimant: claude session sid-1; the step is that session's: hand it over"
+        self.assertEqual(self.run_decide("apply", claims=[("o/r", "7")]), ["check-by-unknown"])
 
     def test_shadow_reports_would_close_and_keeps(self):
         self.assertEqual(self.run_decide("shadow"), ["idle:10<60min"])
