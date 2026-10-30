@@ -285,7 +285,7 @@ class DoneCheckBy(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         self.inbox = Path(d) / "neo-inbox.md"
-        self.cfg = dict(CFG, DONE_INBOX=str(self.inbox))
+        self.cfg = dict(CFG, DONE_INBOX=str(self.inbox), CHECKBY_REPO="o/r")
         self.checkby = "CLEAR"
         self.claim = reaper.calendar.timegm((2026, 10, 25, 10, 0, 0, 0, 0, 0))  # 18:00 TPE
 
@@ -359,7 +359,7 @@ class DoneCheckBy(unittest.TestCase):
 
     def shadow(self, **kw):
         """DONE_INBOX off, DONE_INBOX_SHADOW on: (keep, inbox_done_shadow) for one decide."""
-        self.cfg = dict(CFG, DONE_INBOX="", DONE_INBOX_SHADOW=str(self.inbox))
+        self.cfg = dict(CFG, DONE_INBOX="", DONE_INBOX_SHADOW=str(self.inbox), CHECKBY_REPO="o/r")
         kw.setdefault("last_text", "all good")
         kw.setdefault("name", "ops-dispatch")
         kw.setdefault("claims", [("o/r", "2")])
@@ -1002,6 +1002,106 @@ class NewKeepGates(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text())["status"], "aborted:skipped:background-tasks")
         reaper.mark_record(path, "reaped")
         self.assertEqual(json.loads(path.read_text())["status"], "reaped")
+
+
+class DoneGrace(unittest.TestCase):
+    """EL-T2512: a session that said it is done, after its last prompt, waits DONE_GRACE_MINUTES, not IDLE_MINUTES."""
+    def setUp(self):
+        self.states, self.checkby = {"1": "CLOSED"}, "CLEAR"
+        self.brief = "delivery #1: closed -> none"
+
+    def run_decide(self, mode, **kw):
+        kw.setdefault("idle_min", 10)
+        kw.setdefault("text_at", 2000)
+        kw.setdefault("prompt_at", 1000)
+        self.s = session(**kw)
+        cfg = dict(CFG, DONE_GRACE=mode, NOCLAIM_DONE="off", CHECKBY_REPO="o/r")
+        brief = lambda r, n, c, now: self.brief
+        with mock.patch.object(reaper, "issue_state", side_effect=lambda r, n: self.states[n]), \
+             mock.patch.object(reaper, "oracle_brief", side_effect=brief), \
+             mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.checkby), \
+             mock.patch.object(reaper, "worktree_state", side_effect=lambda w, c: w.get("problems", [])):
+            return reaper.decide(self.s, cfg, 3000)
+
+    def test_session_done_after_the_prompt_closes_after_the_grace(self):
+        self.assertEqual(self.run_decide("apply"), [])
+        self.assertEqual(self.run_decide("apply", idle_min=3), ["idle:3<5min"])
+
+    def test_without_a_fresh_done_line_the_idle_wait_stands(self):
+        self.assertEqual(self.run_decide("apply", prompt_at=2000), ["idle:10<60min"])  # prompted since
+        self.assertEqual(self.run_decide("apply", last_text="shipped it"), ["idle:10<60min", "claim-unknown"])
+        self.assertEqual(self.run_decide("apply", last_text="quoted: SESSION-DONE: x"),
+                         ["idle:10<60min", "claim-unknown"])  # mid-line prose is not a done line
+        self.assertEqual(self.run_decide("off"), ["idle:10<60min"])
+        for quoted in ("- `SESSION-DONE: x`", "> SESSION-DONE: x", "`SESSION-STATE: IDLE_NO_WORK`",
+                       "```\nSESSION-DONE: x\n```", "SESSION-DONE: x\nmore\nand more\nstill more"):
+            self.run_decide("shadow", last_text=quoted)
+            self.assertFalse(self.s.get("done_grace_shadow"), quoted)  # explained, quoted or not at the end
+
+    def test_idle_no_work_shortens_only_the_wait(self):
+        text = "nothing left\nSESSION-STATE: IDLE_NO_WORK"
+        self.assertEqual(self.run_decide("apply", last_text=text, claims=[("o/r", "1")]), [])
+        self.assertEqual(self.run_decide("apply", last_text=text), ["claim-unknown"])  # not a done line by itself
+
+    def test_every_other_gate_still_holds(self):
+        wt = {"path": Path("/x/wt"), "problems": ["uncommitted:wt"]}
+        self.assertEqual(self.run_decide("apply", owned=[wt]), ["uncommitted:wt"])
+        self.assertEqual(self.run_decide("apply", bg_shells=[1]), ["shell-child"])
+        self.checkby, self.states["1"] = "OPEN", "OPEN"
+        self.brief = "delivery #1: pr -> agent x\n  claimant: claude session sid-1; the step is that session's: hand it over"
+        self.assertEqual(self.run_decide("apply", claims=[("o/r", "1")]), ["check-by-open"])
+
+    def test_a_claim_handed_to_another_live_session_carries_its_check_by(self):
+        self.checkby = "OPEN"
+        handed = "delivery #1: pr -> agent x\n  claimant: claude session pr-drain-1 (pr-drain); the step is that session's: hand it over"
+        with mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
+             mock.patch.object(reaper, "oracle_brief", return_value=handed), \
+             mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.checkby), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]):
+            cfg = dict(CFG, NOCLAIM_DONE="off", CHECKBY_REPO="o/r")
+            live = session(claims=[("o/r", "1")], other_sids=("pr-drain-1",))
+            gone = session(claims=[("o/r", "1")], other_sids=())
+            self.assertEqual(reaper.decide(live, cfg, 3000), [])
+            self.assertEqual(reaper.decide(gone, cfg, 3000), ["check-by-open"])  # claimant not live: unknown, kept
+            own = session(claims=[("o/r", "1")], other_sids=("pr-drain-1",),
+                          owned=[{"path": Path("/x/wt"), "marker": "pr-drain-1"}])
+            self.assertEqual(reaper.decide(own, cfg, 3000), ["check-by-open"])  # its own marker: its check-by
+
+    def test_a_claim_outside_the_checkby_repo_has_no_check_by(self):
+        self.states["7"] = "OPEN"
+        self.checkby = "UNKNOWN"
+        self.assertEqual(self.run_decide("apply", claims=[("o/docs", "7")]), [])
+        self.brief = "delivery #7: pr -> agent x\n  claimant: claude session sid-1; the step is that session's: hand it over"
+        self.assertEqual(self.run_decide("apply", claims=[("o/r", "7")]), ["check-by-unknown"])
+
+    def test_shadow_reports_would_close_and_keeps(self):
+        self.assertEqual(self.run_decide("shadow"), ["idle:10<60min"])
+        self.assertTrue(self.s.get("done_grace_shadow"))
+        self.assertIn("would-close: done grace (shadow)", reaper.report_line(
+            dict(self.s, pid=1, descendants=0), ["idle:10<60min"], "would-close"))
+        self.run_decide("shadow", bg_shells=[1])
+        self.assertFalse(self.s.get("done_grace_shadow"))
+        self.run_decide("shadow", idle_min=3)
+        self.assertFalse(self.s.get("done_grace_shadow"))
+
+    def test_transcript_records_when_the_text_was_written(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        p = Path(d) / "t.jsonl"
+        p.write_text("\n".join(json.dumps(e) for e in [
+            {"type": "user", "timestamp": "2026-10-11T00:00:00.000Z", "message": {"content": "go"}},
+            {"type": "assistant", "timestamp": "2026-10-11T00:05:00.000Z",
+             "message": {"content": [{"type": "text", "text": "SESSION-DONE: done"}]}},
+            {"type": "assistant", "timestamp": "2026-10-11T00:06:00.000Z",
+             "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]}}]) + "\n")
+        now = reaper.calendar.timegm((2026, 10, 11, 0, 10, 0, 0, 0, 0))
+        f = reaper.transcript_facts(p, now)
+        self.assertFalse(reaper.said_done(f))  # a tool call came after the done text: still working
+        lines = p.read_text().splitlines()
+        p.write_text("\n".join(lines[:2]) + "\n")
+        f = reaper.transcript_facts(p, now)
+        self.assertEqual(f["text_at"] - f["prompt_at"], 300)
+        self.assertTrue(reaper.said_done(f))
 
 
 class Nudge(unittest.TestCase):
