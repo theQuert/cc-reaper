@@ -1046,9 +1046,11 @@ class Nudge(unittest.TestCase):
         self.assertEqual(self.run_once(["owed-step:#1"], idle_min=30), [])
         self.assertEqual(self.run_once(["owed-step:#1"], status="busy"), [])
 
-    def test_uiux_and_homepage_are_never_nudged(self):
-        for name in ("uiux", "homepage", "UIUX-2"):
-            self.assertEqual(self.run_once(["owed-step:#1"], tmux=name, name=name), [], name)
+    def test_uiux_and_homepage_are_nudged_like_every_session_and_only_protect_skips(self):
+        for name in ("uiux", "homepage"):  # EL-T2490: NEVER_CLOSE (default uiux* homepage*) stops a close, not a nudge
+            self.assertEqual(self.run_once(["owed-step:#1"], tmux=name, name=name), [f"abcdef01:owed-step:#1"], name)
+            reaper.nudge_events(self.cfg, [], self.now)
+        self.assertEqual(self.run_once(["owed-step:#1"], tmux="keep-me", name="keep-me"), [], "PROTECT keep-*")
 
     def test_a_draft_or_a_menu_on_screen_is_not_idle_at_the_prompt(self):
         self.screen = f"{self.SEP}\n❯ #24 head 9ccc7b4 待 merge\n{self.SEP}"

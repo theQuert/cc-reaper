@@ -798,8 +798,8 @@ def nudge_events(cfg, seen, now):
     """EL-T2482: an idle session at an empty prompt kept ONLY by open work of its own (an owed oracle step, an
     uncommitted or unpushed worktree, an open check-by) gets one `ROUTE nudge <tmux> <fingerprint>` line in
     NUDGE_EVENTS, and ops-dispatch sends it a message. Once per fingerprint (session id + reasons); one no longer
-    seen is forgotten, so it nudges again if it returns. Never PROTECT or NEVER_CLOSE (uiux, homepage: Leo's own).
-    Types nothing into any pane. Returns the fingerprints it routed."""
+    seen is forgotten, so it nudges again if it returns. No name is skipped but PROTECT (EL-T2490: uiux and homepage
+    are nudged like every session; NEVER_CLOSE only stops a close). Types nothing into any pane. Returns what it routed."""
     if not cfg["NUDGE_EVENTS"]:
         return []
     st = Path(os.path.expanduser(cfg["NUDGE_STATE"]))
@@ -811,8 +811,7 @@ def nudge_events(cfg, seen, now):
     for s, keep, outcome in seen:
         names = [n for n in (s["tmux"], s.get("name")) if n]
         if (not keep or not all(k.startswith(OPEN_WORK) for k in keep) or s["status"] != "idle"
-                or s["idle_min"] < float(cfg["IDLE_MINUTES"]) or protected(cfg, *names)
-                or any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in names)):
+                or s["idle_min"] < float(cfg["IDLE_MINUTES"]) or protected(cfg, *names)):
             continue
         state = pane_state(s["pane"]) if s.get("pane") else None
         if not state or not empty_prompt(state):  # working, a menu, or a draft in the input: not idle at ❯
