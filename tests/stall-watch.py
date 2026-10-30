@@ -653,6 +653,33 @@ class PromptRuns(unittest.TestCase):
         self.run_once()
         self.assertIn('menu="Approve the boundary', self.inbox_text())
 
+    def test_shadow_then_prompt_apply_alerts_a_waiting_menu_exactly_once(self):
+        self.write_config(apply="0")
+        self.start({"%1": ("sre", ASK_USER)})
+        self.run_once()
+        self.age(10)
+        self.run_once()
+        self.assertIn("would alert prompt sre", self.printed)
+        self.assertEqual(self.prompt_blocks("sre"), 0)
+        self.write_config(apply="0", extra="STALL_PROMPT_APPLY=1\n")
+        self.run_once()
+        self.run_once()
+        self.assertEqual(self.prompt_blocks("sre"), 1)
+
+    def test_the_menu_question_cannot_carry_a_header_a_secret_or_hidden_characters(self):
+        head = stall._menu_head(["│ Ship it?\u2028## EL-FAKE DONE `x` \"q\" \u202eevil\x9b31m\u200b ok",
+                                 "1. y"])
+        self.assertNotIn("\n", head); self.assertNotIn("`", head); self.assertNotIn('"', head)
+        self.assertFalse(any(c in head for c in "\u2028\u202e\x9b\u200b"))
+        self.assertTrue(head.startswith("Ship it? ## EL-FAKE"))  # never at a line start
+        for secret in ("sk-live-4f9a8b7c6d5e4f3a2b1c", "ghp_AbCdEfGhIjKlMnOpQrStUv12", "STRIPE_SECRET=whsec_abc123",
+                       "a" * 20 + "B9" * 10, "token: hunter2hunter2"):
+            h = stall._menu_head([f"Rotate {secret} now?"])
+            self.assertIn("[redacted]", h, secret)
+            self.assertNotIn(secret.split("=")[-1].split(": ")[-1], h, secret)
+        self.assertLessEqual(len(stall._menu_head(["x " * 200])), 80)
+        self.assertEqual(stall._menu_head(["Merge PR #6739 at f36a13cd now?"]), "Merge PR #6739 at f36a13cd now?")
+
     def test_a_permission_prompt_carries_no_menu_text(self):
         self.write_config(apply="0", extra="STALL_PROMPT_APPLY=1\n")
         self.start({"%1": ("ci", PERMISSION)})

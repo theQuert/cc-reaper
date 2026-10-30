@@ -54,6 +54,7 @@ import os
 import re
 import shlex
 import sys
+import unicodedata
 import time
 from pathlib import Path
 
@@ -212,7 +213,18 @@ def _menu_head(region):
     with no backtick or quote, and only an AskUserQuestion alert carries it."""
     body = [l for l in region if l.strip() and not RULE_RE.search(l)]
     pick = next((l for l in body if not ASK_TAB_RE.search(l)), body[0] if body else "")
-    return re.sub(r"[`\"'\x00-\x1f\x7f]", "", one_line(pick.strip(" │|☐☒✔✓←→")))[:80]
+    text = one_line(pick.strip(" │|☐☒✔✓←→"))
+    # every control, format (bidi override, zero width), private-use and surrogate character, then quotes
+    text = re.sub(r"[`\"']", "", "".join(c for c in text if unicodedata.category(c)[0] != "C"))
+    return SECRET_RE.sub("[redacted]", text)[:80]
+
+
+# What a question may quote that must not reach an inbox mirrored on GitHub: known key shapes, NAME=value for a
+# token-like name, and any long unbroken key-like run.
+SECRET_RE = re.compile(
+    r"(?i)\b(?:sk|pk|rk|whsec)[-_][\w-]{8,}|\b(?:ghp|gho|ghs|ghu|ghr|github_pat|xox[abprs])[-_][\w-]{8,}|\bAKIA[0-9A-Z]{12,}"
+    r"|\bAIza[\w-]{20,}|\beyJ[\w-]{8,}\.[\w.-]+|\b\w*(?:token|secret|passw(?:or)?d|api[-_]?key)\w*\s*[=:]\s*\S+"
+    r"|[A-Za-z0-9_+=-]{32,}")
 
 
 def scan_prompt(lines):
