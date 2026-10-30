@@ -890,8 +890,11 @@ a person's or Neo's step.
   format character, key-like text `[redacted]`; other kinds carry no screen text), in shadow one `would alert prompt`
   line, once per prompt instance. While the same prompt stays it gets a `still on screen` log line at most
   every `STALL_PROMPT_REALERT_MINUTES` (120), never a second inbox entry (one entry per state change). A
-  prompt that leaves the screen is forgotten; a malformed stored entry is dropped and seen afresh. No push
-  channel to the founder's device exists here, so that half is a log line. The prompt is never answered.
+  prompt that leaves the screen is forgotten; a malformed stored entry is dropped and seen afresh. With
+  `STALL_PUSH=1` (#130) a new prompt alert also pings `STALL_PUSH_KEY` (the Better Stack founder-decision heartbeat,
+  read from `STALL_PUSH_ENV`) at `/fail` once, which pages the founder's device: numbers, kind and session name only,
+  the URL never printed, a failure a log line. release-owner-driver's 5-minute success ping on the same heartbeat
+  resolves that incident after the page; a dedicated heartbeat removes that. The prompt is never answered.
 
 ```bash
 install -m 755 shell/stall-watch.py ~/.cc-reaper/stall-watch.py

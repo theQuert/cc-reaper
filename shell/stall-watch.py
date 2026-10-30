@@ -34,7 +34,8 @@ until a person looks. This is the cheap detector for that, and it calls no model
           `## EL-T921-PROMPT-STALL <session>` block in STALL_INBOX, in shadow one `would alert prompt` line, once per
           prompt instance (one inbox entry per state change). While the same prompt stays, a `still on screen` log
           line at most every STALL_PROMPT_REALERT_MINUTES (120), never a second inbox entry. No push channel to the
-          founder's device exists in cc-reaper or ~/.claude hooks, so that half is a log line only. An
+          founder's device: a new prompt alert also pings the Better Stack founder-decision heartbeat's /fail once
+          (STALL_PUSH=1, #130; numbers, kind and session name only), which pages the founder. An
           AskUserQuestion block names its question as menu="..." (one line, 80 characters, no backtick or quote);
           the other kinds carry no screen text, since their region can hold a command line. The prompt is
           never answered.
@@ -55,6 +56,7 @@ import re
 import shlex
 import sys
 import unicodedata
+import urllib.request
 import time
 from pathlib import Path
 
@@ -74,6 +76,9 @@ DEFAULTS = {
     "STALL_PROMPT_MINUTES": "10",  # a permission prompt or AskUserQuestion menu on screen this long is flagged (0: off)
     "STALL_PROMPT_REALERT_MINUTES": "120",  # the same prompt still on screen is flagged again at most this often
     "STALL_PROMPT_APPLY": "0",  # 1: prompt alerts go to STALL_INBOX while STALL_APPLY stays shadow (#128)
+    "STALL_PUSH": "0",  # 1: a live prompt alert also pings STALL_PUSH_KEY's URL + /fail once (#130); 0: `would push`
+    "STALL_PUSH_ENV": "~/ci-runner/heartbeats.env",
+    "STALL_PUSH_KEY": "HEARTBEAT_FOUNDER_DECISION",  # Better Stack: an incident on it pages the founder
 }
 READ_ONLY_TMUX = ("display", "capture-pane")  # #5212: nothing that types into a pane
 
@@ -587,8 +592,39 @@ def prompt_sweep(cfg, apply, state, prompts, kept, inbox, now, failures):
             would += 1
             ev["shadow_at"] = now
             print(f"stall-watch shadow: would alert prompt {line} -> {inbox}")
-        print(f"stall-watch: push: no founder-device channel in cc-reaper or ~/.claude hooks; logged only ({name})")
+        founder_push(cfg, apply, name, sid, pane, ev, now)
     return out, seen, flagged, would
+
+
+def _ping(url, body):
+    urllib.request.urlopen(urllib.request.Request(url, data=body.encode()), timeout=10).read()
+
+
+def founder_push(cfg, live, name, sid, pane, ev, now):
+    """One push per prompt instance, to the founder's device: a /fail ping on a Better Stack heartbeat opens an
+    incident, which pages. The body carries numbers, the kind and the session name only (it leaves this machine);
+    the URL is never printed (it is the credential). Nothing here can fail the tick or answer the prompt."""
+    key = cfg.get("STALL_PUSH_KEY") or ""
+    if not (live and cfg.get("STALL_PUSH") == "1"):
+        print(f"stall-watch shadow: would push {name} ({sid[:8]}) via {key}")
+        return
+    try:
+        env = Path(cfg.get("STALL_PUSH_ENV") or "").expanduser()
+        line = next((l for l in env.read_text().splitlines() if key and l.startswith(key + "=")), "")
+    except (OSError, ValueError):
+        line = ""
+    url = line.partition("=")[2].strip()
+    if not url.startswith("https://"):
+        print(f"stall-watch: push: no https URL under {key}; logged only ({name})")
+        return
+    body = (f"PROMPT-STALL session={name} id={sid[:8]} pane={pane} kind={ev['kind']} prompt={ev['fp']} "
+            f"on-screen={int((now - ev['first']) // 60)}m")
+    try:
+        _ping(url.rstrip("/") + "/fail", body)
+    except Exception as e:  # noqa: BLE001 - never the message: it can quote the URL
+        print(f"stall-watch: push failed ({type(e).__name__}); logged only ({name})")
+        return
+    print(f"stall-watch: pushed {name} ({sid[:8]}) via {key}")
 
 
 if __name__ == "__main__":
