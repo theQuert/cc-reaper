@@ -29,11 +29,14 @@ until a person looks. This is the cheap detector for that, and it calls no model
           approval ("Would you like to proceed?"), folder trust ("1. Yes, I trust this folder" / "2. No, exit") or an
           AskUserQuestion menu ("☐ <header>", options, "Enter to select · ↑/↓ to navigate") live at the bottom of a
           pane, with no input box below it, is aged from its first sighting per (session id, prompt fingerprint) in
-          the state file. Past STALL_PROMPT_MINUTES (10) it is flagged with its age: with apply one
+          the state file. Past STALL_PROMPT_MINUTES (10) it is flagged with its age: with apply (STALL_APPLY=1, or
+          STALL_PROMPT_APPLY=1 alone, which leaves marks and STALL entries in shadow; cc-reaper #128) one
           `## EL-T921-PROMPT-STALL <session>` block in STALL_INBOX, in shadow one `would alert prompt` line, once per
           prompt instance (one inbox entry per state change). While the same prompt stays, a `still on screen` log
           line at most every STALL_PROMPT_REALERT_MINUTES (120), never a second inbox entry. No push channel to the
-          founder's device exists in cc-reaper or ~/.claude hooks, so that half is a log line only. The prompt is
+          founder's device exists in cc-reaper or ~/.claude hooks, so that half is a log line only. An
+          AskUserQuestion block names its question as menu="..." (one line, 80 characters, no backtick or quote);
+          the other kinds carry no screen text, since their region can hold a command line. The prompt is
           never answered.
 
 HARD RULE (stima-api #5212): nothing here types into another agent's pane. The only tmux calls are `display`
@@ -51,6 +54,7 @@ import os
 import re
 import shlex
 import sys
+import unicodedata
 import time
 from pathlib import Path
 
@@ -69,6 +73,7 @@ DEFAULTS = {
     "STALL_FLEET_MIN": "2",  # panes showing interrupted-idle at once that stand in for "Login successful"
     "STALL_PROMPT_MINUTES": "10",  # a permission prompt or AskUserQuestion menu on screen this long is flagged (0: off)
     "STALL_PROMPT_REALERT_MINUTES": "120",  # the same prompt still on screen is flagged again at most this often
+    "STALL_PROMPT_APPLY": "0",  # 1: prompt alerts go to STALL_INBOX while STALL_APPLY stays shadow (#128)
 }
 READ_ONLY_TMUX = ("display", "capture-pane")  # #5212: nothing that types into a pane
 
@@ -198,7 +203,28 @@ def _ask_menu(lines):
     first_opt = next((j for j in range(tab, foot) if OPT_RE.search(lines[j])), None)
     if first_opt is None:
         return None
-    return {"kind": "ask-user-question", "fp": _fingerprint("ask-user-question", lines[tab:first_opt], lines[first_opt])}
+    region = lines[tab:first_opt]
+    return {"kind": "ask-user-question", "fp": _fingerprint("ask-user-question", region, lines[first_opt]),
+            "head": _menu_head(region)}
+
+
+def _menu_head(region):
+    """The menu's question (else its tab line) as one short line: text a session wrote, so it is cut to 80 characters
+    with no backtick or quote, and only an AskUserQuestion alert carries it."""
+    body = [l for l in region if l.strip() and not RULE_RE.search(l)]
+    pick = next((l for l in body if not ASK_TAB_RE.search(l)), body[0] if body else "")
+    text = one_line(pick.strip(" │|☐☒✔✓←→"))
+    # every control, format (bidi override, zero width), private-use and surrogate character, then quotes
+    text = re.sub(r"[`\"']", "", "".join(c for c in text if unicodedata.category(c)[0] != "C"))
+    return SECRET_RE.sub("[redacted]", text)[:80]
+
+
+# What a question may quote that must not reach an inbox mirrored on GitHub: known key shapes, NAME=value for a
+# token-like name, and any long unbroken key-like run.
+SECRET_RE = re.compile(
+    r"(?i)\b(?:sk|pk|rk|whsec)[-_][\w-]{8,}|\b(?:ghp|gho|ghs|ghu|ghr|github_pat|xox[abprs])[-_][\w-]{8,}|\bAKIA[0-9A-Z]{12,}"
+    r"|\bAIza[\w-]{20,}|\beyJ[\w-]{8,}\.[\w.-]+|\b\w*(?:token|secret|passw(?:or)?d|api[-_]?key)\w*\s*[=:]\s*\S+"
+    r"|[A-Za-z0-9_+=-]{32,}")
 
 
 def scan_prompt(lines):
@@ -335,7 +361,9 @@ def prompt_block(name, sid, pane, ev, now):
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(ev["first"]))
     return (f"\n## {PROMPT_HEADER} {name}\n\n"
             f"PROMPT session={name} id={sid} pane={pane} kind={ev['kind']} prompt={ev['fp']} "
-            f"on-screen={int((now - ev['first']) // 60)}m since={stamp}; "
+            f"on-screen={int((now - ev['first']) // 60)}m since={stamp}"
+            + (f' menu="{ev["head"]}"' if ev.get("kind") == "ask-user-question" and ev.get("head") else "")
+            + "; "
             f"a person answers it at the pane (the detector never answers, types nothing)\n")
 
 
@@ -398,7 +426,9 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
                 panes[pane] = prev
             continue
         h = screen_hash(ps)
-        if prev and prev.get("hash") == h and prev.get("sid") == sid and "prompt" in prev:
+        stale = isinstance(prev, dict) and isinstance(prev.get("prompt"), dict) and \
+            prev["prompt"].get("kind") == "ask-user-question" and "head" not in prev["prompt"]  # read before #128
+        if prev and prev.get("hash") == h and prev.get("sid") == sid and "prompt" in prev and not stale:
             panes[pane] = prev  # unchanged screen: nothing to re-read (a state from before prompt detection is re-read)
             continue
         rescanned += 1
@@ -448,7 +478,8 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
                 events[f"{pane}|{fp}|{sid}"]["shadow_logged"] = True
             print(f"stall-watch shadow: would report {name} ({sid[:8]}) {','.join(fresh)} -> {resume_command(sid, name)}")
     try:  # after the STALL inbox writes and before the state write: nothing here may stop the state being saved
-        prompt_events, seen, flagged, pwould = prompt_sweep(cfg, apply, state, prompts, kept, inbox, now, failures)
+        papply = apply or cfg.get("STALL_PROMPT_APPLY") == "1"
+        prompt_events, seen, flagged, pwould = prompt_sweep(cfg, papply, state, prompts, kept, inbox, now, failures)
     except Exception as e:  # noqa: BLE001 - reported as a failure (exit 1), never silent
         failures.append(f"prompt sweep failed ({type(e).__name__}): prompt state reset")
         prompt_events, seen, flagged, pwould = {}, 0, 0, 0
@@ -526,6 +557,8 @@ def prompt_sweep(cfg, apply, state, prompts, kept, inbox, now, failures):
         ev = stored.get(key) or {"first": now, "kind": pr["kind"], "fp": pr["fp"], "alerts": 0,
                                  "alerted": None, "shadow_at": None}
         ev["pane"] = pane
+        if isinstance(pr.get("head"), str):
+            ev["head"] = pr["head"]
         out[key] = ev
         age = now - ev["first"]
         if age < after:

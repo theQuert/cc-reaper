@@ -884,8 +884,10 @@ a person's or Neo's step.
   live at the bottom of a pane, with no `❯` input line below it, is aged from its first sighting per
   (session id, prompt fingerprint); the fingerprint is the prompt's title, question and first option label,
   without the option cursor, preview box or wrap width. Past `STALL_PROMPT_MINUTES` (10; 0 is off) it is
-  flagged with its age: with `STALL_APPLY=1` one `## EL-T921-PROMPT-STALL <session-name>` block in
-  `STALL_INBOX` (numbers, kind and session name only, no screen text), in shadow one `would alert prompt`
+  flagged with its age: with `STALL_APPLY=1`, or `STALL_PROMPT_APPLY=1` alone (marks and STALL entries stay
+  shadow; #128), one `## EL-T921-PROMPT-STALL <session-name>` block in `STALL_INBOX` (numbers, kind and session
+  name; an AskUserQuestion also its question as `menu="…"`: one line, 80 characters, no quote, backtick, control or
+  format character, key-like text `[redacted]`; other kinds carry no screen text), in shadow one `would alert prompt`
   line, once per prompt instance. While the same prompt stays it gets a `still on screen` log line at most
   every `STALL_PROMPT_REALERT_MINUTES` (120), never a second inbox entry (one entry per state change). A
   prompt that leaves the screen is forgotten; a malformed stored entry is dropped and seen afresh. No push
