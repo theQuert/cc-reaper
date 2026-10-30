@@ -792,44 +792,54 @@ def protected(cfg, *names):
 
 
 OPEN_WORK = ("owed-step:", "uncommitted:", "unpushed:", "check-by-open")  # decide()/worktree_state() keep reasons
+NUDGE_FOR = OPEN_WORK[:3]  # a pending check-by alone is not: checkby_state says OPEN before it is due, the router wakes it
 
 
 def nudge_events(cfg, seen, now):
     """EL-T2482: an idle session at an empty prompt kept ONLY by open work of its own (an owed oracle step, an
-    uncommitted or unpushed worktree, an open check-by) gets one `ROUTE nudge <tmux> <fingerprint>` line in
-    NUDGE_EVENTS, and ops-dispatch sends it a message. Once per fingerprint (session id + reasons); one no longer
-    seen is forgotten, so it nudges again if it returns. No name is skipped but PROTECT (EL-T2490: uiux and homepage
-    are nudged like every session; NEVER_CLOSE only stops a close). Types nothing into any pane. Returns what it routed."""
+    uncommitted or unpushed worktree, plus at most an open check-by) gets one `ROUTE nudge <tmux> <fingerprint>` line
+    in NUDGE_EVENTS, and ops-dispatch sends it a message. Once per fingerprint (session id + reasons): it stays
+    remembered while the session is kept by those same reasons, busy or not, and is forgotten only when a judged
+    session's reasons change, so it nudges again only on new open work. A session not judged this sweep (budget,
+    error, skipped by gather, aborted sweep) keeps what was remembered. No name is skipped but PROTECT (EL-T2490: uiux
+    and homepage are nudged like every session; NEVER_CLOSE only stops a close). Types nothing into any pane."""
     if not cfg["NUDGE_EVENTS"]:
         return []
     st = Path(os.path.expanduser(cfg["NUDGE_STATE"]))
     try:
-        sent = set(json.loads(st.read_text()))
+        sent = {str(x) for x in json.loads(st.read_text())}
     except (OSError, ValueError, TypeError):
         sent = set()
-    cur, new = set(), []
+    judged, cur, new = set(), set(), []
     for s, keep, outcome in seen:
+        if outcome == "error" or any(k.startswith("unjudged:") for k in keep):
+            continue
+        judged.add(s["sid"][:8])
+        if not keep or not all(k.startswith(OPEN_WORK) for k in keep) or not any(k.startswith(NUDGE_FOR) for k in keep):
+            continue
+        fp = f"{s['sid'][:8]}:" + ",".join(sorted(keep))
+        if fp in sent:  # already nudged for exactly this: remembered, busy or idle
+            cur.add(fp)
+            continue
         names = [n for n in (s["tmux"], s.get("name")) if n]
-        if (not keep or not all(k.startswith(OPEN_WORK) for k in keep) or s["status"] != "idle"
-                or s["idle_min"] < float(cfg["IDLE_MINUTES"]) or protected(cfg, *names)):
+        if s["status"] != "idle" or s["idle_min"] < float(cfg["IDLE_MINUTES"]) or protected(cfg, *names):
             continue
         state = pane_state(s["pane"]) if s.get("pane") else None
         if not state or not empty_prompt(state):  # working, a menu, or a draft in the input: not idle at ❯
             continue
-        fp = f"{s['sid'][:8]}:" + ",".join(sorted(keep))
         cur.add(fp)
-        if fp not in sent:
-            new.append((s["tmux"], fp))
+        new.append((s["tmux"], fp))
+    keep_sent = {fp for fp in sent if fp.split(":", 1)[0] not in judged} | cur
+    st.parent.mkdir(parents=True, exist_ok=True)
+    tmp = st.with_name(st.name + ".tmp")
+    tmp.write_text(json.dumps(sorted(keep_sent)))
+    os.replace(tmp, st)  # at most once: remembered before the line is written
     if new:
         path = Path(os.path.expanduser(cfg["NUDGE_EVENTS"]))
         path.parent.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
         with open(path, "a") as f:
             f.writelines(f"{stamp} ROUTE nudge {t} {fp}\n" for t, fp in new)
-    st.parent.mkdir(parents=True, exist_ok=True)
-    tmp = st.with_name(st.name + ".tmp")
-    tmp.write_text(json.dumps(sorted(cur)))
-    os.replace(tmp, st)
     return [fp for _, fp in new]
 
 
@@ -1530,14 +1540,14 @@ def main(argv=None):
             idle_list(cfg, seen, now)
     except Exception as e:  # a report-only list must not stop the report
         failures.append(f"idle list: {type(e).__name__}: {e}")
-    try:
-        if not args.only and not any("unjudged:run-budget" in k for _, k, _ in seen):  # partial: would forget fingerprints
+    signal.alarm(0)
+    faulthandler.cancel_dump_traceback_later()
+    try:  # after the alarm is off, so the deadline cannot cut it between the state write and the event line
+        if not args.only:
             for fp in nudge_events(cfg, seen, now):
                 notes.append(f"nudge routed: {fp}")
     except Exception as e:  # a nudge must not stop the report
         failures.append(f"nudge: {type(e).__name__}: {e}")
-    signal.alarm(0)
-    faulthandler.cancel_dump_traceback_later()
     mode = "apply" if apply else "report-only"
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
     report = [f"# session-reaper {mode} {stamp}", "",

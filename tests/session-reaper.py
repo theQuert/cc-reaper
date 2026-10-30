@@ -1033,12 +1033,46 @@ class Nudge(unittest.TestCase):
         self.assertEqual(len(self.events()), 1)
 
     def test_a_fingerprint_that_clears_nudges_again_when_it_returns(self):
-        self.run_once(["check-by-open"])
-        reaper.nudge_events(self.cfg, [], self.now)
-        self.assertEqual(self.run_once(["check-by-open"]), ["abcdef01:check-by-open"])
+        self.run_once(["owed-step:#1"])
+        reaper.nudge_events(self.cfg, [(session(sid="abcdef0123", pane="%1"), [], "keep")], self.now)  # judged, no work
+        self.assertEqual(self.run_once(["owed-step:#1"]), ["abcdef01:owed-step:#1"])
+
+    def test_busy_or_a_draft_after_a_nudge_does_not_forget_it(self):
+        self.run_once(["owed-step:#1"])
+        self.assertEqual(self.run_once(["owed-step:#1"], status="busy"), [])
+        self.screen = f"{self.SEP}\n❯ half a reply\n{self.SEP}"
+        self.assertEqual(self.run_once(["owed-step:#1"]), [])
+        self.screen = f"{self.SEP}\n❯ \n{self.SEP}"
+        self.assertEqual(self.run_once(["owed-step:#1"]), [], "same work, idle again: still once")
+
+    def test_a_busy_session_is_nudged_once_it_is_idle_at_the_prompt(self):
+        self.assertEqual(self.run_once(["owed-step:#1"], status="busy"), [])
+        self.assertEqual(self.run_once(["owed-step:#1"]), ["abcdef01:owed-step:#1"])
+
+    def test_a_session_not_judged_this_sweep_keeps_its_fingerprint(self):
+        self.run_once(["owed-step:#1"])
+        for seen in ([], [(session(sid="abcdef0123"), ["unjudged:run-budget"], "keep")],
+                     [(session(sid="abcdef0123"), [], "error")]):
+            reaper.nudge_events(self.cfg, seen, self.now)
+            self.assertEqual(self.run_once(["owed-step:#1"]), [], seen)
+
+    def test_a_pending_check_by_alone_is_not_a_nudge(self):
+        self.assertEqual(self.run_once(["check-by-open"]), [])
+        self.assertEqual(self.run_once(["check-by-open", "unpushed:wt"]), ["abcdef01:check-by-open,unpushed:wt"])
+
+    def test_a_corrupt_state_file_counts_as_empty(self):
+        (self.tmp / "nudged.json").write_text("{not json")
+        self.assertEqual(self.run_once(["owed-step:#1"]), ["abcdef01:owed-step:#1"])
+        self.assertEqual(json.loads((self.tmp / "nudged.json").read_text()), ["abcdef01:owed-step:#1"])
+
+    def test_no_pane_or_an_unreadable_pane_is_not_a_nudge(self):
+        s = session(sid="abcdef0123")  # no "pane" key
+        self.assertEqual(reaper.nudge_events(self.cfg, [(s, ["owed-step:#1"], "keep")], self.now), [])
+        with mock.patch.object(reaper, "pane_state", lambda pane: None):
+            self.assertEqual(self.run_once(["owed-step:#1"]), [])
 
     def test_any_other_keep_reason_is_not_a_nudge(self):
-        for keep in (["owed-step:#1", "waiting"], ["uncommitted:wt", "protected"], ["subagent-active"], [],
+        for keep in (["owed-step:#1", "check-by-unknown"], ["unpushed:wt", "unchecked:wt"], ["owed-step:#1", "waiting"], ["uncommitted:wt", "protected"], ["subagent-active"], [],
                      ["owed-step:#1", "loop-pending"], ["claim-unknown"]):
             self.assertEqual(self.run_once(keep), [], keep)
 
@@ -1048,14 +1082,17 @@ class Nudge(unittest.TestCase):
 
     def test_uiux_and_homepage_are_nudged_like_every_session_and_only_protect_skips(self):
         for name in ("uiux", "homepage"):  # EL-T2490: NEVER_CLOSE (default uiux* homepage*) stops a close, not a nudge
-            self.assertEqual(self.run_once(["owed-step:#1"], tmux=name, name=name), [f"abcdef01:owed-step:#1"], name)
-            reaper.nudge_events(self.cfg, [], self.now)
+            self.assertEqual(self.run_once(["owed-step:#1"], tmux=name, name=name), ["abcdef01:owed-step:#1"], name)
+            reaper.nudge_events(self.cfg, [(session(sid="abcdef0123", pane="%1"), [], "keep")], self.now)
         self.assertEqual(self.run_once(["owed-step:#1"], tmux="keep-me", name="keep-me"), [], "PROTECT keep-*")
 
     def test_a_draft_or_a_menu_on_screen_is_not_idle_at_the_prompt(self):
         self.screen = f"{self.SEP}\n❯ #24 head 9ccc7b4 待 merge\n{self.SEP}"
         with mock.patch.object(reaper, "pane_state", lambda pane: {"screen": self.screen, "cx": 30, "cy": 1}):
             self.assertEqual(self.run_once(["owed-step:#1"]), [])
+        for text in (reaper.MENU_TEXT, *reaper.DIALOG_TEXT):
+            self.screen = f"{self.SEP}\n❯ \n{self.SEP}\n{text}"
+            self.assertEqual(self.run_once(["owed-step:#1"]), [], text)
 
     def test_off_by_default(self):
         self.cfg["NUDGE_EVENTS"] = ""
