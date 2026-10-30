@@ -43,12 +43,19 @@ Environment:
   CC_RW_RATE_ALERT_GBH     Disk free falling faster than this many GB/h raises ALERT:disk-rate (default: 10); 0 disables
   CC_RW_RATE_FLAG_GBH      Falling faster than this many GB/h also writes <state>/disk-rate-high,
                        removed once a measured rate is at or below it (default: 20); 0 disables
-  CC_RW_SWAP_FLAG_GB   Swap used above this many GB (vm.swapusage) also writes <state>/disk-rate-high
-                       (with swap=<gb>, so heavy leases hold) and <state>/swap-high (`<epoch> swap=<gb>
-                       limit=<gb>`), and raises ALERT:swap. swap-high is removed once swap is read at or below
-                       it and left alone when swap cannot be read; disk-rate-high then follows the rate
-                       alone (default: 18; 0 disables)
+  CC_RW_SWAP_FLAG_GB   Swap used above this many GB (vm.swapusage), while swap is still being written
+                       (kern.memorystatus_vm_pressure_level >= 2, or vm_stat Swapouts grew since the last
+                       round, kept in <state>/swapouts-last), also writes <state>/disk-rate-high (with
+                       swap=<gb>, so heavy leases hold) and <state>/swap-high (`<epoch> swap=<gb> limit=<gb>
+                       pressure=<n> swapouts=<n>`), and raises ALERT:swap. macOS never shrinks swap once
+                       pressure ends, so high but calm swap clears them. swap-high is removed once swap is
+                       read at or below the limit, or above it with a readable calm signal; it is left alone
+                       when swap, or both pressure and Swapouts, cannot be read; disk-rate-high then follows
+                       the rate alone, except that a swap-high left alone for unreadable pressure and Swapouts
+                       keeps it too (default: 18; 0 disables)
   CC_RW_SWAP_USED_GB   Test seam: used swap in GB, replacing the sysctl read; set but empty = unreadable
+  CC_RW_VM_PRESSURE_LEVEL  Test seam: kern.memorystatus_vm_pressure_level; set but empty = unreadable
+  CC_RW_SWAPOUTS       Test seam: vm_stat's Swapouts count; set but empty = unreadable
   CC_RW_GO_CAP_MAX_SECONDS The go cache cap is ended, by pid, past this many seconds (default: 120); 0 = no bound
   CC_RW_ROUND_MAX_SECONDS  A whole round past this many seconds ends its own process tree (never a detached
                        act), with ERROR and ALERT:round-overrun, so launchd can start the next (default: 240); 0 = no bound
@@ -926,24 +933,64 @@ _cc_rw_snapshot() {
   # Swap is the disk writer behind the 4-18 GB dips (2026-10-29 root cause: memory pressure grows
   # /System/Volumes/VM swapfiles 20 -> 26). Over CC_RW_SWAP_FLAG_GB the same disk-rate-high flag holds
   # heavy leases (with_local_resource.py), so no new next build / test suite adds memory while swap is
-  # high; <state>/swap-high says which cause it is. CC_RW_SWAP_USED_GB, when set, replaces the sysctl
-  # read (empty = unreadable), for tests.
-  local swap_gb swap_flag=false swap_limit
+  # high; <state>/swap-high says which cause it is.
+  # macOS never shrinks swap after the pressure ends (measured 2026-10-30: 20.9 of 22.5 GB used at
+  # pressure level 1), so size alone made a flag that never cleared. The flag holds only while swap is
+  # still being written: over the limit AND (pressure level >= 2 OR Swapouts grew since the previous
+  # round, stored in <state>/swapouts-last). Over the limit with a readable calm signal clears it.
+  # First round (no stored Swapouts): growth is unknown, not "growing"; a readable pressure < 2 then
+  # decides, clearing a flag the next round re-sets within one interval if Swapouts do grow. A stuck
+  # flag is the bug, and holding one round on a size-only reading would repeat it after every reinstall.
+  # Over the limit with both pressure and Swapouts unreadable leaves swap-high as it was (neither set
+  # nor cleared), as an unreadable swap does, and with it the disk-rate-high it holds. Seams, for tests (set = replaces the read; set but empty =
+  # unreadable): CC_RW_SWAP_USED_GB, CC_RW_VM_PRESSURE_LEVEL, CC_RW_SWAPOUTS.
+  local swap_gb swap_flag=false swap_limit swap_pressure swapouts swapouts_prev swap_grow=unknown
+  local swap_over=false swap_keep=false
   if [ "${CC_RW_SWAP_USED_GB+x}" = "x" ]; then
     swap_gb=$CC_RW_SWAP_USED_GB
   else
     swap_gb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="used") {v=$(i+2); if (sub(/M$/,"",v)) printf "%.1f", v/1024}}')  # no M suffix: unreadable, not 0
   fi
+  if [ "${CC_RW_VM_PRESSURE_LEVEL+x}" = "x" ]; then
+    swap_pressure=$CC_RW_VM_PRESSURE_LEVEL
+  else
+    swap_pressure=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
+  fi
+  [[ "$swap_pressure" =~ ^[0-9]+$ ]] || swap_pressure=""
+  if [ "${CC_RW_SWAPOUTS+x}" = "x" ]; then
+    swapouts=$CC_RW_SWAPOUTS
+  else
+    swapouts=$(vm_stat 2>/dev/null | awk '/^Swapouts:/ {v=$2; sub(/\.$/,"",v); print v; exit}')
+  fi
+  [[ "$swapouts" =~ ^[0-9]+$ ]] || swapouts=""
+  swapouts_prev=$(head -n 1 "${state_dir}/swapouts-last" 2>/dev/null || true)
+  [[ "$swapouts_prev" =~ ^[0-9]+$ ]] || swapouts_prev=""
+  if [ -n "$swapouts" ]; then
+    if [ -n "$swapouts_prev" ]; then
+      # A count below the stored one is a reboot's reset: not growth.
+      if [ "$swapouts" -gt "$swapouts_prev" ]; then swap_grow=yes; else swap_grow=no; fi
+    fi
+    printf '%s\n' "$swapouts" > "${state_dir}/swapouts-last" 2>/dev/null
+  fi
   swap_limit=$(_cc_rw_num CC_RW_SWAP_FLAG_GB 18)
-  _cc_rw_above "$swap_gb" "$swap_limit" && swap_flag=true
+  _cc_rw_above "$swap_gb" "$swap_limit" && swap_over=true
+  if [ "$swap_over" = "true" ]; then
+    if [ "$swap_grow" = "yes" ] || { [ -n "$swap_pressure" ] && [ "$swap_pressure" -ge 2 ]; }; then
+      swap_flag=true
+    elif [ -z "$swap_pressure" ] && [ -z "$swapouts" ]; then
+      swap_keep=true   # over the limit, nothing says whether it is still written: leave the flag as it is
+    fi
+  fi
   if [ "$swap_flag" = "true" ]; then
-    printf '%s swap=%s limit=%s\n' "$now" "$swap_gb" "$swap_limit" > "${state_dir}/swap-high" 2>/dev/null
-  elif [[ "$swap_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf '%s swap=%s limit=%s pressure=%s swapouts=%s\n' "$now" "$swap_gb" "$swap_limit" \
+      "${swap_pressure:-?}" "${swapouts:-?}" > "${state_dir}/swap-high" 2>/dev/null
+  elif [ "$swap_keep" != "true" ] && [[ "$swap_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     rm -f "${state_dir}/swap-high" 2>/dev/null
   fi
   if [ "$rate_flag" = "true" ] || [ "$swap_flag" = "true" ]; then
     printf '%s %s %s swap=%s\n' "$now" "${rate_gbh:-0}" "$disk_free_gb" "${swap_gb:-?}" > "${state_dir}/disk-rate-high" 2>/dev/null
-  elif [ -n "$rate_gbh" ]; then
+  elif [ -n "$rate_gbh" ] && ! { [ "$swap_keep" = "true" ] && [ -e "${state_dir}/swap-high" ]; }; then
+    # A swap-high left alone keeps the disk-rate-high it was written with.
     rm -f "${state_dir}/disk-rate-high" 2>/dev/null
   fi
 
