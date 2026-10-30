@@ -811,6 +811,7 @@ def nudge_events(cfg, seen, now):
     except (OSError, ValueError, TypeError):
         sent = set()
     seen_sids, judged, cur, new = set(), set(), set(), []
+    seen_sids |= {(SKIPPED_INFO.get(label) or {}).get("sid") for label, _, live in SKIPPED if live} - {None}  # live, not gathered
     for s, keep, outcome in seen:
         seen_sids.add(s["sid"][:8])
         # decide() names open work only for a session idle past IDLE_MINUTES (busy gets status:busy, a short idle

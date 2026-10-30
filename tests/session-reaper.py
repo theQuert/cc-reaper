@@ -1067,6 +1067,14 @@ class Nudge(unittest.TestCase):
         reaper.nudge_events(self.cfg, [(other, ["status:busy"], "keep")], self.now)
         self.assertEqual(json.loads((self.tmp / "nudged.json").read_text()), [])
 
+    def test_a_live_session_gather_skipped_keeps_its_fingerprint(self):
+        self.run_once(["owed-step:#1"])
+        other = session(sid="99999999xx", tmux="other", name="other")
+        with mock.patch.object(reaper, "SKIPPED", [("work", "pane-missing", True)]), \
+                mock.patch.object(reaper, "SKIPPED_INFO", {"work": {"sid": "abcdef01"}}):
+            reaper.nudge_events(self.cfg, [(other, ["status:busy"], "keep")], self.now)
+        self.assertEqual(json.loads((self.tmp / "nudged.json").read_text()), ["abcdef01:owed-step:#1"])
+
     def test_a_failed_event_write_forgets_the_fingerprint(self):
         self.cfg["NUDGE_EVENTS"] = str(self.tmp)  # a directory: open() fails
         with self.assertRaises(OSError) as cm:
