@@ -10,6 +10,10 @@ swap value on the line to check ALERT:swap against. This module is the one judge
                   takes the script's environment from; a value the script would refuse falls back as it does.
   judge_line()    one snapshot line: the ALERT markers its own numbers imply (load, disk, disk-low,
                   disk-emergency, mem, swap, disk-rate) against the markers it carries, plus the swap=/rate= fields.
+                  Swap is judged on the line's swap_hot= field, the script's own decision (swap over the limit
+                  AND still being written: macOS never shrinks swap, so size alone is not the flag): ALERT:swap
+                  exactly when swap_hot=1, either way when swap_hot=?. A line without swap_hot (written before
+                  it existed) keeps the size-only rule.
   judge_events()  the pause chain in a run of lines: a DISK-PAUSE never follows a DISK-PAUSE (nor a RESUME a
                   RESUME) in one mode, and no snapshot whose own numbers hold a lease (swap, emergency, flag rate)
                   comes while the newest event says DISK-RESUME.
@@ -48,7 +52,8 @@ NUM = re.compile(r"^[0-9]+(\.[0-9]+)?$")  # the script's own knob check: anythin
 LINE = re.compile(
     r"^(?P<ts>\S+) load=(?P<l1>[\d.]+)/(?P<l5>[\d.]+)/(?P<l15>[\d.]+) cpu_idle=\S+ mem_free=(?P<mf>[\d.]+)% "
     r"compressor=(?P<comp>[\d.]+)GB disk_free=(?P<free>[\d.]+)GB/(?P<pct>[\d.]+)%"
-    r"(?P<fields> swap=(?:(?P<swap>[\d.]+)GB|\?) rate=(?:(?P<rate>-?[\d.]+)GB/h|\?))?(?P<rest>.*)$")
+    r"(?P<fields> swap=(?:(?P<swap>[\d.]+)GB|\?) rate=(?:(?P<rate>-?[\d.]+)GB/h|\?)(?: swap_hot=(?P<hot>[01?]))?)?"
+    r"(?P<rest>.*)$")
 EVENT = re.compile(r"^\S+ EVENT (?P<mode>shadow|emitted)\b.*?: (?P<kind>DISK-PAUSE on|DISK-RESUME): ")
 # Markers whose truth is on the line itself. disk-drop, disk-act-*, reclaim-stalled read state the line
 # does not carry, so they are not judged here.
@@ -76,6 +81,14 @@ def is_snapshot(line):
     return len(parts) > 1 and parts[1].startswith("load=")
 
 
+def swap_hot(x, cfg):
+    """True/False when the line says whether swap holds the flag this round, None when it cannot be told
+    (swap_hot=?). A line without swap_hot falls back to size alone, the rule before the field existed."""
+    if x["hot"] is not None:
+        return {"1": True, "0": False}.get(x["hot"])
+    return x["swap"] is not None and cfg["CC_RW_SWAP_FLAG_GB"] > 0 and float(x["swap"]) > cfg["CC_RW_SWAP_FLAG_GB"]
+
+
 def implied(x, cfg, ncpu, phys_gb):
     """The judged markers a parsed line's own numbers call for."""
     f = lambda k: float(x[k])
@@ -91,7 +104,7 @@ def implied(x, cfg, ncpu, phys_gb):
         want.add("disk-emergency")
     if f("mf") < cfg["CC_RW_MEM_MIN_PCT"] and f("comp") > phys_gb * 0.5:
         want.add("mem")
-    if x["swap"] is not None and on("CC_RW_SWAP_FLAG_GB") and f("swap") > cfg["CC_RW_SWAP_FLAG_GB"]:
+    if swap_hot(x, cfg):
         want.add("swap")
     if x["rate"] is not None and on("CC_RW_RATE_ALERT_GBH") and f("rate") > cfg["CC_RW_RATE_ALERT_GBH"]:
         want.add("disk-rate")
@@ -100,9 +113,10 @@ def implied(x, cfg, ncpu, phys_gb):
 
 def holds_lease(x, cfg):
     """True when the line's own numbers write a pause flag this round (a lower bound: disk-stop is a dispatch's,
-    and disk-rate-high outlives an unmeasured round, so a line can be paused without this)."""
+    disk-rate-high outlives an unmeasured round, and swap_hot=? leaves swap-high as it was, so a line can be
+    paused without this). Swap counts by swap_hot, or by size on a line from before that field."""
     num = lambda k: x[k] is not None
-    return ((num("swap") and cfg["CC_RW_SWAP_FLAG_GB"] > 0 and float(x["swap"]) > cfg["CC_RW_SWAP_FLAG_GB"])
+    return (bool(swap_hot(x, cfg))
             or (cfg["CC_RW_DISK_EMERGENCY_GB"] > 0 and float(x["free"]) < cfg["CC_RW_DISK_EMERGENCY_GB"])
             or (num("rate") and cfg["CC_RW_RATE_FLAG_GBH"] > 0 and float(x["rate"]) > cfg["CC_RW_RATE_FLAG_GBH"]))
 
@@ -120,6 +134,8 @@ def judge_line(line, cfg, ncpu, phys_gb):
         judged = JUDGED - {"swap", "disk-rate"}
     have = set(re.findall(r"ALERT:([\w-]+)", x["rest"])) & judged
     want = implied(x, cfg, ncpu, phys_gb) & judged
+    if x["hot"] == "?":  # the script left swap-high as it was: ALERT:swap is right either way
+        have, want = have - {"swap"}, want - {"swap"}
     if have != want:
         misses.append(f"{x['ts']} markers {sorted(have) or '-'} but its numbers imply {sorted(want) or '-'} "
                       f"(swap={x['swap'] or '?'} rate={x['rate'] or '?'})")

@@ -818,6 +818,14 @@ expect_yes "T17b1: and the reset count is stored" grep -qx 100 "$t17b1/state/swa
 t17p=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17p"; echo 1000 > "$t17p/state/swapouts-last"
 guard_case "$t17p" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL= CC_RW_SWAPOUTS=1000
 expect_no  "T17p: pressure unreadable, Swapouts readable and unchanged: the flag clears" test -e "$t17p/state/swap-high"
+t17f2=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17f2"
+guard_case "$t17f2" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL= CC_RW_SWAPOUTS=1000
+expect_yes "T17f2: first round with pressure unreadable: no calm evidence, swap-high left as it was" \
+  test "$(cat "$t17f2/state/swap-high")" = "1 swap=30 limit=18"
+expect_yes "T17f2: and its disk-rate-high" test "$(cat "$t17f2/state/disk-rate-high")" = "1 0 100 swap=30"
+expect_yes "T17f2: the first sample is still stored" grep -qx 1000 "$t17f2/state/swapouts-last"
+guard_case "$t17f2" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL= CC_RW_SWAPOUTS=1000
+expect_no  "T17f2: the next round, Swapouts unchanged, clears it" test -e "$t17f2/state/swap-high"
 t17q=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17q"; echo 1000 > "$t17q/state/swapouts-last"
 guard_case "$t17q" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL=1 CC_RW_SWAPOUTS=
 expect_no  "T17q: pressure 1, Swapouts unreadable: the flag clears" test -e "$t17q/state/swap-high"
@@ -1038,7 +1046,16 @@ t21_judge() { PATH="$stub_dir:$PATH" python3 "$ROOT_DIR/shell/resource-watch-jud
 expect_yes "T21a: the judge passes the T20 shadow log (pause, resume, swap= and rate= lines)" t21_judge --log "$t20a/resource-watch.log"
 expect_yes "T21a: and the T20 on-mode log" t21_judge --log "$t20e/resource-watch.log"
 sed 's/ ALERT:swap//' "$t20a/resource-watch.log" > "$t20a/no-swap-marker.log"
-expect_no  "T21b: a swap line without ALERT:swap is a miss" t21_judge --log "$t20a/no-swap-marker.log"
+expect_no  "T21b: a swap_hot=1 line without ALERT:swap is a miss" t21_judge --log "$t20a/no-swap-marker.log"
+expect_yes "T21b: (those lines do carry swap_hot=1)" grep -q ' swap=22\.5GB rate=[^ ]* swap_hot=1 ' "$t20a/resource-watch.log"
+expect_yes "T21d: the judge passes the T17w log (swap high but calm, then growing)" t21_judge --log "$t17w/resource-watch.log"
+expect_yes "T21d: whose calm line says swap_hot=0 and has no ALERT:swap" \
+  sh -c "head -n 1 '$t17w/resource-watch.log' | grep ' swap=20\.9GB rate=[^ ]* swap_hot=0' | grep -qv 'ALERT:swap'"
+expect_yes "T21d: and the T17z log (pressure and Swapouts unreadable: swap_hot=?)" t21_judge --log "$t17z/resource-watch.log"
+expect_yes "T21d: (swap_hot=? on it)" grep -q ' swap_hot=? ' "$t17z/resource-watch.log"
+sed -E 's/ swap_hot=[01?]//' "$t17w/resource-watch.log" > "$t17w/legacy.log"
+expect_no  "T21e: the same lines without swap_hot (a legacy log) keep the size-only rule: a miss" \
+  t21_judge --log "$t17w/legacy.log"
 grep -v 'DISK-RESUME' "$t20a/resource-watch.log" > "$t20a/no-resume.log"; grep 'DISK-PAUSE' "$t20a/resource-watch.log" >> "$t20a/no-resume.log"
 expect_no  "T21c: a second DISK-PAUSE with no resume between is a miss" t21_judge --log "$t20a/no-resume.log"
 

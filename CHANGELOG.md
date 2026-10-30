@@ -90,6 +90,20 @@
   line shapes, and a failed tmux read keeps the earlier state. It never types into a pane (#5212): only `display` and `capture-pane` are reachable.
 
 ### Fixed
+- **`resource-watch.sh`'s `swap-high` (and the `disk-rate-high` it shares) holds heavy leases only while swap
+  is still being written, not on swap size alone.** macOS never shrinks swap after memory pressure ends
+  (2026-10-30: 20.9 of 22.5 GB used at `kern.memorystatus_vm_pressure_level` 1), so the size-only flag never
+  cleared and `with_local_resource.py` heavy leases stayed paused on a stale signal. The flag now needs swap
+  over `CC_RW_SWAP_FLAG_GB` AND (pressure level >= 2 OR vm_stat `Swapouts` grew since the previous round,
+  stored in the new `<state>/swapouts-last`; a lower count, a reboot's reset, is not growth). Over the limit
+  with a readable calm signal clears it; with neither signal known (pressure unreadable, and Swapouts
+  unreadable or no stored sample yet) the flag and its `disk-rate-high` stay as they were. A first round with
+  a readable pressure under 2 clears it, and the next round re-sets it if Swapouts grow. `swap-high` now reads
+  `<epoch> swap=<gb> limit=<gb> pressure=<n|?> swapouts=<n|?>`. Every snapshot line carries the decision as
+  `swap_hot=1|0|?` after `rate=`; `resource-watch-judge.py` requires `ALERT:swap` exactly on `swap_hot=1`,
+  accepts either on `?`, counts a lease after `DISK-RESUME` by the same field, and keeps the size-only rule for
+  lines without it. Test seams: `CC_RW_VM_PRESSURE_LEVEL`, `CC_RW_SWAPOUTS` (set but empty = unreadable).
+  Tests: `tests/resource-watch.sh` (T17w-T17q, T21b/d/e), `tests/resource-watch-judge.py`.
 - **`worktree-janitor.sh` stops rescanning sessions before every removal, reads a dirty tree's status
   once, and archives an ignored `*.log` instead of keeping its tree.** Each scheduled sweep spent its
   1800 s removal budget with ~72 trees unexamined (~23 s a tree): before every candidate the removal

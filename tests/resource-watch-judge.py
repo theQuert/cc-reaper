@@ -21,8 +21,9 @@ NCPU, PHYS = 10, 32.0
 CFG = judge.config(env={})
 
 
-def snap(load1=4.0, mf=30.0, comp=6.0, free=100.0, pct=20.0, swap="3.0GB", rate="1.0GB/h", markers=""):
-    fields = "" if swap is None else f" swap={swap} rate={rate}"
+def snap(load1=4.0, mf=30.0, comp=6.0, free=100.0, pct=20.0, swap="3.0GB", rate="1.0GB/h", markers="", hot=None):
+    """hot=None writes a line from before swap_hot existed (judged on size); "1"/"0"/"?" writes the field."""
+    fields = "" if swap is None else f" swap={swap} rate={rate}" + ("" if hot is None else f" swap_hot={hot}")
     return (f"2026-10-30T01:07:01 load={load1:.2f}/5.00/5.00 cpu_idle=50% mem_free={mf}% compressor={comp}GB "
             f"disk_free={free}GB/{pct}%{fields}{(' ' + markers) if markers else ''}")
 
@@ -72,7 +73,26 @@ class Line(unittest.TestCase):
         self.assertEqual(self.j(line), [])
 
     def test_swap_over_the_line_without_its_marker(self):
+        # a line without swap_hot keeps the size-only rule
         self.assertTrue(any("imply ['swap']" in m for m in self.j(snap(swap="19.5GB"))))
+
+    def test_high_but_calm_swap_needs_no_marker(self):
+        # 2026-10-30: macOS keeps 20.9 GB swapped after pressure ends; the script says swap_hot=0
+        self.assertEqual(self.j(snap(swap="20.9GB", hot="0")), [])
+        self.assertTrue(self.j(snap(swap="20.9GB", hot="0", markers="ALERT:swap")), "a marker on a calm line is a miss")
+
+    def test_swap_hot_requires_the_marker(self):
+        self.assertTrue(any("imply ['swap']" in m for m in self.j(snap(swap="20.9GB", hot="1"))))
+        self.assertEqual(self.j(snap(swap="20.9GB", hot="1", markers="ALERT:swap")), [])
+
+    def test_swap_hot_unknown_accepts_either(self):
+        self.assertEqual(self.j(snap(swap="22.5GB", hot="?")), [])
+        self.assertEqual(self.j(snap(swap="22.5GB", hot="?", markers="ALERT:swap")), [])
+
+    def test_the_field_is_parsed_with_the_markers_after_it(self):
+        line = snap(swap="20.9GB", rate="4.5GB/h", hot="1", markers="ALERT:swap disk_rate=4.5GB/h")
+        self.assertIn(" swap=20.9GB rate=4.5GB/h swap_hot=1 ALERT:swap", line)
+        self.assertEqual(self.j(line), [])
 
     def test_swap_marker_without_swap_over_the_line(self):
         self.assertTrue(self.j(snap(swap="3.0GB", markers="ALERT:swap")))
@@ -142,8 +162,15 @@ class Events(unittest.TestCase):
         self.assertEqual(self.j([event("pause", "shadow"), event("pause", "emitted")]), [])
 
     def test_swap_after_a_resume(self):
+        # a line without swap_hot keeps the size-only rule
         self.assertTrue(any("newest event is DISK-RESUME" in m
                             for m in self.j([event("pause"), event("resume"), snap(swap="19.5GB")])))
+
+    def test_high_but_calm_swap_after_a_resume_holds_nothing(self):
+        self.assertEqual(self.j([event("pause"), event("resume"), snap(swap="20.9GB", hot="0")]), [])
+        self.assertEqual(self.j([event("resume"), snap(swap="22.5GB", hot="?")]), [], "unknown is not counted")
+        self.assertTrue(any("newest event is DISK-RESUME" in m
+                            for m in self.j([event("resume"), snap(swap="20.9GB", hot="1")])))
 
     def test_emergency_and_flag_rate_after_a_resume(self):
         cfg = dict(CFG, CC_RW_DISK_EMERGENCY_GB=25.0, CC_RW_RATE_FLAG_GBH=12.0)

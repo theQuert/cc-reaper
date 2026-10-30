@@ -50,7 +50,8 @@ Environment:
                        pressure=<n> swapouts=<n>`), and raises ALERT:swap. macOS never shrinks swap once
                        pressure ends, so high but calm swap clears them. swap-high is removed once swap is
                        read at or below the limit, or above it with a readable calm signal; it is left alone
-                       when swap, or both pressure and Swapouts, cannot be read; disk-rate-high then follows
+                       when swap cannot be read, or when neither pressure nor Swapouts growth is known (the
+                       first round has no stored Swapouts); disk-rate-high then follows
                        the rate alone, except that a swap-high left alone for unreadable pressure and Swapouts
                        keeps it too (default: 18; 0 disables)
   CC_RW_SWAP_USED_GB   Test seam: used swap in GB, replacing the sysctl read; set but empty = unreadable
@@ -77,7 +78,8 @@ Environment:
                        Each mode keeps its own last state (<state>/disk-pause.state, disk-pause.shadow.state), so
                        a transition is told once, and a new mode starts by telling the state it finds
   CC_RW_EVENTS_LOG     The event log the gateway and the event router read (default: ~/handoffs/ops-dispatch/events.log)
-Every snapshot line carries `swap=<gb>GB rate=<gbh>GB/h` after disk_free (`?` when unreadable or unmeasured).
+Every snapshot line carries `swap=<gb>GB rate=<gbh>GB/h swap_hot=<1|0|?>` after disk_free (`?` when unreadable
+or unmeasured; swap_hot is this round's swap-high decision: 1 written, 0 not hot, ? left as it was).
 Reclaim output goes to resource-watch-act.log beside CC_RW_LOG. Each round appends
 `<epoch>\t<free KB>` to <state>/disk-free-samples.tsv (last 48 hours kept), and first of all
 writes its start epoch to <state>/resource-watch.heartbeat. A detached reclaim that is stopped
@@ -941,8 +943,11 @@ _cc_rw_snapshot() {
   # First round (no stored Swapouts): growth is unknown, not "growing"; a readable pressure < 2 then
   # decides, clearing a flag the next round re-sets within one interval if Swapouts do grow. A stuck
   # flag is the bug, and holding one round on a size-only reading would repeat it after every reinstall.
-  # Over the limit with both pressure and Swapouts unreadable leaves swap-high as it was (neither set
-  # nor cleared), as an unreadable swap does, and with it the disk-rate-high it holds. Seams, for tests (set = replaces the read; set but empty =
+  # Over the limit with neither signal known (pressure unreadable, and growth unknown: Swapouts
+  # unreadable or no stored sample) leaves swap-high as it was (neither set nor cleared), as an
+  # unreadable swap does, and with it the disk-rate-high it holds. The snapshot line carries the
+  # decision as swap_hot=1 (written), 0 (not hot: cleared or under the limit) or ? (left as it was),
+  # which resource-watch-judge.py reads instead of re-deriving it from the size. Seams, for tests (set = replaces the read; set but empty =
   # unreadable): CC_RW_SWAP_USED_GB, CC_RW_VM_PRESSURE_LEVEL, CC_RW_SWAPOUTS.
   local swap_gb swap_flag=false swap_limit swap_pressure swapouts swapouts_prev swap_grow=unknown
   local swap_over=false swap_keep=false
@@ -977,7 +982,7 @@ _cc_rw_snapshot() {
   if [ "$swap_over" = "true" ]; then
     if [ "$swap_grow" = "yes" ] || { [ -n "$swap_pressure" ] && [ "$swap_pressure" -ge 2 ]; }; then
       swap_flag=true
-    elif [ -z "$swap_pressure" ] && [ -z "$swapouts" ]; then
+    elif [ -z "$swap_pressure" ] && [ "$swap_grow" = "unknown" ]; then
       swap_keep=true   # over the limit, nothing says whether it is still written: leave the flag as it is
     fi
   fi
@@ -986,6 +991,10 @@ _cc_rw_snapshot() {
       "${swap_pressure:-?}" "${swapouts:-?}" > "${state_dir}/swap-high" 2>/dev/null
   elif [ "$swap_keep" != "true" ] && [[ "$swap_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     rm -f "${state_dir}/swap-high" 2>/dev/null
+  fi
+  local swap_hot=0
+  if [ "$swap_flag" = "true" ]; then swap_hot=1
+  elif [ "$swap_keep" = "true" ] || ! [[ "$swap_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then swap_hot="?"
   fi
   if [ "$rate_flag" = "true" ] || [ "$swap_flag" = "true" ]; then
     printf '%s %s %s swap=%s\n' "$now" "${rate_gbh:-0}" "$disk_free_gb" "${swap_gb:-?}" > "${state_dir}/disk-rate-high" 2>/dev/null
@@ -1038,11 +1047,11 @@ _cc_rw_snapshot() {
   # --- write log line ---
   local ts
   ts=$(date '+%Y-%m-%dT%H:%M:%S')
-  printf '%s load=%s/%s/%s cpu_idle=%s%% mem_free=%s%% compressor=%sGB disk_free=%sGB/%s%% swap=%s rate=%s%s\n' \
+  printf '%s load=%s/%s/%s cpu_idle=%s%% mem_free=%s%% compressor=%sGB disk_free=%sGB/%s%% swap=%s rate=%s swap_hot=%s%s\n' \
     "$ts" "$load1" "$load5" "$load15" \
     "$cpu_idle" "$mem_free_pct" "$compressor_gb" \
     "$disk_free_gb" "$disk_free_pct" \
-    "$(_cc_rw_val "$swap_gb" GB)" "$(_cc_rw_val "$rate_gbh" GB/h)" \
+    "$(_cc_rw_val "$swap_gb" GB)" "$(_cc_rw_val "$rate_gbh" GB/h)" "$swap_hot" \
     "${markers:+ ${markers}}" \
     >> "$log_file" 2>/dev/null || true
 
