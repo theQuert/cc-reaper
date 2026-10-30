@@ -1104,6 +1104,132 @@ class DoneGrace(unittest.TestCase):
         self.assertTrue(reaper.said_done(f))
 
 
+class WaitingUntil(unittest.TestCase):
+    """EL-T2520: a reply that ends on an alarm closes under the grace only with no open work; else FALSE_WAITING."""
+    WAIT = "checked it\nSESSION-STATE: WAITING_UNTIL=2026-10-31T09:00:00Z — the dispatcher wakes it"
+    OWN = "delivery #{n}: pr-open (none) -> agent {step}  [x]\n  check-by {at}: x\n  claimant: claude session sid-1; the step is that session's: hand it over"
+    # the oracle's real shape for a step that waits on an event (delivery_state.py 6702 --brief, 2026-10-30 09:59Z)
+    WAITS = ("delivery #{n}: pr-open (none) -> wait auto-merge  [781beaabc01cfc73]\n  auto-merge is armed on #6703\n"
+             "  wake: #6703 merged by GitHub\n  owner: github-auto-merge wakes it; no watcher needed, and the session may end")
+    WT = {"path": Path("/x/wt"), "repo": "/r", "branch": "feat/x", "marker": "m-1"}
+
+    def setUp(self):
+        self.prs, self.brief = [], None
+
+    def run_decide(self, mode, **kw):
+        kw.setdefault("last_text", self.WAIT)
+        kw.setdefault("idle_min", 10)
+        kw.setdefault("text_at", 2000)
+        kw.setdefault("prompt_at", 1000)
+        kw.setdefault("descendants", 0)
+        kw.setdefault("owned", [dict(self.WT)])
+        kw.setdefault("cwd", "/x/wt")
+        self.s = session(**kw)
+        cfg = dict(CFG, DONE_GRACE=mode, NOCLAIM_DONE="off", CHECKBY_REPO="o/r")
+        with mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
+             mock.patch.object(reaper, "oracle_brief", side_effect=lambda r, n, c, now: self.brief), \
+             mock.patch.object(reaper, "checkby_state", return_value="OPEN"), \
+             mock.patch.object(reaper, "open_prs", side_effect=lambda s: list(self.prs)), \
+             mock.patch.object(reaper, "worktree_state", side_effect=lambda w, c: w.get("problems", [])):
+            return reaper.decide(self.s, cfg, reaper.calendar.timegm((2026, 10, 30, 10, 0, 0, 0, 0, 0)))
+
+    def test_a_pure_alarm_closes_after_the_grace(self):
+        self.assertEqual(self.run_decide("apply"), [])
+        self.assertEqual(self.run_decide("apply", idle_min=3), ["idle:3<5min"])
+        self.assertIsNone(self.s.get("false_waiting"))
+
+    def test_a_claim_that_waits_on_an_event_is_the_alarm(self):
+        self.brief = self.WAITS.format(n=7)
+        self.assertEqual(self.run_decide("apply", claims=[("o/r", "7")]), [])
+        self.brief = self.OWN.format(n=7, step="check-by", at="2026-10-30T05:00Z")  # due: the oracle says agent
+        self.assertEqual(self.run_decide("apply", claims=[("o/r", "7")]), ["owed-step:#7"])
+        self.assertEqual(self.s["false_waiting"], ["owed-step:#7"])
+        self.brief = self.OWN.format(n=7, step="repair-ci", at="2026-10-31T09:00Z")  # a red gate is not an alarm
+        self.assertEqual(self.run_decide("apply", claims=[("o/r", "7")]), ["owed-step:#7"])
+
+    def test_open_work_is_false_waiting_and_never_closes(self):
+        self.prs = ["open-pr:o/r#5"]
+        self.assertEqual(self.run_decide("apply"), ["open-pr:o/r#5"])
+        self.assertEqual(self.s["false_waiting"], ["open-pr:o/r#5"])
+        self.prs = ["open-pr-unknown:feat/x"]
+        self.assertEqual(self.run_decide("apply"), ["open-pr-unknown:feat/x"])
+        self.prs = []
+        wt = {"path": Path("/x/wt"), "problems": ["unpushed:wt"]}
+        self.assertEqual(self.run_decide("apply", owned=[wt]), ["unpushed:wt"])
+        self.assertEqual(self.s["false_waiting"], ["unpushed:wt"])
+
+    def test_a_claim_less_alarm_carries_the_noclaim_gates(self):
+        """Review of 4764bdf: the alarm stands in for claim-unknown, so every noclaim_done() gate but the inbox holds."""
+        self.assertEqual(self.run_decide("apply", owned=[], cwd="/repo"), ["open-pr-unknown:no-worktree"])
+        self.assertEqual(self.s["false_waiting"], ["open-pr-unknown:no-worktree"])
+        self.assertEqual(self.run_decide("apply", descendants=1), ["child-process"])
+        self.assertEqual(self.run_decide("apply", descendants=None), ["child-process"])  # unread counts as one
+        self.assertEqual(self.run_decide("apply", cwd="/repo"), [])  # a clean cwd outside its worktrees
+        self.assertEqual(self.run_decide("apply", owned=[], cwd=None), ["open-pr-unknown:no-worktree"])
+        with mock.patch.object(reaper, "worktree_state", side_effect=lambda w, c: ["uncommitted:repo"]), \
+             mock.patch.object(reaper, "open_prs", return_value=[]), \
+             mock.patch.object(reaper, "oracle_brief", return_value=None):
+            s = session(last_text=self.WAIT, descendants=0, owned=[dict(self.WT)], cwd="/repo")
+            self.assertIn("uncommitted:repo", reaper.waiting_keeps(
+                s, dict(CFG, CHECKBY_REPO="o/r"), reaper.calendar.timegm((2026, 10, 30, 10, 0, 0))))
+        self.assertEqual(self.run_decide("apply", tmux="homepage", name="homepage"), ["never-close"])
+        self.brief = self.OWN.format(n=909, step="repair", at="2026-10-31T09:00Z")  # a claim it names, no branch
+        self.assertEqual(self.run_decide("apply", last_text="fixing #909\n" + self.WAIT), ["named-claim:#909"])
+
+    def test_a_claimed_session_past_the_idle_wait_keeps_mains_path(self):
+        """Review of 8eeb559: a passed alarm must not keep a claimed session main would close."""
+        late = self.WAIT.replace("2026-10-31T09:00:00Z", "2026-10-30T09:00Z")
+        self.brief = self.WAITS.format(n=7)
+        self.assertEqual(self.run_decide("apply", last_text=late, claims=[("o/r", "7")], idle_min=90), [])
+        self.assertEqual(self.run_decide("apply", last_text=late, claims=[("o/r", "7")]), ["alarm-passed"])
+
+    def test_a_passed_or_unread_alarm_keeps(self):
+        late = self.WAIT.replace("2026-10-31T09:00:00Z", "2026-10-30T09:00Z")
+        self.assertEqual(self.run_decide("apply", last_text=late), ["alarm-passed"])
+        self.assertEqual(self.s["false_waiting"], ["alarm-passed"])
+        bad = self.WAIT.replace("2026-10-31T09:00:00Z", "2026-13-45T99:00Z")
+        self.assertEqual(self.run_decide("apply", last_text=bad), ["alarm-passed"])
+
+    def test_off_never_asks_github(self):
+        calls = []
+        with mock.patch.object(reaper, "waiting_keeps", side_effect=lambda *a: calls.append(a) or []):
+            self.run_decide("off", idle_min=90)
+        self.assertEqual(calls, [])
+
+    def test_shadow_and_off_close_nothing_and_still_report(self):
+        self.assertEqual(self.run_decide("shadow", idle_min=90), ["claim-unknown"])
+        self.assertTrue(self.s.get("done_grace_shadow"))
+        self.prs = ["open-pr:o/r#5"]
+        self.assertEqual(self.run_decide("shadow", idle_min=90), ["claim-unknown"])
+        self.assertEqual(self.s["false_waiting"], ["open-pr:o/r#5"])
+        self.assertFalse(self.s.get("done_grace_shadow"))
+        self.assertIn("FALSE_WAITING: open-pr:o/r#5", reaper.report_line(
+            dict(self.s, pid=1, descendants=0), ["claim-unknown"], "keep"))
+        self.assertEqual(self.run_decide("off", idle_min=90), ["claim-unknown"])
+        self.assertIsNone(self.s.get("false_waiting"))  # off asks GitHub nothing; only keep's own reasons show
+        self.assertEqual(self.run_decide("off", idle_min=90, owned=[dict(self.WT, problems=["unpushed:wt"])]),
+                         ["claim-unknown", "unpushed:wt"])
+        self.assertEqual(self.s["false_waiting"], ["unpushed:wt"])
+
+    def test_only_a_bare_fresh_alarm_counts(self):
+        for text, kw in (("- `SESSION-STATE: WAITING_UNTIL=2026-10-31T09:00:00Z`", {}),
+                         ("SESSION-STATE: WAITING_UNTIL=soon", {}), (self.WAIT, {"prompt_at": 3000})):
+            self.assertEqual(self.run_decide("apply", last_text=text, **kw), ["idle:10<60min", "claim-unknown"], text)
+        both = self.WAIT + "\nSESSION-DONE: nothing left"
+        self.assertFalse(reaper.said_waiting(dict(last_text=both, text_at=2, prompt_at=1)))  # a done reply is done
+
+    def test_open_prs_reads_each_worktree_branch(self):
+        reaper._pr_cache.clear()
+        self.addCleanup(reaper._pr_cache.clear)
+        owned = [{"repo": "/r", "branch": "feat/a"}, {"repo": "/r", "branch": "feat/b"}, {"repo": "/r", "branch": "main"}]
+        answers = {"feat/a": (0, "12\n"), "feat/b": (1, "")}
+        with mock.patch.object(reaper, "gh_repo", return_value="o/r"), \
+             mock.patch.object(reaper, "run", side_effect=lambda cmd, timeout=30, cwd=None: answers[cmd[cmd.index("--head") + 1]]):
+            self.assertEqual(reaper.open_prs({"owned": owned}), ["open-pr:o/r#12", "open-pr-unknown:feat/b"])
+            detached = [{"repo": "/r", "branch": "c06cce66eb16", "path": Path("/x/wt-6703")}]
+            self.assertEqual(reaper.open_prs({"owned": detached}), ["open-pr-unknown:wt-6703"])
+
+
 class Nudge(unittest.TestCase):
     """EL-T2482: an idle session at an empty prompt kept only by its own open work gets one ROUTE nudge per fingerprint."""
     SEP = "─" * 20
