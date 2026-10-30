@@ -90,9 +90,9 @@ STATE_IDLE_RE = re.compile(r"(?m)^\W*SESSION-STATE:\s*IDLE_NO_WORK\b")
 GRACE_RE = re.compile(r"^\s*(?:SESSION-DONE:\s*\S|SESSION-STATE:\s*IDLE_NO_WORK\b)")
 # EL-T2520: a reply that ends on an alarm. Closable under the grace only with no open PR, no owed step and nothing
 # unpushed; otherwise it is a FALSE_WAITING row (report-only), so the continue path can fire.
-WAIT_RE = re.compile(r"^\s*SESSION-STATE:\s*WAITING_UNTIL=\d{4}-\d\d-\d\dT")
-ALARM_STEP_RE = re.compile(r"delivery #\d+: .*-> agent check-by\b")
-FALSE_WAITING = ("open-pr", "owed-step:", "unpushed:", "uncommitted:", "issue-unknown:")
+WAIT_RE = re.compile(r"^\s*SESSION-STATE:\s*WAITING_UNTIL=(\d{4}-\d\d-\d\dT\d\d:\d\d)(?::\d\d)?Z?(?!\S)")
+FALSE_WAITING = ("open-pr", "owed-step:", "unpushed:", "uncommitted:", "issue-unknown:", "alarm-passed",
+                 "named-claim:", "child-process")
 DONE_PHRASE_RE = re.compile(r"這個主題(已經)?結束|may be closed", re.I)
 WAITING_RE = re.compile(
     r"production-authorization|authoriz|approv|授權|批准|等你|你決定|請確認", re.I
@@ -927,7 +927,8 @@ def decide(s, cfg, now=None):
     keep = _decide(s, cfg, now)
     # EL-T2520: an alarm with open work is FALSE_WAITING (report-only; never closed): the continue path fires on it.
     if said_waiting(s) and s["status"] == "idle":
-        work = [k for k in keep + (open_prs(s) if cfg.get("DONE_GRACE") != "apply" else []) if k.startswith(FALSE_WAITING)]
+        extra = waiting_keeps(s, cfg, now if now is not None else time.time()) if cfg.get("DONE_GRACE") == "shadow" else []
+        work = [k for k in keep + extra if k.startswith(FALSE_WAITING)]
         if work:
             s["false_waiting"] = sorted(set(work))
     # EL-T2512: the same second decide under DONE_GRACE=apply, for a session that said it is done (the idle wait
@@ -1029,6 +1030,30 @@ def said_waiting(s):
     return not said_done(s) and _ends_on(s, WAIT_RE)
 
 
+def waiting_keeps(s, cfg, now):
+    """What keeps an alarm from being pure (EL-T2520): it stands in for claim-unknown, so it carries noclaim_done()'s
+    gates (minus the inbox header) and adds the alarm's own: unread or past, an open PR, no worktree to read PRs from."""
+    m = next((WAIT_RE.match(ln) for ln in reversed((s.get("last_text") or "").splitlines()) if WAIT_RE.match(ln)), None)
+    try:
+        due = calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M")) if m else 0
+    except ValueError:
+        due = 0
+    keep = [] if due > now else ["alarm-passed"]  # nothing wakes a claim-less session whose alarm has passed
+    if s.get("descendants") != 0:
+        keep.append("child-process")
+    names = [n for n in (s["tmux"], s.get("name")) if n]
+    if any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in names):
+        keep.append("never-close")
+    cwd = s.get("cwd")
+    if cwd and not any(str(w["path"]) == cwd for w in s["owned"]):
+        keep.extend(worktree_state({"path": Path(cwd)}, cfg))
+    named = oracle_claims(s, cfg, now) if not s["claims"] else []
+    if named:
+        keep.append("named-claim:" + ",".join(f"#{n}" for _, n in named))
+    keep.extend(open_prs(s) if s["owned"] else ["open-pr-unknown:no-worktree"])
+    return keep
+
+
 _pr_cache = {}
 
 
@@ -1038,7 +1063,10 @@ def open_prs(s):
     out = []
     for w in s["owned"]:
         repo, branch = gh_repo(w["repo"]), w.get("branch") or ""
-        if not branch or branch in ("main", "master"):
+        if branch in ("main", "master"):
+            continue
+        if not branch or re.fullmatch(r"[0-9a-f]{7,40}", branch):  # detached HEAD: no branch to ask about
+            out.append(f"open-pr-unknown:{w['path'].name if w.get('path') else branch}")
             continue
         key = (repo, branch)
         if key not in _pr_cache:
@@ -1120,19 +1148,16 @@ def _decide(s, cfg, now=None):
     else:
         waiting = cfg.get("DONE_GRACE") == "apply" and said_waiting(s)
         if waiting:
-            keep.extend(open_prs(s))  # an alarm is pure only with no open PR of its own
+            keep.extend(waiting_keeps(s, cfg, now if now is not None else time.time()))
         if not s["claims"] and not waiting:
             keep.append("claim-unknown")
         elif s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg):
             at = now if now is not None else time.time()
             marks, owed, unknown = [], [], []
             for r, n in s["claims"]:
-                brief = oracle_brief(r, n, cfg, at)
                 cls, overdue = classify_claim(
-                    brief, s["sid"], at, s.get("other_sids", ()),
+                    oracle_brief(r, n, cfg, at), s["sid"], at, s.get("other_sids", ()),
                     [w["marker"] for w in s["owned"] if w.get("marker")])
-                if waiting and cls == "owed" and not overdue and ALARM_STEP_RE.match(brief or ""):
-                    cls = "alarm"  # its own check-by, not yet due: the alarm the dispatcher wakes it for (EL-T2520)
                 marks.append(f"#{n}:{cls}" + (":stalled" if overdue else ""))
                 if cls == "owed":
                     owed.append(f"#{n}")
