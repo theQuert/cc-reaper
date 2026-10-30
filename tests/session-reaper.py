@@ -1033,6 +1033,10 @@ class DoneGrace(unittest.TestCase):
         self.assertEqual(self.run_decide("apply", last_text="quoted: SESSION-DONE: x"),
                          ["idle:10<60min", "claim-unknown"])  # mid-line prose is not a done line
         self.assertEqual(self.run_decide("off"), ["idle:10<60min"])
+        for quoted in ("- `SESSION-DONE: x`", "> SESSION-DONE: x", "`SESSION-STATE: IDLE_NO_WORK`",
+                       "```\nSESSION-DONE: x\n```", "SESSION-DONE: x\nmore\nand more\nstill more"):
+            self.run_decide("shadow", last_text=quoted)
+            self.assertFalse(self.s.get("done_grace_shadow"), quoted)  # explained, quoted or not at the end
 
     def test_idle_no_work_shortens_only_the_wait(self):
         text = "nothing left\nSESSION-STATE: IDLE_NO_WORK"
@@ -1059,6 +1063,9 @@ class DoneGrace(unittest.TestCase):
             gone = session(claims=[("o/r", "1")], other_sids=())
             self.assertEqual(reaper.decide(live, cfg, 3000), [])
             self.assertEqual(reaper.decide(gone, cfg, 3000), ["check-by-open"])  # claimant not live: unknown, kept
+            own = session(claims=[("o/r", "1")], other_sids=("pr-drain-1",),
+                          owned=[{"path": Path("/x/wt"), "marker": "pr-drain-1"}])
+            self.assertEqual(reaper.decide(own, cfg, 3000), ["check-by-open"])  # its own marker: its check-by
 
     def test_shadow_reports_would_close_and_keeps(self):
         self.assertEqual(self.run_decide("shadow"), ["idle:10<60min"])
@@ -1080,7 +1087,12 @@ class DoneGrace(unittest.TestCase):
              "message": {"content": [{"type": "text", "text": "SESSION-DONE: done"}]}},
             {"type": "assistant", "timestamp": "2026-10-11T00:06:00.000Z",
              "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]}}]) + "\n")
-        f = reaper.transcript_facts(p, reaper.calendar.timegm((2026, 10, 11, 0, 10, 0, 0, 0, 0)))
+        now = reaper.calendar.timegm((2026, 10, 11, 0, 10, 0, 0, 0, 0))
+        f = reaper.transcript_facts(p, now)
+        self.assertFalse(reaper.said_done(f))  # a tool call came after the done text: still working
+        lines = p.read_text().splitlines()
+        p.write_text("\n".join(lines[:2]) + "\n")
+        f = reaper.transcript_facts(p, now)
         self.assertEqual(f["text_at"] - f["prompt_at"], 300)
         self.assertTrue(reaper.said_done(f))
 

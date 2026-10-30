@@ -85,6 +85,9 @@ TAIL_BYTES = 4 << 20
 EXIT_WAIT_SECONDS = 20
 DONE_RE = re.compile(r"(?m)^\W*SESSION-DONE:\s*(.+)$")
 STATE_IDLE_RE = re.compile(r"(?m)^\W*SESSION-STATE:\s*IDLE_NO_WORK\b")
+# The done-grace marker (EL-T2512) is stricter than DONE_RE: a bare line among the last three of the reply, not
+# quoted, listed, back-ticked or inside a code fence, so a reply that explains the rule does not shorten the wait.
+GRACE_RE = re.compile(r"^\s*(?:SESSION-DONE:\s*\S|SESSION-STATE:\s*IDLE_NO_WORK\b)")
 DONE_PHRASE_RE = re.compile(r"這個主題(已經)?結束|may be closed", re.I)
 WAITING_RE = re.compile(
     r"production-authorization|authoriz|approv|授權|批准|等你|你決定|請確認", re.I
@@ -649,8 +652,11 @@ def transcript_facts(path, now):
         last = e
         text = "\n".join(b.get("text", "") for b in blocks(e) if b.get("type") == "text").strip()
         if text:
-            facts["last_text"], facts["text_at"] = text, ts(e)
+            facts["last_text"] = text
     if last:
+        # text_at is when the reply that ends the transcript was written; a tool call after the text leaves it 0
+        facts["text_at"] = ts(last) if any(b.get("type") == "text" and b.get("text", "").strip()
+                                           for b in blocks(last)) else 0
         facts["asking"] = any(b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion"
                               for b in blocks(last))
     return facts
@@ -991,8 +997,12 @@ def stall_mark(cfg, sid, now=None):
 
 def said_done(s):
     """The newest assistant text says the session is done, and nobody prompted it since (EL-T2512)."""
-    text = s.get("last_text") or ""
-    return bool(DONE_RE.search(text) or STATE_IDLE_RE.search(text)) and (s.get("text_at") or 0) > (s.get("prompt_at") or 0)
+    lines = [ln for ln in (s.get("last_text") or "").splitlines() if ln.strip()]
+    tail = lines[-3:]
+    fenced = sum(ln.lstrip().startswith("```") for ln in lines[:len(lines) - len(tail)]) % 2
+    return (not fenced and not any(ln.lstrip().startswith("```") for ln in tail)
+            and any(GRACE_RE.match(ln) for ln in tail)
+            and (s.get("text_at") or 0) > (s.get("prompt_at") or 0))
 
 
 def idle_threshold(s, cfg):
