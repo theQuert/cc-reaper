@@ -711,20 +711,40 @@ class PromptRuns(unittest.TestCase):
             self.assertEqual(ping.call_count, 3)
         self.assertEqual({c[1] for c in f.calls}, {"display", "capture-pane"})  # never answered, never typed
 
-    def test_a_missing_url_or_a_failed_ping_is_a_log_line_and_never_fails_the_tick(self):
+    def test_a_failed_push_is_a_failure_and_retried_until_it_goes_out_whatever_the_inbox(self):
+        self.push_config()
+        self.start({"%2": ("ci", PERMISSION)})
+        with mock.patch.object(stall, "_ping", side_effect=[OSError("https://uptime.betterstack.com/secret"), None]) as ping:
+            self.run_once(); self.age(10)
+            self.assertEqual(self.run_once(), 1)  # the inbox alert went out, the push did not: a failure, not silence
+            self.assertIn("push failed (OSError)", self.printed)
+            self.assertIn("founder push failed, try 1 of 5", self.printed)
+            self.assertNotIn("secret", self.printed)
+            self.assertEqual(self.run_once(), 0)  # retried on the next tick, although the inbox was alerted already
+            self.run_once()
+        self.assertEqual(ping.call_count, 2)
+        self.assertEqual(self.prompt_blocks("ci"), 1)
+
+    def test_a_missing_url_is_retried_five_times_then_left(self):
         self.push_config(url="")
         self.start({"%1": ("sre", ASK_USER)})
         with mock.patch.object(stall, "_ping") as ping:
-            self.run_once(); self.age(10); self.run_once()
+            self.run_once(); self.age(10)
+            rcs, said = [], []
+            for _ in range(7):
+                rcs.append(self.run_once()); said.append(self.printed)
         ping.assert_not_called()
-        self.assertIn("push: no https URL under HEARTBEAT_FOUNDER_DECISION", self.printed)
+        self.assertEqual(rcs, [1] * 5 + [0, 0])
+        self.assertIn("push: no https URL under HEARTBEAT_FOUNDER_DECISION", said[0])
         self.assertEqual(self.prompt_blocks("sre"), 1)
+
+    def test_an_inbox_that_cannot_be_written_still_pushes(self):
         self.push_config()
-        self.start({"%2": ("ci", PERMISSION)})
-        with mock.patch.object(stall, "_ping", side_effect=OSError("https://uptime.betterstack.com/secret")):
-            self.run_once(); self.age(10); self.assertEqual(self.run_once(), 0)
-        self.assertIn("push failed (OSError)", self.printed)
-        self.assertNotIn("secret", self.printed)
+        self.inbox.parent.mkdir(parents=True, exist_ok=True)
+        self.start({"%1": ("sre", ASK_USER)})
+        with mock.patch.object(stall, "_ping") as ping, mock.patch.object(stall, "append_inbox", side_effect=OSError("ro")):
+            self.run_once(); self.age(10); self.run_once()
+        self.assertEqual(ping.call_count, 1)
 
     def test_a_permission_prompt_carries_no_menu_text(self):
         self.write_config(apply="0", extra="STALL_PROMPT_APPLY=1\n")

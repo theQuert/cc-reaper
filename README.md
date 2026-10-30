@@ -893,7 +893,8 @@ a person's or Neo's step.
   prompt that leaves the screen is forgotten; a malformed stored entry is dropped and seen afresh. With
   `STALL_PUSH=1` (#130) a new prompt alert also pings `STALL_PUSH_KEY` (the Better Stack founder-decision heartbeat,
   read from `STALL_PUSH_ENV`) at `/fail` once, which pages the founder's device: numbers, kind and session name only,
-  the URL never printed, a failure a log line. release-owner-driver's 5-minute success ping on the same heartbeat
+  the URL never printed; a failed push is a failure line and is retried once a tick, up to 5 ticks, whether or not
+  the inbox write worked. release-owner-driver's 5-minute success ping on the same heartbeat
   resolves that incident after the page; a dedicated heartbeat removes that. The prompt is never answered.
 
 ```bash

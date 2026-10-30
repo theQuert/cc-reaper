@@ -525,7 +525,12 @@ def _prompt_event(ev, sid, fp):
             or not all(ev.get(k) is None or _num(ev.get(k)) for k in ("alerted", "shadow_at")) \
             or not SID_RE.fullmatch(sid) or not re.fullmatch(r"[0-9a-f]{16}", fp):
         return None
-    return {k: ev.get(k) for k in ("first", "kind", "fp", "pane", "alerts", "alerted", "shadow_at")}
+    out = {k: ev.get(k) for k in ("first", "kind", "fp", "pane", "alerts", "alerted", "shadow_at")}
+    if "push_tries" in ev or "pushed" in ev:  # the push record (#130): a damaged one restarts the push, not the alert
+        tries = ev.get("push_tries")
+        out["push_tries"] = tries if isinstance(tries, int) and not isinstance(tries, bool) and tries >= 0 else 0
+        out["pushed"] = ev.get("pushed") if _num(ev.get("pushed")) else None
+    return out
 
 
 def _stored_prompts(state):
@@ -569,6 +574,14 @@ def prompt_sweep(cfg, apply, state, prompts, kept, inbox, now, failures):
         if age < after:
             continue
         flagged += 1
+        push = apply and cfg.get("STALL_PUSH") == "1"
+        tries = ev.get("push_tries") if isinstance(ev.get("push_tries"), int) else 0
+        if push and not ev.get("pushed") and tries < PUSH_TRIES:  # its own record: neither the inbox nor a re-alert gates it
+            ev["push_tries"] = tries + 1
+            if founder_push(cfg, name, sid, pane, ev, now):
+                ev["pushed"] = now
+            else:
+                failures.append(f"{name} ({sid}): founder push failed, try {tries + 1} of {PUSH_TRIES}")
         last = ev["alerted"] if apply else ev["shadow_at"]
         if last is not None and now - last < every:
             continue
@@ -592,7 +605,8 @@ def prompt_sweep(cfg, apply, state, prompts, kept, inbox, now, failures):
             would += 1
             ev["shadow_at"] = now
             print(f"stall-watch shadow: would alert prompt {line} -> {inbox}")
-        founder_push(cfg, apply, name, sid, pane, ev, now)
+        if not push:
+            print(f"stall-watch shadow: would push {name} ({sid[:8]}) via {cfg.get('STALL_PUSH_KEY') or ''}")
     return out, seen, flagged, would
 
 
@@ -600,14 +614,14 @@ def _ping(url, body):
     urllib.request.urlopen(urllib.request.Request(url, data=body.encode()), timeout=10).read()
 
 
-def founder_push(cfg, live, name, sid, pane, ev, now):
-    """One push per prompt instance, to the founder's device: a /fail ping on a Better Stack heartbeat opens an
-    incident, which pages. The body carries numbers, the kind and the session name only (it leaves this machine);
-    the URL is never printed (it is the credential). Nothing here can fail the tick or answer the prompt."""
+PUSH_TRIES = 5  # ticks a failing push is retried on (one a tick), each a failure line; then it stops
+
+
+def founder_push(cfg, name, sid, pane, ev, now):
+    """A push to the founder's device: a /fail ping on a Better Stack heartbeat opens an incident, which pages. The
+    body carries numbers, the kind and the session name only (it leaves this machine); the URL is never printed (it
+    is the credential). True when the ping went out; never raises, never answers the prompt."""
     key = cfg.get("STALL_PUSH_KEY") or ""
-    if not (live and cfg.get("STALL_PUSH") == "1"):
-        print(f"stall-watch shadow: would push {name} ({sid[:8]}) via {key}")
-        return
     try:
         env = Path(cfg.get("STALL_PUSH_ENV") or "").expanduser()
         line = next((l for l in env.read_text().splitlines() if key and l.startswith(key + "=")), "")
@@ -616,15 +630,16 @@ def founder_push(cfg, live, name, sid, pane, ev, now):
     url = line.partition("=")[2].strip()
     if not url.startswith("https://"):
         print(f"stall-watch: push: no https URL under {key}; logged only ({name})")
-        return
+        return False
     body = (f"PROMPT-STALL session={name} id={sid[:8]} pane={pane} kind={ev['kind']} prompt={ev['fp']} "
             f"on-screen={int((now - ev['first']) // 60)}m")
     try:
         _ping(url.rstrip("/") + "/fail", body)
     except Exception as e:  # noqa: BLE001 - never the message: it can quote the URL
         print(f"stall-watch: push failed ({type(e).__name__}); logged only ({name})")
-        return
+        return False
     print(f"stall-watch: pushed {name} ({sid[:8]}) via {key}")
+    return True
 
 
 if __name__ == "__main__":
