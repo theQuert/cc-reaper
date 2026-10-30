@@ -88,6 +88,11 @@ STATE_IDLE_RE = re.compile(r"(?m)^\W*SESSION-STATE:\s*IDLE_NO_WORK\b")
 # The done-grace marker (EL-T2512) is stricter than DONE_RE: a bare line among the last three of the reply, not
 # quoted, listed, back-ticked or inside a code fence, so a reply that explains the rule does not shorten the wait.
 GRACE_RE = re.compile(r"^\s*(?:SESSION-DONE:\s*\S|SESSION-STATE:\s*IDLE_NO_WORK\b)")
+# EL-T2520: a reply that ends on an alarm. Closable under the grace only with no open PR, no owed step and nothing
+# unpushed; otherwise it is a FALSE_WAITING row (report-only), so the continue path can fire.
+WAIT_RE = re.compile(r"^\s*SESSION-STATE:\s*WAITING_UNTIL=\d{4}-\d\d-\d\dT")
+ALARM_STEP_RE = re.compile(r"delivery #\d+: .*-> agent check-by\b")
+FALSE_WAITING = ("open-pr", "owed-step:", "unpushed:", "uncommitted:", "issue-unknown:")
 DONE_PHRASE_RE = re.compile(r"這個主題(已經)?結束|may be closed", re.I)
 WAITING_RE = re.compile(
     r"production-authorization|authoriz|approv|授權|批准|等你|你決定|請確認", re.I
@@ -920,8 +925,16 @@ def decide(s, cfg, now=None):
     (`would-close: inbox DONE (shadow)`) and nothing else changes. That is how the inbox-DONE close path earns its
     clean rounds before it is switched on (EL-FLOW-P2-2106, SCRIPT-SAFE-RULE)."""
     keep = _decide(s, cfg, now)
-    # EL-T2512: the same second decide under DONE_GRACE=apply, only for a session the idle wait alone keeps waiting.
-    if keep and cfg.get("DONE_GRACE") == "shadow" and said_done(s) and any(k.startswith("idle:") for k in keep):
+    # EL-T2520: an alarm with open work is FALSE_WAITING (report-only; never closed): the continue path fires on it.
+    if said_waiting(s) and s["status"] == "idle":
+        work = [k for k in keep + (open_prs(s) if cfg.get("DONE_GRACE") != "apply" else []) if k.startswith(FALSE_WAITING)]
+        if work:
+            s["false_waiting"] = sorted(set(work))
+    # EL-T2512: the same second decide under DONE_GRACE=apply, for a session that said it is done (the idle wait
+    # alone keeps it) or ends on an alarm (EL-T2520: idle or claim-unknown keeps it).
+    if (keep and cfg.get("DONE_GRACE") == "shadow"
+            and ((said_done(s) and any(k.startswith("idle:") for k in keep))
+                 or (said_waiting(s) and all(k.startswith(("idle:", "claim-unknown")) for k in keep)))):
         try:
             s["done_grace_shadow"] = not _decide(dict(s), dict(cfg, DONE_GRACE="apply"), now)
         except Exception as e:  # a report-only trial must not turn a kept session into an error
@@ -995,21 +1008,53 @@ def stall_mark(cfg, sid, now=None):
         return ""
 
 
-def said_done(s):
-    """The newest assistant text says the session is done, and nobody prompted it since (EL-T2512)."""
+def _ends_on(s, rx):
+    """A bare `rx` line among the last three of the reply that ends the transcript, outside a code fence, written
+    after the last prompt."""
     lines = [ln for ln in (s.get("last_text") or "").splitlines() if ln.strip()]
     tail = lines[-3:]
     fenced = sum(ln.lstrip().startswith("```") for ln in lines[:len(lines) - len(tail)]) % 2
     return (not fenced and not any(ln.lstrip().startswith("```") for ln in tail)
-            and any(GRACE_RE.match(ln) for ln in tail)
+            and any(rx.match(ln) for ln in tail)
             and (s.get("text_at") or 0) > (s.get("prompt_at") or 0))
+
+
+def said_done(s):
+    """The newest assistant text says the session is done, and nobody prompted it since (EL-T2512)."""
+    return _ends_on(s, GRACE_RE)
+
+
+def said_waiting(s):
+    """The newest reply ends on `SESSION-STATE: WAITING_UNTIL=<iso>` and does not also say it is done (EL-T2520)."""
+    return not said_done(s) and _ends_on(s, WAIT_RE)
+
+
+_pr_cache = {}
+
+
+def open_prs(s):
+    """Keep reasons for open pull requests on the branches of the session's own worktrees: `open-pr:<repo>#N`, or
+    `open-pr-unknown:<branch>` when GitHub cannot say (kept)."""
+    out = []
+    for w in s["owned"]:
+        repo, branch = gh_repo(w["repo"]), w.get("branch") or ""
+        if not branch or branch in ("main", "master"):
+            continue
+        key = (repo, branch)
+        if key not in _pr_cache:
+            rc, txt = run(["gh", "pr", "list", "-R", repo, "--head", branch, "--state", "open",
+                           "--json", "number", "-q", ".[].number"], 30) if repo else (1, "")
+            _pr_cache[key] = txt.split() if rc == 0 else None
+        nums = _pr_cache[key]
+        out += [f"open-pr-unknown:{branch}"] if nums is None else [f"open-pr:{repo}#{n}" for n in nums]
+    return out
 
 
 def idle_threshold(s, cfg):
     """Minutes a session must sit idle before it can close: IDLE_MINUTES, or DONE_GRACE_MINUTES when DONE_GRACE=apply
     and said_done(). The grace replaces only the idle wait; every other keep gate still applies."""
     idle = float(cfg["IDLE_MINUTES"])
-    if cfg.get("DONE_GRACE") == "apply" and said_done(s):
+    if cfg.get("DONE_GRACE") == "apply" and (said_done(s) or said_waiting(s)):
         return min(idle, float(cfg.get("DONE_GRACE_MINUTES") or idle))
     return idle
 
@@ -1073,15 +1118,21 @@ def _decide(s, cfg, now=None):
             elif "UNKNOWN" in cb:
                 keep.append("check-by-unknown")
     else:
-        if not s["claims"]:
+        waiting = cfg.get("DONE_GRACE") == "apply" and said_waiting(s)
+        if waiting:
+            keep.extend(open_prs(s))  # an alarm is pure only with no open PR of its own
+        if not s["claims"] and not waiting:
             keep.append("claim-unknown")
         elif s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg):
             at = now if now is not None else time.time()
             marks, owed, unknown = [], [], []
             for r, n in s["claims"]:
+                brief = oracle_brief(r, n, cfg, at)
                 cls, overdue = classify_claim(
-                    oracle_brief(r, n, cfg, at), s["sid"], at, s.get("other_sids", ()),
+                    brief, s["sid"], at, s.get("other_sids", ()),
                     [w["marker"] for w in s["owned"] if w.get("marker")])
+                if waiting and cls == "owed" and not overdue and ALARM_STEP_RE.match(brief or ""):
+                    cls = "alarm"  # its own check-by, not yet due: the alarm the dispatcher wakes it for (EL-T2520)
                 marks.append(f"#{n}:{cls}" + (":stalled" if overdue else ""))
                 if cls == "owed":
                     owed.append(f"#{n}")
@@ -1496,6 +1547,7 @@ def report_line(s, keep, outcome):
     why = [f"would-close: {s['would_close']}"] if s.get("would_close") else []
     why += ["would-close: inbox DONE (shadow)"] if s.get("inbox_done_shadow") else []
     why += ["would-close: done grace (shadow)"] if s.get("done_grace_shadow") else []
+    why += ["FALSE_WAITING: " + ",".join(s["false_waiting"])] if s.get("false_waiting") else []
     why += [f"would-close: no claim, {s['noclaim_done_shadow']} (shadow)"] if s.get("noclaim_done_shadow") else []
     if s.get("claim_why"):  # name why no claim was found
         keep = [f"claim-unknown({s['claim_why']})" if k == "claim-unknown" else k for k in keep]
