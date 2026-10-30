@@ -601,7 +601,7 @@ class PromptRuns(unittest.TestCase):
         self.assertIn("on-screen=11m", text)
         self.assertNotIn("r.git", text)  # no screen text reaches the inbox
         self.assertNotIn("fine", text)
-        self.assertIn("push: no founder-device channel", self.printed)
+        self.assertIn("would push ci", self.printed)  # STALL_PUSH unset: the push is shadow
         self.assertEqual({c[1] for c in f.calls}, {"display", "capture-pane"})  # never answered, never typed
 
     def test_an_ask_user_question_menu_is_flagged(self):
@@ -679,6 +679,72 @@ class PromptRuns(unittest.TestCase):
             self.assertNotIn(secret.split("=")[-1].split(": ")[-1], h, secret)
         self.assertLessEqual(len(stall._menu_head(["x " * 200])), 80)
         self.assertEqual(stall._menu_head(["Merge PR #6739 at f36a13cd now?"]), "Merge PR #6739 at f36a13cd now?")
+
+    def push_config(self, url="https://uptime.betterstack.com/api/v1/heartbeat/abc123"):
+        env = self.tmp / "heartbeats.env"
+        env.write_text(f"HEARTBEAT_MAC_HOST=https://x/other\nHEARTBEAT_FOUNDER_DECISION={url}\n")
+        self.write_config(apply="0", extra=f"STALL_PROMPT_APPLY=1\nSTALL_PUSH=1\nSTALL_PUSH_ENV={env}\n")
+
+    def test_one_founder_push_per_prompt_hash_and_none_while_it_stays(self):
+        # cc-reaper #130: the inbox alert reached no device; a P0 waited 7 h on a keypress.
+        self.push_config()
+        f = self.start({"%1": ("sre", ASK_USER), "%2": ("ci", PERMISSION)})
+        with mock.patch.object(stall, "_ping") as ping:
+            self.run_once()
+            self.age(10)
+            self.run_once()  # both prompts cross the threshold: one push each
+            self.assertEqual(ping.call_count, 2)
+            urls = {c.args[0] for c in ping.call_args_list}
+            self.assertEqual(urls, {"https://uptime.betterstack.com/api/v1/heartbeat/abc123/fail"})
+            bodies = " ".join(c.args[1] for c in ping.call_args_list)
+            self.assertIn("PROMPT-STALL session=sre", bodies); self.assertIn("kind=permission", bodies)
+            self.assertNotIn("Approve the boundary", bodies)  # no screen text leaves the machine
+            self.assertNotIn("abc123", self.printed)  # the URL is never printed
+            self.run_once()  # unchanged hash: no push
+            f.set("%1", ASK_MOVED)  # cursor moved, same prompt: no push
+            self.run_once()
+            self.age(200, "alerted")  # a log-only re-alert is not a push either
+            self.run_once()
+            self.assertEqual(ping.call_count, 2)
+            f.set("%1", HEALTHY); self.run_once()
+            f.set("%1", ASK_USER); self.run_once(); self.age(10); self.run_once()  # a new instance: one more
+            self.assertEqual(ping.call_count, 3)
+        self.assertEqual({c[1] for c in f.calls}, {"display", "capture-pane"})  # never answered, never typed
+
+    def test_a_failed_push_is_a_failure_and_retried_until_it_goes_out_whatever_the_inbox(self):
+        self.push_config()
+        self.start({"%2": ("ci", PERMISSION)})
+        with mock.patch.object(stall, "_ping", side_effect=[OSError("https://uptime.betterstack.com/secret"), None]) as ping:
+            self.run_once(); self.age(10)
+            self.assertEqual(self.run_once(), 1)  # the inbox alert went out, the push did not: a failure, not silence
+            self.assertIn("push failed (OSError)", self.printed)
+            self.assertIn("founder push failed, try 1 of 5", self.printed)
+            self.assertNotIn("secret", self.printed)
+            self.assertEqual(self.run_once(), 0)  # retried on the next tick, although the inbox was alerted already
+            self.run_once()
+        self.assertEqual(ping.call_count, 2)
+        self.assertEqual(self.prompt_blocks("ci"), 1)
+
+    def test_a_missing_url_is_retried_five_times_then_left(self):
+        self.push_config(url="")
+        self.start({"%1": ("sre", ASK_USER)})
+        with mock.patch.object(stall, "_ping") as ping:
+            self.run_once(); self.age(10)
+            rcs, said = [], []
+            for _ in range(7):
+                rcs.append(self.run_once()); said.append(self.printed)
+        ping.assert_not_called()
+        self.assertEqual(rcs, [1] * 5 + [0, 0])
+        self.assertIn("push: no https URL under HEARTBEAT_FOUNDER_DECISION", said[0])
+        self.assertEqual(self.prompt_blocks("sre"), 1)
+
+    def test_an_inbox_that_cannot_be_written_still_pushes(self):
+        self.push_config()
+        self.inbox.parent.mkdir(parents=True, exist_ok=True)
+        self.start({"%1": ("sre", ASK_USER)})
+        with mock.patch.object(stall, "_ping") as ping, mock.patch.object(stall, "append_inbox", side_effect=OSError("ro")):
+            self.run_once(); self.age(10); self.run_once()
+        self.assertEqual(ping.call_count, 1)
 
     def test_a_permission_prompt_carries_no_menu_text(self):
         self.write_config(apply="0", extra="STALL_PROMPT_APPLY=1\n")
