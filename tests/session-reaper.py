@@ -1039,11 +1039,40 @@ class Nudge(unittest.TestCase):
 
     def test_busy_or_a_draft_after_a_nudge_does_not_forget_it(self):
         self.run_once(["owed-step:#1"])
-        self.assertEqual(self.run_once(["owed-step:#1"], status="busy"), [])
+        # what decide() really returns once the session works on it (review: a busy row never carries owed-step)
+        self.assertEqual(self.run_once(["status:busy", "issue-open:#1"], status="busy", idle_min=0), [])
+        self.assertEqual(self.run_once(["idle:20<60min", "issue-open:#1"], idle_min=20), [])
         self.screen = f"{self.SEP}\n❯ half a reply\n{self.SEP}"
         self.assertEqual(self.run_once(["owed-step:#1"]), [])
         self.screen = f"{self.SEP}\n❯ \n{self.SEP}"
         self.assertEqual(self.run_once(["owed-step:#1"]), [], "same work, idle again: still once")
+
+    def test_decide_then_nudge_end_to_end_nudges_once_across_a_busy_spell(self):
+        cfg = dict(self.cfg, CHECKBY_ORACLE="")
+        brief = lambda r, n, c, now: f"next: agent repair #{n} claimant: sid-x"
+        with mock.patch.object(reaper, "oracle_brief", brief), \
+                mock.patch.object(reaper, "classify_claim", lambda *a, **k: ("owed", False)), \
+                mock.patch.object(reaper, "issue_state", lambda r, n: "OPEN"):
+            routed = []
+            for st, idle in (("idle", 90), ("busy", 0), ("idle", 20), ("idle", 90)):
+                s = session(sid="abcdef0123", pane="%1", status=st, idle_min=idle, last_text="working",
+                            claims=[("o/r", "7")])
+                keep = reaper.decide(s, cfg)
+                routed += reaper.nudge_events(cfg, [(s, keep, "keep")], self.now)
+        self.assertEqual(routed, ["abcdef01:owed-step:#7"])
+
+    def test_an_ended_session_is_dropped_from_the_state(self):
+        self.run_once(["owed-step:#1"])
+        other = session(sid="99999999xx", tmux="other", name="other")
+        reaper.nudge_events(self.cfg, [(other, ["status:busy"], "keep")], self.now)
+        self.assertEqual(json.loads((self.tmp / "nudged.json").read_text()), [])
+
+    def test_a_failed_event_write_forgets_the_fingerprint(self):
+        self.cfg["NUDGE_EVENTS"] = str(self.tmp)  # a directory: open() fails
+        with self.assertRaises(OSError) as cm:
+            self.run_once(["owed-step:#1"])
+        self.assertIn("abcdef01:owed-step:#1", str(cm.exception))
+        self.assertEqual(json.loads((self.tmp / "nudged.json").read_text()), [])
 
     def test_a_busy_session_is_nudged_once_it_is_idle_at_the_prompt(self):
         self.assertEqual(self.run_once(["owed-step:#1"], status="busy"), [])

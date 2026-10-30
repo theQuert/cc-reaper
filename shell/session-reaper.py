@@ -810,9 +810,13 @@ def nudge_events(cfg, seen, now):
         sent = {str(x) for x in json.loads(st.read_text())}
     except (OSError, ValueError, TypeError):
         sent = set()
-    judged, cur, new = set(), set(), []
+    seen_sids, judged, cur, new = set(), set(), set(), []
     for s, keep, outcome in seen:
-        if outcome == "error" or any(k.startswith("unjudged:") for k in keep):
+        seen_sids.add(s["sid"][:8])
+        # decide() names open work only for a session idle past IDLE_MINUTES (busy gets status:busy, a short idle
+        #  idle:N<..min, an owed step only past the threshold), so only such a session can say its work changed
+        if (outcome == "error" or any(k.startswith("unjudged:") for k in keep) or s["status"] != "idle"
+                or s["idle_min"] < float(cfg["IDLE_MINUTES"])):
             continue
         judged.add(s["sid"][:8])
         if not keep or not all(k.startswith(OPEN_WORK) for k in keep) or not any(k.startswith(NUDGE_FOR) for k in keep):
@@ -822,24 +826,33 @@ def nudge_events(cfg, seen, now):
             cur.add(fp)
             continue
         names = [n for n in (s["tmux"], s.get("name")) if n]
-        if s["status"] != "idle" or s["idle_min"] < float(cfg["IDLE_MINUTES"]) or protected(cfg, *names):
+        if protected(cfg, *names):
             continue
         state = pane_state(s["pane"]) if s.get("pane") else None
         if not state or not empty_prompt(state):  # working, a menu, or a draft in the input: not idle at ❯
             continue
         cur.add(fp)
         new.append((s["tmux"], fp))
-    keep_sent = {fp for fp in sent if fp.split(":", 1)[0] not in judged} | cur
-    st.parent.mkdir(parents=True, exist_ok=True)
-    tmp = st.with_name(st.name + ".tmp")
-    tmp.write_text(json.dumps(sorted(keep_sent)))
-    os.replace(tmp, st)  # at most once: remembered before the line is written
+    # an ended session's sid leaves the sweep; drop it then (not on an empty, aborted sweep)
+    keep_sent = {fp for fp in sent if fp.split(":", 1)[0] not in judged
+                 and (not seen_sids or fp.split(":", 1)[0] in seen_sids)} | cur
+
+    def save(fps):
+        st.parent.mkdir(parents=True, exist_ok=True)
+        tmp = st.with_name(st.name + ".tmp")
+        tmp.write_text(json.dumps(sorted(fps)))
+        os.replace(tmp, st)
+    save(keep_sent)  # at most once: remembered before the line is written
     if new:
-        path = Path(os.path.expanduser(cfg["NUDGE_EVENTS"]))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
-        with open(path, "a") as f:
-            f.writelines(f"{stamp} ROUTE nudge {t} {fp}\n" for t, fp in new)
+        try:
+            path = Path(os.path.expanduser(cfg["NUDGE_EVENTS"]))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
+            with open(path, "a") as f:
+                f.writelines(f"{stamp} ROUTE nudge {t} {fp}\n" for t, fp in new)
+        except OSError as e:  # not routed: forget them so the next sweep tries again
+            save(keep_sent - {fp for _, fp in new})
+            raise OSError(f"{e}; not routed: {', '.join(fp for _, fp in new)}") from e
     return [fp for _, fp in new]
 
 
