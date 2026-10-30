@@ -520,6 +520,7 @@ guard_case() {
     export CC_RW_TEST_DF_KB=$(( free_gb * GB ))
     export CC_RW_JANITOR_SCRIPT="$guard_dir/janitor.sh" CC_RW_RECLAIM_SCRIPT="$guard_dir/reclaim.sh"
     export CC_RW_SWAP_USED_GB=""   # unreadable unless a case sets it: the host's real swap must not decide
+    export CC_RW_VM_PRESSURE_LEVEL="" CC_RW_SWAPOUTS=""   # nor its real memory pressure or Swapouts
     for pair in "$@"; do export "$pair"; done
     /bin/bash "$ROOT_DIR/shell/resource-watch.sh"
   ) || true
@@ -751,9 +752,10 @@ expect_no  "T17h: CC_RW_RATE_*_GBH=0 disable alert and flag" \
 
 # T17s: swap over CC_RW_SWAP_FLAG_GB holds heavy leases and says so in its own flag
 t17s=$(rate_seed "$((t17_now - 3600)) $((80 * GB))")
-guard_case "$t17s" 100 CC_RW_SWAP_USED_GB=22.5
-expect_yes "T17s: swap 22.5 > 18 writes swap-high" test -f "$t17s/state/swap-high"
-expect_yes "T17s: swap-high is <epoch> swap=<gb> limit=<gb>" grep -qE '^[0-9]+ swap=22\.5 limit=18$' "$t17s/state/swap-high"
+guard_case "$t17s" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2
+expect_yes "T17s: swap 22.5 > 18 under pressure 2 writes swap-high" test -f "$t17s/state/swap-high"
+expect_yes "T17s: swap-high is <epoch> swap=<gb> limit=<gb> pressure=<n> swapouts=<n|?>" \
+  grep -qE '^[0-9]+ swap=22\.5 limit=18 pressure=2 swapouts=\?$' "$t17s/state/swap-high"
 expect_yes "T17s: and disk-rate-high with swap=" grep -q 'swap=22.5' "$t17s/state/disk-rate-high"
 expect_yes "T17s: and ALERT:swap" grep -q 'ALERT:swap' "$t17s/resource-watch.log"
 guard_case "$t17s" 100 CC_RW_SWAP_USED_GB=3.0
@@ -764,8 +766,70 @@ echo "1 swap=30 limit=18" > "$t17u/state/swap-high"
 guard_case "$t17u" 100 CC_RW_SWAP_USED_GB=
 expect_yes "T17u: unreadable swap leaves swap-high alone" test -f "$t17u/state/swap-high"
 t17v=$(rate_seed "$((t17_now - 3600)) $((80 * GB))")
-guard_case "$t17v" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_SWAP_FLAG_GB=30
+guard_case "$t17v" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2 CC_RW_SWAP_FLAG_GB=30
 expect_no  "T17v: CC_RW_SWAP_FLAG_GB raises the limit" test -e "$t17v/state/swap-high"
+
+# T17w: macOS never shrinks swap, so the flag holds only while swap is still written:
+# over the limit AND (pressure >= 2 OR Swapouts grew since the stored sample)
+t17w_flags() { echo "1 swap=30 limit=18" > "$1/state/swap-high"; echo "1 0 100 swap=30" > "$1/state/disk-rate-high"; }
+t17w=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17w"; echo 1000 > "$t17w/state/swapouts-last"
+guard_case "$t17w" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL=1 CC_RW_SWAPOUTS=1000
+expect_no  "T17w: high (20.9 > 18) but calm (pressure 1, Swapouts unchanged) removes swap-high" test -e "$t17w/state/swap-high"
+expect_no  "T17w: and disk-rate-high, the rate being calm" test -e "$t17w/state/disk-rate-high"
+expect_no  "T17w: and raises no ALERT:swap" grep -q 'ALERT:swap' "$t17w/resource-watch.log"
+expect_yes "T17w: the Swapouts sample is kept" grep -qx 1000 "$t17w/state/swapouts-last"
+guard_case "$t17w" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL=1 CC_RW_SWAPOUTS=1500
+expect_yes "T17x: high and growing (Swapouts 1000 -> 1500, pressure 1) writes swap-high" \
+  grep -qE '^[0-9]+ swap=20\.9 limit=18 pressure=1 swapouts=1500$' "$t17w/state/swap-high"
+expect_yes "T17x: and disk-rate-high with swap=" grep -q 'swap=20.9' "$t17w/state/disk-rate-high"
+expect_yes "T17x: and ALERT:swap" grep -q 'ALERT:swap' "$t17w/resource-watch.log"
+expect_yes "T17x: the stored sample moves to 1500" grep -qx 1500 "$t17w/state/swapouts-last"
+t17y=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); echo 1000 > "$t17y/state/swapouts-last"
+guard_case "$t17y" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL=2 CC_RW_SWAPOUTS=1000
+expect_yes "T17y: pressure 2 with Swapouts unchanged writes swap-high" test -f "$t17y/state/swap-high"
+expect_yes "T17y: and disk-rate-high" test -f "$t17y/state/disk-rate-high"
+expect_yes "T17y: and ALERT:swap" grep -q 'ALERT:swap' "$t17y/resource-watch.log"
+t17z=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17z"; echo 1000 > "$t17z/state/swapouts-last"
+guard_case "$t17z" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL= CC_RW_SWAPOUTS=
+expect_yes "T17z: high swap with pressure and Swapouts unreadable leaves swap-high as it was" \
+  test "$(cat "$t17z/state/swap-high")" = "1 swap=30 limit=18"
+expect_yes "T17z: and disk-rate-high as it was" test "$(cat "$t17z/state/disk-rate-high")" = "1 0 100 swap=30"
+expect_yes "T17z: and the stored sample" grep -qx 1000 "$t17z/state/swapouts-last"
+t17z2=$(rate_seed "$((t17_now - 3600)) $((80 * GB))")
+guard_case "$t17z2" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL= CC_RW_SWAPOUTS=
+expect_no  "T17z: nor sets swap-high when there was none" test -e "$t17z2/state/swap-high"
+expect_no  "T17z: nor disk-rate-high, the rate being calm" test -e "$t17z2/state/disk-rate-high"
+t17u2=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17u2"; echo 1000 > "$t17u2/state/swapouts-last"
+guard_case "$t17u2" 100 CC_RW_SWAP_USED_GB=3.0 CC_RW_VM_PRESSURE_LEVEL=3 CC_RW_SWAPOUTS=9000
+expect_no  "T17u2: swap under the limit clears swap-high, whatever pressure and Swapouts say" test -e "$t17u2/state/swap-high"
+expect_no  "T17u2: and disk-rate-high" test -e "$t17u2/state/disk-rate-high"
+t17r=$(rate_seed "$((t17_now - 3600)) $((130 * GB))"); t17w_flags "$t17r"; echo 1000 > "$t17r/state/swapouts-last"
+guard_case "$t17r" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL=1 CC_RW_SWAPOUTS=1000
+expect_no  "T17r: calm swap removes swap-high" test -e "$t17r/state/swap-high"
+expect_yes "T17r: but a 30GB/h rate keeps disk-rate-high" test -f "$t17r/state/disk-rate-high"
+t17f1=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17f1"
+guard_case "$t17f1" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL=1 CC_RW_SWAPOUTS=1000
+expect_no  "T17f1: first round (no stored Swapouts) at pressure 1: growth unknown, the flag clears" test -e "$t17f1/state/swap-high"
+expect_yes "T17f1: and the first sample is stored" grep -qx 1000 "$t17f1/state/swapouts-last"
+t17b1=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17b1"; echo 5000 > "$t17b1/state/swapouts-last"
+guard_case "$t17b1" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL=1 CC_RW_SWAPOUTS=100
+expect_no  "T17b1: Swapouts below the stored count (a reboot's reset) is not growth" test -e "$t17b1/state/swap-high"
+expect_yes "T17b1: and the reset count is stored" grep -qx 100 "$t17b1/state/swapouts-last"
+t17p=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17p"; echo 1000 > "$t17p/state/swapouts-last"
+guard_case "$t17p" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL= CC_RW_SWAPOUTS=1000
+expect_no  "T17p: pressure unreadable, Swapouts readable and unchanged: the flag clears" test -e "$t17p/state/swap-high"
+t17f2=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17f2"
+guard_case "$t17f2" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL= CC_RW_SWAPOUTS=1000
+expect_yes "T17f2: first round with pressure unreadable: no calm evidence, swap-high left as it was" \
+  test "$(cat "$t17f2/state/swap-high")" = "1 swap=30 limit=18"
+expect_yes "T17f2: and its disk-rate-high" test "$(cat "$t17f2/state/disk-rate-high")" = "1 0 100 swap=30"
+expect_yes "T17f2: the first sample is still stored" grep -qx 1000 "$t17f2/state/swapouts-last"
+guard_case "$t17f2" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL= CC_RW_SWAPOUTS=1000
+expect_no  "T17f2: the next round, Swapouts unchanged, clears it" test -e "$t17f2/state/swap-high"
+t17q=$(rate_seed "$((t17_now - 3600)) $((80 * GB))"); t17w_flags "$t17q"; echo 1000 > "$t17q/state/swapouts-last"
+guard_case "$t17q" 100 CC_RW_SWAP_USED_GB=20.9 CC_RW_VM_PRESSURE_LEVEL=1 CC_RW_SWAPOUTS=
+expect_no  "T17q: pressure 1, Swapouts unreadable: the flag clears" test -e "$t17q/state/swap-high"
+expect_yes "T17q: and an unreadable count leaves the stored sample" grep -qx 1000 "$t17q/state/swapouts-last"
 
 # ---------------------------------------------------------------------------
 # T18: the go cache cap is bounded, so a hung cap cannot hold the round
@@ -916,13 +980,13 @@ expect_yes "T20a: the shadow state starts as clear" grep -qx clear "$t20a/state/
 expect_no  "T20a: shadow writes no on-mode state" test -e "$t20a/state/disk-pause.state"
 expect_yes "T20a: the snapshot line carries swap= and rate=" \
   grep -qE 'disk_free=100\.0GB/[0-9.]+% swap=3\.0GB rate=-20\.0GB/h( |$)' "$t20a/resource-watch.log"
-guard_case "$t20a" 100 CC_RW_SWAP_USED_GB=22.5
+guard_case "$t20a" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2
 expect_yes "T20b: swap over the line: one shadow EVENT" test "$(t20_events "$t20a")" -eq 1
 expect_yes "T20b: it names every flag present, in order, and the values" \
   grep -qE "EVENT shadow \(CC_RW_PAUSE_EVENTS=shadow\): would emit to $CC_RW_EVENTS_LOG: DISK-PAUSE on: disk-rate-high,swap-high free=100\.0GB swap=22\.5GB rate=-?[0-9.]+GB/h$" "$t20a/resource-watch.log"
 expect_no  "T20b: shadow appends nothing to the events log" test -e "$CC_RW_EVENTS_LOG"
 expect_yes "T20b: the shadow state records the pause" grep -qx 'paused disk-rate-high,swap-high' "$t20a/state/disk-pause.shadow.state"
-guard_case "$t20a" 100 CC_RW_SWAP_USED_GB=22.5
+guard_case "$t20a" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2
 expect_yes "T20c: the same state next round tells nothing (deduped)" test "$(t20_events "$t20a")" -eq 1
 guard_case "$t20a" 100 CC_RW_SWAP_USED_GB=3.0
 expect_yes "T20d: every flag cleared: one DISK-RESUME" \
@@ -932,12 +996,12 @@ expect_yes "T20d: and nothing the round after" test "$(t20_events "$t20a")" -eq 
 
 # on: the line goes to events.log, stamped as events.log stamps (diskwatch.py's %Y-%m-%dT%H:%M:%S%z)
 t20e=$(rate_seed "$((t20_now - 3600)) $((80 * GB))"); ev="$t20e/events.log"
-guard_case "$t20e" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$ev"
+guard_case "$t20e" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$ev"
 expect_yes "T20e: on: one line in events.log" test "$(t20_lines "$ev")" -eq 1
 expect_yes "T20e: in the events.log shape" \
   grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{4} DISK-PAUSE on: disk-rate-high,swap-high free=100\.0GB swap=22\.5GB rate=' "$ev"
 expect_yes "T20e: and the round's log says it was emitted" grep -q "EVENT emitted to $ev: DISK-PAUSE on:" "$t20e/resource-watch.log"
-guard_case "$t20e" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$ev"
+guard_case "$t20e" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$ev"
 expect_yes "T20e: deduped across rounds" test "$(t20_lines "$ev")" -eq 1
 guard_case "$t20e" 100 CC_RW_SWAP_USED_GB=3.0 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$ev"
 guard_case "$t20e" 100 CC_RW_SWAP_USED_GB=3.0 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$ev"
@@ -953,23 +1017,23 @@ guard_case "$t20g" 15 CC_RW_SWAP_USED_GB=3.0 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_
 expect_yes "T20g: free under the emergency line is a pause" grep -q ' DISK-PAUSE on: disk-emergency free=15.0GB ' "$t20g/events.log"
 
 t20h=$(rate_seed "$((t20_now - 3600)) $((80 * GB))")
-guard_case "$t20h" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20h/no-such-dir/events.log"
+guard_case "$t20h" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20h/no-such-dir/events.log"
 expect_yes "T20h: an append that fails is an ERROR line" grep -q 'ERROR pause chain: cannot append to' "$t20h/resource-watch.log"
 expect_no  "T20h: and leaves the state untold" test -e "$t20h/state/disk-pause.state"
-guard_case "$t20h" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20h/events.log"
+guard_case "$t20h" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20h/events.log"
 expect_yes "T20h: so the next round tells it" grep -q ' DISK-PAUSE on: ' "$t20h/events.log"
 
 t20i=$(rate_seed "$((t20_now - 3600)) $((80 * GB))")
-guard_case "$t20i" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=off CC_RW_EVENTS_LOG="$t20i/events.log"
+guard_case "$t20i" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2 CC_RW_PAUSE_EVENTS=off CC_RW_EVENTS_LOG="$t20i/events.log"
 expect_yes "T20i: off: no EVENT line" test "$(t20_events "$t20i")" -eq 0
 expect_no  "T20i: no events.log" test -e "$t20i/events.log"
 expect_no  "T20i: and no state" sh -c "ls '$t20i/state' | grep -q disk-pause"
 
 t20j=$(rate_seed "$((t20_now - 3600)) $((80 * GB))")
-guard_case "$t20j" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=bogus CC_RW_EVENTS_LOG="$t20j/events.log"
+guard_case "$t20j" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2 CC_RW_PAUSE_EVENTS=bogus CC_RW_EVENTS_LOG="$t20j/events.log"
 expect_yes "T20j: an unknown mode is shadow" grep -q 'EVENT shadow' "$t20j/resource-watch.log"
 expect_no  "T20j: and writes no events.log" test -e "$t20j/events.log"
-guard_case "$t20j" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20j/events.log"
+guard_case "$t20j" 100 CC_RW_SWAP_USED_GB=22.5 CC_RW_VM_PRESSURE_LEVEL=2 CC_RW_PAUSE_EVENTS=on CC_RW_EVENTS_LOG="$t20j/events.log"
 expect_yes "T20k: turned on mid-pause, on tells the pause it finds (its own state)" \
   test "$(t20_lines "$t20j/events.log")" -eq 1
 
@@ -982,7 +1046,16 @@ t21_judge() { PATH="$stub_dir:$PATH" python3 "$ROOT_DIR/shell/resource-watch-jud
 expect_yes "T21a: the judge passes the T20 shadow log (pause, resume, swap= and rate= lines)" t21_judge --log "$t20a/resource-watch.log"
 expect_yes "T21a: and the T20 on-mode log" t21_judge --log "$t20e/resource-watch.log"
 sed 's/ ALERT:swap//' "$t20a/resource-watch.log" > "$t20a/no-swap-marker.log"
-expect_no  "T21b: a swap line without ALERT:swap is a miss" t21_judge --log "$t20a/no-swap-marker.log"
+expect_no  "T21b: a swap_hot=1 line without ALERT:swap is a miss" t21_judge --log "$t20a/no-swap-marker.log"
+expect_yes "T21b: (those lines do carry swap_hot=1)" grep -q ' swap=22\.5GB rate=[^ ]* swap_hot=1 ' "$t20a/resource-watch.log"
+expect_yes "T21d: the judge passes the T17w log (swap high but calm, then growing)" t21_judge --log "$t17w/resource-watch.log"
+expect_yes "T21d: whose calm line says swap_hot=0 and has no ALERT:swap" \
+  sh -c "head -n 1 '$t17w/resource-watch.log' | grep ' swap=20\.9GB rate=[^ ]* swap_hot=0' | grep -qv 'ALERT:swap'"
+expect_yes "T21d: and the T17z log (pressure and Swapouts unreadable: swap_hot=?)" t21_judge --log "$t17z/resource-watch.log"
+expect_yes "T21d: (swap_hot=? on it)" grep -q ' swap_hot=? ' "$t17z/resource-watch.log"
+sed -E 's/ swap_hot=[01?]//' "$t17w/resource-watch.log" > "$t17w/legacy.log"
+expect_no  "T21e: the same lines without swap_hot (a legacy log) keep the size-only rule: a miss" \
+  t21_judge --log "$t17w/legacy.log"
 grep -v 'DISK-RESUME' "$t20a/resource-watch.log" > "$t20a/no-resume.log"; grep 'DISK-PAUSE' "$t20a/resource-watch.log" >> "$t20a/no-resume.log"
 expect_no  "T21c: a second DISK-PAUSE with no resume between is a miss" t21_judge --log "$t20a/no-resume.log"
 
