@@ -62,6 +62,11 @@ DEFAULTS = {
     "STALL_MARK_HOURS": "12",  # a mark not refreshed for this long is stale and ignored
     "STALL_MARK_MAX_HOURS": "48",  # a mark whose event was first seen longer ago is ignored however fresh it is
     "IDLE_LIST_EXCLUDE": "",
+    # EL-T2512: a session whose newest assistant text, written after its last prompt, says SESSION-DONE or
+    # `SESSION-STATE: IDLE_NO_WORK` waits DONE_GRACE_MINUTES instead of IDLE_MINUTES; every other gate still holds.
+    # `shadow` reports `would-close: done grace (shadow)` and closes nothing; `apply` uses it; `off` neither.
+    "DONE_GRACE": "off",
+    "DONE_GRACE_MINUTES": "5",
     # EL-T2482: a path (ops-dispatch's events.log) that gets `ROUTE nudge <tmux> <fingerprint>` for an idle session kept
     # only by its own open work; ops-dispatch sends the message. Empty: off. NUDGE_STATE dedups. See nudge_events().
     "NUDGE_EVENTS": "",
@@ -79,6 +84,7 @@ MARKER = "claude-task-worktree"
 TAIL_BYTES = 4 << 20
 EXIT_WAIT_SECONDS = 20
 DONE_RE = re.compile(r"(?m)^\W*SESSION-DONE:\s*(.+)$")
+STATE_IDLE_RE = re.compile(r"(?m)^\W*SESSION-STATE:\s*IDLE_NO_WORK\b")
 DONE_PHRASE_RE = re.compile(r"這個主題(已經)?結束|may be closed", re.I)
 WAITING_RE = re.compile(
     r"production-authorization|authoriz|approv|授權|批准|等你|你決定|請確認", re.I
@@ -596,7 +602,7 @@ def ts(entry):
 
 
 def transcript_facts(path, now):
-    facts = {"loop": False, "crons": 0, "last_text": "", "asking": False, "prompt_at": 0}
+    facts = {"loop": False, "crons": 0, "last_text": "", "text_at": 0, "asking": False, "prompt_at": 0}
     if not path:
         return facts
     with open(path, "rb") as f:
@@ -643,7 +649,7 @@ def transcript_facts(path, now):
         last = e
         text = "\n".join(b.get("text", "") for b in blocks(e) if b.get("type") == "text").strip()
         if text:
-            facts["last_text"] = text
+            facts["last_text"], facts["text_at"] = text, ts(e)
     if last:
         facts["asking"] = any(b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion"
                               for b in blocks(last))
@@ -908,6 +914,12 @@ def decide(s, cfg, now=None):
     (`would-close: inbox DONE (shadow)`) and nothing else changes. That is how the inbox-DONE close path earns its
     clean rounds before it is switched on (EL-FLOW-P2-2106, SCRIPT-SAFE-RULE)."""
     keep = _decide(s, cfg, now)
+    # EL-T2512: the same second decide under DONE_GRACE=apply, only for a session the idle wait alone keeps waiting.
+    if keep and cfg.get("DONE_GRACE") == "shadow" and said_done(s) and any(k.startswith("idle:") for k in keep):
+        try:
+            s["done_grace_shadow"] = not _decide(dict(s), dict(cfg, DONE_GRACE="apply"), now)
+        except Exception as e:  # a report-only trial must not turn a kept session into an error
+            s["done_grace_error"] = f"{type(e).__name__}: {e}"
     shadow = cfg.get("DONE_INBOX_SHADOW")
     if keep and shadow and not cfg.get("DONE_INBOX") and s["claims"]:
         s["inbox_done_shadow"] = not _decide(dict(s), dict(cfg, DONE_INBOX=shadow), now)
@@ -977,6 +989,21 @@ def stall_mark(cfg, sid, now=None):
         return ""
 
 
+def said_done(s):
+    """The newest assistant text says the session is done, and nobody prompted it since (EL-T2512)."""
+    text = s.get("last_text") or ""
+    return bool(DONE_RE.search(text) or STATE_IDLE_RE.search(text)) and (s.get("text_at") or 0) > (s.get("prompt_at") or 0)
+
+
+def idle_threshold(s, cfg):
+    """Minutes a session must sit idle before it can close: IDLE_MINUTES, or DONE_GRACE_MINUTES when DONE_GRACE=apply
+    and said_done(). The grace replaces only the idle wait; every other keep gate still applies."""
+    idle = float(cfg["IDLE_MINUTES"])
+    if cfg.get("DONE_GRACE") == "apply" and said_done(s):
+        return min(idle, float(cfg.get("DONE_GRACE_MINUTES") or idle))
+    return idle
+
+
 def _decide(s, cfg, now=None):
     keep = []
     stalled = stall_mark(cfg, s.get("sid"), now)
@@ -992,8 +1019,8 @@ def _decide(s, cfg, now=None):
         keep.append("vim-mode")
     if s["status"] != "idle":
         keep.append(f"status:{s['status']}")
-    elif s["idle_min"] < float(cfg["IDLE_MINUTES"]):
-        keep.append(f"idle:{s['idle_min']:.0f}<{cfg['IDLE_MINUTES']}min")
+    elif s["idle_min"] < idle_threshold(s, cfg):
+        keep.append(f"idle:{s['idle_min']:.0f}<{idle_threshold(s, cfg):g}min")
     if s["bg_shells"]:
         keep.append("shell-child")
     if s["loop"]:
@@ -1020,8 +1047,14 @@ def _decide(s, cfg, now=None):
         s["noclaim_done"] = noclaim_done(s, cfg, now if now is not None else time.time())
         done = bool(s["noclaim_done"])
     if done:
-        if s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"]) and s["claims"]:
-            cb = [checkby_state(r, n, cfg) for r, n in s["claims"]]
+        if s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg) and s["claims"]:
+            # A claim the oracle now names another live session for (the issue was handed over) carries that
+            # session's check-by, not this one's (EL-T2512: homepage kept by #6515 after pr-drain claimed it).
+            at = now if now is not None else time.time()
+            mine = [w["marker"] for w in s["owned"] if w.get("marker")]
+            cb = [checkby_state(r, n, cfg) for r, n in s["claims"]
+                  if classify_claim(oracle_brief(r, n, cfg, at), s["sid"], at, s.get("other_sids", ()), mine)[0]
+                  != "ended"]
             if "OPEN" in cb:
                 keep.append("check-by-open")
             elif "UNKNOWN" in cb:
@@ -1029,7 +1062,7 @@ def _decide(s, cfg, now=None):
     else:
         if not s["claims"]:
             keep.append("claim-unknown")
-        elif s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"]):
+        elif s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg):
             at = now if now is not None else time.time()
             marks, owed, unknown = [], [], []
             for r, n in s["claims"]:
@@ -1065,7 +1098,7 @@ def judge_order(s, cfg):
     """Sort key: the sessions most likely to close come first, so a budget cut leaves only the busy ones unjudged
     (#6477: 13 of 18 ended `unjudged:run-budget`, so nothing was ever reaped). Idle past the threshold before the
     rest, protected last (they never close), fewer claims first (an issue each costs a lookup), longest idle first."""
-    idle = s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"])
+    idle = s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg)
     names = [n for n in (s["tmux"], s.get("name")) if n]
     return (2 if protected(cfg, *names) else 0 if idle else 1, len(s["claims"]), -s["idle_min"])
 
@@ -1080,7 +1113,7 @@ def prefetch(sessions, cfg, now):
     jobs = []
     for s in sessions:
         done = DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])
-        idle = s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"])
+        idle = s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg)
         for r, n in s.get("claims") or ():
             jobs.append(lambda r=r, n=n: oracle_brief(r, n, cfg, now))
             jobs.append(lambda r=r, n=n, sid=s["sid"]: claim_time(r, n, sid))
@@ -1144,7 +1177,7 @@ def shadow_verdict(s, cfg, keep, now):
             blocked.append(n)
     for n in BLOCKED_RE.findall(s["last_text"]):
         block(n)
-    idle = s["status"] == "idle" and s["idle_min"] >= float(cfg["IDLE_MINUTES"])
+    idle = s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg)
     claims = list(s["claims"])
     marks = []
     mine = [w["marker"] for w in s["owned"] if w.get("marker")]
@@ -1449,6 +1482,7 @@ def report_line(s, keep, outcome):
     new_only = "yes" if keep and all(k.startswith(NEW_GATES) for k in keep) else "-"
     why = [f"would-close: {s['would_close']}"] if s.get("would_close") else []
     why += ["would-close: inbox DONE (shadow)"] if s.get("inbox_done_shadow") else []
+    why += ["would-close: done grace (shadow)"] if s.get("done_grace_shadow") else []
     why += [f"would-close: no claim, {s['noclaim_done_shadow']} (shadow)"] if s.get("noclaim_done_shadow") else []
     if s.get("claim_why"):  # name why no claim was found
         keep = [f"claim-unknown({s['claim_why']})" if k == "claim-unknown" else k for k in keep]
@@ -1520,6 +1554,8 @@ def main(argv=None):
             keep, outcome = [], "error"
             try:
                 keep = decide(s, cfg)
+                if s.get("done_grace_error"):
+                    notes.append(f"{s['tmux']} ({s['sid']}): DONE_GRACE shadow: {s['done_grace_error']}")
                 if s.get("noclaim_shadow_error"):
                     notes.append(f"{s['tmux']} ({s['sid']}): NOCLAIM_DONE shadow: {s['noclaim_shadow_error']}")
                 outcome = "keep" if keep else ("reap" if apply else "would-reap")
@@ -1527,7 +1563,8 @@ def main(argv=None):
                     try:
                         sv = shadow_verdict(s, cfg, keep, now)
                         s["blocked"], s["would_close"] = sv["blocked"], sv["would_close"]
-                        outcome = "would-close" if sv["would_close"] or s.get("noclaim_done_shadow") else outcome
+                        outcome = ("would-close" if sv["would_close"] or s.get("noclaim_done_shadow") or s.get("done_grace_shadow")
+                                   else outcome)
                     except Exception as e:  # a report-only verdict must not fail the sweep
                         notes.append(f"{s['tmux']} ({s['sid']}): shadow verdict: {type(e).__name__}: {e}")
                 if not keep and apply:
