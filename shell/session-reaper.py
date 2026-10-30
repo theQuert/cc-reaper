@@ -1146,7 +1146,9 @@ def _decide(s, cfg, now=None):
             elif "UNKNOWN" in cb:
                 keep.append("check-by-unknown")
     else:
-        waiting = cfg.get("DONE_GRACE") == "apply" and said_waiting(s)
+        # the alarm's gates only decide an early close: a claimed session past IDLE_MINUTES keeps main's path
+        waiting = (cfg.get("DONE_GRACE") == "apply" and said_waiting(s)
+                   and not (s["claims"] and s["idle_min"] >= int(cfg["IDLE_MINUTES"])))
         if waiting:
             keep.extend(waiting_keeps(s, cfg, now if now is not None else time.time()))
         if not s["claims"] and not waiting:

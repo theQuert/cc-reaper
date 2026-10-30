@@ -1176,6 +1176,13 @@ class WaitingUntil(unittest.TestCase):
         self.brief = self.OWN.format(n=909, step="repair", at="2026-10-31T09:00Z")  # a claim it names, no branch
         self.assertEqual(self.run_decide("apply", last_text="fixing #909\n" + self.WAIT), ["named-claim:#909"])
 
+    def test_a_claimed_session_past_the_idle_wait_keeps_mains_path(self):
+        """Review of 8eeb559: a passed alarm must not keep a claimed session main would close."""
+        late = self.WAIT.replace("2026-10-31T09:00:00Z", "2026-10-30T09:00Z")
+        self.brief = self.WAITS.format(n=7)
+        self.assertEqual(self.run_decide("apply", last_text=late, claims=[("o/r", "7")], idle_min=90), [])
+        self.assertEqual(self.run_decide("apply", last_text=late, claims=[("o/r", "7")]), ["alarm-passed"])
+
     def test_a_passed_or_unread_alarm_keeps(self):
         late = self.WAIT.replace("2026-10-31T09:00:00Z", "2026-10-30T09:00Z")
         self.assertEqual(self.run_decide("apply", last_text=late), ["alarm-passed"])
