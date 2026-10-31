@@ -1085,7 +1085,8 @@ def named_open_prs(s, cfg, limit=NAMED_PR_LOOKUPS):
     """Open pull requests of a session that owns no worktree (it works in the primary checkout): search the repo for
     the issues the session names (`#N` in its name or last text, the first `limit` of them) and return
     `open-pr:<repo>#N` per hit, so the reason names the PR. `open-pr-unknown:no-worktree` stays when nothing is
-    named, when a lookup fails (alongside any hit another lookup found), or when there is no repo to ask."""
+    named, when no lookup finds a PR, when a lookup fails (alongside any hit another lookup found), or when there is
+    no repo to ask."""
     repo = cfg.get("CHECKBY_REPO") or ""
     named = []
     for n in NAMED_RE.findall(f"{s.get('name') or ''}\n{s.get('last_text') or ''}"):
@@ -1105,7 +1106,9 @@ def named_open_prs(s, cfg, limit=NAMED_PR_LOOKUPS):
             failed = True
         else:
             hits += [f"open-pr:{repo}#{num}" for num in nums if f"open-pr:{repo}#{num}" not in hits]
-    return hits + (["open-pr-unknown:no-worktree"] if failed else [])
+    # ponytail: no hit keeps the unknown label, so this change never opens a new close path; a PR on an issue the
+    # session does not name stays invisible here
+    return hits + (["open-pr-unknown:no-worktree"] if failed or not hits else [])
 
 
 def idle_threshold(s, cfg):

@@ -1253,9 +1253,9 @@ class WaitingUntil(unittest.TestCase):
             reaper._pr_cache.clear()
             answers["6500"] = (1, "")  # GitHub cannot say: the lossy label stays
             self.assertEqual(reaper.named_open_prs(s, cfg), ["open-pr-unknown:no-worktree"])
-            answers["6500"] = (0, "")  # asked and none open
+            answers["6500"] = (0, "")  # asked and none open: still kept, a PR on an unnamed issue is invisible here
             reaper._pr_cache.clear()
-            self.assertEqual(reaper.named_open_prs(s, cfg), [])
+            self.assertEqual(reaper.named_open_prs(s, cfg), ["open-pr-unknown:no-worktree"])
             calls.clear()
             self.assertEqual(reaper.named_open_prs(session(last_text=self.WAIT, owned=[]), cfg),
                              ["open-pr-unknown:no-worktree"])  # nothing named
