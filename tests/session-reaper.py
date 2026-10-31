@@ -1229,6 +1229,52 @@ class WaitingUntil(unittest.TestCase):
             detached = [{"repo": "/r", "branch": "c06cce66eb16", "path": Path("/x/wt-6703")}]
             self.assertEqual(reaper.open_prs({"owned": detached}), ["open-pr-unknown:wt-6703"])
 
+    def test_a_worktree_less_session_reads_the_prs_of_the_issues_it_names(self):
+        """EL-LEO-T2570: sre works #6500 from the primary checkout; its PR #6806 is named, not `no-worktree`."""
+        reaper._pr_cache.clear()
+        self.addCleanup(reaper._pr_cache.clear)
+        cfg = dict(CFG, CHECKBY_REPO="o/r")
+        s = session(name="sre", last_text="working #6500, PR open\n" + self.WAIT, descendants=0, owned=[], cwd=None)
+        calls = []
+        answers = {"6500": (0, "6806\n")}
+
+        def fake(cmd, timeout=30, cwd=None):
+            calls.append(cmd)
+            return answers.get(cmd[cmd.index("--search") + 1].split()[0], (1, ""))
+        with mock.patch.object(reaper, "run", side_effect=fake), \
+             mock.patch.object(reaper, "oracle_brief", return_value=None):
+            keep = reaper.waiting_keeps(s, cfg, reaper.calendar.timegm((2026, 10, 30, 10, 0, 0)))
+            self.assertIn("open-pr:o/r#6806", keep)
+            self.assertNotIn("open-pr-unknown:no-worktree", keep)
+            self.assertEqual(calls[0][:6], ["gh", "pr", "list", "-R", "o/r", "--state"])
+            self.assertIn("6500 in:title,body", calls[0])
+            reaper.waiting_keeps(s, cfg, reaper.calendar.timegm((2026, 10, 30, 10, 0, 0)))
+            self.assertEqual(len(calls), 1)  # cached
+            reaper._pr_cache.clear()
+            answers["6500"] = (1, "")  # GitHub cannot say: the lossy label stays
+            self.assertEqual(reaper.named_open_prs(s, cfg), ["open-pr-unknown:no-worktree"])
+            answers["6500"] = (0, "")  # asked and none open
+            reaper._pr_cache.clear()
+            self.assertEqual(reaper.named_open_prs(s, cfg), [])
+            calls.clear()
+            self.assertEqual(reaper.named_open_prs(session(last_text=self.WAIT, owned=[]), cfg),
+                             ["open-pr-unknown:no-worktree"])  # nothing named
+            self.assertEqual(calls, [])
+
+    def test_named_issue_lookups_are_bounded_and_a_failed_one_keeps_the_hits(self):
+        reaper._pr_cache.clear()
+        self.addCleanup(reaper._pr_cache.clear)
+        cfg = dict(CFG, CHECKBY_REPO="o/r")
+        s = session(last_text="#1001 #1002 #1003 #1004 #1005 #1006 #1007", owned=[])
+        calls = []
+
+        def fake(cmd, timeout=30, cwd=None):
+            calls.append(cmd[cmd.index("--search") + 1].split()[0])
+            return (0, "77\n") if calls[-1] == "1001" else (1, "")
+        with mock.patch.object(reaper, "run", side_effect=fake):
+            self.assertEqual(reaper.named_open_prs(s, cfg), ["open-pr:o/r#77", "open-pr-unknown:no-worktree"])
+        self.assertEqual(calls, ["1001", "1002", "1003", "1004", "1005"])
+
 
 class Nudge(unittest.TestCase):
     """EL-T2482: an idle session at an empty prompt kept only by its own open work gets one ROUTE nudge per fingerprint."""
@@ -1554,6 +1600,30 @@ class ShadowVerdict(unittest.TestCase):
             self.assertEqual(calls, [])
             self.view(last_text=self.SEC_P1 + " See #6200.")
             self.assertEqual(calls, [1])
+
+    GTM = ("SESSION-DONE: 剩 #6802 和 docs #49 等創辦人 go，#6747 等 merge-gate…\n"
+           "check-by wakes at 2026-10-31T08:00Z and 12:00Z")
+
+    def test_a_done_line_beside_live_work_is_not_would_close(self):
+        """EL-LEO-T2570: gtm-content's last text states work that remains; a claim-less close line must not close it."""
+        soft = ["claim-unknown"]
+        _, v = self.view(last_text=self.GTM, name="gtm-content", tmux="gtm-content", force_keep=soft)
+        self.assertEqual(v["would_close"], "")
+        for text in ("SESSION-DONE: 剩 #6802 等創辦人 go", "SESSION-DONE: Remaining: #6802 awaits review",
+                     "Opened PR #6806.\nSESSION-DONE: handed off", "SESSION-DONE: handed off, 待 merge",
+                     "SESSION-DONE: ok\nSESSION-STATE: WAITING_UNTIL=2026-10-28T01:00Z"):
+            with self.subTest(text):
+                _, v = self.view(last_text=text, force_keep=soft)
+                self.assertEqual(v["would_close"], "")
+
+    def test_a_done_line_with_nothing_left_still_would_close(self):
+        soft = ["claim-unknown"]
+        for text in ("SESSION-DONE: 無剩餘", "SESSION-DONE: none", "SESSION-DONE: remaining: none",
+                     "Merged PR #6806.\nSESSION-DONE: nothing left",
+                     "SESSION-DONE: shipped\ncheck-by 2026-10-26T08:00Z passed, closed"):  # a check-by already past
+            with self.subTest(text):
+                _, v = self.view(last_text=text, force_keep=soft)
+                self.assertEqual(v["would_close"], "no claim, close line")
 
 class SkippedAndApply(unittest.TestCase):
     def setUp(self):
