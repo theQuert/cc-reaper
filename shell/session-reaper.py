@@ -1050,7 +1050,7 @@ def waiting_keeps(s, cfg, now):
     named = oracle_claims(s, cfg, now) if not s["claims"] else []
     if named:
         keep.append("named-claim:" + ",".join(f"#{n}" for _, n in named))
-    keep.extend(open_prs(s) if s["owned"] else ["open-pr-unknown:no-worktree"])
+    keep.extend(open_prs(s) if s["owned"] else named_open_prs(s, cfg))
     return keep
 
 
@@ -1076,6 +1076,39 @@ def open_prs(s):
         nums = _pr_cache[key]
         out += [f"open-pr-unknown:{branch}"] if nums is None else [f"open-pr:{repo}#{n}" for n in nums]
     return out
+
+
+NAMED_PR_LOOKUPS = 5  # `gh pr list` calls a worktree-less session may cost per run (the first issues it names)
+
+
+def named_open_prs(s, cfg, limit=NAMED_PR_LOOKUPS):
+    """Open pull requests of a session that owns no worktree (it works in the primary checkout): search the repo for
+    the issues the session names (`#N` in its name or last text, the first `limit` of them) and return
+    `open-pr:<repo>#N` per hit, so the reason names the PR. `open-pr-unknown:no-worktree` stays when nothing is
+    named, when no lookup finds a PR, when a lookup fails (alongside any hit another lookup found), or when there is
+    no repo to ask."""
+    repo = cfg.get("CHECKBY_REPO") or ""
+    named = []
+    for n in NAMED_RE.findall(f"{s.get('name') or ''}\n{s.get('last_text') or ''}"):
+        if n not in named:
+            named.append(n)
+    if not named or not repo:
+        return ["open-pr-unknown:no-worktree"]
+    hits, failed = [], False
+    for n in named[:limit]:
+        key = ("named", repo, n)
+        if key not in _pr_cache:
+            rc, txt = run(["gh", "pr", "list", "-R", repo, "--state", "open", "--search", f"{n} in:title,body",
+                           "--json", "number,headRefName", "-q", ".[].number"], 30)
+            _pr_cache[key] = txt.split() if rc == 0 else None
+        nums = _pr_cache[key]
+        if nums is None:
+            failed = True
+        else:
+            hits += [f"open-pr:{repo}#{num}" for num in nums if f"open-pr:{repo}#{num}" not in hits]
+    # ponytail: no hit keeps the unknown label, so this change never opens a new close path; a PR on an issue the
+    # session does not name stays invisible here
+    return hits + (["open-pr-unknown:no-worktree"] if failed or not hits else [])
 
 
 def idle_threshold(s, cfg):
@@ -1254,6 +1287,34 @@ def oracle_claims(s, cfg, now, limit=8):
     return out
 
 
+ISO_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d")
+PR_NAMED_RE = re.compile(r"\bPR\s*#\d+", re.I)
+PR_DONE_RE = re.compile(r"\b(?:merged|closed|landed)\b|已\s*(?:合併|merge)", re.I)
+
+
+def live_work(text, now):
+    """Why a reply that carries a close line still states live work (else ""): a `check-by` / `WAITING_UNTIL` time
+    still ahead, an open `PR #N` (or `待 merge`), or a SESSION-DONE whose remainder starts `剩` / `remaining` and names
+    an issue or PR. A SESSION-DONE that says nothing remains, with none of these, is not live work."""
+    for line in text.splitlines():
+        if re.search(r"check-by|WAITING_UNTIL", line, re.I):
+            for iso in ISO_RE.findall(line):
+                try:
+                    if calendar.timegm(time.strptime(iso, "%Y-%m-%dT%H:%M")) > now:
+                        return "future-check-by:" + iso
+                except ValueError:
+                    pass
+        if re.search(r"待\s*merge", line, re.I):
+            return "awaiting-merge"
+        if PR_NAMED_RE.search(line) and not PR_DONE_RE.search(line):
+            return "open-pr-named"
+    for m in DONE_RE.finditer(text):
+        rest = m.group(1).strip()
+        if re.match(r"剩|remain", rest, re.I) and re.search(r"#\d+", rest):
+            return "done-line-remaining"
+    return ""
+
+
 def shadow_verdict(s, cfg, keep, now):
     """Report-only view of a KEPT session: {"would_close": why|"", "blocked": [issue numbers]}.
 
@@ -1299,7 +1360,9 @@ def shadow_verdict(s, cfg, keep, now):
         return out
     text = s["last_text"]
     if not claims:
-        if DONE_RE.search(text) or DONE_PHRASE_RE.search(text) or CLOSE_LINE_RE.search(text):
+        if live_work(text, now if now is not None else time.time()):
+            pass  # the text still states live work: a close line beside it is not "nothing left" (EL-LEO-T2570)
+        elif DONE_RE.search(text) or DONE_PHRASE_RE.search(text) or CLOSE_LINE_RE.search(text):
             out["would_close"] = "no claim, close line"
         elif keep == ["claim-unknown"] and s["idle_min"] >= float(cfg.get("NOCLAIM_IDLE_MINUTES", "480")):
             # A session that finished without a close line never closes (founder 2026-10-29: 「session 如果已經都
