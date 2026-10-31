@@ -1500,6 +1500,20 @@ class ShadowVerdict(unittest.TestCase):
         self.assertEqual(keep, ["waiting-keyword"])
         self.assertEqual(v["would_close"], "all claims ended")
 
+    def test_session_done_beats_a_waiting_word_6840(self):
+        # gtm-content: a done reply that also says WAITING was kept as `waiting-keyword` forever
+        keep, _ = self.view({"9": ENDED}, last_text="PR approved, merged.\nSESSION-DONE: nothing left",
+                            claims=[(REPO, "9")])
+        self.assertNotIn("waiting-keyword", keep)
+        self.assertNotIn("waiting", keep)
+        keep, _ = self.view({"9": ENDED}, last_text="PR approved, merged.", claims=[(REPO, "9")])
+        self.assertEqual(keep, ["waiting-keyword"])  # the same reply without SESSION-DONE keeps its hint
+
+    def test_session_done_with_a_check_by_ahead_still_keeps_the_waiting_word_6840(self):
+        keep, _ = self.view({"9": ENDED}, last_text="PR approved, merged; check-by 2099-01-01T00:00Z\nSESSION-DONE: nothing left",
+                            claims=[(REPO, "9")])
+        self.assertIn("waiting-keyword", keep)
+
     def test_a_claim_the_oracle_names_to_this_session_is_found_and_keeps_it(self):
         # no worktree: the claim only exists as `claimant: claude session sid-1` on the issue the text names
         keep, v = self.view({"6200": MINE}, last_text=self.SEC_P1 + " Follow-up in #6200.")
