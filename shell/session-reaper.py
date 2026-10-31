@@ -1147,8 +1147,13 @@ def _decide(s, cfg, now=None):
         keep.append("waiting")
     elif waiting_re(cfg).search(DONE_RE.sub("", s["last_text"])):
         # The keyword alone counts for a session with no claim or a claim at a person step. Otherwise it
-        # is only a hint: still kept (shadow, #6477), under a name the shadow verdict can tell apart.
-        keep.append("waiting" if not s["claims"] or person_step(s, cfg, now) else "waiting-keyword")
+        # is only a hint: still kept (shadow, #6477), under a name the shadow verdict can tell apart. A SESSION-DONE
+        # line beats that hint unless the reply still states live work (a check-by ahead, an open PR, `剩 #N`):
+        # gtm-content sat `waiting-keyword` on a done reply (#6840 c). A wait on a person stays `waiting`.
+        if not s["claims"] or person_step(s, cfg, now):
+            keep.append("waiting")
+        elif not (DONE_RE.search(s["last_text"]) and not live_work(s["last_text"], now if now is not None else time.time())):
+            keep.append("waiting-keyword")
     if s.get("sub_active"):
         keep.append("subagent-active")
     if s.get("relay_pending"):
