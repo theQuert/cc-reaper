@@ -1346,6 +1346,7 @@ def oracle_claims(s, cfg, now, limit=8):
 ISO_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d")
 PR_NAMED_RE = re.compile(r"\bPR\s*#\d+", re.I)
 PR_DONE_RE = re.compile(r"\b(?:merged|closed|landed)\b|已\s*(?:合併|merge)", re.I)
+PR_UNCERTAIN_RE = re.compile(r"\b(?:not|never|pending|awaiting|unmerged|unclosed|unlanded)\b|n['’]t\b|未|沒|没有", re.I)
 
 
 def live_work(text, now):
@@ -1362,7 +1363,10 @@ def live_work(text, now):
                     pass
         if re.search(r"待\s*merge", line, re.I):
             return "awaiting-merge"
-        if PR_NAMED_RE.search(line) and not PR_DONE_RE.search(line):
+        prs = PR_NAMED_RE.findall(line)
+        # A completion word cannot prove multiple named PRs ended, or override a negation/pending state.
+        # Keep ambiguous lines rather than assigning one PR's `merged` to its still-open neighbour (#6840).
+        if prs and (len(prs) > 1 or PR_UNCERTAIN_RE.search(line) or not PR_DONE_RE.search(line)):
             return "open-pr-named"
     for m in DONE_RE.finditer(text):
         rest = m.group(1).strip()

@@ -1477,6 +1477,7 @@ class ShadowVerdict(unittest.TestCase):
         s.setdefault("other_sids", [])
         with mock.patch.object(reaper, "oracle_brief", side_effect=lambda r, n, c, at: briefs.get(n)), \
              mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
+             mock.patch.object(reaper, "checkby_state", return_value="CLEAR"), \
              mock.patch.object(reaper, "worktree_state",
                                side_effect=lambda w, c: list(wt_problems) + w.get("problems", [])):
             keep = reaper.decide(s, CFG, now)
@@ -1521,6 +1522,20 @@ class ShadowVerdict(unittest.TestCase):
         keep, _ = self.view({"5630": STOP6432}, last_text="Needs authorization.\nSESSION-DONE: staged",
                             claims=[(REPO, "5630")])
         self.assertIn("waiting", keep)
+
+    def test_session_done_does_not_infer_every_pr_merged_from_one_word_6840(self):
+        for line in ("PR #138 approved but not merged.",
+                     "PR #137 merged; PR #138 awaiting approval."):
+            with self.subTest(line=line):
+                keep, _ = self.view({"9": ENDED}, last_text=line + "\nSESSION-DONE: nothing left",
+                                    claims=[(REPO, "9")])
+                self.assertIn("waiting-keyword", keep)
+                self.assertEqual(reaper.live_work(line, NOW0), "open-pr-named")
+
+    def test_session_done_accepts_an_unambiguously_merged_pr_6840(self):
+        keep, _ = self.view({"9": ENDED}, last_text="PR #138 approved and merged.\nSESSION-DONE: nothing left",
+                            claims=[(REPO, "9")])
+        self.assertEqual(keep, [])
 
     def test_a_claim_the_oracle_names_to_this_session_is_found_and_keeps_it(self):
         # no worktree: the claim only exists as `claimant: claude session sid-1` on the issue the text names
