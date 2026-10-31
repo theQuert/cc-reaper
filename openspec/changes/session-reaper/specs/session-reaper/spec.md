@@ -1,15 +1,30 @@
 ## ADDED Requirements
 
 ### Requirement: A session is reaped only when every gate holds
-The session reaper SHALL consider only interactive Claude Code sessions whose session file names a tmux pane that still holds the recorded process (same pid and start time). It SHALL keep a session when any of these holds: its tmux or session name matches a protection pattern; its status is not `idle`, or has been idle for less than `IDLE_MINUTES`; it has a background shell child, a pending `ScheduleWakeup`, more `CronCreate` than `CronDelete` calls, or a `scheduled_tasks.json` in its cwd; its latest assistant turn asks a question or asks for authorization; its latest assistant text has no `SESSION-DONE:` line or topic-end phrase and not every claimed issue is closed (no claim evidence keeps it); a worktree it owns has uncommitted changes or commits on no remote that the worktree janitor does not prove landed.
+The session reaper SHALL consider interactive Claude Code sessions whose session file names a tmux pane that still holds the recorded process (same pid and start time), and SHALL classify background sessions as specified below without closing them. It SHALL keep a session when any of these holds: its tmux or session name matches a protection pattern; its status is not `idle`, or has been idle for less than `IDLE_MINUTES`; it has a background shell child, a pending `ScheduleWakeup`, more `CronCreate` than `CronDelete` calls, or a `scheduled_tasks.json` in its cwd; its latest assistant turn asks a question or asks for authorization; its latest assistant text has no `SESSION-DONE:` line or topic-end phrase and not every claimed issue is closed (no claim evidence keeps it); a worktree it owns has uncommitted changes or commits on no remote that the worktree janitor does not prove landed. A waiting keyword alone, with claims but no oracle person step, SHALL NOT keep a `SESSION-DONE:` reply unless that reply still states live work.
 
 #### Scenario: A finished session
 - **WHEN** a session is idle past the threshold, its last message carries `SESSION-DONE:`, and nothing else keeps it
 - **THEN** the report marks it `would-reap`, or with apply on, it is reaped
 
 #### Scenario: A session waiting on a person
-- **WHEN** the latest assistant text asks for authorization, even beside a `SESSION-DONE:` line
+- **WHEN** the latest assistant turn asks a question, has no claim and asks for authorization, or has a claim at an oracle person step, even beside a `SESSION-DONE:` line
 - **THEN** it is kept as `waiting`
+
+#### Scenario: A done reply contains a waiting keyword
+- **WHEN** a claimed session has a `SESSION-DONE:` reply containing a waiting keyword, no oracle person step and no live work
+- **THEN** `waiting-keyword` does not keep it; a future check-by or open PR stated in the reply still preserves that keep reason
+
+### Requirement: Attached background sessions are classified but never closed
+A live `kind:bg` session SHALL be gathered only when its recorded pid and start time match, and one tmux pane holds a Claude `attach` process naming that session id. The attachment process, not the detached worker, SHALL supply the pane ancestry and foreground checks. A unique session-id prefix of at least eight characters MAY identify an attachment. Missing, ambiguous or unreadable attachment evidence SHALL leave the session unjudged. A gathered background session SHALL receive the ordinary classification and a permanent `kind:bg` keep reason, including with `APPLY=1` or `--apply`. The reap entrypoint SHALL independently refuse background sessions before writing a reap record or sending any keys. No background close path is introduced.
+
+#### Scenario: A done background session is attached
+- **WHEN** a live background session is attached by a unique Claude attach process in a tmux pane and all ordinary gates would permit closing
+- **THEN** its report contains the pane name and `kind:bg`, its outcome is `keep`, and apply mode never types `/exit`, kills a pane or writes a reap record
+
+#### Scenario: Attachment evidence does not identify one pane
+- **WHEN** no pane holds the matching attach process, two panes attach the same session, the session-id prefix is ambiguous, or process identity changed
+- **THEN** the session stays unjudged and no close action is attempted
 
 ### Requirement: Reaping never stops background work or overwrites input
 Before acting the reaper SHALL re-read the session file and skip the session if its status or status time changed since the sweep read it, if claude is not its tty's foreground process, or if the current tmux name is protected. It SHALL type `/exit` only when the cursor sits after an empty prompt and no dialog or menu is on screen, and SHALL press Enter only if the prompt line then reads exactly `/exit`, otherwise removing the typed text and skipping. When the background-task exit menu appears it SHALL press Esc (Stay) and skip the session. Only after the claude process has exited SHALL it close claude's pane, and the tmux session (targeted by id) only when that pane was its only one, and SHALL record the session in the closed-sessions log and on each claimed issue with its resume command.
