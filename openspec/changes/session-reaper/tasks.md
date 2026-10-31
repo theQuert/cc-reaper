@@ -2,3 +2,5 @@
 - [x] Live on the host: a finished disposable session reaped and verified; a session with a background task left on Stay; a draft left intact; a second window left running.
 - [x] Report-only run over every live session, each with the gate that keeps it.
 - [ ] `APPLY=1` on the host after a person confirms.
+- [x] #6840: fixture-prove attached `kind:bg` classification and unconditional keep in apply mode; no live execution or installation in this change. `python3 tests/session-reaper.py`: 192 tests pass, with the verifier's disposable tmux socket isolated through `TMUX_TMPDIR`.
+- [x] #6840: preserve SESSION-DONE precedence over waiting keywords with live-work and actual-person safeguards.

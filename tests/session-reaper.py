@@ -2,7 +2,7 @@
 """Isolated tests for the session reaper: every keep gate, transcript reading, the prompt
 check, and a verifier calibrated against a real surviving process, tmux session and lock."""
 
-from contextlib import redirect_stderr
+from contextlib import ExitStack, redirect_stderr
 import importlib.util
 import io
 import json
@@ -1514,6 +1514,14 @@ class ShadowVerdict(unittest.TestCase):
                             claims=[(REPO, "9")])
         self.assertIn("waiting-keyword", keep)
 
+    def test_session_done_keeps_open_pr_and_actual_person_waits_6840(self):
+        keep, _ = self.view({"9": ENDED}, last_text="PR #138 approved, awaiting merge.\nSESSION-DONE: nothing left",
+                            claims=[(REPO, "9")])
+        self.assertIn("waiting-keyword", keep)
+        keep, _ = self.view({"5630": STOP6432}, last_text="Needs authorization.\nSESSION-DONE: staged",
+                            claims=[(REPO, "5630")])
+        self.assertIn("waiting", keep)
+
     def test_a_claim_the_oracle_names_to_this_session_is_found_and_keeps_it(self):
         # no worktree: the claim only exists as `claimant: claude session sid-1` on the issue the text names
         keep, v = self.view({"6200": MINE}, last_text=self.SEC_P1 + " Follow-up in #6200.")
@@ -1955,6 +1963,104 @@ class NeverKill(unittest.TestCase):
             reaper.recover_exiting(cfg, 0)
         tmux.assert_not_called()
         self.assertEqual(json.loads(rec.read_text())["status"], "aborted:never-kill")
+
+
+class BackgroundAttached(unittest.TestCase):
+    """#6840: exercise gather -> decide -> report in a disposable, fully mocked sweep."""
+    SID = "e1284bef-1234-5678-9012-123456789abc"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.sessions = self.tmp / "sessions"
+        self.sessions.mkdir()
+        self.now = time.time()
+        self.record = dict(kind="bg", pid=11, procStart="B", sessionId=self.SID, name="audit",
+                           cwd=str(self.tmp), status="idle", statusUpdatedAt=(self.now - 7200) * 1000)
+        self.file = self.sessions / "11.json"
+        self.file.write_text(json.dumps(self.record))
+        self.table = {11: (1, "B", "claude --bg"), 20: (1, "P", "-zsh"),
+                      21: (20, "A", f"claude attach {self.SID}")}
+        self.state = dict(session="audit-pane", session_id="$1", pane_pid=20, cx=2, cy=0,
+                          alone=True, screen="❯ ")
+        self.cfg = dict(CFG, APPLY="1", PROTECT="", REPORT=str(self.tmp / "report.md"),
+                        DONE_GRACE="apply", NOCLAIM_DONE="apply", CC_NEVER_KILL_PIDS="")
+        self.panes = (0, "%1\n")
+
+    def mocked(self):
+        stack = ExitStack()
+        for name, value in {"HOME": self.tmp, "SESSIONS_DIR": self.sessions}.items():
+            stack.enter_context(mock.patch.object(reaper, name, value))
+        for name, value in {"ps_table": self.table, "worktrees": [], "pane_state": self.state,
+                            "foreground": True, "vim_mode": False, "subagent_activity": False,
+                            "transcript_path": None, "transcript_facts": dict(last_text="SESSION-DONE: nothing left",
+                            loop=False, crons=0, asking=False), "relay_pending": [], "worktree_state": [],
+                            "recover_exiting": [], "load_config": self.cfg}.items():
+            stack.enter_context(mock.patch.object(reaper, name, return_value=value))
+        stack.enter_context(mock.patch.dict(os.environ, {"CC_NEVER_KILL_PIDS": ""}))
+        def tmux(*args):
+            self.assertEqual(args, ("list-panes", "-a", "-F", "#{pane_id}"))
+            return self.panes
+        stack.enter_context(mock.patch.object(reaper, "tmux", side_effect=tmux))
+        stack.enter_context(mock.patch.object(reaper, "write_record", side_effect=AssertionError("wrote reap record")))
+        return stack
+
+    def test_attach_worker_is_gathered_classified_and_kept_under_apply(self):
+        with self.mocked(), mock.patch.object(reaper, "reap", side_effect=AssertionError("called reap")) as reap:
+            gathered = reaper.gather(self.cfg, self.now)
+            self.assertEqual(len(gathered), 1)
+            s = gathered[0]
+            self.assertEqual((s["kind"], s["pid"], s["attach_pid"], s["pane"], s["tmux"]),
+                             ("bg", 11, 21, "%1", "audit-pane"))
+            reaper.foreground.assert_called_with(21)
+            self.assertEqual(reaper.decide(s, self.cfg, self.now), ["kind:bg"])
+            self.assertEqual(reaper.SKIPPED, [])
+            self.assertEqual(reaper.main(["--config", "unused", "--apply"]), 0)
+            reap.assert_not_called()
+        report = (self.tmp / "report.md").read_text()
+        self.assertIn("| audit-pane | `e1284bef` | idle 120m | - | keep | kind:bg |", report)
+        self.assertNotIn("would-close", report)
+
+    def test_existing_work_gates_are_still_classified(self):
+        with self.mocked(), mock.patch.object(reaper, "transcript_facts", return_value=dict(
+                last_text="SESSION-DONE: nothing left", loop=True, crons=0, asking=True)):
+            s = reaper.gather(self.cfg, self.now)[0]
+            self.assertEqual(reaper.decide(s, self.cfg, self.now), ["kind:bg", "loop-pending", "waiting"])
+
+    def test_unique_prefix_and_versioned_cli_are_supported(self):
+        self.table[21] = (20, "A", "/Users/test/.local/share/claude/versions/2.1.293 attach e1284bef")
+        with self.mocked():
+            self.assertEqual(len(reaper.gather(self.cfg, self.now)), 1)
+
+    def test_invalid_or_ambiguous_attachment_stays_unjudged(self):
+        for command in ("echo claude attach " + self.SID, "claude attach different",
+                        "claude attach e128", "claude --resume " + self.SID, "claude attach " + self.SID + "extra"):
+            with self.subTest(command=command):
+                self.table[21] = (20, "A", command)
+                with self.mocked():
+                    self.assertEqual(reaper.gather(self.cfg, self.now), [])
+        self.table[21] = (20, "A", "claude attach e1284bef")
+        (self.sessions / "other.json").write_text(json.dumps(dict(self.record, sessionId="e1284bef-another", pid=12)))
+        with self.mocked():
+            self.assertEqual(reaper.gather(self.cfg, self.now), [])
+
+    def test_missing_or_multiple_panes_and_stale_process_are_unjudged(self):
+        for panes in ((1, ""), (0, ""), (0, "%1\n%2\n")):
+            self.panes = panes
+            with self.mocked():
+                self.assertEqual(reaper.gather(self.cfg, self.now), [])
+        self.panes = (0, "%1\n")
+        for table in ({**self.table, 11: (1, "RECYCLED", "claude --bg")},
+                      {**self.table, 21: (99, "A", "claude attach " + self.SID)}):
+            with self.mocked(), mock.patch.object(reaper, "ps_table", return_value=table):
+                self.assertEqual(reaper.gather(self.cfg, self.now), [])
+
+    def test_reap_independently_refuses_bg_before_any_side_effect(self):
+        with self.mocked(), mock.patch.object(reaper, "ps_table", side_effect=AssertionError("read processes")):
+            self.assertEqual(reaper.reap(dict(kind="bg"), self.cfg, self.now), ("skipped:kind:bg", []))
+            # Also protect against a session file that changed kind since gather.
+            s = session(file=str(self.file), status_at=self.record["statusUpdatedAt"])
+            self.assertEqual(reaper.reap(s, self.cfg, self.now), ("skipped:kind:bg", []))
 
 
 class Unjudged(unittest.TestCase):

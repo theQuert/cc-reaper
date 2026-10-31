@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -741,35 +742,82 @@ def claim_why(owned, repos):
     return ""
 
 
+def attached_pane(table, sid, session_ids):
+    """Bind a background job for classification only. Never infer ownership from arbitrary arguments.
+
+    Claude accepts abbreviated session ids; require at least eight characters and one matching session file.
+    A second attaching pane is ambiguous, so it is not safe to attribute its screen to this job.
+    """
+    attach = []
+    for pid, (_, _, command) in table.items():
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            continue
+        if len(args) != 3 or not CLAUDE_CMD.search(args[0]) or args[1] != "attach":
+            continue
+        target = args[2]
+        if target == sid or (len(target) >= 8 and sid.startswith(target)
+                             and sum(s.startswith(target) for s in session_ids) == 1):
+            attach.append(pid)
+    if not attach:
+        return None
+    rc, panes = tmux("list-panes", "-a", "-F", "#{pane_id}")
+    if rc:
+        return None
+    matches = []
+    for pane in set(panes.splitlines()):
+        if not re.fullmatch(r"%[0-9]+", pane):
+            continue
+        state = pane_state(pane)
+        if state:
+            for pid in attach:
+                if is_ancestor(table, state["pane_pid"], pid):
+                    matches.append((pane, state, pid))
+    return matches[0] if len(matches) == 1 else None
+
+
 def gather(cfg, now):
     table = ps_table()
     wts = worktrees(cfg)
     found = []
     SKIPPED.clear()
     SKIPPED_INFO.clear()
+    records = []
     for f in sorted(SESSIONS_DIR.glob("*.json")):
         try:
-            d = json.loads(f.read_text())
+            records.append((f, json.loads(f.read_text())))
         except (OSError, ValueError):
             continue
+    session_ids = {d["sessionId"] for _, d in records if isinstance(d.get("sessionId"), str)}
+    for f, d in records:
         pid = d.get("pid")
         running = pid in table
-        if d.get("kind") != "interactive":
+        kind = d.get("kind")
+        if kind not in ("interactive", "bg"):
             _skip(d, f, f"kind:{d.get('kind')}", running, now)
             continue
-        if not d.get("tmux"):
+        if kind == "interactive" and not d.get("tmux"):
             _skip(d, f, "no-tmux-field", running, now)
             continue
         alive = running and " ".join(d.get("procStart", "").split()) == table[pid][1]
         if not alive:
             _skip(d, f, "procstart-mismatch" if running else "pid-gone", running, now)
             continue
-        pane = d["tmux"].rsplit(".", 1)[-1]
-        state = pane_state(pane)
+        attach_pid = None
+        if kind == "bg":
+            bound = attached_pane(table, d.get("sessionId") or "", session_ids)
+            if not bound:
+                _skip(d, f, "kind:bg", True, now)
+                continue
+            pane, state, attach_pid = bound
+        else:
+            pane = d["tmux"].rsplit(".", 1)[-1]
+            state = pane_state(pane)
         if not state:
             _skip(d, f, f"pane-missing:{pane}", True, now)
             continue
-        if not is_ancestor(table, state["pane_pid"], pid):
+        if not is_ancestor(table, state["pane_pid"], attach_pid if kind == "bg" else pid):
             _skip(d, f, f"pane-ancestor-mismatch:{pane}", True, now)
             continue  # a pane that no longer holds this claude
         sid, cwd = d["sessionId"], d.get("cwd", "")
@@ -783,9 +831,11 @@ def gather(cfg, now):
             if m and repo and (repo, m.group(1)) not in claims:
                 claims.append((repo, m.group(1)))
         found.append({
+            "kind": kind, "attach_pid": attach_pid,
             "file": str(f), "pid": pid, "sid": sid, "cwd": cwd, "name": d.get("name", ""),
             "tmux": state["session"], "pane": pane, "status": d.get("status"),
-            "status_at": d.get("statusUpdatedAt"), "start": table[pid][1], "fg": foreground(pid),
+            "status_at": d.get("statusUpdatedAt"), "start": table[pid][1],
+            "fg": foreground(attach_pid if kind == "bg" else pid),
             "vim": vim_mode(),
             "idle_min": (now - d.get("statusUpdatedAt", now * 1000) / 1000) / 60,
             "bg_shells": [p for p, (pp, _, cmd) in table.items()
@@ -1121,7 +1171,8 @@ def idle_threshold(s, cfg):
 
 
 def _decide(s, cfg, now=None):
-    keep = []
+    # /exit on an attachment does not prove the detached job has stopped. Classification is the whole bg path.
+    keep = ["kind:bg"] if s.get("kind") == "bg" else []
     stalled = stall_mark(cfg, s.get("sid"), now)
     if stalled:  # an account switch or rate limit stalled it: not idle, not finished
         keep.append("stalled:" + stalled)
@@ -1554,11 +1605,15 @@ def recover_exiting(cfg, now):
 
 def reap(s, cfg, now):
     """Return (outcome, failures). outcome is reaped, or skipped:<why>."""
+    if s.get("kind") == "bg":
+        return "skipped:kind:bg", []
     # Everything gather saw may be minutes old: re-check that nobody has touched the session.
     try:
         fresh = json.loads(Path(s["file"]).read_text())
     except (OSError, ValueError):
         return "skipped:session-file-unreadable", []
+    if fresh.get("kind") == "bg":
+        return "skipped:kind:bg", []
     if fresh.get("status") != "idle" or fresh.get("statusUpdatedAt") != s["status_at"]:
         return "skipped:session-changed", []
     table = ps_table()

@@ -21,6 +21,7 @@ one such sweep already disagreed with what was still running.
   are gone, and no worktree is locked. A failure notifies, comments on a tracking issue, and
   exits non-zero.
 - No Stop hook: the session file and transcript give the sweep every signal a hook could mark.
+- #6840 extends reporting to background jobs attached through `claude attach`, with an unconditional keep and no close path. SESSION-DONE overrides a waiting keyword only without stated live work or a person step. Installation, live reaping and other session automation are outside this hardening change.
 
 ## Impact
 
