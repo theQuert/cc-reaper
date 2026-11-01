@@ -851,6 +851,7 @@ def gather(cfg, now):
         found[-1]["relay_pending"] = relay_pending(cfg, claims, now)
     for s in found:
         s["other_sids"] = [o["sid"] for o in found if o is not s and o["sid"]]
+        s["other_claims"] = {ref for o in found if o is not s for ref in o["claims"]}
     return found
 
 
@@ -1349,10 +1350,29 @@ PR_DONE_RE = re.compile(r"\b(?:merged|closed|landed)\b|已\s*(?:合併|merge)", 
 PR_UNCERTAIN_RE = re.compile(r"\b(?:not|never|pending|awaiting|unmerged|unclosed|unlanded)\b|n['’]t\b|未|沒|没有", re.I)
 
 
-def live_work(text, now):
+def foreign_prs(s, cfg):
+    """`PR #N` the reply names whose head branch is an issue another live session claims: a handover note, not this
+    session's work (#6477: sec-p1 named auth-audit's PR #6186 and stayed off would-close). Anything GitHub cannot
+    answer, and any PR past NAMED_PR_LOOKUPS, stays this session's (kept)."""
+    repo, out = cfg.get("CHECKBY_REPO") or "", set()
+    for pr in PR_NAMED_RE.findall(s.get("last_text") or "")[:NAMED_PR_LOOKUPS]:
+        n = pr.rsplit("#", 1)[1]
+        key = ("head", repo, n)
+        if key not in _pr_cache:
+            rc, txt = run(["gh", "pr", "view", n, "-R", repo, "--json", "headRefName", "-q", ".headRefName"], 30) \
+                if repo else (1, "")
+            _pr_cache[key] = txt.strip() if rc == 0 else ""
+        m = ISSUE_RE.search(_pr_cache[key])
+        if m and (repo, m.group(1)) in s.get("other_claims", ()):
+            out.add(n)
+    return out
+
+
+def live_work(text, now, foreign=()):
     """Why a reply that carries a close line still states live work (else ""): a `check-by` / `WAITING_UNTIL` time
     still ahead, an open `PR #N` (or `待 merge`), or a SESSION-DONE whose remainder starts `剩` / `remaining` and names
-    an issue or PR. A SESSION-DONE that says nothing remains, with none of these, is not live work."""
+    an issue or PR. A SESSION-DONE that says nothing remains, with none of these, is not live work. `foreign` holds
+    PR numbers that are not this session's; only the shadow verdict passes it, so a real close never depends on it."""
     for line in text.splitlines():
         if re.search(r"check-by|WAITING_UNTIL", line, re.I):
             for iso in ISO_RE.findall(line):
@@ -1366,7 +1386,9 @@ def live_work(text, now):
         prs = PR_NAMED_RE.findall(line)
         # A completion word cannot prove multiple named PRs ended, or override a negation/pending state.
         # Keep ambiguous lines rather than assigning one PR's `merged` to its still-open neighbour (#6840).
-        if prs and (len(prs) > 1 or PR_UNCERTAIN_RE.search(line) or not PR_DONE_RE.search(line)):
+        # The count stays on every PR named: a foreign PR's `merged` must not vouch for this session's own.
+        if any(p.rsplit("#", 1)[1] not in foreign for p in prs) \
+                and (len(prs) > 1 or PR_UNCERTAIN_RE.search(line) or not PR_DONE_RE.search(line)):
             return "open-pr-named"
     for m in DONE_RE.finditer(text):
         rest = m.group(1).strip()
@@ -1420,7 +1442,11 @@ def shadow_verdict(s, cfg, keep, now):
         return out
     text = s["last_text"]
     if not claims:
-        if live_work(text, now if now is not None else time.time()):
+        at = now if now is not None else time.time()
+        live = live_work(text, at)
+        if live == "open-pr-named":  # the only reason that costs a GitHub read to answer
+            live = live_work(text, at, foreign_prs(s, cfg))
+        if live:
             pass  # the text still states live work: a close line beside it is not "nothing left" (EL-LEO-T2570)
         elif DONE_RE.search(text) or DONE_PHRASE_RE.search(text) or CLOSE_LINE_RE.search(text):
             out["would_close"] = "no claim, close line"
