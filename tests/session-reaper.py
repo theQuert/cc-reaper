@@ -1692,6 +1692,18 @@ class ShadowVerdict(unittest.TestCase):
                                      other_claims=frozenset({(REPO, "5449")}))
                 self.assertEqual(v["would_close"], "")
 
+    def test_a_stated_wake_ahead_is_not_would_close_in_any_words(self):
+        # The live cve-6725 reply, round 8: no close line, idle past 8h, and a wake named without `check-by`.
+        wake = "#6725 目前沒有可做的待辦：要等 founder，否則就等 ops-dispatch 在 2026-10-28T06:00Z 喚醒做 vendor 讀取。"
+        idle = {"force_keep": ["claim-unknown"], "status": "idle", "idle_min": 500}
+        _, v = self.view(last_text=wake, **idle)
+        self.assertEqual(v["would_close"], "")
+        _, v = self.view(last_text=wake.replace("2026-10-28", "2026-10-26"), **idle)
+        self.assertEqual(v["would_close"], "no claim, idle 8h, no close line")  # the same reply once its wake has passed
+        _, v = self.view(last_text=wake + "\nSESSION-DONE: ops-dispatch wakes it at 2026-10-28T06:00Z", **idle)
+        self.assertEqual(v["would_close"], "no claim, close line")  # the close line names who wakes it
+        self.assertEqual(reaper.live_work(wake, NOW0), "")  # decide() reads this one, and it must not move
+
     def test_a_person_wait_with_no_close_line_stays_kept(self):
         # The live apertis-ops reply: the keyword is a real wait, and nothing here says the session is done.
         _, v = self.view(last_text="session-todo 這份清單我也還沒動，等你說可以繼續，我再更新我的那幾列。",

@@ -1350,6 +1350,17 @@ PR_DONE_RE = re.compile(r"\b(?:merged|closed|landed)\b|已\s*(?:合併|merge)", 
 PR_UNCERTAIN_RE = re.compile(r"\b(?:not|never|pending|awaiting|unmerged|unclosed|unlanded)\b|n['’]t\b|未|沒|没有", re.I)
 
 
+def future_time(text, now):
+    """The first ISO minute in `text` still ahead of `now`, or ""."""
+    for iso in ISO_RE.findall(text):
+        try:
+            if calendar.timegm(time.strptime(iso, "%Y-%m-%dT%H:%M")) > now:
+                return iso
+        except ValueError:
+            pass
+    return ""
+
+
 def foreign_prs(s, cfg):
     """`PR #N` the reply names whose head branch is an issue another live session claims: a handover note, not this
     session's work (#6477: sec-p1 named auth-audit's PR #6186 and stayed off would-close). Anything GitHub cannot
@@ -1374,13 +1385,8 @@ def live_work(text, now, foreign=()):
     an issue or PR. A SESSION-DONE that says nothing remains, with none of these, is not live work. `foreign` holds
     PR numbers that are not this session's; only the shadow verdict passes it, so a real close never depends on it."""
     for line in text.splitlines():
-        if re.search(r"check-by|WAITING_UNTIL", line, re.I):
-            for iso in ISO_RE.findall(line):
-                try:
-                    if calendar.timegm(time.strptime(iso, "%Y-%m-%dT%H:%M")) > now:
-                        return "future-check-by:" + iso
-                except ValueError:
-                    pass
+        if re.search(r"check-by|WAITING_UNTIL", line, re.I) and future_time(line, now):
+            return "future-check-by:" + future_time(line, now)
         if re.search(r"待\s*merge", line, re.I):
             return "awaiting-merge"
         prs = PR_NAMED_RE.findall(line)
@@ -1446,7 +1452,9 @@ def shadow_verdict(s, cfg, keep, now):
         live = live_work(text, at)
         if live == "open-pr-named":  # the only reason that costs a GitHub read to answer
             live = live_work(text, at, foreign_prs(s, cfg))
-        if live:
+        # A wake can be named in any words (#6477: cve-6725 said `喚醒`), so here any time ahead counts, unless a
+        # SESSION-DONE owns it: that line names who wakes the session. Not in live_work(): decide() reads that.
+        if live or (future_time(text, at) and not DONE_RE.search(text)):
             pass  # the text still states live work: a close line beside it is not "nothing left" (EL-LEO-T2570)
         elif DONE_RE.search(text) or DONE_PHRASE_RE.search(text) or CLOSE_LINE_RE.search(text):
             out["would_close"] = "no claim, close line"
