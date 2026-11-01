@@ -1653,6 +1653,61 @@ class ShadowVerdict(unittest.TestCase):
                 _, v = self.view(last_text=text, force_keep=soft)
                 self.assertEqual(v["would_close"], "")
 
+    # The live sec-p1 reply, cut to what decides (#6477 round 7): a handover note naming auth-audit's open PR.
+    HANDOVER = ("#6568 的授權確認已記下。\n"
+                "- 沒有 owner 的項目：#5449 的 PR #6186 被判需要 relay，這筆我只記在摘要裡，沒有動。\n"
+                "SESSION-DONE: 無 claim、無未推送、無背景工作。#5449 歸 auth-audit")
+
+    def verdict_with_head(self, text, head, rc=0, other_claims=frozenset({(REPO, "5449")})):
+        """shadow_verdict for a claim-less session whose `gh pr view` answers `head` with exit `rc`."""
+        with mock.patch.object(reaper, "run", return_value=(rc, head + "\n")) as run, \
+             mock.patch.dict(reaper._pr_cache, clear=True):
+            _, v = self.view(last_text=text, force_keep=["claim-unknown"], other_claims=other_claims)
+        return v, run
+
+    def test_a_pr_another_live_session_claims_is_a_handover_not_live_work(self):
+        v, run = self.verdict_with_head(self.HANDOVER, "claude/5449-router-split")
+        self.assertEqual(v["would_close"], "no claim, close line")
+        self.assertEqual(run.call_args[0][0][:3], ["gh", "pr", "view"])
+
+    def test_a_pr_nobody_else_is_shown_to_claim_stays_live_work(self):
+        for case, head, rc, others in (("no live session claims it", "claude/5449-router-split", 0, frozenset()),
+                                       ("another issue's claim", "claude/5449-router-split", 0,
+                                        frozenset({(REPO, "6432")})),
+                                       ("its branch names no issue", "router-split", 0, frozenset({(REPO, "5449")})),
+                                       ("GitHub cannot answer", "", 1, frozenset({(REPO, "5449")}))):
+            with self.subTest(case):
+                v, _ = self.verdict_with_head(self.HANDOVER, head, rc, others)
+                self.assertEqual(v["would_close"], "")
+
+    def test_a_foreign_pr_hides_no_other_live_work(self):
+        for text in (self.HANDOVER + "\ncheck-by 2099-01-01T00:00Z: mine", "PR #6186 and PR #7000 are open\nSESSION-DONE: ok",
+                     "PR #6186 merged, my PR #7000 is open\nSESSION-DONE: ok",
+                     "SESSION-DONE: 剩 #7000 等 review\nPR #6186 is auth-audit's"):
+            with self.subTest(text):
+                calls = iter([(0, "claude/5449-router-split\n"), (0, "claude/7000-other\n")] * 2)
+                with mock.patch.object(reaper, "run", side_effect=lambda *a, **k: next(calls)), \
+                     mock.patch.dict(reaper._pr_cache, clear=True):
+                    _, v = self.view(last_text=text, force_keep=["claim-unknown"],
+                                     other_claims=frozenset({(REPO, "5449")}))
+                self.assertEqual(v["would_close"], "")
+
+    def test_a_person_wait_with_no_close_line_stays_kept(self):
+        # The live apertis-ops reply: the keyword is a real wait, and nothing here says the session is done.
+        _, v = self.view(last_text="session-todo 這份清單我也還沒動，等你說可以繼續，我再更新我的那幾列。",
+                         other_claims=frozenset({(REPO, "5449")}), force_keep=["waiting", "claim-unknown"])
+        self.assertEqual(v["would_close"], "")
+
+    def test_the_real_close_path_does_not_read_foreign_prs(self):
+        """decide()'s return value is cc-selfpush's contract, and would-close is report-only in this revision."""
+        with mock.patch.object(reaper, "foreign_prs", side_effect=AssertionError("read by decide()")), \
+             mock.patch.dict(reaper._pr_cache, clear=True):
+            s = session(last_text=self.HANDOVER, cwd="/work/x", other_sids=[], other_claims={(REPO, "5449")})
+            with mock.patch.object(reaper, "oracle_brief", return_value=None), \
+                 mock.patch.object(reaper, "worktree_state", return_value=[]):
+                self.assertIn("waiting", reaper.decide(s, CFG, NOW0))
+        self.assertEqual(reaper.live_work(self.HANDOVER, NOW0), "open-pr-named")
+
     def test_a_done_line_with_nothing_left_still_would_close(self):
         soft = ["claim-unknown"]
         for text in ("SESSION-DONE: 無剩餘", "SESSION-DONE: none", "SESSION-DONE: remaining: none",
@@ -1929,6 +1984,28 @@ class NeverKill(unittest.TestCase):
              mock.patch.object(reaper, "subagent_activity", return_value=0), \
              mock.patch.dict(os.environ, {"CC_NEVER_KILL_PIDS": pids}):
             return reaper.gather(CFG, time.time())[0]
+
+    def test_gather_tells_each_session_what_only_its_peers_claim(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        (tmp / "sessions").mkdir()
+        for sid in ("sid-1", "sid-2"):
+            (tmp / "sessions" / f"{sid}.json").write_text(json.dumps(dict(
+                kind="interactive", tmux="%1", pid=10, procStart="A", sessionId=sid, name=sid, status="idle",
+                statusUpdatedAt=(time.time() - 7200) * 1000, cwd="/w/primary")))
+        wt = dict(path=Path("/w/5449"), branch="claude/5449-router-split", repo="/r", marker="sid-2")
+        state = {"session": "s", "session_id": "$1", "pane_pid": 100, "cx": 2, "cy": 0, "alone": True, "screen": "❯ "}
+        with mock.patch.object(reaper, "SESSIONS_DIR", tmp / "sessions"), \
+             mock.patch.object(reaper, "ps_table", return_value=self.TABLE), \
+             mock.patch.object(reaper, "worktrees", return_value=[wt]), \
+             mock.patch.object(reaper, "gh_repo", return_value=REPO), \
+             mock.patch.object(reaper, "pane_state", return_value=state), \
+             mock.patch.object(reaper, "foreground", return_value=True), \
+             mock.patch.object(reaper, "transcript_path", return_value=None), \
+             mock.patch.object(reaper, "subagent_activity", return_value=0):
+            found = {s["sid"]: s for s in reaper.gather(CFG, time.time())}
+        self.assertEqual(found["sid-1"]["other_claims"], {(REPO, "5449")})
+        self.assertEqual(found["sid-2"]["other_claims"], set())
 
     def test_gather_names_the_never_kill_pid_and_the_missing_claim_and_decide_keeps_it(self):
         s = self.gathered("12")
