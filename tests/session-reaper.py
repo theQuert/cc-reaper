@@ -763,6 +763,15 @@ class RecoverExiting(unittest.TestCase):
         self.assertEqual(len(self.comments), 1)
         tmux.assert_not_called()
 
+    def test_a_resumed_session_closed_again_gets_its_own_entry(self):
+        # #6477: apertis-ops was closed, resumed, and closed again; its id was already in the log, so the second
+        # close wrote nothing. The entry is per close (its pid), not per session id.
+        (self.d / "closed.md").write_text("\n## 2026-11-01 12:00:00 session-reaper\n- work sid-1 cwd=/w issues=- — old\n")
+        self.recover()
+        self.recover()
+        self.assertEqual((self.d / "closed.md").read_text().count("- work sid-1 "), 2)
+        self.assertIn("<!-- pid:4242 -->", (self.d / "closed.md").read_text())
+
     def test_an_existing_marker_comment_is_not_posted_again(self):
         self.recover(comments_existing=("sid-1",))
         self.assertEqual(self.comments, [])
@@ -838,6 +847,13 @@ class FinishAndReap(unittest.TestCase):
             ok = reaper.finish_close("work", "sid-1", "/w", [("o/r", "7")], "x", "%9", "$3", True, self.cfg, 0)
         self.assertFalse(ok)
         comment.assert_not_called()
+
+    def test_finish_close_writes_one_entry_per_close_of_the_same_session(self):
+        close = lambda pid: reaper.finish_close("work", "sid-1", "/w", [], "done\n\n- next", "%9", "$3", True, self.cfg, 0, pid)
+        self.assertTrue(close(4242))
+        self.assertTrue(close(4242))  # a repeat of the same close (crash recovery) adds nothing
+        self.assertTrue(close(5151))  # the same session, resumed and closed again
+        self.assertEqual((self.d / "closed.md").read_text().count("- work sid-1 "), 2)
 
     def sess(self):
         f = self.d / "1.json"

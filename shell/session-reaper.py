@@ -1551,13 +1551,16 @@ def has_marker(issue_ref, sid):
         return None
 
 
-def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg, now):
+def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg, now, pid=None):
     """The steps after claude has exited, safe to repeat: each checks for its own earlier effect.
     Returns False when a step could not be confirmed (the record then stays "exiting")."""
     log = Path(os.path.expanduser(cfg["CLOSED_LOG"]))
     log.parent.mkdir(parents=True, exist_ok=True)
+    # One entry per close, not per session id: a resumed session that is closed again needs its own entry (#6477:
+    # apertis-ops's second close left none, because its id was already in the log). Its pid is new on every resume.
+    mark, summ = f"<!-- pid:{pid} -->", " ".join(summ.split())  # one line, so the id and the mark share it
     try:
-        done = sid in log.read_text()
+        done = any(sid in ln and mark in ln for ln in log.read_text().splitlines())
     except OSError:
         done = False
     if not done:
@@ -1565,7 +1568,7 @@ def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg,
         issues = " ".join(f"{r}#{n}" for r, n in claims) or "-"
         with log.open("a") as fh:
             fh.write(f"\n## {stamp} session-reaper (resume: claude --resume <sid>)\n"
-                     f"- {rec_tmux} {sid} cwd={cwd} issues={issues} — {summ}\n")
+                     f"- {rec_tmux} {sid} cwd={cwd} issues={issues} — {summ} {mark}\n")
     ok = True
     for ref in claims:
         seen = has_marker(ref, sid)
@@ -1620,7 +1623,7 @@ def recover_exiting(cfg, now):
                 continue
         claims = [tuple(c.rsplit("#", 1)) for c in rec.get("claims", []) if "#" in c]
         if not finish_close(rec["tmux"], rec["sid"], rec["cwd"], claims, (rec.get("last_text") or "").strip()[:120],
-                            pane, rec.get("session_id"), True, cfg, now):
+                            pane, rec.get("session_id"), True, cfg, now, pid):
             try:
                 if now - path.stat().st_mtime > STALE_EXITING_SECONDS:
                     notes.append(f"{rec['tmux']} ({rec['sid']}): record exiting over 24h, issue comment unconfirmed")
@@ -1698,7 +1701,7 @@ def reap(s, cfg, now):
         mark_record(s["record"], "exception")
         raise
     if not finish_close(s["tmux"], s["sid"], s["cwd"], s["claims"], summary(s), s["pane"],
-                        s["session_id"], alone, cfg, now):
+                        s["session_id"], alone, cfg, now, s["pid"]):
         return "skipped:close-unconfirmed", [f"{s['tmux']}: log or issue comment not confirmed; record stays exiting"]
     # Kill only what this session owned: the whole tmux session if it was its only pane.
     # Recount just before the kill: a window opened during the exit wait must survive. A pane
