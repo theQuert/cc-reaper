@@ -1539,16 +1539,35 @@ def mark_record(path, outcome):
         pass
 
 
+CLAIM_BY_SESSION_RE = re.compile(r"Claimed by[^\n]*?session\s+`?([0-9a-f]{8,}(?:-[0-9a-f-]+)?)`?", re.I)
+
+
+def claims_session(body, sid):
+    """True when a comment claims for this session: its full id or a prefix of it (the usual 8-hex claim)."""
+    sid = sid.lower()
+    for m in CLAIM_BY_SESSION_RE.finditer(body or ""):
+        cid = m.group(1).lower()
+        if sid.startswith(cid) or cid.startswith(sid):
+            return True
+    return False
+
+
 def has_marker(issue_ref, sid):
-    """True/False when the issue has (no) comment carrying our marker; None when gh could not say."""
+    """True when the issue has our marker in a comment after the session's newest claim, False when it has none
+    there; None when gh could not say. A resumed session keeps its id, so a claim it makes after an earlier release
+    needs a release of its own at the next reap (stima-api#7000), or the claim hangs on a dead session."""
     repo, num = issue_ref
     rc, out = run(["gh", "issue", "view", num, "-R", repo, "--json", "comments"], 60)
     if rc != 0:
         return None
     try:
-        return any(f"session-reaper:{sid}" in (c.get("body") or "") for c in json.loads(out).get("comments", []))
+        bodies = [c.get("body") or "" for c in json.loads(out).get("comments", [])]  # oldest first
     except (ValueError, AttributeError):
         return None
+    mark = f"session-reaper:{sid}"
+    marked = [i for i, b in enumerate(bodies) if mark in b]
+    claimed = [i for i, b in enumerate(bodies) if mark not in b and claims_session(b, sid)]
+    return bool(marked) and (not claimed or marked[-1] > claimed[-1])
 
 
 def release_comment(rec_tmux, sid, cwd, ref, cfg, now):

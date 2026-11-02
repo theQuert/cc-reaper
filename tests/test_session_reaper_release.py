@@ -3,6 +3,7 @@
 <id>` form that stima-api's delivery_state.claimant() honours (#6134), so a reaped session's issue reads unclaimed."""
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -51,6 +52,37 @@ class ReleaseComment(unittest.TestCase):
                                                     "%9", "$3", True, self.cfg, NOW, 4242))
         self.assertEqual(len(posted), 1)
         self.assertTrue(posted[0][1].startswith(f"Released by work session {SID} "))
+
+
+class ReleasePostdatesTheClaim(unittest.TestCase):
+    """A resumed session keeps its id: a claim made after its earlier release needs a new release at the next reap."""
+
+    def marker(self, *bodies, rc=0):
+        out = json.dumps({"comments": [{"body": b} for b in bodies]})
+        with mock.patch.object(reaper, "run", return_value=(rc, out)):
+            return reaper.has_marker(("theQuert/stima-api", "7000"), SID)
+
+    def test_release_after_the_newest_claim_counts(self):
+        claim = f"Claimed by claude session {SID} (work)"
+        release = f"Released by work session {SID}\n\n<!-- session-reaper:{SID} -->"
+        self.assertIs(self.marker(claim, release), True)
+        self.assertIs(self.marker(release), True)  # no claim in view: the release stands
+        self.assertIs(self.marker(claim), False)
+
+    def test_reclaim_after_the_release_needs_a_new_one(self):
+        release = f"Released by work session {SID}\n\n<!-- session-reaper:{SID} -->"
+        for again in (f"Claimed by claude session {SID} (work)", f"Claimed by claude session `{SID[:8]}` (work)",
+                      f"Claimed by Claude Code session {SID[:8].upper()}"):
+            self.assertIs(self.marker(f"Claimed by claude session {SID}", release, again), False, again)
+            self.assertIs(self.marker(f"Claimed by claude session {SID}", release, again, release), True, again)
+
+    def test_another_sessions_claim_does_not_void_the_release(self):
+        release = f"Released by work session {SID}\n\n<!-- session-reaper:{SID} -->"
+        other = "Claimed by claude session 11111111 (other)"
+        self.assertIs(self.marker(f"Claimed by claude session {SID}", release, other), True)
+
+    def test_unreadable_is_none(self):
+        self.assertIsNone(self.marker(rc=1))
 
 
 def _delivery_state():
