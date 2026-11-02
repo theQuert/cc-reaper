@@ -9,6 +9,11 @@ then verifies the process tree, tmux session, session file and worktree locks ar
 
 Report-only unless the config sets APPLY=1 or --apply is passed.
 
+Oracle gate (stima-api #7001): a claimed issue whose `delivery_state.py N --brief` says the step is not the session's
+(a `stop` with a wake, or a `wait` with a posted check-by) no longer keeps an idle session: reason `oracle:not-mine`,
+`would-close` in the report under ORACLE_NOT_MINE=shadow, a real close under ORACLE_NOT_MINE=apply. Spot-check: the
+report row names each claim and its waker; compare with `--brief` of the same issue.
+
 Shadow verdict (#6477): a kept session that a person would also call finished gets the outcome
 `would-close` in the report. It is never acted on: reap() runs only for a session with no keep reason.
 """
@@ -78,6 +83,10 @@ DEFAULTS = {
     # Space- or comma-separated pids: a session whose process tree holds one is kept (`never-kill:<pid>`) and its
     # pane is never killed. The environment variable of the same name wins over this value.
     "CC_NEVER_KILL_PIDS": "70987 4565",
+    # stima-api #7001: a claimed issue whose oracle brief says the step is not this session's (a `stop` with a wake, or
+    # a `wait` with a posted check-by) does not keep an idle session. `shadow` reports `would-close: oracle:not-mine`
+    # and closes nothing (SCRIPT-SAFE-RULE: run it for three reaper reports, then switch to `apply`); `off` neither.
+    "ORACLE_NOT_MINE": "shadow",
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
@@ -487,6 +496,54 @@ def classify_claim(brief, sid, now, others=(), mine=()):
             continue
         overdue = overdue or tt < now
     return "owed", overdue
+
+
+CHECKBY_END_RE = re.compile(r"\A\s*check-by scheduled for (\d{4}-\d\d-\d\dT[\d:]+Z?); the stranded-step dispatcher wakes "
+                            r"the session then: end the turn\.\Z")
+STOP_HEAD_RE = re.compile(r"\Adelivery #\d+: [^\n]*? -> stop (\S+)")
+WAKE_LINE_RE = re.compile(r"(?m)^  wake: (\S.*)$")
+
+
+def _cell(text, limit=160):
+    """One table-safe line."""
+    return " ".join(str(text).replace("|", "/").split())[:limit]
+
+
+def oracle_not_mine(brief):
+    """Why the oracle's brief says the step is not this session's, or "" (stima-api #7001).
+
+    Only the oracle's own header and last line count, never free text from an issue comment (the same rule as
+    classify_claim): a `-> stop <reason>` header with a `wake:` line (a person or a record wakes it), or a
+    `-> wait` header whose last line is the oracle's `check-by scheduled for <iso>; the stranded-step dispatcher
+    wakes the session then` (a check-by is posted and the dispatcher wakes the session). An `agent` step, a stop
+    nothing wakes, and a wait with no check-by yet (the session still owes the comment) are the session's."""
+    if not brief:
+        return ""
+    k = BRIEF_KIND_RE.match(brief)
+    last = brief.rstrip("\n").rsplit("\n", 1)[-1]
+    if k and k.group(1) == "stop":
+        head, wake = STOP_HEAD_RE.match(brief), WAKE_LINE_RE.search(brief)
+        if head and wake:
+            return _cell(f"stop {head.group(1)}; wake: {wake.group(1)}")
+    elif k and k.group(1) == "wait":
+        m = CHECKBY_END_RE.match(last)
+        if m:
+            return f"wait check-by {m.group(1)}; the dispatcher wakes it"
+    return ""
+
+
+def claim_class(brief, repo, num, s, at, mine, cfg):
+    """classify_claim() plus the not-mine rule: under ORACLE_NOT_MINE=apply an `unknown` claim whose brief names
+    another waker is `ended`, recorded in s["oracle_not_mine"][num] for the report and the close log. Never for a
+    NEVER_CLOSE session (the exemption is a separate rule, #7001 non-goals)."""
+    cls, overdue = classify_claim(brief, s["sid"], at, s.get("other_sids", ()), mine)
+    if cls == "unknown" and cfg.get("ORACLE_NOT_MINE") == "apply":
+        names = [n for n in (s["tmux"], s.get("name")) if n]
+        why = oracle_not_mine(brief)
+        if why and not any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in names):
+            s.setdefault("oracle_not_mine", {})[num] = why
+            return "ended", False
+    return cls, overdue
 
 
 _claim_cache = {}
@@ -1003,6 +1060,16 @@ def decide(s, cfg, now=None):
                 s["noclaim_done_shadow"] = trial["noclaim_done"]
         except Exception as e:  # a report-only trial must not turn a kept session into an error
             s["noclaim_shadow_error"] = f"{type(e).__name__}: {e}"
+    # stima-api #7001: the same second decide under ORACLE_NOT_MINE=apply, for a session kept only by claims the oracle
+    # cannot place (`issue-unknown`, a check-by it reads as open). Nothing else changes.
+    if (keep and cfg.get("ORACLE_NOT_MINE") == "shadow" and s["claims"]
+            and any(k.startswith(("issue-unknown:", "check-by-")) for k in keep)):
+        trial = dict(s, oracle_not_mine={})
+        try:
+            if not _decide(trial, dict(cfg, ORACLE_NOT_MINE="apply"), now) and trial["oracle_not_mine"]:
+                s["oracle_not_mine_shadow"] = dict(trial["oracle_not_mine"])
+        except Exception as e:  # a report-only trial must not turn a kept session into an error
+            s["oracle_not_mine_error"] = f"{type(e).__name__}: {e}"
     return keep
 
 
@@ -1229,8 +1296,7 @@ def _decide(s, cfg, now=None):
             # none to keep it: homepage's docs worktree `claude/6361-…` was read as apertis-ai/docs#6361, which does
             # not exist, and kept it as check-by-unknown for good.
             cb = [checkby_state(r, n, cfg) for r, n in s["claims"] if r == cfg["CHECKBY_REPO"]
-                  and classify_claim(oracle_brief(r, n, cfg, at), s["sid"], at, s.get("other_sids", ()), mine)[0]
-                  != "ended"]
+                  and claim_class(oracle_brief(r, n, cfg, at), r, n, s, at, mine, cfg)[0] != "ended"]
             if "OPEN" in cb:
                 keep.append("check-by-open")
             elif "UNKNOWN" in cb:
@@ -1247,9 +1313,8 @@ def _decide(s, cfg, now=None):
             at = now if now is not None else time.time()
             marks, owed, unknown = [], [], []
             for r, n in s["claims"]:
-                cls, overdue = classify_claim(
-                    oracle_brief(r, n, cfg, at), s["sid"], at, s.get("other_sids", ()),
-                    [w["marker"] for w in s["owned"] if w.get("marker")])
+                cls, overdue = claim_class(
+                    oracle_brief(r, n, cfg, at), r, n, s, at, [w["marker"] for w in s["owned"] if w.get("marker")], cfg)
                 marks.append(f"#{n}:{cls}" + (":stalled" if overdue else ""))
                 if cls == "owed":
                     owed.append(f"#{n}")
@@ -1470,6 +1535,9 @@ def shadow_verdict(s, cfg, keep, now):
 
 def summary(s):
     m = DONE_RE.search(s["last_text"])
+    if not m and s.get("oracle_not_mine"):  # the close line the session did not write (#7001): who wakes each claim
+        return ("SESSION-DONE (derived, oracle:not-mine): "
+                + "; ".join(f"#{n} {_cell(w, 120)}" for n, w in s["oracle_not_mine"].items()))[:300]
     lines = s["last_text"].strip().splitlines()
     return (m.group(1) if m else lines[-1] if lines else "")[:200]
 
@@ -1738,6 +1806,10 @@ def report_line(s, keep, outcome):
     why = [f"would-close: {s['would_close']}"] if s.get("would_close") else []
     why += ["would-close: inbox DONE (shadow)"] if s.get("inbox_done_shadow") else []
     why += ["would-close: done grace (shadow)"] if s.get("done_grace_shadow") else []
+    nm = s.get("oracle_not_mine_shadow") or s.get("oracle_not_mine") or {}
+    why += [("would-close: " if s.get("oracle_not_mine_shadow") else "") + "oracle:not-mine "
+            + "; ".join(f"#{n} {_cell(w, 120)}" for n, w in nm.items())
+            + (" (shadow)" if s.get("oracle_not_mine_shadow") else "")] if nm else []
     why += ["FALSE_WAITING: " + ",".join(s["false_waiting"])] if s.get("false_waiting") else []
     why += [f"would-close: no claim, {s['noclaim_done_shadow']} (shadow)"] if s.get("noclaim_done_shadow") else []
     if s.get("claim_why"):  # name why no claim was found
@@ -1812,6 +1884,8 @@ def main(argv=None):
                 keep = decide(s, cfg)
                 if s.get("done_grace_error"):
                     notes.append(f"{s['tmux']} ({s['sid']}): DONE_GRACE shadow: {s['done_grace_error']}")
+                if s.get("oracle_not_mine_error"):
+                    notes.append(f"{s['tmux']} ({s['sid']}): ORACLE_NOT_MINE shadow: {s['oracle_not_mine_error']}")
                 if s.get("noclaim_shadow_error"):
                     notes.append(f"{s['tmux']} ({s['sid']}): NOCLAIM_DONE shadow: {s['noclaim_shadow_error']}")
                 outcome = "keep" if keep else ("reap" if apply else "would-reap")
@@ -1820,7 +1894,7 @@ def main(argv=None):
                         sv = shadow_verdict(s, cfg, keep, now)
                         s["blocked"], s["would_close"] = sv["blocked"], sv["would_close"]
                         outcome = ("would-close" if sv["would_close"] or s.get("noclaim_done_shadow") or s.get("done_grace_shadow")
-                                   else outcome)
+                                   or s.get("oracle_not_mine_shadow") else outcome)
                     except Exception as e:  # a report-only verdict must not fail the sweep
                         notes.append(f"{s['tmux']} ({s['sid']}): shadow verdict: {type(e).__name__}: {e}")
                 if not keep and apply:
