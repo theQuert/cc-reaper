@@ -9,6 +9,20 @@ then verifies the process tree, tmux session, session file and worktree locks ar
 
 Report-only unless the config sets APPLY=1 or --apply is passed.
 
+Oracle gate (stima-api #7001): a claimed issue whose `delivery_state.py N --brief` says the step is not the session's
+no longer keeps an idle session: reason `oracle:not-mine`, `would-close` in the report under ORACLE_NOT_MINE=shadow
+(the default), a real close under ORACLE_NOT_MINE=apply. Not the session's means one of two oracle shapes, and nothing
+else: a stop the session already reported (`  stop: <reason> (reported)`, with a `wake:` line) while the issue has no
+pending or due check-by; or a wait whose check-by the session posted itself (the `--json` claimant is this session and
+the check-by comment is newer than its newest claim) and that is still ahead. Spot-check: the report row names each
+claim and its waker; compare with `--brief` of the same issue.
+
+A not-mine close never releases the claim: its issue comment (notmine_comment) has no `Released by` first line, so the
+claim stays on this session and the stranded-step dispatcher can `claude --resume` it, with its context, at the
+check-by or wake. The release comment of stima-api #7000 is for a session closed as finished, not for one whose step
+is merely someone else's for now; the not-mine comment carries its own marker (`session-reaper-notmine:<sid>:<pid>`),
+so the finished comment and its release still come when the resumed session is closed as finished.
+
 Shadow verdict (#6477): a kept session that a person would also call finished gets the outcome
 `would-close` in the report. It is never acted on: reap() runs only for a session with no keep reason.
 """
@@ -78,6 +92,10 @@ DEFAULTS = {
     # Space- or comma-separated pids: a session whose process tree holds one is kept (`never-kill:<pid>`) and its
     # pane is never killed. The environment variable of the same name wins over this value.
     "CC_NEVER_KILL_PIDS": "70987 4565",
+    # stima-api #7001: a claimed issue whose oracle brief says the step is not this session's (a stop it reported, or a
+    # wait on a check-by it posted itself; module docstring) does not keep an idle session. `shadow` reports `would-close: oracle:not-mine`
+    # and closes nothing (SCRIPT-SAFE-RULE: run it for three reaper reports, then switch to `apply`); `off` neither.
+    "ORACLE_NOT_MINE": "shadow",
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
@@ -382,6 +400,28 @@ def issue_state(repo, num):
 
 
 _checkby_cache = {}
+_oracle_json_cache = {}
+
+
+def _fetch_oracle_json(repo, num, cfg):
+    """One `delivery_state.py N --json` call, shared with oracle_json(); None when it cannot say or for another repo."""
+    d = None
+    if repo == cfg["CHECKBY_REPO"]:  # the oracle would read another repo's issue with this number
+        oracle = os.path.expanduser(cfg["CHECKBY_ORACLE"])
+        root = os.path.dirname(os.path.dirname(os.path.dirname(oracle)))
+        rc, out = run(["python3", oracle, str(num), "--json"], 60, cwd=root)
+        try:
+            d = json.loads(out) if rc == 0 else None
+        except ValueError:
+            d = None
+    _oracle_json_cache[(repo, str(num))] = d
+    return d
+
+
+def oracle_json(repo, num, cfg):
+    """`delivery_state.py N --json` for the claim, once per run (checkby_state() fills the same cache)."""
+    key = (repo, str(num))
+    return _oracle_json_cache[key] if key in _oracle_json_cache else _fetch_oracle_json(repo, num, cfg)
 
 
 def checkby_state(repo, num, cfg):
@@ -390,13 +430,10 @@ def checkby_state(repo, num, cfg):
     if key not in _checkby_cache and repo != cfg["CHECKBY_REPO"]:
         _checkby_cache[key] = "UNKNOWN"  # the oracle would read another repo's issue with this number
     if key not in _checkby_cache:
-        oracle = os.path.expanduser(cfg["CHECKBY_ORACLE"])
-        root = os.path.dirname(os.path.dirname(os.path.dirname(oracle)))
-        rc, out = run(["python3", oracle, str(num), "--json"], 60, cwd=root)
+        d = _fetch_oracle_json(repo, num, cfg)
         try:
-            if rc != 0:
-                raise ValueError(rc)
-            d = json.loads(out)
+            if d is None:
+                raise ValueError("unread")
             if isinstance(d, dict) and d.get("state") == "closed":
                 d = dict(d, pending_check_by="", due_check="")  # a closed issue's payload has neither key
             pending, due = d["pending_check_by"], d["due_check"]
@@ -487,6 +524,128 @@ def classify_claim(brief, sid, now, others=(), mine=()):
             continue
         overdue = overdue or tt < now
     return "owed", overdue
+
+
+CHECKBY_END_RE = re.compile(r"\A\s*check-by scheduled for (\d{4}-\d\d-\d\dT[\d:]+Z?); the stranded-step dispatcher wakes "
+                            r"the session then: end the turn\.\Z")
+STOP_HEAD_RE = re.compile(r"\Adelivery #\d+: [^\n]*? -> stop (\S+)")
+# delivery_state.brief(): `  stop: <reason> (reported)` once the stop marker is on the issue, `  stop: <reason>; post once
+# with <marker>` while the session still owes it (stima-api #6945: an unreported stop is the session's step).
+STOP_REPORTED_RE = re.compile(r"(?m)^  stop: (\S+) \(reported\)$")
+WAKE_LINE_RE = re.compile(r"(?m)^  wake: (\S.*)$")
+# delivery_state.py's own claim and check-by grammar (CLAIM_RE, CLAIM_SESSION_RE, CHECK_BY_RE), read the same way: a
+# claim is a comment's first line outside code; a check-by in code or an HTML comment schedules nothing.
+CLAIM_LINE_RE = re.compile(r"^[ \t*_]*claimed by\b", re.I)
+_SESSION_ID = r"[0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?"
+CLAIM_SID_RE = re.compile(rf"\bsession[ \t*_]*(?:`({_SESSION_ID})`|\(({_SESSION_ID})\)|({_SESSION_ID})\b)", re.I)
+CHECKBY_STAMP_RE = re.compile(r"(?<![\w-])check-by:?[ \t]+(\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?)(?:\.\d+)?(?:Z|[+-]00:00)")
+FENCE_RE = re.compile(r"(?ms)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]{0,3}\1[ \t]*$|\Z)")
+HTML_COMMENT_RE = re.compile(r"(?s)<!--.*?-->")
+INDENTED_RE = re.compile(r"(?m)^(?: {4}|\t).*$")
+INLINE_CODE_RE = re.compile(r"(`+)[^`\n].*?\1")
+
+
+def _cell(text, limit=160):
+    """One table-safe line."""
+    return " ".join(str(text).replace("|", "/").split())[:limit]
+
+
+def _iso_epoch(stamp):
+    """Epoch of `YYYY-MM-DDTHH:MM[:SS]...` read as UTC; None when it does not parse."""
+    s = str(stamp or "")
+    for n, fmt in ((19, "%Y-%m-%dT%H:%M:%S"), (16, "%Y-%m-%dT%H:%M")):
+        try:
+            return calendar.timegm(time.strptime(s[:n], fmt))
+        except ValueError:
+            pass
+    return None
+
+
+def _outside_code(body):
+    """A comment's text outside fenced and indented code and HTML comments (delivery_state._readable, less inline)."""
+    return INDENTED_RE.sub("", HTML_COMMENT_RE.sub("", FENCE_RE.sub("", str(body or "").replace("\r\n", "\n"))))
+
+
+def oracle_not_mine(brief):
+    """(`stop`|`wait`, why, due epoch or None) when the oracle's brief says the step is not this session's, else None
+    (stima-api #7001). Pure parse; claim_class() adds the bindings that need the issue.
+
+    Only the oracle's own lines count, never free text from an issue comment (the same rule as classify_claim): a
+    `-> stop <reason>` header with the oracle's `  stop: <reason> (reported)` line and a `wake:` line (the stop is on
+    the issue and a person or a record wakes it), or a `-> wait` header whose last line is the oracle's `check-by
+    scheduled for <iso>; the stranded-step dispatcher wakes the session then`. An `agent` step, a stop the session has
+    not reported yet (`; post once with <marker>`: it still owes that comment or its RELAY-ASK), a stop nothing wakes,
+    and a wait with no check-by yet are the session's."""
+    if not brief:
+        return None
+    k = BRIEF_KIND_RE.match(brief)
+    last = brief.rstrip("\n").rsplit("\n", 1)[-1]
+    if k and k.group(1) == "stop":
+        head, rep, wake = STOP_HEAD_RE.match(brief), STOP_REPORTED_RE.search(brief), WAKE_LINE_RE.search(brief)
+        if head and rep and rep.group(1) == head.group(1) and wake:
+            return "stop", _cell(f"stop {head.group(1)} (reported); wake: {wake.group(1)}"), None
+    elif k and k.group(1) == "wait":
+        m = CHECKBY_END_RE.match(last)
+        if m and _iso_epoch(m.group(1)) is not None:
+            return "wait", f"wait check-by {m.group(1)}; the dispatcher wakes it", _iso_epoch(m.group(1))
+    return None
+
+
+def wait_bound(repo, num, s, mine, cfg, due):
+    """True only when the posted check-by the wait names is this session's own (stima-api #7001 P1-2): the oracle's
+    `--json` claimant is this session (its id or a worktree marker it owns), its pending check-by is `due`, and a
+    comment scheduling that check-by was posted after this session's newest claim. The issue-wide earliest check-by
+    can be another session's or a former owner's (a 7-day tripwire); anything unread or unmatched is False (kept)."""
+    d = oracle_json(repo, num, cfg)
+    if not isinstance(d, dict):
+        return False
+    c = d.get("claimant")
+    cs = str(c.get("session") or "").lower() if isinstance(c, dict) else ""
+    if not (_same_session(cs, s["sid"].lower()) or any(_same_session(cs, str(x).lower()) for x in mine)):
+        return False
+    if _iso_epoch(d.get("pending_check_by")) != due:
+        return False
+    comments = issue_comments(repo, num)
+    if not comments:
+        return False
+    claimed = scheduled = None
+    for cm in comments:
+        at = _iso_epoch(cm.get("createdAt"))
+        if at is None:
+            continue
+        text = _outside_code(cm.get("body"))
+        first = next((ln for ln in text.splitlines() if ln.strip()), "")
+        sm = CLAIM_SID_RE.search(first) if CLAIM_LINE_RE.match(first) else None
+        if sm and _same_session(next(filter(None, sm.group(1, 2, 3))).lower(), cs):
+            claimed = at if claimed is None or at > claimed else claimed
+        if any(_iso_epoch(m.group(1)) == due for m in CHECKBY_STAMP_RE.finditer(INLINE_CODE_RE.sub("", text))):
+            scheduled = at if scheduled is None or at > scheduled else scheduled
+    return claimed is not None and scheduled is not None and scheduled > claimed
+
+
+def claim_class(brief, repo, num, s, at, mine, cfg):
+    """classify_claim() plus the not-mine rule: under ORACLE_NOT_MINE=apply an `unknown` claim whose brief names
+    another waker is `ended`, recorded in s["oracle_not_mine"][num] for the report and the close log. Never for a
+    NEVER_CLOSE session (the exemption is a separate rule, #7001 non-goals).
+
+    A stop still keeps the session while the issue has a pending or due check-by (checkby_state() not CLEAR): at a
+    stop the dispatcher does not take a due check (delivery_state `_deferred` does not run), so the session is the
+    only one to answer it. A wait's check-by is the one the brief names, so it needs no second look; it needs
+    wait_bound() instead, and a scheduled time still ahead of `at` (a cached brief can name a past one)."""
+    cls, overdue = classify_claim(brief, s["sid"], at, s.get("other_sids", ()), mine)
+    if cls == "unknown" and cfg.get("ORACLE_NOT_MINE") == "apply":
+        names = [n for n in (s["tmux"], s.get("name")) if n]
+        nm = oracle_not_mine(brief)
+        if not nm or any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in names):
+            return cls, overdue
+        kind, why, due = nm
+        if kind == "stop" and checkby_state(repo, num, cfg) != "CLEAR":
+            return cls, overdue
+        if kind == "wait" and not (due > at and wait_bound(repo, num, s, mine, cfg, due)):
+            return cls, overdue
+        s.setdefault("oracle_not_mine", {})[num] = why
+        return "ended", False
+    return cls, overdue
 
 
 _claim_cache = {}
@@ -1003,6 +1162,16 @@ def decide(s, cfg, now=None):
                 s["noclaim_done_shadow"] = trial["noclaim_done"]
         except Exception as e:  # a report-only trial must not turn a kept session into an error
             s["noclaim_shadow_error"] = f"{type(e).__name__}: {e}"
+    # stima-api #7001: the same second decide under ORACLE_NOT_MINE=apply, for a session kept only by claims the oracle
+    # cannot place (`issue-unknown`, a check-by it reads as open). Nothing else changes.
+    if (keep and cfg.get("ORACLE_NOT_MINE") == "shadow" and s["claims"]
+            and any(k.startswith(("issue-unknown:", "check-by-")) for k in keep)):
+        trial = dict(s, oracle_not_mine={})
+        try:
+            if not _decide(trial, dict(cfg, ORACLE_NOT_MINE="apply"), now) and trial["oracle_not_mine"]:
+                s["oracle_not_mine_shadow"] = dict(trial["oracle_not_mine"])
+        except Exception as e:  # a report-only trial must not turn a kept session into an error
+            s["oracle_not_mine_error"] = f"{type(e).__name__}: {e}"
     return keep
 
 
@@ -1229,8 +1398,7 @@ def _decide(s, cfg, now=None):
             # none to keep it: homepage's docs worktree `claude/6361-…` was read as apertis-ai/docs#6361, which does
             # not exist, and kept it as check-by-unknown for good.
             cb = [checkby_state(r, n, cfg) for r, n in s["claims"] if r == cfg["CHECKBY_REPO"]
-                  and classify_claim(oracle_brief(r, n, cfg, at), s["sid"], at, s.get("other_sids", ()), mine)[0]
-                  != "ended"]
+                  and claim_class(oracle_brief(r, n, cfg, at), r, n, s, at, mine, cfg)[0] != "ended"]
             if "OPEN" in cb:
                 keep.append("check-by-open")
             elif "UNKNOWN" in cb:
@@ -1247,9 +1415,8 @@ def _decide(s, cfg, now=None):
             at = now if now is not None else time.time()
             marks, owed, unknown = [], [], []
             for r, n in s["claims"]:
-                cls, overdue = classify_claim(
-                    oracle_brief(r, n, cfg, at), s["sid"], at, s.get("other_sids", ()),
-                    [w["marker"] for w in s["owned"] if w.get("marker")])
+                cls, overdue = claim_class(
+                    oracle_brief(r, n, cfg, at), r, n, s, at, [w["marker"] for w in s["owned"] if w.get("marker")], cfg)
                 marks.append(f"#{n}:{cls}" + (":stalled" if overdue else ""))
                 if cls == "owed":
                     owed.append(f"#{n}")
@@ -1470,6 +1637,9 @@ def shadow_verdict(s, cfg, keep, now):
 
 def summary(s):
     m = DONE_RE.search(s["last_text"])
+    if not m and s.get("oracle_not_mine"):  # the close line the session did not write (#7001): who wakes each claim
+        return ("SESSION-DONE (derived, oracle:not-mine): "
+                + "; ".join(f"#{n} {_cell(w, 120)}" for n, w in s["oracle_not_mine"].items()))[:300]
     lines = s["last_text"].strip().splitlines()
     return (m.group(1) if m else lines[-1] if lines else "")[:200]
 
@@ -1521,6 +1691,8 @@ def write_record(s, cfg, now, status):
            "last_text": s["last_text"][-2000:], "at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
            "status": status, "pid": s.get("pid"), "start": s.get("start", ""),
            "pane": s.get("pane", ""), "session_id": s.get("session_id", ""),
+           # #7001: the claims closed as not this session's step; finish_close() releases none of them
+           "oracle_not_mine": dict(s.get("oracle_not_mine") or {}),
            "resume": f"tmux new-session -d -s {s['tmux']} -c {s['cwd']} 'claude --resume {s['sid']}'"}
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=1) + "\n")
@@ -1583,9 +1755,36 @@ def release_comment(rec_tmux, sid, cwd, ref, cfg, now):
             f"Resume it with `cd {cwd} && claude --resume {sid}`.\n\n<!-- session-reaper:{sid} -->")
 
 
-def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg, now, pid=None):
+def notmine_comment(rec_tmux, sid, cwd, why, pid=None):
+    """The close comment on a claim the oracle says is not the session's step (stima-api #7001). It is never a release:
+    no `Released by` (or `Claimed by`) first line, so delivery_state.claimant() still names this session and the
+    stranded-step dispatcher resumes it at its check-by or wake, with its context. The reason goes in inline code, so
+    a check-by time it quotes schedules nothing. Its marker is not the `session-reaper:<sid>` one: that marker says the
+    session was closed as finished, and a session resumed after this close still gets that comment (and with #7000
+    its release) when it is closed as finished. The pid makes each close of a resumed session its own."""
+    why = _cell(why, 200).replace("`", "'")
+    return (f"Session `{rec_tmux}` (`{sid}`) was closed by session-reaper: the oracle says the step is not its own "
+            f"(`{why}`). The claim stays with it, not released, so it is resumed with "
+            f"`cd {cwd} && claude --resume {sid}` when that step comes back.\n\n<!-- {notmine_mark(sid, pid)} -->")
+
+
+def notmine_mark(sid, pid):
+    return f"session-reaper-notmine:{sid}:{pid}"
+
+
+def notmine_posted(ref, sid, pid):
+    """True/False when the issue has (no) not-mine close comment for this close; None when gh could not say."""
+    comments = issue_comments(*ref)
+    if comments is None:
+        return None
+    return any(notmine_mark(sid, pid) in (c.get("body") or "") for c in comments if isinstance(c, dict))
+
+
+def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg, now, pid=None, not_mine=None):
     """The steps after claude has exited, safe to repeat: each checks for its own earlier effect.
-    Returns False when a step could not be confirmed (the record then stays "exiting")."""
+    Returns False when a step could not be confirmed (the record then stays "exiting").
+    `not_mine` ({issue number: why}, #7001): those claims get notmine_comment(), never a release."""
+    not_mine = {str(k): v for k, v in (not_mine or {}).items()}
     log = Path(os.path.expanduser(cfg["CLOSED_LOG"]))
     log.parent.mkdir(parents=True, exist_ok=True)
     # One entry per close, not per session id: a resumed session that is closed again needs its own entry (#6477:
@@ -1602,6 +1801,13 @@ def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg,
             fh.write(f"\n## {stamp} session-reaper (resume: claude --resume <sid>)\n"
                      f"- {rec_tmux} {sid} cwd={cwd} issues={issues} — {summ} {mark}\n")
     ok = True
+    for ref in [r for r in claims if str(r[1]) in not_mine]:  # #7001: never a release, so the claim stays
+        seen = notmine_posted(ref, sid, pid)
+        if seen is False:
+            ok = comment(ref, notmine_comment(rec_tmux, sid, cwd, not_mine[str(ref[1])], pid)) and ok
+        elif seen is None:
+            ok = False
+    claims = [r for r in claims if str(r[1]) not in not_mine]
     for ref in claims:
         seen = has_marker(ref, sid)
         if seen is False:
@@ -1654,7 +1860,7 @@ def recover_exiting(cfg, now):
                 continue
         claims = [tuple(c.rsplit("#", 1)) for c in rec.get("claims", []) if "#" in c]
         if not finish_close(rec["tmux"], rec["sid"], rec["cwd"], claims, (rec.get("last_text") or "").strip()[:120],
-                            pane, rec.get("session_id"), True, cfg, now, pid):
+                            pane, rec.get("session_id"), True, cfg, now, pid, rec.get("oracle_not_mine")):
             try:
                 if now - path.stat().st_mtime > STALE_EXITING_SECONDS:
                     notes.append(f"{rec['tmux']} ({rec['sid']}): record exiting over 24h, issue comment unconfirmed")
@@ -1732,7 +1938,7 @@ def reap(s, cfg, now):
         mark_record(s["record"], "exception")
         raise
     if not finish_close(s["tmux"], s["sid"], s["cwd"], s["claims"], summary(s), s["pane"],
-                        s["session_id"], alone, cfg, now, s["pid"]):
+                        s["session_id"], alone, cfg, now, s["pid"], s.get("oracle_not_mine")):
         return "skipped:close-unconfirmed", [f"{s['tmux']}: log or issue comment not confirmed; record stays exiting"]
     # Kill only what this session owned: the whole tmux session if it was its only pane.
     # Recount just before the kill: a window opened during the exit wait must survive. A pane
@@ -1769,6 +1975,10 @@ def report_line(s, keep, outcome):
     why = [f"would-close: {s['would_close']}"] if s.get("would_close") else []
     why += ["would-close: inbox DONE (shadow)"] if s.get("inbox_done_shadow") else []
     why += ["would-close: done grace (shadow)"] if s.get("done_grace_shadow") else []
+    nm = s.get("oracle_not_mine_shadow") or s.get("oracle_not_mine") or {}
+    why += [("would-close: " if s.get("oracle_not_mine_shadow") else "") + "oracle:not-mine "
+            + "; ".join(f"#{n} {_cell(w, 120)}" for n, w in nm.items())
+            + (" (shadow)" if s.get("oracle_not_mine_shadow") else "")] if nm else []
     why += ["FALSE_WAITING: " + ",".join(s["false_waiting"])] if s.get("false_waiting") else []
     why += [f"would-close: no claim, {s['noclaim_done_shadow']} (shadow)"] if s.get("noclaim_done_shadow") else []
     if s.get("claim_why"):  # name why no claim was found
@@ -1843,6 +2053,8 @@ def main(argv=None):
                 keep = decide(s, cfg)
                 if s.get("done_grace_error"):
                     notes.append(f"{s['tmux']} ({s['sid']}): DONE_GRACE shadow: {s['done_grace_error']}")
+                if s.get("oracle_not_mine_error"):
+                    notes.append(f"{s['tmux']} ({s['sid']}): ORACLE_NOT_MINE shadow: {s['oracle_not_mine_error']}")
                 if s.get("noclaim_shadow_error"):
                     notes.append(f"{s['tmux']} ({s['sid']}): NOCLAIM_DONE shadow: {s['noclaim_shadow_error']}")
                 outcome = "keep" if keep else ("reap" if apply else "would-reap")
@@ -1851,7 +2063,7 @@ def main(argv=None):
                         sv = shadow_verdict(s, cfg, keep, now)
                         s["blocked"], s["would_close"] = sv["blocked"], sv["would_close"]
                         outcome = ("would-close" if sv["would_close"] or s.get("noclaim_done_shadow") or s.get("done_grace_shadow")
-                                   else outcome)
+                                   or s.get("oracle_not_mine_shadow") else outcome)
                     except Exception as e:  # a report-only verdict must not fail the sweep
                         notes.append(f"{s['tmux']} ({s['sid']}): shadow verdict: {type(e).__name__}: {e}")
                 if not keep and apply:
