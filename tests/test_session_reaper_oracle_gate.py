@@ -125,7 +125,8 @@ class Gate(unittest.TestCase):
     def test_wait_on_another_sessions_check_by_keeps(self):
         # review P1-2: the issue's earliest check-by can be another session's or a former owner's
         js = dict(MINE_JSON, claimant={"session": OTHER[:8], "name": "x", "harness": "claude"})
-        self.assertEqual(self.decide({"2": WAIT_CHECK_BY}, js=js)[0], ["issue-unknown:#2"])
+        theirs = dict(CLAIM, body=f"Claimed by claude session {OTHER[:8]} (x)")  # claimed and checked by the other
+        self.assertEqual(self.decide({"2": WAIT_CHECK_BY}, js=js, comments=(theirs, CHECK))[0], ["issue-unknown:#2"])
         self.assertEqual(self.decide({"2": WAIT_CHECK_BY}, js=dict(MINE_JSON, claimant=None))[0], ["issue-unknown:#2"])
 
     def test_wait_on_a_check_by_older_than_the_newest_claim_keeps(self):
@@ -152,7 +153,13 @@ class Gate(unittest.TestCase):
         # review P3-5: a brief cached for ten minutes can name a time that has passed
         past = WAIT_CHECK_BY.replace(DUE, "2026-11-02T15:00:00Z")
         js = dict(MINE_JSON, pending_check_by="2026-11-02T15:00:00Z")
-        self.assertEqual(self.decide({"2": past}, js=js)[0], ["issue-unknown:#2"])
+        check = dict(CHECK, body=CHECK["body"].replace(DUE, "2026-11-02T15:00:00Z"))  # bound in every other way
+        self.assertEqual(self.decide({"2": past}, js=js, comments=(CLAIM, check))[0], ["issue-unknown:#2"])
+        later = NOW + 3600  # the same shape an hour ahead closes, so only the time keeps the one above
+        stamp = reaper.time.strftime("%Y-%m-%dT%H:%M:%SZ", reaper.time.gmtime(later))
+        keep, _ = self.decide({"2": WAIT_CHECK_BY.replace(DUE, stamp)}, js=dict(MINE_JSON, pending_check_by=stamp),
+                              comments=(CLAIM, dict(CHECK, body=CHECK["body"].replace(DUE, stamp))))
+        self.assertEqual(keep, [])
 
     def test_wait_without_a_check_by_keeps(self):
         # the session still owes the check-by comment
