@@ -20,7 +20,8 @@ claim and its waker; compare with `--brief` of the same issue.
 A not-mine close never releases the claim: its issue comment (notmine_comment) has no `Released by` first line, so the
 claim stays on this session and the stranded-step dispatcher can `claude --resume` it, with its context, at the
 check-by or wake. The release comment of stima-api #7000 is for a session closed as finished, not for one whose step
-is merely someone else's for now.
+is merely someone else's for now; the not-mine comment carries its own marker (`session-reaper-notmine:<sid>:<pid>`),
+so the finished comment and its release still come when the resumed session is closed as finished.
 
 Shadow verdict (#6477): a kept session that a person would also call finished gets the outcome
 `would-close` in the report. It is never acted on: reap() runs only for a session with no keep reason.
@@ -1722,15 +1723,29 @@ def has_marker(issue_ref, sid):
         return None
 
 
-def notmine_comment(rec_tmux, sid, cwd, why):
+def notmine_comment(rec_tmux, sid, cwd, why, pid=None):
     """The close comment on a claim the oracle says is not the session's step (stima-api #7001). It is never a release:
     no `Released by` (or `Claimed by`) first line, so delivery_state.claimant() still names this session and the
     stranded-step dispatcher resumes it at its check-by or wake, with its context. The reason goes in inline code, so
-    a check-by time it quotes schedules nothing."""
+    a check-by time it quotes schedules nothing. Its marker is not the `session-reaper:<sid>` one: that marker says the
+    session was closed as finished, and a session resumed after this close still gets that comment (and with #7000
+    its release) when it is closed as finished. The pid makes each close of a resumed session its own."""
     why = _cell(why, 200).replace("`", "'")
     return (f"Session `{rec_tmux}` (`{sid}`) was closed by session-reaper: the oracle says the step is not its own "
             f"(`{why}`). The claim stays with it, not released, so it is resumed with "
-            f"`cd {cwd} && claude --resume {sid}` when that step comes back.\n\n<!-- session-reaper:{sid} -->")
+            f"`cd {cwd} && claude --resume {sid}` when that step comes back.\n\n<!-- {notmine_mark(sid, pid)} -->")
+
+
+def notmine_mark(sid, pid):
+    return f"session-reaper-notmine:{sid}:{pid}"
+
+
+def notmine_posted(ref, sid, pid):
+    """True/False when the issue has (no) not-mine close comment for this close; None when gh could not say."""
+    comments = issue_comments(*ref)
+    if comments is None:
+        return None
+    return any(notmine_mark(sid, pid) in (c.get("body") or "") for c in comments if isinstance(c, dict))
 
 
 def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg, now, pid=None, not_mine=None):
@@ -1754,11 +1769,16 @@ def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg,
             fh.write(f"\n## {stamp} session-reaper (resume: claude --resume <sid>)\n"
                      f"- {rec_tmux} {sid} cwd={cwd} issues={issues} — {summ} {mark}\n")
     ok = True
+    for ref in [r for r in claims if str(r[1]) in not_mine]:  # #7001: never a release, so the claim stays
+        seen = notmine_posted(ref, sid, pid)
+        if seen is False:
+            ok = comment(ref, notmine_comment(rec_tmux, sid, cwd, not_mine[str(ref[1])], pid)) and ok
+        elif seen is None:
+            ok = False
+    claims = [r for r in claims if str(r[1]) not in not_mine]
     for ref in claims:
         seen = has_marker(ref, sid)
-        if seen is False and str(ref[1]) in not_mine:
-            ok = comment(ref, notmine_comment(rec_tmux, sid, cwd, not_mine[str(ref[1])])) and ok
-        elif seen is False:
+        if seen is False:
             ok = comment(ref, f"Session `{rec_tmux}` (`{sid}`) finished and was reaped by session-reaper. "
                               f"Resume it with `cd {cwd} && claude --resume {sid}`.\n\n<!-- session-reaper:{sid} -->") and ok
         elif seen is None:

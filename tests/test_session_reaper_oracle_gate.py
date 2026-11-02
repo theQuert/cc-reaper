@@ -240,21 +240,38 @@ class NoRelease(unittest.TestCase):
 
     def test_a_not_mine_close_posts_no_release_comment(self):
         why = "wait check-by 2026-11-03T06:00:00Z; the dispatcher wakes it"
-        with mock.patch.object(reaper, "has_marker", return_value=False), \
+        with mock.patch.object(reaper, "has_marker", return_value=False) as hm, \
+             mock.patch.object(reaper, "issue_comments", return_value=[]), \
              mock.patch.object(reaper, "comment", return_value=True) as comment:
             ok = reaper.finish_close("work", SID, "/w", [(REPO, "2"), (REPO, "3")], "x", "%9", "$3", True, self.cfg,
                                      NOW, 4242, {"2": why})
         self.assertTrue(ok)
+        self.assertEqual([c.args[0] for c in hm.call_args_list], [(REPO, "3")])  # the release path never sees #2
         bodies = {c.args[0][1]: c.args[1] for c in comment.call_args_list}
         body = bodies["2"]
         first = body.splitlines()[0]
         self.assertNotRegex(first, r"(?i)^[ \t*_]*(released|claimed) by\b")
         self.assertIn("not released", body)
         self.assertIn(f"claude --resume {SID}", body)
-        self.assertIn(f"<!-- session-reaper:{SID} -->", body)
+        self.assertIn(f"<!-- session-reaper-notmine:{SID}:4242 -->", body)
+        # not the finished marker: a resumed session closed as finished later still gets its own comment
+        self.assertNotIn(f"session-reaper:{SID}", body)
         # the check-by time it quotes sits in inline code, so the oracle reads no new check-by from it
         self.assertFalse(reaper.CHECKBY_STAMP_RE.search(reaper.INLINE_CODE_RE.sub("", reaper._outside_code(body))))
         self.assertNotIn("not its own", bodies["3"])  # a claim closed as finished keeps its own comment
+
+    def test_a_not_mine_close_posts_once_per_close_and_waits_when_gh_cannot_say(self):
+        posted = [{"body": f"x\n<!-- session-reaper-notmine:{SID}:4242 -->"}]
+        for comments, calls, ok in ((posted, 0, True), (None, 0, False)):
+            with self.subTest(comments=comments), mock.patch.object(reaper, "issue_comments", return_value=comments), \
+                 mock.patch.object(reaper, "comment", return_value=True) as comment:
+                got = reaper.finish_close("work", SID, "/w", [(REPO, "2")], "x", "%9", "$3", True, self.cfg, NOW, 4242,
+                                          {"2": "stop x (reported); wake: y"})
+            self.assertEqual((comment.call_count, got), (calls, ok))
+        with mock.patch.object(reaper, "issue_comments", return_value=posted), \
+             mock.patch.object(reaper, "comment", return_value=True) as comment:  # the same session resumed, new pid
+            reaper.finish_close("work", SID, "/w", [(REPO, "2")], "x", "%9", "$3", True, self.cfg, NOW, 5151, {"2": "y"})
+        self.assertEqual(comment.call_count, 1)
 
     def test_the_record_carries_the_not_mine_claims_for_recovery(self):
         s = session(oracle_not_mine={"2": "stop x (reported); wake: y"}, pid=4242, start="t0", pane="%9")
