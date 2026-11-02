@@ -1551,6 +1551,19 @@ def has_marker(issue_ref, sid):
         return None
 
 
+def release_comment(rec_tmux, sid, cwd, ref, cfg, now):
+    """The reap comment on a claimed issue. Its first line releases the claim (stima-api#7000): delivery_state.claimant()
+    ends a claim at a `Released by ... session <id>` first line (#6134), so the issue reads unclaimed, not owned by a
+    dead session. `next:` is the oracle's first line, read before the release; the marker keeps the post once."""
+    repo, num = ref
+    brief = oracle_brief(repo, num, cfg, now)
+    step = brief.splitlines()[0] if brief else f"unread; run `delivery_state.py {num} --brief`"
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    return (f"Released by {rec_tmux} session {sid} (reaped {at}); next: {step}\n\n"
+            f"Session `{rec_tmux}` (`{sid}`) finished and was reaped by session-reaper. "
+            f"Resume it with `cd {cwd} && claude --resume {sid}`.\n\n<!-- session-reaper:{sid} -->")
+
+
 def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg, now, pid=None):
     """The steps after claude has exited, safe to repeat: each checks for its own earlier effect.
     Returns False when a step could not be confirmed (the record then stays "exiting")."""
@@ -1573,8 +1586,7 @@ def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg,
     for ref in claims:
         seen = has_marker(ref, sid)
         if seen is False:
-            ok = comment(ref, f"Session `{rec_tmux}` (`{sid}`) finished and was reaped by session-reaper. "
-                              f"Resume it with `cd {cwd} && claude --resume {sid}`.\n\n<!-- session-reaper:{sid} -->") and ok
+            ok = comment(ref, release_comment(rec_tmux, sid, cwd, ref, cfg, now)) and ok
         elif seen is None:
             ok = False
     return ok
