@@ -1955,10 +1955,12 @@ exists "$WORK/l" $SID7 && pass "a gate answer with a non-mention reason keeps th
 # by a transcript, marked.
 SIDM=a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1
 TWO_H_AGO="$(date -v-2H +%Y%m%d%H%M 2>/dev/null || date -d '2 hours ago' +%Y%m%d%H%M)"
-mark() {  # <dir> <sid> [touch -t stamp]
+mark() {  # <dir> <sid> [touch -t stamp]: the stamp ages the marker and the directory it was written into
   printf 'session=%s\nat=2026-11-04T00:00:00Z\n' "$2" > "$1/claude-task-done"
-  [ -z "${3:-}" ] || touch -t "$3" "$1/claude-task-done"
+  [ -z "${3:-}" ] || touch -t "$3" "$1/claude-task-done" "$1"
 }
+# The reap cases run with the class on; it ships as spotcheck (review P3-4), pinned below.
+export CC_RB_DONE_MARKER=auto
 marked_fixture() {
   local root="$1" sid
   live_fixture "$root"
@@ -2003,6 +2005,37 @@ check "  and the log says so" "$OUT" "job dir reaped: .*/${SIDM:0:8} (marked don
 check "  and says why" "$OUT" "job dir kept: .*/${SID7:0:8} — its done marker names session $SIDM"
 check "done marker: the ledger counts the job directories" "$OUT" "done jobs: 1 reaped, 2 kept"
 
+# Review P3-1: later work anywhere in the tree keeps it, and so does a tree moved in whole with its
+# old mtimes, which only the marked directory's own mtime shows.
+age_marked() {  # <root>: SIDM's marker, directory and contents two hours old, so "later" is now
+  find "$1/scratch/proj/$SIDM" -exec touch -t "$TWO_H_AGO" {} +
+}
+marked_fixture "$WORK/m"; age_marked "$WORK/m"
+mkdir -p "$WORK/m/scratch/proj/$SIDM/a/b"; : > "$WORK/m/scratch/proj/$SIDM/a/b/late.txt"
+# Only late.txt is new: every directory above it, the marked one too, is aged back.
+touch -t "$TWO_H_AGO" "$WORK/m/scratch/proj/$SIDM" "$WORK/m/scratch/proj/$SIDM/a" "$WORK/m/scratch/proj/$SIDM/a/b"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && pass "done marker: a file written two levels down after the marker keeps it" \
+  || fail "done marker: removed a tree with a nested file written after its marker"
+check "  and says why" "$OUT" "scratchpad kept: .*$SIDM — marked done, but written after its done marker"
+marked_fixture "$WORK/m"; age_marked "$WORK/m"
+mkdir -p "$WORK/m/moved/sub"; : > "$WORK/m/moved/sub/f"; find "$WORK/m/moved" -exec touch -t "$TWO_H_AGO" {} +
+mv "$WORK/m/moved" "$WORK/m/scratch/proj/$SIDM/moved"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && pass "done marker: a tree moved in whole after the marker keeps it" \
+  || fail "done marker: removed a tree moved in after its marker"
+check "  and says why" "$OUT" "scratchpad kept: .*$SIDM — marked done, but written after its done marker"
+marked_fixture "$WORK/m"; age_marked "$WORK/m"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && fail "done marker: an aged marked tree with nothing later was kept" \
+  || pass "done marker: aged, with nothing written after the marker, it goes"
+
+marked_fixture "$WORK/m"
+OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && [ -d "$WORK/m/home/.claude/jobs/${SIDM:0:8}" ] && pass "done marker: unset, it is spotcheck and removes nothing" \
+  || fail "done marker: the default removed a marked directory"
+check "  and logs what it would remove" "$OUT" "scratchpad spot-check: .*$SIDM .*marked done and removable"
+
 marked_fixture "$WORK/m"
 OUT="$(run "$WORK/m" "$SCRIPT")"
 check "done marker: a dry run says WOULD" "$OUT" "scratchpad WOULD be reaped: .*$SIDM (marked done)"
@@ -2035,6 +2068,7 @@ printf '%s %s\n' 4545 "$WORK/m/scratch/proj/$SIDM/out.txt" > "$WORK/m/lsof-held"
 OUT="$(run_real "$WORK/m" "$SCRIPT")"
 exists "$WORK/m" $SIDM && pass "done marker: held at the pre-removal check, kept" || fail "done marker: removed a directory held at removal"
 check "  and says who" "$OUT" "scratchpad kept: .*$SIDM — marked done, but held by 4545 at removal"
+unset CC_RB_DONE_MARKER
 
 # ---------------------------------------------------------------- the transcript lookup (G3, #5886)
 #

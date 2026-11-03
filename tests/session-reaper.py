@@ -2018,6 +2018,22 @@ class DoneMarker(unittest.TestCase):
     def test_a_reply_without_a_done_line_marks_nothing(self):
         self.assertEqual(reaper.write_done_markers(self.cfg, [self.s(last_text="pushed, CI running")], self.now), [])
 
+    def test_only_a_reply_that_ends_on_a_bare_done_line_marks(self):
+        # stima-api#7106 review P2-1: a reply that quotes, fences or explains the line is not a done reply.
+        not_done = [
+            "- `SESSION-DONE: <what is left>` goes last only when nothing is left\nNext I will run the suite\nthen push",
+            "The format is:\n```\nSESSION-DONE: nothing left\n```",
+            "> SESSION-DONE: nothing left\nThat was the peer's line; I am continuing",
+            "SESSION-DONE: nothing left\nActually one more thing.\nRunning the suite again.\nThen the report.",
+        ]
+        for text in not_done:
+            with self.subTest(text=text):
+                self.assertEqual(reaper.write_done_markers(self.cfg, [self.s(last_text=text)], self.now), [])
+                self.assertEqual(self.marks(), [])
+        out = reaper.write_done_markers(self.cfg, [self.s(last_text="Tests pass.\n\nSESSION-DONE: nothing left")],
+                                        self.now)
+        self.assertEqual(len(out), 3)
+
     def test_a_tool_call_after_the_text_marks_nothing(self):
         self.assertEqual(reaper.write_done_markers(self.cfg, [self.s(text_at=0, prompt_at=0)], self.now), [])
 

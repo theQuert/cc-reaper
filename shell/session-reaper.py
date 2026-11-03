@@ -99,8 +99,8 @@ DEFAULTS = {
     # counted only on the live config at APPLY=1) after which the sweep writes `<FLAG>=apply` for that one source
     # (STATE_DONE, ORACLE_NOT_MINE) into the live policy, with a line in the report.
     "SHADOW_CLEAN_ROUNDS": "5",
-    # stima-api#7106: `on`: at APPLY, a session whose newest reply (written after its last prompt) has a SESSION-DONE
-    # line gets `claude-task-done` (session=<id>, at=<UTC>) in its scratchpads (<SCRATCH_ROOT>/*/<id>) and in
+    # stima-api#7106: `on`: at APPLY, a session whose newest reply (written after its last prompt) ends on a bare
+    # SESSION-DONE line (said_done) gets `claude-task-done` (session=<id>, at=<UTC>) in its scratchpads (<SCRATCH_ROOT>/*/<id>) and in
     # <JOBS_DIR>/<first 8 of id> when they exist; reclaim-byproducts.sh then reaps them once nothing holds them.
     "DONE_MARKER": "on",
     "SCRATCH_ROOT": "",  # empty: /tmp/claude-<uid>
@@ -1045,9 +1045,9 @@ def write_done_markers(cfg, sessions, now, skipped=None):
     root = os.path.expanduser(cfg.get("SCRATCH_ROOT") or f"/tmp/claude-{os.getuid()}")
     jobs = os.path.expanduser(cfg.get("JOBS_DIR") or "~/.claude/jobs")
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-    done = [s for s in sessions
-            if SID_RE.fullmatch(s.get("sid") or "") and s.get("text_at") and s["text_at"] >= s.get("prompt_at", 0)
-            and DONE_RE.search(s.get("last_text") or "")]
+    # said_done(), not DONE_RE: the marker widens deletion, so only a reply that ENDS on a bare SESSION-DONE line,
+    # outside a code fence and after the last prompt, counts; a reply that quotes or explains the line does not.
+    done = [s for s in sessions if SID_RE.fullmatch(s.get("sid") or "") and said_done(s)]
     written = []
     if not done:
         return written

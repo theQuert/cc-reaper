@@ -168,7 +168,9 @@ RB_STATE_DIR="${CC_RB_STATE_DIR:-$HOME/.cc-reaper/state}"
 # neither it nor its session's transcript changed more than DONE_SLACK_SECONDS after the marker
 # (the reaper's own /exit lands after it; anything later is a session that went on working).
 # `auto` removes, `spotcheck` only logs what it would remove, `off` reads no marker.
-DONE_MARKER_MODE="${CC_RB_DONE_MARKER:-auto}"
+# spotcheck first, for one cycle, as every new deletion class here (CC_RB_NEW_RULES_MODE): it logs
+# what it would remove and removes nothing; auto lets it decide (stima-api#7106 review P3-4).
+DONE_MARKER_MODE="${CC_RB_DONE_MARKER:-spotcheck}"
 DONE_SLACK_SECONDS="${CC_RB_DONE_SLACK_SECONDS:-600}"
 case "$DONE_MARKER_MODE" in
   auto|spotcheck|off) ;;
@@ -883,7 +885,9 @@ done_keep_reason() {  # <dir> <sid> <live_ok> <live_set> <protected>
        "$d/claude-task-done" "$ref" "$DONE_SLACK_SECONDS" 2>/dev/null; then
     rm -f "$ref"; printf 'the marker time could not be read'; return
   fi
-  if [ -n "$("$FIND" "$d" -mindepth 1 ! -path "$d/claude-task-done" -newer "$ref" -print -quit 2>/dev/null)" ]; then
+  # The directory itself too: a tree moved in whole keeps its old mtimes, and only its new
+  # parent's mtime says it arrived. Writing the marker set that mtime to before the reference.
+  if [ -n "$("$FIND" "$d" ! -path "$d/claude-task-done" -newer "$ref" -print -quit 2>/dev/null)" ]; then
     rm -f "$ref"; printf 'written after its done marker'; return
   fi
   for t in "$PROJECTS_DIR"/*/"$sid".jsonl; do
