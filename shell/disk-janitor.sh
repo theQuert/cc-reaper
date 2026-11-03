@@ -58,6 +58,9 @@ Environment:
                            (default: ~/.claude/hooks/node-modules-template.sh)
   CC_DJ_TEMPLATE_STORE  The template store (default: $NODE_MODULES_TEMPLATE_STORE or
                            ~/.claude/node-modules-templates)
+  CC_DJ_TEMPLATE_DAILY  auto, spotcheck or off: once a day --check drops templates unused
+                           CC_DJ_TEMPLATE_DAILY_DAYS (7) days and keeps at most CC_DJ_TEMPLATE_CAP (4),
+                           least recently used first, each only after a fresh lsof +D (default: auto)
   CC_DJ_GO_BUILD_MAX_AGE_MIN  When the step runs (see CC_DJ_GO_BUILD_FREE_GB), it deletes go build cache
                            entries (regular files in the 00..ff subdirectories) unused this many
                            minutes, rule go-build-age, or `off` (default: 120, minimum 60: Go
@@ -118,6 +121,9 @@ CC_DJ_ACT_COOLDOWN_SECS="${CC_DJ_ACT_COOLDOWN_SECS:-10800}"
 CC_DJ_ACT_LOW_FREE_GB="${CC_DJ_ACT_LOW_FREE_GB:-20}"
 CC_DJ_ACT_LOW_COOLDOWN_SECS="${CC_DJ_ACT_LOW_COOLDOWN_SECS:-3300}"
 CC_DJ_ACT_TEMPLATES_PRUNE_DAYS="${CC_DJ_ACT_TEMPLATES_PRUNE_DAYS:-7}"
+CC_DJ_TEMPLATE_DAILY="${CC_DJ_TEMPLATE_DAILY:-auto}"
+CC_DJ_TEMPLATE_DAILY_DAYS="${CC_DJ_TEMPLATE_DAILY_DAYS:-7}"
+CC_DJ_TEMPLATE_CAP="${CC_DJ_TEMPLATE_CAP:-4}"
 # Under CC_DJ_ACT_LOW_FREE_GB the act deletes go build cache entries unused this many minutes
 # (rule go-build-age; a new step, so CC_DJ_NEW_STEPS_MODE gates it).
 CC_DJ_GO_BUILD_MAX_AGE_MIN="${CC_DJ_GO_BUILD_MAX_AGE_MIN:-120}"
@@ -420,9 +426,11 @@ _cc_dj_path_holder() {
 # Spot-check (default) logs each candidate - path, size, lsof result, verdict - to
 # CC_DJ_SPOTCHECK_LOG under one run id and deletes nothing. Auto deletes a candidate only
 # after an lsof taken immediately before shows no holder. Sets _CC_DJ_STEP_LINES for the
-# act's report; returns 0 always.
-_cc_dj_act_template_prune() {
-  local step_before="$1" days="$CC_DJ_ACT_TEMPLATES_PRUNE_DAYS" mode="$CC_DJ_NEW_STEPS_MODE"
+# act's report; returns 0 always. The daily step passes its own mode, a cap and its own days:
+# with a cap, a template past the newest <cap> (by mtime, which `apply` refreshes) is a
+# candidate too, unused or not.
+_cc_dj_act_template_prune() {  # <step_before> [mode] [cap] [days]
+  local step_before="$1" days="${4:-$CC_DJ_ACT_TEMPLATES_PRUNE_DAYS}" mode="${2:-$CC_DJ_NEW_STEPS_MODE}" cap="${3:-}"
   local script store slog runid d name bytes verdict reason why
   local cand=0 removed=0 kept=0 would=0 would_bytes=0 removed_bytes=0
   _CC_DJ_STEP_LINES=""
@@ -452,7 +460,7 @@ _cc_dj_act_template_prune() {
   mkdir -p "$(dirname "$slog")" 2>/dev/null || true
   runid="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
   _cc_dj_spot() { printf '[%s] run=%s step=template-prune %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$runid" "$*" >> "$slog" 2>/dev/null || true; }
-  _cc_dj_spot "start mode=$mode store=$store unused_days=$days"
+  _cc_dj_spot "start mode=$mode store=$store unused_days=$days${cap:+ cap=$cap}"
   # Direct children only, plain directories (a symlink is not -type d), not dot-prefixed
   # (.adopting.* is an adopt in progress).
   while IFS= read -r -d '' d; do
@@ -482,17 +490,59 @@ _cc_dj_act_template_prune() {
       *) kept=$((kept + 1)) ;;
     esac
     _cc_dj_spot "mode=$mode path=$d size_bytes=${bytes:-?} holder=$_CC_DJ_HOLDER verdict=$verdict${reason:+ reason=$reason}${_CC_DJ_HOLDER_SAMPLE:+ sample=$_CC_DJ_HOLDER_SAMPLE}"
-  done < <(find "$store" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -mtime -"$days" -print0 2>/dev/null | sort -z)
+  done < <(_cc_dj_template_candidates "$store" "$days" "$cap")
   _cc_dj_spot "end mode=$mode candidates=$cand would_remove=$would removed=$removed kept=$kept"
   unset -f _cc_dj_spot
   if [ "$cand" -eq 0 ]; then
-    _CC_DJ_STEP_LINES="- node-modules template prune ($mode): no template unused for ${days}+ days"
+    _CC_DJ_STEP_LINES="- node-modules template prune ($mode): no template unused for ${days}+ days${cap:+ and at most $cap in the store}"
   elif [ "$mode" = spotcheck ]; then
     _CC_DJ_STEP_LINES="- node-modules template prune (spotcheck): would remove $would ($(_cc_dj_fmt_kb_delta $((would_bytes / 1024)))), kept $kept; nothing deleted; run=$runid in $slog"
   else
     _CC_DJ_STEP_LINES="- node-modules template prune (auto): removed $removed, kept $kept ($(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before )))); run=$runid in $slog"
   fi
   return 0
+}
+
+# The template prune's candidates, NUL-terminated, in name order: direct children of store $1
+# that are plain directories (a symlink is not -type d), not dot-prefixed (.adopting.* is an
+# adopt in progress), and unused $2 days; with a cap $3, also every one past the newest $3 by
+# mtime. Ages come from perl's lstat, not stat(1).
+_cc_dj_template_candidates() {  # <store> <days> [cap]
+  if [ -z "${3:-}" ]; then
+    find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -mtime -"$2" -print0 2>/dev/null | sort -z
+    return
+  fi
+  find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0 2>/dev/null |
+    perl -0 -sne 'chomp; push @d, $_ if defined((lstat $_)[9]);
+      END { my $now = time; my $i = 0;
+            for (sort { (lstat $b)[9] <=> (lstat $a)[9] or $a cmp $b } @d) {
+              print "$_\0" if $i++ >= $cap || $now - (lstat $_)[9] >= $days * 86400 } }' -- -days="$2" -cap="$3" |
+    sort -z
+}
+
+# Daily, from --check (stima-api#7106). The act's prune runs only under CC_DJ_ACT_FREE_GB and in
+# CC_DJ_NEW_STEPS_MODE, spotcheck on the host, so it never deleted: 19 templates on 2026-11-04,
+# 18 of them unused 7+ days. Once a day this runs the same per-path checks with the owner's
+# `prune 7` predicate and a cap of CC_DJ_TEMPLATE_CAP templates, least recently used first.
+# A held, unknown or protected template is kept; the daily stamp is written only after it ran.
+_cc_dj_template_prune_daily() {
+  local stamp="${CC_DJ_STATE_DIR%/}/template-prune-daily.stamp" mode="$CC_DJ_TEMPLATE_DAILY" store cap="$CC_DJ_TEMPLATE_CAP"
+  [ "$mode" = off ] && return 0
+  case "$mode" in
+    auto|spotcheck) ;;
+    *) _cc_dj_log "daily template prune: CC_DJ_TEMPLATE_DAILY=$mode is not auto, spotcheck or off; using spotcheck"; mode=spotcheck ;;
+  esac
+  case "$cap" in
+    ''|*[!0-9]*|0|00*) _cc_dj_log "ERROR daily template prune: CC_DJ_TEMPLATE_CAP=$cap is not a whole number of templates (1 or more); not run"; return 0 ;;
+  esac
+  store="${CC_DJ_TEMPLATE_STORE:-${NODE_MODULES_TEMPLATE_STORE:-$HOME/.claude/node-modules-templates}}"
+  [ -d "$store" ] || return 0
+  if [ -f "$stamp" ] && [ $(( $(date +%s) - $(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp") )) -lt 86400 ]; then
+    return 0
+  fi
+  _cc_dj_act_template_prune "$(_cc_dj_free_kb)" "$mode" "$((10#$cap))" "$CC_DJ_TEMPLATE_DAILY_DAYS"
+  [ -z "$_CC_DJ_STEP_LINES" ] || _cc_dj_log "daily template prune: ${_CC_DJ_STEP_LINES#- }"
+  touch "$stamp"
 }
 
 # A non-negative decimal number of GB as whole KiB. Status 1 for anything else.
@@ -911,6 +961,7 @@ _cc_dj_check() {
   _cc_dj_host_temp_reap
   _cc_dj_chrome_clones clean
   _cc_dj_builder_prune_daily
+  _cc_dj_template_prune_daily
   _cc_dj_orbstack_report
 
   if [ "$free_pct" -lt "$CC_DJ_DISK_MIN_PCT" ]; then
