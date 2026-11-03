@@ -27,7 +27,7 @@ reaper = load("session_reaper", ROOT / "shell" / "session-reaper.py")
 ss = load("session_state", ROOT / "shell" / "session_state.py")
 REAL = json.loads((ROOT / "tests" / "fixtures" / "delivery-state-briefs.json").read_text())
 REPO = "theQuert/stima-api"
-CFG = dict(reaper.DEFAULTS, IDLE_MINUTES="60", DONE_GRACE_MINUTES="5", DONE_INBOX="", STALL_MARK_DIR="",
+CFG = dict(reaper.DEFAULTS, IDLE_MINUTES="60", DONE_GRACE_MINUTES="5", STALL_MARK_DIR="",
            CHECKBY_REPO=REPO, PROTECT="keep-*", NEVER_CLOSE="")
 NOW = 1_800_000_000.0
 
@@ -57,8 +57,6 @@ DIALOG_PANE = " Bash command\n   rm -rf build\n Do you want to proceed?\n ❯ 1.
 WAIT_AHEAD = WAIT_SCHEDULED.replace("6633", "6634").replace("2026-11-03T07:23:00Z", "2027-02-01T08:00:00Z")
 # The reviewer's false-claim branches (stima-api #7061 review, finding 1): none names an issue.
 FALSE_CLAIM_BRANCHES = ("canary-main-1031", "chore/uiux-sync-1026", "uiux-accept-1029", "claude/prompt-size-403-4389")
-# NOW is 2027-01-15 08:00 UTC, 16:00 TPE: a DONE header two hours old, after the session's last prompt.
-INBOX_DONE = "## EL-X DONE · 2027-01-15 14:00 TPE · work\n"
 
 
 def transcript(tmp, text="Merged.\n\nSESSION-DONE: nothing left, #7026 merged"):
@@ -209,7 +207,7 @@ class Judge(unittest.TestCase):
                for i, b in enumerate(branches)]
         returns = {"ps_table": {10: (1, "P", "-zsh"), 11: (10, "A", "claude"), 12: (1, "B", "claude --bg")},
                    "worktrees": wts, "gh_repo": REPO, "pane_state": state, "foreground": True, "vim_mode": False,
-                   "subagent_activity": 0, "transcript_path": None, "relay_pending": [], "attached_pane": None}
+                   "subagent_activity": 0, "transcript_path": None, "attached_pane": None}
         with mock.patch.multiple(reaper, SESSIONS_DIR=tmp / "sessions"), \
              mock.patch.multiple(reaper, **{k: mock.Mock(return_value=v) for k, v in returns.items()}):
             return reaper.gather(CFG, NOW), reaper.gather(CFG, NOW, include_bg=True)
@@ -299,21 +297,24 @@ class ReaperConsumes(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
-        self.inbox = self.tmp / "inbox.md"
-        self.inbox.write_text(INBOX_DONE)
 
     def state(self, st="DONE", claims=()):
         return {"state": st, "claims": [{"issue": int(n), "repo": REPO, "oracle_step": "wait check-by"}
                                         for n in claims], "reasons": []}
 
     def done(self, **kw):
-        """A claim-less session every noclaim_done() gate passes for: a DONE inbox header after its last prompt."""
-        kw.setdefault("state", self.state())
+        """A session the state calls DONE whose one claim the oracle says is a check-by wait another party wakes
+        (see dec()): the oracle's soft `issue-unknown:#6634` is all that keeps it."""
+        kw.setdefault("claims", [(REPO, "6634")])
+        kw.setdefault("state", self.state(claims=["6634"]))
         kw.setdefault("last_text", "all good")
         return session(prompt_at=NOW - 9000, **kw)
 
+    def dec(self, s, **cfg):
+        return self.decide(s, {"6634": WAIT_AHEAD}, bound=True, **cfg)
+
     def decide(self, s, briefs=None, checkby="UNKNOWN", bound=False, **cfg):
-        cfg = dict(CFG, DONE_INBOX="", DONE_INBOX_SHADOW=str(self.inbox), **cfg)
+        cfg = dict(CFG, **cfg)
         with mock.patch.object(reaper, "oracle_brief", side_effect=lambda r, n, c, now: (briefs or {}).get(str(n))), \
              mock.patch.object(reaper, "worktree_state", side_effect=lambda w, c: list(w.get("problems", []))), \
              mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
@@ -325,19 +326,31 @@ class ReaperConsumes(unittest.TestCase):
     def test_the_state_has_its_own_column_shadow_by_default(self):
         self.assertEqual(reaper.DEFAULTS["STATE_DONE"], "shadow")
         s = self.done()
-        self.assertEqual(self.decide(s), ["claim-unknown"])
+        self.assertEqual(self.dec(s), ["issue-unknown:#6634"])
         self.assertEqual(s["state_shadow"], "STATE_DONE")
         self.assertIn("would-close: state DONE (STATE_DONE shadow)", reaper.report_line(dict(s, descendants=0), [], "x"))
-        # NOCLAIM_DONE=apply or ORACLE_NOT_MINE=apply no longer close on the state: only STATE_DONE does
-        s = self.done(last_text="要不要繼續？請確認")  # a waiting keyword: NOCLAIM_DONE's own path keeps it too
-        self.assertIn("waiting", self.decide(s, NOCLAIM_DONE="apply", ORACLE_NOT_MINE="apply"))
+        # ORACLE_NOT_MINE=apply does not close on the state: only STATE_DONE does
+        s = self.done(last_text="要不要繼續？請確認")  # a waiting keyword keeps it
+        self.assertTrue(any(k.startswith("waiting") for k in self.dec(s, ORACLE_NOT_MINE="apply")))
         self.assertNotIn("state_close", s)
         s = self.done()
-        self.assertEqual(self.decide(s, STATE_DONE="apply"), [])
+        self.assertEqual(self.dec(s, STATE_DONE="apply"), [])
         self.assertEqual(s["state_close"], "STATE_DONE")
         s = self.done()
-        self.assertEqual(self.decide(s, STATE_DONE="off"), ["claim-unknown"])
+        self.assertEqual(self.dec(s, STATE_DONE="off"), ["issue-unknown:#6634"])
         self.assertNotIn("state_shadow", s)
+
+    def test_a_claim_less_done_session_is_never_released_by_the_state(self):
+        """stima-api #7079: the inbox DONE header was the only release for a claim-less session besides its own
+        SESSION-DONE line, which decide() reads before the state; with the header gone the state holds it."""
+        for mode in ("shadow", "apply"):
+            with self.subTest(mode):
+                s = self.done(claims=[], state=self.state())
+                self.assertEqual(self.decide(s, STATE_DONE=mode), ["claim-unknown"])
+                self.assertEqual(s["state_held"], "no-claim")
+                self.assertNotIn("state_shadow", s)
+                self.assertNotIn("state_close", s)
+        self.assertFalse(hasattr(reaper, "noclaim_done"))
 
     def test_a_claimed_done_session_closes_only_when_claim_class_ends_every_claim(self):
         claimed = dict(session(claims=[(REPO, "6634")]), state=self.state(claims=["6634"]))
@@ -351,39 +364,32 @@ class ReaperConsumes(unittest.TestCase):
         s = dict(claimed)  # an unread brief: unknown, kept
         self.assertEqual(self.decide(s, {}, bound=True, STATE_DONE="apply"), ["issue-unknown:#6634"])
 
-    def test_a_question_to_a_person_keeps_a_claimless_done_session(self):
+    def test_a_question_to_a_person_keeps_a_done_session(self):
         # finding 3: `waiting` and `owed-step:` are not soft for the state
         self.assertFalse(any(k.startswith(reaper.STATE_SOFT) for k in ("waiting", "waiting-keyword", "owed-step:#1")))
         for text in ("要不要我改成 B 方案？等你回覆", "Should I go with option B? 請確認"):
             with self.subTest(text):
                 s = self.done(last_text=text)
-                keep = self.decide(s, STATE_DONE="apply")
-                self.assertIn("waiting", keep)
+                keep = self.dec(s, STATE_DONE="apply")
+                self.assertTrue(any(k.startswith("waiting") for k in keep), keep)
                 self.assertNotIn("state_close", s)
         # the same session judged end to end: the state calls it DONE (it never reads keywords), the reaper keeps it
         s = self.done(last_text="要不要我改成 B 方案？等你回覆", state=None)
-        with mock.patch.object(reaper, "oracle_brief", return_value=None), \
+        with mock.patch.object(reaper, "oracle_brief", return_value=WAIT_AHEAD), \
+             mock.patch.object(reaper, "wait_bound", return_value=True), \
              mock.patch.object(reaper, "oracle_claims", return_value=[]):
             s["state"] = ss.judge(dict(s), reaper, CFG, NOW)
         self.assertEqual(s["state"]["state"], "DONE")
-        self.assertIn("waiting", self.decide(s, STATE_DONE="apply"))
+        self.assertTrue(any(k.startswith("waiting") for k in self.dec(s, STATE_DONE="apply")))
 
     def test_existing_gates_hold_under_state_done_apply(self):
-        cases = {"never-close": dict(tmux="uiux-work"), "noclaim-done": dict(descendants=2),
+        cases = {"never-close": dict(tmux="uiux-work"),
                  "blocked:#7100": dict(last_text="all good, BLOCKED:#7100 on Leo")}
         for held, kw in cases.items():
             with self.subTest(held):
                 s = self.done(**kw)
-                self.assertEqual(self.decide(s, STATE_DONE="apply", NEVER_CLOSE="uiux*"), ["claim-unknown"])
+                self.assertEqual(self.dec(s, STATE_DONE="apply", NEVER_CLOSE="uiux*"), ["issue-unknown:#6634"])
                 self.assertEqual((s.get("state_held"), "state_close" in s), (held, False))
-        s = self.done()
-        self.inbox.write_text("")  # no DONE header: noclaim_done() says no
-        self.assertEqual(self.decide(s, STATE_DONE="apply"), ["claim-unknown"])
-        self.assertEqual(s["state_held"], "noclaim-done")
-        self.inbox.write_text(INBOX_DONE)
-        s = self.done(cwd=str(self.tmp))  # a dirty cwd
-        with mock.patch.object(reaper, "worktree_state", side_effect=lambda w, c: ["uncommitted:x"]):
-            self.assertFalse(reaper.noclaim_done(s, dict(CFG, DONE_INBOX=str(self.inbox)), NOW))
         # a claimed stop with a wake line closes only once its check-by is CLEAR
         stop = STOP_REPORTED + "\n  wake: a person answers on the issue"
         claimed = dict(session(claims=[(REPO, "6842")]), state=self.state(claims=["6842"]))
@@ -404,20 +410,20 @@ class ReaperConsumes(unittest.TestCase):
         for reason, kw in cases.items():
             with self.subTest(reason):
                 s = self.done(**kw)
-                keep = self.decide(s, STATE_DONE="apply")
+                keep = self.dec(s, STATE_DONE="apply")
                 self.assertIn(reason, keep)
                 self.assertNotIn("state_close", s)
-        s = self.done(state=self.state("PUSH"))
-        self.assertEqual(self.decide(s, STATE_DONE="apply"), ["claim-unknown"])
+        s = self.done(state=self.state("PUSH", claims=["6634"]))
+        self.assertEqual(self.dec(s, STATE_DONE="apply"), ["issue-unknown:#6634"])
 
     def test_an_error_in_the_state_gates_keeps_the_session(self):
         s = self.done()
         with mock.patch.object(reaper, "state_gates", side_effect=RuntimeError("boom")):
-            self.assertEqual(self.decide(s, STATE_DONE="apply"), ["claim-unknown"])
+            self.assertEqual(self.dec(s, STATE_DONE="apply"), ["issue-unknown:#6634"])
         self.assertEqual((s["state_error"], "state_close" in s, "state_shadow" in s), ("RuntimeError: boom", False, False))
         self.assertIn("state error: RuntimeError: boom", reaper.report_line(dict(s, descendants=0), ["claim-unknown"], "x"))
         s = self.done(state={"state": "DONE", "claims": "garbage"})
-        self.assertEqual(self.decide(s, STATE_DONE="apply"), ["claim-unknown"])  # a malformed state record
+        self.assertEqual(self.dec(s, STATE_DONE="apply"), ["issue-unknown:#6634"])  # a malformed state record
         self.assertNotIn("state_close", s)
 
 
@@ -428,7 +434,7 @@ class Rounds(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
         self.live = self.tmp / "session-reaper.conf"
-        self.live.write_text("APPLY=1\nSTATE_DONE=shadow\nORACLE_NOT_MINE=shadow\nNOCLAIM_DONE=shadow\n")
+        self.live.write_text("APPLY=1\nSTATE_DONE=shadow\nORACLE_NOT_MINE=shadow\n")
         self.sdir = self.tmp / "state"
         self.sdir.mkdir()
         patcher = mock.patch.object(reaper, "CONFIG", self.live)
@@ -484,9 +490,10 @@ class Rounds(unittest.TestCase):
         for i in range(6):
             self.sweep(NOW + i * 1800, (f"o{i % 3}",), source="oracle_not_mine_shadow")
         cfg = reaper.load_config(self.live)
-        self.assertEqual((cfg["ORACLE_NOT_MINE"], cfg["STATE_DONE"], cfg["NOCLAIM_DONE"]), ("apply", "shadow", "shadow"))
+        self.assertEqual((cfg["ORACLE_NOT_MINE"], cfg["STATE_DONE"]), ("apply", "shadow"))
         data = self.counter()
-        self.assertEqual((data["STATE_DONE"].get("streak", 0), data["NOCLAIM_DONE"].get("streak", 0)), (0, 0))
+        self.assertEqual(data["STATE_DONE"].get("streak", 0), 0)
+        self.assertNotIn("NOCLAIM_DONE", data)  # #7079: the claim-less inbox source is gone
 
     def test_a_miss_resets_the_streak_and_its_sessions(self):
         for i in range(4):

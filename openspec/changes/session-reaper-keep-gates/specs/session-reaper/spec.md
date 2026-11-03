@@ -3,19 +3,16 @@
 ### Requirement: Work the process tree cannot show keeps a session
 The session reaper SHALL keep a session in any of these cases:
 - **`subagent-active`:** a file under `<projects>/*/<session id>/subagents/` or `.../workflows/` was written within `SUBAGENT_QUIET_MINUTES`.
-- **`handoff-pending:relay#N`:** a request file `<issue>-*.json` for one of its claimed issues sits at the top of `RELAY_DIR` and is younger than `RELAY_MAX_AGE_HOURS`.
 - **`handoff-pending:prompt`:** the last 15 lines of its pane match `PROMPT_RE`.
 - **`handoff-missing:<file>`:** its latest assistant text names a path under `HANDOFF_ROOT` that does not exist.
 
-With `RELAY_DIR` or `HANDOFF_ROOT` empty, the matching check SHALL be off.
+With `HANDOFF_ROOT` empty, the matching check SHALL be off.
+
+Removed (stima-api #7079): the `handoff-pending:relay#N` gate and its `RELAY_DIR` / `RELAY_MAX_AGE_HOURS` settings. No relay requests exist any more, so a pending one keeps no session; every other gate here is unchanged.
 
 #### Scenario: A subagent is still working while the main prompt is idle
 - **WHEN** a session is idle past the threshold, done, and clean, but a subagent transcript was written within `SUBAGENT_QUIET_MINUTES`
 - **THEN** it is kept as `subagent-active`
-
-#### Scenario: An answered request does not keep a session
-- **WHEN** the only request for a claimed issue is renamed `.done`, moved into a subdirectory, or older than `RELAY_MAX_AGE_HOURS`
-- **THEN** no `handoff-pending:relay` reason is reported
 
 ### Requirement: The context to bring a session back is written before it exits
 Before typing `/exit`, the reaper SHALL write `<REAPED_DIR>/<tmux name>.json` holding:
