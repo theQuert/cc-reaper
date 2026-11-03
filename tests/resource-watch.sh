@@ -115,6 +115,8 @@ export CC_RW_RECLAIM_PLIST=/nonexistent/com.cc-reaper.reclaim-byproducts.plist C
 # The removed pause chain (stima-api #7079) wrote ~/handoffs/ops-dispatch/events.log; T20 sets the old variables on
 # purpose and asserts that nothing is written.
 export CC_RW_EVENTS_LOG="$TMPDIR_ROOT/no-events/events.log"
+# Nor the host's Chrome clones (T22 points this at its own fixtures).
+export CC_RW_CHROME_CLONE_GLOB="$TMPDIR_ROOT/no-clones/*/X/com.google.Chrome.code_sign_clone"
 
 # Helper: run a fresh snapshot in a controlled environment
 # Usage: run_snapshot [extra env vars as VAR=val ...]
@@ -1022,6 +1024,67 @@ expect_yes "T21d: (swap_hot=? on it)" grep -q ' swap_hot=? ' "$t17z/resource-wat
 sed -E 's/ swap_hot=[01?]//' "$t17w/resource-watch.log" > "$t17w/legacy.log"
 expect_no  "T21e: the same lines without swap_hot (a legacy log) keep the size-only rule: a miss" \
   t21_judge --log "$t17w/legacy.log"
+
+# T22: Chrome's code-sign clones (stima-api#7106): over CC_RW_CHROME_CLONE_GB while the running Chrome is not the
+# installed version, one ALERT:chrome-clone line and a notification "quit Chrome to free N GB"; at most once per hour.
+t22=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); t22s="$t22/stubs"; mkdir -p "$t22s"
+t22_plist() {  # <bundle dir> <version>
+  mkdir -p "$1/Contents/MacOS"; : > "$1/Contents/MacOS/Google Chrome"
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>%s</string></dict></plist>\n' "$2" > "$1/Contents/Info.plist"
+}
+for u in a b; do mkdir -p "$t22/clones/$u/X/com.google.Chrome.code_sign_clone"; done
+t22_run_app="$t22/clones/a/X/com.google.Chrome.code_sign_clone/code_sign_clone.rJvthW/Google Chrome.app.bundle"
+t22_plist "$t22_run_app" 156.0.8078.76
+t22_plist "$t22/Applications/Google Chrome.app" 156.0.8078.80
+t22_plist "$t22/Applications/Same Chrome.app" 156.0.8078.76
+cat > "$t22s/du" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in -*) ;; *) printf '%s\t%s\n' "${CC_RW_TEST_DU_KB:-0}" "$a" ;; esac; done
+STUB
+cat > "$t22s/pgrep" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = -x ]; then [ -n "${CC_RW_TEST_CHROME_PID:-}" ] && echo "$CC_RW_TEST_CHROME_PID"; exit 0; fi
+exec /usr/bin/pgrep "$@"
+STUB
+cat > "$t22s/lsof" <<'STUB'
+#!/usr/bin/env bash
+printf 'p%s\nftxt\nn/usr/lib/dyld\nftxt\nn%s\n' "${CC_RW_TEST_CHROME_PID:-}" "${CC_RW_TEST_CHROME_EXE:-/nonexistent}"
+STUB
+chmod +x "$t22s/du" "$t22s/pgrep" "$t22s/lsof"
+t22_case() {  # <out var prefix> [VAR=val ...]: one round with both clone dirs at 6 GB each, Chrome pid 4242 running .76
+  run_snapshot PATH="$t22s:$stub_dir:$PATH" CC_RW_CHROME_CLONE_GLOB="$t22/clones/*/X/com.google.Chrome.code_sign_clone" \
+    CC_RW_TEST_DU_KB=$((6 * 1048576)) CC_RW_TEST_CHROME_PID=4242 \
+    CC_RW_TEST_CHROME_EXE="$t22_run_app/Contents/MacOS/Google Chrome" \
+    CC_RW_CHROME_APP="$t22/Applications/Google Chrome.app" "$@"
+}
+t22a=$(t22_case); t22a_log=$(cat "$t22a.logpath")
+expect_yes "T22a: clones over the line under an outdated Chrome log ALERT:chrome-clone" \
+  grep -q 'ALERT:chrome-clone 12.0GB of Chrome code-sign clones; running 156.0.8078.76 (pid 4242), installed 156.0.8078.80: quit Chrome to free 12.0 GB' "$t22a_log"
+expect_yes "T22a: and notify, once, with the size" test "$(grep -c 'quit Chrome to free 12.0 GB' "$t22a")" -eq 1
+expect_yes "T22a: the judge still passes that log" t21_judge --log "$t22a_log"
+t22b=$(t22_case CC_RW_CHROME_APP="$t22/Applications/Same Chrome.app")
+expect_no  "T22b: the running Chrome is the installed version: no alert" grep -q 'chrome-clone' "$(cat "$t22b.logpath")"
+expect_no  "T22b: and no notification" grep -q 'quit Chrome' "$t22b"
+t22c=$(t22_case CC_RW_TEST_DU_KB=$((4 * 1048576)))
+expect_no  "T22c: two clones of 4 GB (8 GB) are under 10 GB: no alert" grep -q 'chrome-clone' "$(cat "$t22c.logpath")"
+t22d_state=$(mktemp -d "$TMPDIR_ROOT/XXXXXX"); touch "$t22d_state/chrome-clone.checked"
+t22d=$(t22_case CC_RW_STATE_DIR="$t22d_state")
+expect_no  "T22d: measured within the hour: not measured again" grep -q 'quit Chrome' "$t22d"
+touch -t "$(date -v-2H +%Y%m%d%H%M)" "$t22d_state/chrome-clone.checked"
+t22d=$(t22_case CC_RW_STATE_DIR="$t22d_state")
+expect_yes "T22d: an hour later it is" grep -q 'quit Chrome to free 12.0 GB' "$t22d"
+expect_yes "T22d: and the stamp is fresh again" test "$(( $(date +%s) - $(stat -f %m "$t22d_state/chrome-clone.checked") ))" -lt 600
+t22e=$(t22_case CC_RW_TEST_CHROME_PID=)
+expect_no  "T22e: no Chrome running: nothing to quit, no line" grep -q 'chrome-clone' "$(cat "$t22e.logpath")"
+t22f=$(t22_case CC_RW_TEST_CHROME_EXE=/nonexistent/Contents/MacOS/Google\ Chrome)
+expect_yes "T22f: a running version it cannot read is INFO" \
+  grep -q 'INFO chrome-clone: 12.0GB of code-sign clones; running Chrome version unreadable (pid 4242), installed 156.0.8078.80: no alert' "$(cat "$t22f.logpath")"
+expect_no  "T22f: never an alert" grep -q 'ALERT:chrome-clone\|quit Chrome' "$(cat "$t22f.logpath")" "$t22f"
+t22g=$(t22_case CC_RW_CHROME_CLONE_GB=0)
+expect_no  "T22g: CC_RW_CHROME_CLONE_GB=0 disables it" grep -q 'chrome-clone' "$(cat "$t22g.logpath")"
+expect_no  "T22g: and measures nothing" test -e "$(cat "$t22g.statedir")/chrome-clone.checked"
+t22h=$(t22_case CC_RW_CHROME_CLONE_GB=20)
+expect_no  "T22h: under a raised line (12 GB < 20): no alert" grep -q 'quit Chrome' "$t22h"
 
 if [ "$failures" -gt 0 ]; then
   printf "%s test failure(s)\n" "$failures"

@@ -68,6 +68,12 @@ Environment:
                        LaunchAgent (CC_RW_RECLAIM_PLIST), 172800 for a calendar schedule, and 7200 when the
                        plist cannot be read. Alert only, nothing is ended. Skipped when CC_RW_RECLAIM_SCRIPT
                        is not installed
+  CC_RW_CHROME_CLONE_GB  Chrome's code-sign clones (/private/var/folders/*/*/X/com.google.Chrome.code_sign_clone)
+                       over this many GB, while the running Chrome is not the installed version, log
+                       ALERT:chrome-clone and notify "quit Chrome to free N GB" (default: 10); 0 disables.
+                       Measured once per CC_RW_CHROME_CLONE_EVERY_SECS (default: 3600). Alert only
+  CC_RW_CHROME_CLONE_GLOB  Test seam: the clone directories (a glob)
+  CC_RW_CHROME_APP     The installed Chrome (default: /Applications/Google Chrome.app)
   CC_RW_RECLAIM_STAMP  That stamp (default: ~/.claude/logs/reclaim-byproducts.last, BYPRODUCT_STAMP's default)
   CC_RW_RECLAIM_PLIST  The reclaimer's LaunchAgent (default: ~/Library/LaunchAgents/com.cc-reaper.reclaim-byproducts.plist)
 Every snapshot line carries `swap=<gb>GB rate=<gbh>GB/h swap_hot=<1|0|?>` after disk_free (`?` when unreadable
@@ -423,6 +429,56 @@ _cc_rw_reclaim_stall() {  # <now epoch>
   [ "$(cat "$marker" 2>/dev/null)" = "$key" ] && return 0
   printf '%s\n' "$key" > "$marker" 2>/dev/null || true
   _CC_RW_RECLAIM_STALL_FIRE="the reclaimer's last finished sweep was ${age}s ago (over ${limit}s)"
+}
+
+# ---------------------------------------------------------------------------
+# Chrome's code-sign clones (stima-api#7106)
+# ---------------------------------------------------------------------------
+#
+# A Chrome that keeps running across an update runs from a copy of its old bundle under
+# $TMPDIR/../X/com.google.Chrome.code_sign_clone, and every relaunch of a helper can leave another;
+# they go only when that Chrome quits. On 2026-11-04 the Mac mini held 28 of them under a Chrome
+# running 156.0.8078.76 (its executable inside a clone) with 156.0.8078.80 installed. Once per
+# CC_RW_CHROME_CLONE_EVERY_SECS: when the clones hold over CC_RW_CHROME_CLONE_GB and the running
+# version (the Info.plist of the bundle that lsof reports as the main Chrome process's executable)
+# differs from the installed one, one ALERT:chrome-clone line and a notification. Alert only: it
+# quits nothing and deletes nothing. A version it cannot read is logged as INFO, never alerted.
+_cc_rw_plist_version() {
+  /usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$1/Contents/Info.plist" 2>/dev/null
+}
+_cc_rw_chrome_clone() {  # <now epoch>
+  local now=$1 limit every stamp mt kb gb pid exe app running installed
+  local -a dirs
+  limit=$(_cc_rw_num CC_RW_CHROME_CLONE_GB 10)
+  awk -v l="$limit" 'BEGIN { exit !(l + 0 > 0) }' || return 0
+  every=$(_cc_rw_num CC_RW_CHROME_CLONE_EVERY_SECS 3600)
+  stamp="$(_cc_rw_state_dir)/chrome-clone.checked"
+  if [ -f "$stamp" ]; then
+    mt=$(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp" 2>/dev/null || echo 0)
+    [ $(( now - mt )) -lt "${every%.*}" ] && return 0
+  fi
+  touch "$stamp" 2>/dev/null || true
+  # shellcheck disable=SC2206
+  dirs=( ${CC_RW_CHROME_CLONE_GLOB:-/private/var/folders/*/*/X/com.google.Chrome.code_sign_clone} )
+  [ -d "${dirs[0]}" ] || return 0
+  kb=$(_cc_rw_run_bounded 60 du -sk "${dirs[@]}" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ { s += $1 } END { print s + 0 }')
+  gb=$(awk -v k="$kb" 'BEGIN { printf "%.1f", k / 1048576 }')
+  _cc_rw_above "$gb" "$limit" || return 0
+  installed=$(_cc_rw_plist_version "${CC_RW_CHROME_APP:-/Applications/Google Chrome.app}")
+  pid=$(pgrep -x -U "$(id -u)" 'Google Chrome' 2>/dev/null | head -n 1)
+  if [ -n "$pid" ]; then
+    exe=$(_cc_rw_run_bounded 20 lsof -a -p "$pid" -d txt -Fn 2>/dev/null \
+      | awk '/^n.*\/Contents\/MacOS\/Google Chrome$/ { print substr($0, 2); exit }')
+    [ -n "$exe" ] && running=$(_cc_rw_plist_version "${exe%/Contents/MacOS/Google Chrome}")
+  fi
+  if [ -z "$running" ] || [ -z "$installed" ]; then
+    [ -z "$pid" ] && return 0   # no Chrome running: the clones are left from one that quit
+    _cc_rw_log_line "INFO chrome-clone: ${gb}GB of code-sign clones; running Chrome version ${running:-unreadable} (pid ${pid}), installed ${installed:-unreadable}: no alert"
+    return 0
+  fi
+  [ "$running" = "$installed" ] && return 0
+  _cc_rw_log_line "ALERT:chrome-clone ${gb}GB of Chrome code-sign clones; running ${running} (pid ${pid}), installed ${installed}: quit Chrome to free ${gb} GB"
+  _cc_rw_maybe_notify "chrome-clone" "quit Chrome to free ${gb} GB" "$now"
 }
 
 # ---------------------------------------------------------------------------
@@ -1003,6 +1059,8 @@ _cc_rw_snapshot() {
 
   [ "$mem_breach"  = "true" ] && _cc_rw_maybe_notify "mem" \
     "mem free ${mem_free_pct}% below ${mem_min_pct}% and compressor ${compressor_gb}GB above ${comp_threshold_gb}GB" "$now"
+
+  _cc_rw_chrome_clone "$now"
 
   # --- disk guard: the go cache cap every run, bounded so the round stays short ---
   local reclaim_script="${CC_RW_RECLAIM_SCRIPT:-$HOME/.cc-reaper/reclaim-byproducts.sh}"
