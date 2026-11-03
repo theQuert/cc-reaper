@@ -285,6 +285,9 @@ class File(unittest.TestCase):
                 self.assertEqual(ss.main(["--config", str(bare)]), 2)
                 self.assertEqual(ss.main(["--config", str(copy)]), 0)
                 self.assertFalse(live_file.exists())
+                # review 2, P3: --out may not point a non-live run at the live file either
+                self.assertEqual(ss.main(["--config", str(copy), "--out", str(live_file)]), 2)
+                self.assertFalse(live_file.exists())
                 self.assertEqual(ss.read(own / "sessions.json", time.time())["counts"]["DONE"], 1)
                 self.assertEqual(ss.main(["--config", str(live_conf)]), 0)
                 self.assertEqual(ss.read(live_file, time.time())["counts"]["DONE"], 1)

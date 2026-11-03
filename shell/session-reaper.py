@@ -1215,7 +1215,7 @@ def decide(s, cfg, now=None):
 # other reason still keeps it: protected, never-kill, vim-mode, not-foreground, a subagent, a shell, a loop or
 # scheduled task, a child process, a stall mark, a handoff, a question to a person (`waiting`), a step the oracle says
 # is its own (`owed-step:`), uncommitted or unpushed work.
-STATE_SOFT = ("claim-unknown", "issue-unknown:", "issue-open:", "check-by-", "idle:", "open-pr", "alarm-passed",
+STATE_SOFT = ("claim-unknown", "issue-unknown:", "issue-open:", "check-by-", "open-pr", "alarm-passed",
               "named-claim:")
 # Each shadow source has its own clean-round counter and flips only its own flag (stima-api #7061 review, finding 9).
 SHADOW_SOURCES = ("STATE_DONE", "ORACLE_NOT_MINE", "NOCLAIM_DONE")
@@ -1310,17 +1310,20 @@ def state_file(cfg, live, ss):
     if not cfg.get("STATE_DIR"):
         return None
     own = state_dir(cfg) / "sessions.json"
+    return None if is_live_state_path(own, ss) else own
+
+
+def is_live_state_path(path, ss):
+    """True when `path` is a sessions.json readers act on (or cannot be resolved), so a non-live run must not write it."""
     lives = {ss.default_path(), HOME / ".cc-reaper" / "state" / "sessions.json"}
     try:
         lives.add(ss.default_path(state_dir(load_config(CONFIG))))
     except Exception:
         pass
     try:
-        if own.resolve() in {Path(p).expanduser().resolve() for p in lives}:
-            return None
+        return Path(path).expanduser().resolve() in {Path(p).expanduser().resolve() for p in lives}
     except (OSError, RuntimeError):
-        return None
-    return own
+        return True
 
 
 def load_session_state():

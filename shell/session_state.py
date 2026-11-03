@@ -263,7 +263,12 @@ def main(argv=None):
     records = judge_all(r, gathered, cfg, now)
     unjudged = [{"label": label, "why": why} for label, why, live in r.SKIPPED if live and why != "kind:bg"]
     live = args.config is None or r.live_config(args.config)
-    out = Path(args.out) if args.out else r.state_file(cfg, live, SimpleNamespace(default_path=default_path))
+    ss = SimpleNamespace(default_path=default_path)
+    out = Path(args.out) if args.out else r.state_file(cfg, live, ss)
+    if args.out and not live and r.is_live_state_path(out, ss):
+        print("session_state: not written: --out names the live sessions.json while --config is not the live config",
+              file=sys.stderr)
+        return 2
     if out is None:
         print("session_state: not written: --config is not the live config and sets no STATE_DIR of its own; "
               "pass --out", file=sys.stderr)
