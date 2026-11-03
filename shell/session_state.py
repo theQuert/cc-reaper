@@ -4,19 +4,19 @@
 Each session gets exactly one `state`:
 
   WORKING         busy, background work of its own (a shell, a pending wakeup, a cron, a scheduled task, a subagent
-                  written to lately), an oracle step that is this session's, a `loop #N` whose check-by is still ahead,
-                  or idle for less than its threshold.
+                  written to lately, a child process, a never-kill pid in its tree), an oracle step that is this
+                  session's, a `loop #N` whose check-by is still ahead, or idle for less than its threshold.
   WAITING_PERSON  an oracle person-step on one of its claims (a stop it has reported), an open AskUserQuestion, or a
                   confirmation dialog on screen. Never a keyword in its text.
   UNKNOWN         a claim the oracle cannot place (unread brief, a claimant that is no live session, an unclaimed
                   agent step, a wait shape not recognized), a worktree not checked within the budget, or a stall mark.
   PUSH            only unpushed or uncommitted work in a worktree it owns keeps it.
   DONE            idle past its threshold, no claim whose oracle step is its own, every worktree clean and pushed, no
-                  background work. A `SESSION-DONE:` line (or `SESSION-STATE: IDLE_NO_WORK`) at the end of its last
-                  reply only shortens the threshold from IDLE_MINUTES to DONE_GRACE_MINUTES.
+                  background work. The threshold is the reaper's own idle_threshold(): a `SESSION-DONE:` line (or
+                  `SESSION-STATE: IDLE_NO_WORK`) shortens it to DONE_GRACE_MINUTES only under DONE_GRACE=apply.
 
-Claims: the issue number in the branch of every worktree the session owns, `(?:^|[/-])(\\d{3,6})(?:-|$)` (so
-`claude-7023-no-signature` names #7023); for a session with no branch claim, an issue its name or last reply names
+Claims: the issue number in the branch of every worktree the session owns, the reaper's ISSUE_RE (the number starts
+the branch or follows a `/`: `claude/7023-x` names #7023, `claude-7023-x` and `canary-main-1031` name none); for a session with no branch claim, an issue its name or last reply names
 whose oracle claimant (`delivery_state.py N --brief`, from the newest `Claimed by ... session` comment) is this
 session; for a `loop #N ...` background session, #N.
 
@@ -26,6 +26,8 @@ session-reaper.py runs it in every sweep and writes the file; `session_state.py`
 otherwise: no pane is typed into, no session closed).
 
 File: ~/.cc-reaper/state/sessions.json (CC_SESSION_STATE_FILE overrides; the reaper's STATE_DIR moves the default).
+Only a run on the live policy (the reaper's CONFIG) with its own threshold writes it; a run on another config writes
+under that config's STATE_DIR, or nowhere (the reaper's state_file()).
 Readers call read(): None when the file is missing, unreadable, of another version or older than MAX_AGE_SECONDS,
 which every reader treats as "no answer" (nothing is released on it).
 """
@@ -39,6 +41,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 VERSION = 1
 STATES = ("WORKING", "PUSH", "WAITING_PERSON", "DONE", "UNKNOWN")
@@ -103,14 +106,6 @@ def claim_step(r, brief, sid, mine_ids=(), other_sids=()):
     return step, None, False
 
 
-def threshold(s, r, cfg):
-    """Minutes idle before DONE: IDLE_MINUTES, or DONE_GRACE_MINUTES after a bare SESSION-DONE line."""
-    idle = float(cfg["IDLE_MINUTES"])
-    if r.said_done(s):
-        return min(idle, float(cfg.get("DONE_GRACE_MINUTES") or idle))
-    return idle
-
-
 def _claims(s, r, cfg, now, thr):
     """[(repo, number, source)]: branch claims, a background loop's #N, else issues the session names whose claimant
     is this session (only for an idle session past its threshold: the lookup costs an oracle call per issue)."""
@@ -132,7 +127,7 @@ def judge(s, r, cfg, now):
            "status_at": s.get("status_at"), "idle_min": round(float(s.get("idle_min") or 0), 1),
            "claims": [], "worktrees": [], "bg_work": [], "state": "UNKNOWN", "reasons": []}
     try:
-        thr = threshold(s, r, cfg)
+        thr = r.idle_threshold(s, cfg)  # the reaper's own: DONE_GRACE=shadow keeps IDLE_MINUTES
         rec["idle_threshold"] = thr
         mine_ids = [w["marker"] for w in s.get("owned") or () if w.get("marker")]
         own, person, unknown = [], [], []
@@ -158,6 +153,9 @@ def judge(s, r, cfg, now):
         bg += ["loop-pending"] if s.get("loop") else []
         bg += ["scheduled-task"] if (s.get("crons") or 0) > 0 or s.get("scheduled") else []
         bg += ["subagent-active"] if s.get("sub_active") else []
+        # a never-kill pid or a child process: B (the dispatcher) stops a DONE session, so these are never DONE
+        bg += ["never-kill:" + ",".join(str(p) for p in s["never_kill"])] if s.get("never_kill") else []
+        bg += [f"child-process:{s['descendants']}"] if (s.get("descendants") or 0) > 0 else []
         stalled = r.stall_mark(cfg, sid, now)
         ahead = [c for c in rec["claims"] if c.get("check_by") and (r._iso_epoch(c["check_by"]) or 0) > now]
         dirty = [w for w in rec["worktrees"] if w["dirty"] or w["unpushed"]]
@@ -253,7 +251,8 @@ def load_reaper(path=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", help="the reaper policy (default: the reaper's CONFIG)")
-    ap.add_argument("--out", help="where to write (default: CC_SESSION_STATE_FILE, else STATE_DIR/sessions.json)")
+    ap.add_argument("--out", help="where to write (default: the live file for the live config, else the config's "
+                                  "own STATE_DIR/sessions.json)")
     ap.add_argument("--print", action="store_true", help="also print one line per session")
     args = ap.parse_args(argv)
     r = load_reaper()
@@ -263,7 +262,13 @@ def main(argv=None):
     r.prefetch([s for s in gathered if not s.get("unattached")], cfg, now)
     records = judge_all(r, gathered, cfg, now)
     unjudged = [{"label": label, "why": why} for label, why, live in r.SKIPPED if live and why != "kind:bg"]
-    out = write(document(records, now, unjudged), args.out or default_path(r.state_dir(cfg)))
+    live = args.config is None or r.live_config(args.config)
+    out = Path(args.out) if args.out else r.state_file(cfg, live, SimpleNamespace(default_path=default_path))
+    if out is None:
+        print("session_state: not written: --config is not the live config and sets no STATE_DIR of its own; "
+              "pass --out", file=sys.stderr)
+        return 2
+    out = write(document(records, now, unjudged), out)
     if args.print:
         for x in records:
             print(f"{x['name']}\t{x['sid'][:8]}\t{x['state']}\t{', '.join(x['reasons'])}")
