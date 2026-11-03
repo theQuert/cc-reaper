@@ -41,7 +41,7 @@ CC_PAYLOAD="shell/resource-watch.sh shell/resource-watch-judge.py shell/disk-jan
 shell/cc-monitor.sh shell/claude-cleanup.sh shell/guard-runner.sh shell/chrome-clone-janitor.py
 shell/growth-watch.py shell/host-temp-reaper.py shell/dev-server-reaper.py shell/reclaim-byproducts.sh
 shell/orbstack-memory-trim.sh shell/session-reaper.py shell/stall-watch.py shell/wip-backup.sh
-shell/gce-disk-watch.py hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
+shell/gce-disk-watch.py shell/session_state.py hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
 # session-reaper, stall-watch and gce-disk-watch ship report-only (APPLY=0, STALL_APPLY=0,
 # GDW_APPLY=0 in their policy), so scheduling them changes nothing until the operator's policy says so. reclaim-byproducts' agent
 # is the one its own --install-launchd 2h writes, byte for byte.
