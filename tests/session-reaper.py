@@ -2025,6 +2025,14 @@ class DoneMarker(unittest.TestCase):
             "The format is:\n```\nSESSION-DONE: nothing left\n```",
             "> SESSION-DONE: nothing left\nThat was the peer's line; I am continuing",
             "SESSION-DONE: nothing left\nActually one more thing.\nRunning the suite again.\nThen the report.",
+            # review r2 P3-A: the line must be the LAST non-blank line, not one of the last three.
+            "SESSION-DONE: nothing left\nActually, one more thing.",
+            "Peer wrote:\nSESSION-DONE: nothing left\nI am continuing with the suite.\nRunning it now.",
+            "Tests pass.\nSESSION-DONE: nothing left\n\nOne more line.",
+            "The format is:\n~~~\nSESSION-DONE: nothing left\n~~~",
+            "The format is:\n~~~\nSESSION-DONE: nothing left",
+            "The format is:\n\n    SESSION-DONE: nothing left",
+            "The format is:\n\n\tSESSION-DONE: nothing left",
         ]
         for text in not_done:
             with self.subTest(text=text):

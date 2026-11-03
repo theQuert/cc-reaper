@@ -902,7 +902,7 @@ done_keep_reason() {  # <dir> <sid> <live_ok> <live_set> <protected>
 # Judge and remove marked directory $1 (session $2, label $3). Status 0 when it was removed (or
 # would be, on a dry run), and DONE_KB holds its size; 1 when it was kept.
 DONE_KB=0
-reap_done_marked() {  # <dir> <sid> <label> <live_ok> <live_set> <protected>
+reap_done_marked() {  # <dir> <sid> <label> <live_ok> <live_set> <protected> [<spotcheck note>]
   local d="$1" why kb
   DONE_KB=0
   lsof_snapshot  # here, not inside the $(...) below, so the run keeps one snapshot
@@ -910,7 +910,7 @@ reap_done_marked() {  # <dir> <sid> <label> <live_ok> <live_set> <protected>
   if [ -n "$why" ]; then log "$3 kept: $d — marked done, but $why"; return 1; fi
   kb="$(kb_of "$d")"
   if [ "$DONE_MARKER_MODE" = spotcheck ]; then
-    log "$3 spot-check: $d ($(as_gb "$kb")) is marked done and removable; logged only, not removed (CC_RB_DONE_MARKER=spotcheck)"
+    log "$3 spot-check: $d ($(as_gb "$kb")) is marked done and removable; logged only, not removed (CC_RB_DONE_MARKER=spotcheck)${7:+; $7}"
     return 1
   fi
   if [ "$DRY" -eq 1 ]; then log "$3 WOULD be reaped: $d (marked done)"; DONE_KB=$kb; return 0; fi
@@ -1030,12 +1030,15 @@ reap_scratchpads() {
     if ! is_session_id "$sid"; then kept=$((kept + 1)); continue; fi
 
     # Marked done by its session (stima-api#7106): no idle window and no transcript mention,
-    # only liveness (done_keep_reason).
+    # only liveness (done_keep_reason). The marker only ADDS a reason to remove: when
+    # reap_done_marked keeps the directory (spotcheck, a later write, a holder, a live session),
+    # the idle rule below still judges it, so a marker never subtracts the old reap.
     if [ "$DONE_MARKER_MODE" != off ] && [ "$(done_marker_session "$d")" = "$sid" ]; then
-      if reap_done_marked "$d" "$sid" scratchpad "$live_ok" "$live_set" "$prot"; then
+      if reap_done_marked "$d" "$sid" scratchpad "$live_ok" "$live_set" "$prot" \
+           "the idle rule still judges it"; then
         reaped=$((reaped + 1)); bytes=$((bytes + DONE_KB))
-      else kept=$((kept + 1)); fi
-      continue
+        continue
+      fi
     fi
 
     window=$IDLE_HOURS

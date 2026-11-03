@@ -586,7 +586,7 @@ else
   fail "a non-numeric volume age refuses and reaps nothing (rc=$RC_VOLBAD)"
 fi
 
-OUT_NOGATE="$(BYPRODUCT_SCRATCH_ROOT="$WORK/f/scratch" BYPRODUCT_ARCHIVE_ROOT="$WORK/f/archive" \
+OUT_NOGATE="$(HOME="$WORK/f/home" BYPRODUCT_SCRATCH_ROOT="$WORK/f/scratch" BYPRODUCT_ARCHIVE_ROOT="$WORK/f/archive" \
   BYPRODUCT_DOCKER_BIN="$WORK/f/bin/docker" PATH_IN_USE_BIN="$WORK/f/bin/does-not-exist" \
   BYPRODUCT_LOG="$WORK/f/stray.log" BYPRODUCT_DEAD_CACHE_PATHS="$WORK/f/nothing" \
   bash "$SCRIPT" 2>&1)"; RC_NOGATE=$?
@@ -2068,6 +2068,37 @@ printf '%s %s\n' 4545 "$WORK/m/scratch/proj/$SIDM/out.txt" > "$WORK/m/lsof-held"
 OUT="$(run_real "$WORK/m" "$SCRIPT")"
 exists "$WORK/m" $SIDM && pass "done marker: held at the pre-removal check, kept" || fail "done marker: removed a directory held at removal"
 check "  and says who" "$OUT" "scratchpad kept: .*$SIDM — marked done, but held by 4545 at removal"
+
+# Review r2 P2-A: a marker only ADDS a reason to remove. UU is the fixture's scratchpad no
+# transcript names, 40 days idle, which the idle rule reaps; whatever the marker path answers
+# (spotcheck keep, a transcript newer than the marker), the idle rule still judges it.
+UU=11111111-1111-1111-1111-111111111111
+TWO_D_AGO="$(date -v-2d +%Y%m%d%H%M 2>/dev/null || date -d '2 days ago' +%Y%m%d%H%M)"
+uu_transcript() {  # <root>: the session's own transcript, last written two days ago
+  : > "$1/home/.claude/projects/proj/$UU.jsonl"; touch -t "$TWO_D_AGO" "$1/home/.claude/projects/proj/$UU.jsonl"
+}
+marked_fixture "$WORK/m"
+OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $UU && fail "P2-A A: an unmarked 40-day-idle scratchpad was kept" || pass "P2-A A: no marker, 40 d idle: reaped by the idle rule"
+check "  and the log says reaped" "$OUT" "scratchpad reaped: .*$UU"
+marked_fixture "$WORK/m"; mark "$WORK/m/scratch/proj/$UU" $UU "$OLD_TS"
+OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $UU && fail "P2-A B: a spotcheck-kept marked scratchpad escaped the idle rule" \
+  || pass "P2-A B: 40 d old marker naming it, spotcheck: reaped by the idle rule"
+check "  and the spotcheck line says the idle rule still judges it" "$OUT" "scratchpad spot-check: .*$UU .*marked done and removable.*the idle rule still judges it"
+check "  and the idle rule reaped it" "$OUT" "scratchpad reaped: .*$UU"
+marked_fixture "$WORK/m"; mark "$WORK/m/scratch/proj/$UU" $UU "$OLD_TS"; uu_transcript "$WORK/m"
+OUT="$(CC_RB_DONE_MARKER=auto run_real "$WORK/m" "$SCRIPT")"
+check "P2-A C: auto, a transcript newer than the marker: the marker path keeps it" "$OUT" "scratchpad kept: .*$UU — marked done, but its session wrote a transcript after its done marker"
+exists "$WORK/m" $UU && fail "P2-A C: the idle rule never judged a marker-kept scratchpad (transcript 2 d ago)" \
+  || pass "P2-A C: and the idle rule reaps it (transcript 2 d ago, past the window)"
+marked_fixture "$WORK/m"; uu_transcript "$WORK/m"
+OUT="$(CC_RB_DONE_MARKER=auto run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $UU && fail "P2-A D: unmarked, transcript 2 d ago, auto: kept" || pass "P2-A D: no marker, transcript 2 d ago, auto: reaped"
+# The idle rule's own keeps survive a marker: written just now, it stays.
+marked_fixture "$WORK/m"; mark "$WORK/m/scratch/proj/$UU" $UU; touch "$WORK/m/scratch/proj/$UU/fresh"
+OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $UU && pass "P2-A: a marked scratchpad written just now is still kept by the idle rule (spotcheck)" || fail "P2-A: a marked, fresh scratchpad was removed"
 unset CC_RB_DONE_MARKER
 
 # ---------------------------------------------------------------- the transcript lookup (G3, #5886)

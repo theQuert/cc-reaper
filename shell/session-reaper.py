@@ -113,7 +113,7 @@ TAIL_BYTES = 4 << 20
 EXIT_WAIT_SECONDS = 20
 DONE_RE = re.compile(r"(?m)^\W*SESSION-DONE:\s*(.+)$")
 STATE_IDLE_RE = re.compile(r"(?m)^\W*SESSION-STATE:\s*IDLE_NO_WORK\b")
-# The done-grace marker (EL-T2512) is stricter than DONE_RE: a bare line among the last three of the reply, not
+# The done-grace marker (EL-T2512) is stricter than DONE_RE: a bare LAST line of the reply, not
 # quoted, listed, back-ticked or inside a code fence, so a reply that explains the rule does not shorten the wait.
 GRACE_RE = re.compile(r"^\s*(?:SESSION-DONE:\s*\S|SESSION-STATE:\s*IDLE_NO_WORK\b)")
 # EL-T2520: a reply that ends on an alarm. Closable under the grace only with no open PR, no owed step and nothing
@@ -1430,13 +1430,16 @@ def stall_mark(cfg, sid, now=None):
 
 
 def _ends_on(s, rx):
-    """A bare `rx` line among the last three of the reply that ends the transcript, outside a code fence, written
-    after the last prompt."""
+    """The reply that ends the transcript, written after the last prompt, has a bare `rx` line as its LAST non-blank
+    line, outside a code fence (``` or ~~~) and not in an indented (4 spaces or a tab) code block."""
     lines = [ln for ln in (s.get("last_text") or "").splitlines() if ln.strip()]
-    tail = lines[-3:]
-    fenced = sum(ln.lstrip().startswith("```") for ln in lines[:len(lines) - len(tail)]) % 2
-    return (not fenced and not any(ln.lstrip().startswith("```") for ln in tail)
-            and any(rx.match(ln) for ln in tail)
+    if not lines:
+        return False
+    last = lines[-1]
+    fenced = sum(ln.lstrip().startswith(("```", "~~~")) for ln in lines[:-1]) % 2
+    return (not fenced and not last.lstrip().startswith(("```", "~~~"))
+            and not last.startswith(("    ", "\t"))
+            and bool(rx.match(last))
             and (s.get("text_at") or 0) > (s.get("prompt_at") or 0))
 
 
