@@ -2141,6 +2141,33 @@ class BackgroundAttached(unittest.TestCase):
         self.assertIn("| audit-pane | `e1284bef` | idle 120m | - | keep | kind:bg |", report)
         self.assertNotIn("would-close", report)
 
+    def marker_fixture(self, apply):
+        self.cfg.update(APPLY="1" if apply else "0", SCRATCH_ROOT=str(self.tmp / "scratch"),
+                        JOBS_DIR=str(self.tmp / "jobs"))
+        pad, job = self.tmp / "scratch" / "proj" / self.SID, self.tmp / "jobs" / self.SID[:8]
+        pad.mkdir(parents=True)
+        job.mkdir(parents=True)
+        return pad, job
+
+    def test_an_apply_sweep_marks_a_done_sessions_scratchpad_and_job_dir(self):
+        pad, job = self.marker_fixture(apply=True)
+        facts = dict(last_text="SESSION-DONE: nothing left", loop=False, crons=0, asking=False,
+                     text_at=self.now - 100, prompt_at=self.now - 200)
+        with self.mocked(), mock.patch.object(reaper, "transcript_facts", return_value=facts):
+            self.assertEqual(reaper.main(["--config", "unused"]), 0)
+        for d in (pad, job):
+            self.assertRegex((d / "claude-task-done").read_text(),
+                             rf"\Asession={self.SID}\nat=\d{{4}}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n\Z")
+
+    def test_a_report_only_sweep_marks_nothing(self):
+        pad, job = self.marker_fixture(apply=False)
+        facts = dict(last_text="SESSION-DONE: nothing left", loop=False, crons=0, asking=False,
+                     text_at=self.now - 100, prompt_at=self.now - 200)
+        with self.mocked(), mock.patch.object(reaper, "transcript_facts", return_value=facts):
+            self.assertEqual(reaper.main(["--config", "unused"]), 0)
+        self.assertFalse((pad / "claude-task-done").exists())
+        self.assertFalse((job / "claude-task-done").exists())
+
     def test_existing_work_gates_are_still_classified(self):
         with self.mocked(), mock.patch.object(reaper, "transcript_facts", return_value=dict(
                 last_text="SESSION-DONE: nothing left", loop=True, crons=0, asking=True)):
@@ -2212,6 +2239,76 @@ class Unjudged(unittest.TestCase):
         self.assertIn("| ci-2 | `cccccccc` | busy ?m | - | unjudged | pane-missing:%309 |", report)
         self.assertIn("- auth-audit sid=bbbbbbbb pid=11: kind:bg (unjudged, idle 30m)", report)
         self.assertNotIn("gone", report)
+
+
+class DoneMarker(unittest.TestCase):
+    """stima-api#7106: write_done_markers() marks what reclaim-byproducts.sh may reap once nothing holds it."""
+    SID = "0123abcd-1111-2222-3333-444455556666"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.now = time.time()
+        self.cfg = dict(CFG, SCRATCH_ROOT=str(self.tmp / "scratch"), JOBS_DIR=str(self.tmp / "jobs"))
+        self.pads = [self.tmp / "scratch" / p / self.SID for p in ("proj-a", "proj-b")]
+        self.job = self.tmp / "jobs" / self.SID[:8]
+        for d in (*self.pads, self.job):
+            d.mkdir(parents=True)
+
+    def s(self, **kw):
+        return session(**dict(dict(sid=self.SID, text_at=self.now - 60, prompt_at=self.now - 120), **kw))
+
+    def marks(self):
+        return sorted(str(p) for p in self.tmp.rglob("claude-task-done"))
+
+    def test_a_done_reply_after_the_last_prompt_marks_every_scratchpad_and_the_job(self):
+        out = reaper.write_done_markers(self.cfg, [self.s()], self.now)
+        want = sorted(str(d / "claude-task-done") for d in (*self.pads, self.job))
+        self.assertEqual(sorted(out), want)
+        self.assertEqual(self.marks(), want)
+        self.assertTrue(self.job.joinpath("claude-task-done").read_text().startswith(f"session={self.SID}\nat="))
+
+    def test_a_prompt_after_the_done_reply_marks_nothing(self):
+        self.assertEqual(reaper.write_done_markers(self.cfg, [self.s(prompt_at=self.now - 10)], self.now), [])
+        self.assertEqual(self.marks(), [])
+
+    def test_a_reply_without_a_done_line_marks_nothing(self):
+        self.assertEqual(reaper.write_done_markers(self.cfg, [self.s(last_text="pushed, CI running")], self.now), [])
+
+    def test_a_tool_call_after_the_text_marks_nothing(self):
+        self.assertEqual(reaper.write_done_markers(self.cfg, [self.s(text_at=0, prompt_at=0)], self.now), [])
+
+    def test_off_marks_nothing(self):
+        cfg = dict(self.cfg, DONE_MARKER="off")
+        self.assertEqual(reaper.write_done_markers(cfg, [self.s()], self.now), [])
+
+    def test_a_session_id_that_is_not_one_marks_nothing(self):
+        bad = self.tmp / "scratch" / "proj-a" / "*"
+        bad.mkdir()
+        self.assertEqual(reaper.write_done_markers(self.cfg, [self.s(sid="*")], self.now), [])
+
+    def test_a_link_is_never_marked(self):
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        shutil.rmtree(self.pads[0])
+        self.pads[0].symlink_to(elsewhere)
+        reaper.write_done_markers(self.cfg, [self.s()], self.now)
+        self.assertFalse((elsewhere / "claude-task-done").exists())
+
+    def test_no_directory_is_created(self):
+        shutil.rmtree(self.tmp / "jobs")
+        reaper.write_done_markers(self.cfg, [self.s()], self.now)
+        self.assertFalse((self.tmp / "jobs").exists())
+
+    def test_a_marker_newer_than_the_reply_is_kept_and_an_older_one_rewritten(self):
+        reaper.write_done_markers(self.cfg, [self.s()], self.now - 30)
+        m = self.job / "claude-task-done"
+        first = m.read_text()
+        self.assertEqual(reaper.write_done_markers(self.cfg, [self.s()], self.now), [])
+        self.assertEqual(m.read_text(), first)
+        # The session said done again, later: the marker moves with it.
+        os.utime(m, (self.now - 3600, self.now - 3600))
+        self.assertIn(str(m), reaper.write_done_markers(self.cfg, [self.s()], self.now))
 
 
 if __name__ == "__main__":

@@ -111,6 +111,12 @@ DEFAULTS = {
     # counted only on the live config at APPLY=1) after which the sweep writes `<FLAG>=apply` for that one source
     # (STATE_DONE, ORACLE_NOT_MINE, NOCLAIM_DONE) into the live policy, with a line in the report.
     "SHADOW_CLEAN_ROUNDS": "5",
+    # stima-api#7106: `on`: at APPLY, a session whose newest reply (written after its last prompt) has a SESSION-DONE
+    # line gets `claude-task-done` (session=<id>, at=<UTC>) in its scratchpads (<SCRATCH_ROOT>/*/<id>) and in
+    # <JOBS_DIR>/<first 8 of id> when they exist; reclaim-byproducts.sh then reaps them once nothing holds them.
+    "DONE_MARKER": "on",
+    "SCRATCH_ROOT": "",  # empty: /tmp/claude-<uid>
+    "JOBS_DIR": "~/.claude/jobs",
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
@@ -1047,6 +1053,40 @@ def _record(cfg, now, table, wts, f, d, pane, state, attach_pid):
         s["unattached"] = True
     s["relay_pending"] = relay_pending(cfg, claims, now)
     return s
+
+
+SID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+DONE_MARKER = "claude-task-done"
+
+
+def write_done_markers(cfg, sessions, now):
+    """stima-api#7106: mark the scratchpads and job directory of every session whose newest reply, written after its
+    last prompt, says SESSION-DONE. Only existing directories, never a link; a marker already naming the session and
+    no older than that reply is left as it is. Returns the markers written."""
+    if cfg.get("DONE_MARKER", "on") != "on":
+        return []
+    root = Path(os.path.expanduser(cfg.get("SCRATCH_ROOT") or f"/tmp/claude-{os.getuid()}"))
+    jobs = Path(os.path.expanduser(cfg.get("JOBS_DIR") or "~/.claude/jobs"))
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    written = []
+    for s in sessions:
+        sid = s.get("sid") or ""
+        if not SID_RE.fullmatch(sid) or not s.get("text_at") or s["text_at"] < s.get("prompt_at", 0):
+            continue
+        if not DONE_RE.search(s.get("last_text") or ""):
+            continue
+        for d in [Path(p) for p in sorted(glob.glob(str(root / "*" / sid)))] + [jobs / sid[:8]]:
+            m = d / DONE_MARKER
+            if d.is_symlink() or not d.is_dir() or m.is_symlink():
+                continue
+            try:
+                if m.read_text().startswith(f"session={sid}\n") and m.stat().st_mtime >= s["text_at"]:
+                    continue
+            except OSError:
+                pass
+            m.write_text(f"session={sid}\nat={stamp}\n")
+            written.append(str(m))
+    return written
 
 
 def protected(cfg, *names):
@@ -2314,7 +2354,7 @@ def main(argv=None):
         print("session-reaper: another run holds the lock")
         return 0
     now = time.time()
-    rows, failures, reaped, seen, stale, notes, rounds = [], [], 0, [], [], [], []
+    rows, failures, reaped, seen, stale, notes, rounds, gathered = [], [], 0, [], [], [], [], []
     swept = state_on = False
     STATE_ROWS.clear()
     # #6477, 2026-10-29: RUN_BUDGET is checked between sessions, so a run blocked inside one call (pid 22262, 30 min
@@ -2403,6 +2443,11 @@ def main(argv=None):
             idle_list(cfg, seen, now)
     except Exception as e:  # a report-only list must not stop the report
         failures.append(f"idle list: {type(e).__name__}: {e}")
+    try:
+        if apply:
+            notes += [f"done marker written: {m}" for m in write_done_markers(cfg, gathered, now)]
+    except Exception as e:  # a marker that could not be written only delays a reclaim
+        notes.append(f"done marker: {type(e).__name__}: {e}")
     signal.alarm(0)
     faulthandler.cancel_dump_traceback_later()
     try:  # after the alarm is off, so the deadline cannot cut it between the state write and the event line
