@@ -5,8 +5,14 @@ A /login leaves every session at "Login successful. Remote Control disconnected.
 a spent quota leaves a session (or its subagents) at "You've hit your weekly limit" / HTTP 429. Nobody notices
 until a person looks. This is the cheap detector for that, and it calls no model:
 
-  detect  one `tmux display` + `tmux capture-pane -p` per live interactive session; the screen (and cursor) is
-          hashed per pane and a pane is re-scanned only when the hash changed. Fingerprints:
+  detect  one `ps` and one `tmux list-panes -a` (the activity probe: window_activity and the cursor of every pane)
+          per run, then a `tmux capture-pane -p` only for a pane whose activity or cursor moved since its last read, or
+          whose last read was less than a second after its last activity (STALL_PROBE=1, stima-api#7073). Every
+          STALL_FULL_EVERY-th run (10) captures every pane anyway, as the spot-check: a pane the probe called unchanged
+          whose screen changed is counted `probe-miss`. Without the probe (STALL_PROBE=0, or `list-panes` failing) it is
+          one `tmux display` + `capture-pane` per session, as before. The screen (and cursor) is hashed per pane and a
+          pane is re-scanned only when the hash changed. The summary line carries `spawns=N`, the processes this run
+          started (ps and tmux). Fingerprints:
             weekly-limit      "hit your weekly limit" (any "<word> limit")
             remote-disconnected   "Remote Control disconnected", unless a later line says it is connected again
             rate-limit-429    "429" or "rate_limit_error" in an `API Error` line, or "status 429" in a `⎿` result
@@ -40,8 +46,14 @@ until a person looks. This is the cheap detector for that, and it calls no model
           the other kinds carry no screen text, since their region can hold a command line. The prompt is
           never answered.
 
-HARD RULE (stima-api #5212): nothing here types into another agent's pane. The only tmux calls are `display`
-and `capture-pane`; `tmux_ro` refuses every other subcommand, send-keys included. Re-enabling Remote Control
+live-sessions.json  each run writes STALL_LIVE_FILE (~/.cc-reaper/state/live-sessions.json, 0600): version,
+  written_at and, per live session, id, pane, pid, the pane's screen fingerprint and its screen only when it changed
+  in this run. `read_live_snapshot` is the reader: it returns None when the file is missing, unreadable, of another
+  version or older than STALL_LIVE_MAX_AGE_SECONDS (180), and a caller then reads for itself. Nothing acts on a
+  snapshot past its age.
+
+HARD RULE (stima-api #5212): nothing here types into another agent's pane. The only tmux calls are `display`,
+`capture-pane` and `list-panes` (all read-only); `tmux_ro` refuses every other subcommand, send-keys included. Re-enabling Remote Control
 (or resuming) is a person's or Neo's step, given in the report.
 """
 
@@ -79,8 +91,15 @@ DEFAULTS = {
     "STALL_PUSH": "0",  # 1: a live prompt alert also pings STALL_PUSH_KEY's URL + /fail once (#130); 0: `would push`
     "STALL_PUSH_ENV": "~/ci-runner/heartbeats.env",
     "STALL_PUSH_KEY": "HEARTBEAT_FOUNDER_DECISION",  # Better Stack: an incident on it pages the founder
+    "STALL_PROBE": "1",  # 1: one list-panes for every pane's activity, capture only a pane that moved; 0: capture each (old)
+    "STALL_FULL_EVERY": "10",  # every Nth run captures all panes regardless of the probe (the spot-check)
+    "STALL_LIVE_FILE": "~/.cc-reaper/state/live-sessions.json",  # the shared snapshot of live sessions ("" : not written)
+    "STALL_LIVE_MAX_AGE_SECONDS": "180",  # a reader ignores a snapshot older than this
 }
-READ_ONLY_TMUX = ("display", "capture-pane")  # #5212: nothing that types into a pane
+LIVE_VERSION = 1
+READ_ONLY_TMUX = ("display", "capture-pane", "list-panes")
+SPAWNS = 0  # processes started in this run: ps and tmux; reset by sweep()
+PROBE_FORMAT = "#{pane_id}\t#{session_name}\t#{pane_pid}\t#{cursor_x}\t#{cursor_y}\t#{window_activity}\t#{window_panes}\t#{session_windows}"  # #5212: nothing that types into a pane
 
 # Claude Code's own system and status lines only. Each pattern is anchored at the start of a line (after an optional
 # `⎿` result gutter or `⏺`/`●` message bullet) and has the exact shape of the line, so a sentence that quotes the words,
@@ -241,6 +260,8 @@ def tmux_ro(*args):
     """The only tmux entry point: read-only subcommands, so no code path can type into a pane."""
     if not args or args[0] not in READ_ONLY_TMUX:
         raise RuntimeError(f"stall-watch never runs tmux {args[0] if args else ''}: it must not type into a pane (#5212)")
+    global SPAWNS
+    SPAWNS += 1
     return reaper.run(["tmux", *args], timeout=10)
 
 
@@ -285,13 +306,55 @@ def screen_hash(pane):
 SID_RE = re.compile(r"[\w-]+")
 
 
-def live_sessions():
+def probe_panes():
+    """{pane id: state without a screen} from one `tmux list-panes -a`, or None when it failed or printed nothing."""
+    rc, out = tmux_ro("list-panes", "-a", "-F", PROBE_FORMAT)
+    if rc:
+        return None
+    panes = {}
+    for line in out.splitlines():
+        f = line.split("\t")
+        if len(f) != 8:
+            continue
+        try:
+            panes[f[0]] = {"session": f[1], "pane_pid": int(f[2]), "cx": int(f[3]), "cy": int(f[4]),
+                           "act": int(f[5] or 0), "alone": f[6] == "1" and f[7] == "1", "screen": None}
+        except ValueError:
+            continue
+    return panes or None
+
+
+def reusable(prev, sid):
+    """A stored pane reading that a run may stand on without re-reading the screen (same session, a hash, a prompt
+    reading from the current code)."""
+    if not (isinstance(prev, dict) and prev.get("sid") == sid and prev.get("hash") and "prompt" in prev):
+        return False
+    pr = prev["prompt"]
+    return not (isinstance(pr, dict) and pr.get("kind") == "ask-user-question" and "head" not in pr)  # read before #128
+
+
+def probe_says_unchanged(prev, st):
+    """Nothing moved since the stored read, and that read began over a second after the last activity (output later
+    in the same second would carry the same window_activity)."""
+    at, act = prev.get("at"), st.get("act")
+    return bool(act) and prev.get("act") == act and prev.get("cur") == [st["cx"], st["cy"]] \
+        and _num(at) and at > act + 1
+
+
+def live_sessions(prev_panes=None, probe=False, full=True):
     """Interactive tmux sessions whose pid and start time still match: [(file data, pane id, pane state)].
     The state is None when the read failed (a tmux timeout under load, an empty capture): that session is still
-    live, so the caller keeps what it knew instead of treating the session as gone."""
+    live, so the caller keeps what it knew instead of treating the session as gone. With `probe`, one list-panes
+    stands in for the per-pane display, and a pane the probe shows unchanged since its stored read gets a state with
+    "screen": None (and no capture) unless `full`, the spot-check, which captures it and marks it "probed_same"."""
+    global SPAWNS
+    prev_panes = prev_panes or {}
     table = reaper.ps_table()
+    SPAWNS += 1
     if not table:
         return None  # ps failed: every session would look gone, which must not clear anything
+    probed = probe_panes() if probe else None
+    read_at = time.time()
     out = []
     for f in sorted(reaper.SESSIONS_DIR.glob("*.json")):
         try:
@@ -305,14 +368,67 @@ def live_sessions():
         pane = d["tmux"].rsplit(".", 1)[-1]
         if not SID_RE.fullmatch(str(d.get("sessionId") or "")):
             continue  # the id goes into a file name, a shell command and the inbox: only [\w-]+
-        state = reaper.pane_state(pane)
-        if state is not None and not state["screen"].strip():
+        reused = False
+        if probed is None:
+            state = reaper.pane_state(pane)
+        elif pane not in probed:
+            state = None  # not in tmux's list: the same as a failed display
+        else:
+            state = dict(probed[pane])
+            prev = prev_panes.get(pane)
+            if reusable(prev, d["sessionId"]) and probe_says_unchanged(prev, state):
+                if full:
+                    state["probed_same"] = True  # the spot-check: capture it and compare
+                else:
+                    reused = True
+            if not reused:
+                rc, screen = tmux_ro("capture-pane", "-p", "-t", pane)
+                state["screen"] = screen if rc == 0 else ""
+        if state is not None:
+            state["at"] = read_at
+        if state is not None and not reused and not (state["screen"] or "").strip():
             state = None  # tmux answered `display` but the capture came back empty: not a reading
         if state is None:
             out.append((d, pane, None))
         elif reaper.is_ancestor(table, state["pane_pid"], pid):
             out.append((d, pane, state))
     return out
+
+
+def write_live(path, live, panes, changed, now):
+    """The shared snapshot: version, written_at and per session id, pane, pid, fingerprint, and the screen only when it
+    changed in this run. Written 0600 (a screen can hold anything)."""
+    sessions = []
+    for d, pane, ps in live:
+        if ps is None:
+            continue
+        p = panes.get(pane) or {}
+        e = {"id": d["sessionId"], "pane": pane, "pid": d.get("pid"), "fingerprint": p.get("hash")}
+        if pane in changed and ps.get("screen"):
+            e["screen"] = ps["screen"]
+        sessions.append(e)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps({"version": LIVE_VERSION, "written_at": now, "sessions": sessions}) + "\n")
+    os.replace(tmp, path)
+
+
+def read_live_snapshot(path, now=None, max_age=180.0):
+    """The shared live-sessions snapshot, or None when it is missing, unreadable, malformed, of another version,
+    from the future or older than max_age seconds: a reader then reads for itself and never acts on it."""
+    now = time.time() if now is None else now
+    try:
+        d = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("version") != LIVE_VERSION or not isinstance(d.get("sessions"), list):
+        return None
+    w = d.get("written_at")
+    if not _num(w) or w > now + 5 or now - w > max_age:
+        return None
+    return d
 
 
 def atomic_write(path, text):
@@ -382,10 +498,12 @@ def load_state(path):
     try:
         st = json.loads(path.read_text())
         prompts = st.get("prompts")  # checked entry by entry in prompt_sweep; a bad one never costs panes or events
+        n = st.get("runs")
         return {"panes": dict(st.get("panes", {})), "events": dict(st.get("events", {})),
-                "prompts": prompts if isinstance(prompts, dict) else {}}
+                "prompts": prompts if isinstance(prompts, dict) else {},
+                "runs": n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0}
     except (OSError, ValueError, AttributeError, TypeError):
-        return {"panes": {}, "events": {}, "prompts": {}}
+        return {"panes": {}, "events": {}, "prompts": {}, "runs": 0}
 
 
 def main(argv=None):
@@ -411,15 +529,26 @@ def main(argv=None):
         lock.close()
 
 
+def probe_fields(ps):
+    """What the next run's probe compares against: activity, cursor and when this screen was read."""
+    if ps.get("act") is None:
+        return {}
+    return {"act": ps["act"], "cur": [ps["cx"], ps["cy"]], "at": ps.get("at")}
+
+
 def sweep(cfg, apply, state_path, mark_dir, inbox):
     now = time.time()
     failures = []
     if mark_dir and shared_dir(mark_dir):
         failures.append(f"STALL_MARK_DIR {mark_dir} is a shared directory: no marks written or removed")
         mark_dir = None
+    global SPAWNS
+    SPAWNS = 0
     state = load_state(state_path)
-    panes, rescanned, unread = {}, 0, set()
-    live = live_sessions()
+    panes, rescanned, unread, changed, misses = {}, 0, set(), set(), 0
+    runs = state["runs"] + 1
+    every = max(1, int(_minutes(cfg, "STALL_FULL_EVERY")))
+    live = live_sessions(state["panes"], cfg.get("STALL_PROBE") == "1", full=runs % every == 0)
     if live is None:
         print("stall-watch: ERROR process table unavailable; nothing read, nothing changed")
         return 1
@@ -430,14 +559,20 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
             if prev and prev.get("sid") == sid:
                 panes[pane] = prev
             continue
+        if ps.get("screen") is None:  # the probe showed nothing moved: live_sessions only says so for a reusable reading
+            panes[pane] = prev
+            continue
         h = screen_hash(ps)
+        if ps.get("probed_same") and prev and prev.get("hash") != h:
+            misses += 1  # the spot-check: the probe said unchanged and the screen had changed
         stale = isinstance(prev, dict) and isinstance(prev.get("prompt"), dict) and \
             prev["prompt"].get("kind") == "ask-user-question" and "head" not in prev["prompt"]  # read before #128
         if prev and prev.get("hash") == h and prev.get("sid") == sid and "prompt" in prev and not stale:
-            panes[pane] = prev  # unchanged screen: nothing to re-read (a state from before prompt detection is re-read)
+            panes[pane] = {**prev, **probe_fields(ps)}  # unchanged screen: nothing to re-read (a state from before prompt detection is re-read)
             continue
         rescanned += 1
-        panes[pane] = {"hash": h, "sid": sid, **scan(ps)}
+        changed.add(pane)
+        panes[pane] = {"hash": h, "sid": sid, **probe_fields(ps), **scan(ps)}
     fleet = sum("interrupted-idle" in p["fps"] for p in panes.values())
     fleet_min = max(1, int(cfg["STALL_FLEET_MIN"] or 2))
     max_age = float(cfg["STALL_MARK_MAX_HOURS"] or 48) * 3600
@@ -495,10 +630,15 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
         for f in mark_dir.glob("*.json"):
             if f.stem not in stalled and f.stem not in kept and is_mark(f):
                 f.unlink(missing_ok=True)  # the stall cleared, or the session is gone
-    atomic_write(state_path, json.dumps({"panes": panes, "events": events, "prompts": prompt_events}) + "\n")
+    atomic_write(state_path, json.dumps({"panes": panes, "events": events, "prompts": prompt_events, "runs": runs}) + "\n")
+    if cfg.get("STALL_LIVE_FILE"):
+        try:
+            write_live(Path(os.path.expanduser(cfg["STALL_LIVE_FILE"])), live, panes, changed, now)
+        except OSError as e:
+            failures.append(f"live-sessions write failed: {e}")
     print(f"stall-watch {'apply' if apply else 'shadow'}: {len(live)} sessions, {rescanned} rescanned, "
           f"{len(unread)} unread, {len(stalled)} marked, {would} would report, {seen} prompts on screen, "
-          f"{flagged} prompts flagged, {pwould} would alert, {len(failures)} failures")
+          f"{flagged} prompts flagged, {pwould} would alert, {len(failures)} failures, probe-miss={misses}, spawns={SPAWNS}")
     for f in failures:
         print(f"stall-watch: ERROR {f}")
     return 1 if failures else 0

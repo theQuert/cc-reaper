@@ -19,6 +19,7 @@ spec.loader.exec_module(stall)
 reaper = stall.reaper
 
 NB = "\xa0"
+ACT_OLD = int(time.time()) - 1000  # a window_activity well before any run of a test
 RULE = "─" * 40
 
 
@@ -237,6 +238,7 @@ class Fleet:
 
     def __init__(self, tmp, panes):
         self.tmp, self.panes, self.calls, self.fail, self.empty = tmp, panes, [], set(), set()
+        self.act, self.no_probe = {}, False  # window_activity per pane (default: long ago); list-panes failing
         (tmp / "sessions").mkdir(exist_ok=True)
         self.table = {}
         for n, (pid_pane, (name, spec_)) in enumerate(panes.items()):
@@ -255,6 +257,12 @@ class Fleet:
     def run(self, cmd, timeout=30, cwd=None):
         self.calls.append(cmd)
         assert cmd[0] == "tmux", cmd
+        if cmd[1] == "list-panes":
+            assert cmd[2] == "-a", cmd
+            if self.no_probe:
+                return 1, ""
+            return 0, "".join(f"{t}\t{name}\t{100 + 10 * n}\t{cx}\t{cy}\t{self.act.get(t, ACT_OLD)}\t1\t1\n"
+                             for n, (t, (name, (text, cx, cy))) in enumerate(self.panes.items()))
         sub, target = cmd[1], cmd[cmd.index("-t") + 1]
         name, (text, cx, cy) = self.panes[target]
         n = list(self.panes).index(target)
@@ -282,7 +290,7 @@ class Runs(unittest.TestCase):
     def write_config(self, apply="1", fleet_min="2", extra=""):
         self.cfg = self.tmp / "conf"
         self.cfg.write_text(f"STALL_APPLY={apply}\nSTALL_INBOX={self.inbox}\nSTALL_STATE={self.tmp / 'state.json'}\n"
-                            f"STALL_MARK_DIR={self.marks}\nSTALL_FLEET_MIN={fleet_min}\n{extra}")
+                            f"STALL_MARK_DIR={self.marks}\nSTALL_FLEET_MIN={fleet_min}\nSTALL_PROBE=0\nSTALL_LIVE_FILE={self.tmp / 'live.json'}\n{extra}")
 
     def start(self, panes):
         self.fleet = Fleet(self.tmp, panes)
@@ -569,6 +577,172 @@ class Runs(unittest.TestCase):
         with mock.patch.object(reaper, "run", return_value=(0, "")) as run:
             stall.tmux_ro("capture-pane", "-p", "-t", "%1")
             run.assert_called_once_with(["tmux", "capture-pane", "-p", "-t", "%1"], timeout=10)
+
+
+class ProbeRuns(unittest.TestCase):
+    """stima-api#7073: one list-panes stands in for the per-pane display + capture; a pane is captured only when its
+    activity or cursor moved, every STALL_FULL_EVERY-th run captures all (the spot-check), and each run writes the
+    shared live-sessions.json."""
+    table = None
+    setUp, write_config, start, run_once, inbox_text = Runs.setUp, Runs.write_config, Runs.start, Runs.run_once, Runs.inbox_text
+
+    def subs(self, f):
+        out = {}
+        for c in f.calls:
+            out[c[1]] = out.get(c[1], 0) + 1
+        f.calls.clear()
+        return out
+
+    def spawns(self):
+        return int(self.printed.rsplit("spawns=", 1)[1].split()[0])
+
+    def nine(self):
+        return {f"%{i}": (f"s{i}", HEALTHY) for i in range(1, 10)}
+
+    def test_an_unchanged_pane_costs_no_capture_and_spawns_drop_by_half_or_more(self):
+        self.write_config(extra="STALL_PROBE=0\n")
+        f = self.start(self.nine())
+        self.run_once()
+        old = self.spawns()
+        self.assertEqual(old, 1 + 2 * 9)  # ps, then display + capture-pane for each of nine sessions
+        self.write_config(extra="STALL_PROBE=1\n")
+        (self.tmp / "state.json").unlink()
+        self.run_once()  # first sight: every pane is read
+        self.assertEqual(self.spawns(), 1 + 1 + 9)
+        f.calls.clear()
+        self.run_once()
+        self.assertEqual(self.subs(f), {"list-panes": 1})
+        self.assertEqual(self.spawns(), 2)
+        self.assertLessEqual(self.spawns(), old / 2)
+        self.assertIn("9 sessions, 0 rescanned", self.printed)
+
+    def test_a_pane_with_new_activity_is_captured_and_its_stall_reported(self):
+        self.write_config(extra="STALL_PROBE=1\n")
+        f = self.start({"%1": ("quiet", HEALTHY), "%2": ("busy", HEALTHY)})
+        self.run_once()
+        f.calls.clear()
+        f.set("%2", WEEKLY)
+        f.act["%2"] = ACT_OLD + 5
+        self.run_once()
+        self.assertEqual(self.subs(f), {"list-panes": 1, "capture-pane": 1})
+        self.assertEqual(self.inbox_text().count("STALL busy"), 1)
+        self.assertEqual(self.inbox_text().count("STALL quiet"), 0)
+
+    def test_a_moved_cursor_alone_is_a_change(self):
+        self.write_config(extra="STALL_PROBE=1\n")
+        f = self.start({"%1": ("work", HEALTHY)})
+        self.run_once()
+        f.calls.clear()
+        f.set("%1", (HEALTHY[0], HEALTHY[1] + 1, HEALTHY[2]))
+        self.run_once()
+        self.assertEqual(self.subs(f), {"list-panes": 1, "capture-pane": 1})
+
+    def test_activity_in_the_same_second_as_the_read_is_not_trusted(self):
+        self.write_config(extra="STALL_PROBE=1\n")
+        f = self.start({"%1": ("work", HEALTHY)})
+        f.act["%1"] = int(time.time()) + 1  # output arrived in the second the screen was read: more could follow it
+        self.run_once()
+        f.calls.clear()
+        self.run_once()
+        self.assertEqual(self.subs(f), {"list-panes": 1, "capture-pane": 1})
+
+    def test_the_full_run_captures_every_pane_and_counts_a_probe_miss(self):
+        self.write_config(extra="STALL_PROBE=1\nSTALL_FULL_EVERY=3\n")
+        f = self.start({"%1": ("a", HEALTHY), "%2": ("b", HEALTHY)})
+        self.run_once()
+        self.run_once()
+        f.calls.clear()
+        same_cursor = screen("● x", "● y", "  ⎿  You've hit your weekly limit · resets Nov 2, 9am")
+        self.assertEqual(same_cursor[1:], HEALTHY[1:])
+        f.set("%2", same_cursor)  # the screen changed but activity and cursor did not move: the probe cannot see it
+        self.run_once()  # the third run is the spot-check
+        self.assertEqual(self.subs(f), {"list-panes": 1, "capture-pane": 2})
+        self.assertIn("probe-miss=1", self.printed)
+        self.assertEqual(self.inbox_text().count("STALL b"), 1)  # and the spot-check still caught the stall
+        self.run_once()
+        self.assertIn("probe-miss=0", self.printed)
+
+    def test_a_failing_probe_falls_back_to_display_and_capture(self):
+        self.write_config(extra="STALL_PROBE=1\n")
+        f = self.start({"%1": ("work", WEEKLY)})
+        f.no_probe = True
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.subs(f), {"list-panes": 1, "display": 1, "capture-pane": 1})
+        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+
+    def test_a_session_whose_pane_left_tmux_is_unread_not_gone(self):
+        self.write_config(extra="STALL_PROBE=1\n")
+        f = self.start({"%1": ("work", WEEKLY)})
+        self.run_once()
+        del f.panes["%1"]
+        f.panes["%2"] = ("other", HEALTHY)
+        self.run_once()
+        self.assertIn("1 unread", self.printed)
+        self.assertEqual(list(self.marks.glob("*.json"))[0].stem, f.sids["%1"])  # its mark stays
+
+    def test_the_probe_can_be_switched_off(self):
+        self.write_config(extra="STALL_PROBE=0\n")
+        f = self.start({"%1": ("work", HEALTHY)})
+        self.run_once()
+        self.run_once()
+        self.assertEqual({c[1] for c in f.calls}, {"display", "capture-pane"})
+
+    def test_the_wall_allows_list_panes_and_nothing_that_types(self):
+        with mock.patch.object(reaper, "run", return_value=(0, "")) as run:
+            stall.tmux_ro("list-panes", "-a", "-F", "#{pane_id}")
+            run.assert_called_once()
+        with self.assertRaises(RuntimeError):
+            stall.tmux_ro("send-keys", "-t", "%1", "x")
+
+    def live(self):
+        return json.loads((self.tmp / "live.json").read_text())
+
+    def test_live_sessions_json_has_the_fingerprint_and_a_screen_only_when_changed(self):
+        self.write_config(extra="STALL_PROBE=1\n")
+        f = self.start({"%1": ("a", HEALTHY), "%2": ("b", HEALTHY)})
+        self.run_once()
+        d = self.live()
+        self.assertEqual((d["version"], sorted(x["pane"] for x in d["sessions"])), (1, ["%1", "%2"]))
+        self.assertTrue(abs(d["written_at"] - time.time()) < 60)
+        a = next(x for x in d["sessions"] if x["pane"] == "%1")
+        self.assertEqual((a["id"], a["pid"]), (f.sids["%1"], 101))
+        self.assertEqual(a["fingerprint"], stall.screen_hash({"cx": HEALTHY[1], "cy": HEALTHY[2], "screen": HEALTHY[0]}))
+        self.assertIn("screen", a)  # first sight: changed
+        self.assertEqual(oct((self.tmp / "live.json").stat().st_mode & 0o777), "0o600")
+        self.run_once()
+        self.assertFalse([x for x in self.live()["sessions"] if "screen" in x])  # unchanged: no screen
+        f.set("%2", WEEKLY)
+        f.act["%2"] = ACT_OLD + 9
+        self.run_once()
+        self.assertEqual([x["pane"] for x in self.live()["sessions"] if "screen" in x], ["%2"])
+
+    def test_a_stale_missing_or_damaged_snapshot_is_no_snapshot(self):
+        path = self.tmp / "live.json"
+        now = 1_800_000_000.0
+        self.assertIsNone(stall.read_live_snapshot(path, now))  # missing
+        good = {"version": 1, "written_at": now - 60, "sessions": []}
+        path.write_text(json.dumps(good))
+        self.assertEqual(stall.read_live_snapshot(path, now, 180), good)
+        path.write_text(json.dumps({**good, "written_at": now - 181}))
+        self.assertIsNone(stall.read_live_snapshot(path, now, 180))  # stale
+        path.write_text(json.dumps({**good, "written_at": now + 600}))
+        self.assertIsNone(stall.read_live_snapshot(path, now, 180))  # from the future
+        path.write_text(json.dumps({**good, "version": 2}))
+        self.assertIsNone(stall.read_live_snapshot(path, now, 180))
+        path.write_text(json.dumps({**good, "sessions": "x"}))
+        self.assertIsNone(stall.read_live_snapshot(path, now, 180))
+        path.write_text("{not json")
+        self.assertIsNone(stall.read_live_snapshot(path, now, 180))
+        path.write_text("[]")
+        self.assertIsNone(stall.read_live_snapshot(path, now, 180))
+
+    def test_a_failed_snapshot_write_is_a_counted_failure_not_a_stopped_run(self):
+        self.write_config(extra=f"STALL_PROBE=1\nSTALL_LIVE_FILE={self.tmp / 'file' / 'live.json'}\n")
+        (self.tmp / "file").write_text("a file where the directory should be")
+        f = self.start({"%1": ("work", WEEKLY)})
+        self.assertEqual(self.run_once(), 1)
+        self.assertIn("live-sessions write failed", self.printed)
+        self.assertEqual(self.inbox_text().count("STALL work"), 1)
 
 
 class PromptRuns(unittest.TestCase):
