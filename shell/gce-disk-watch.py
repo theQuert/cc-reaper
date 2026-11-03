@@ -427,14 +427,20 @@ def valid_entry(e):
     if not isinstance(todo, list) or not all(isinstance(c, str) and (c in CHANNELS or c in LEGACY_CHANNELS) for c in todo) \
             or (todo and e.get("notice") is None):
         return None
-    todo = [c for c in todo if c in CHANNELS]
+    kept = [c for c in todo if c in CHANNELS]
+    sent = e.get("sent")
+    if todo and not kept and sent is None:
+        # Only legacy channels were pending: the notice counts as sent when it was last read, so the
+        # host is re-alerted after GDW_REALERT_MINUTES instead of never (one_host re-alerts only from `sent`).
+        sent = e.get("read_at") if isinstance(e.get("read_at"), (int, float)) else e.get("since")
+    todo = kept
     if not (e.get("sent") is None or num(e.get("sent"))) or not (e.get("since") is None or num(e.get("since"))):
         return None
     fails = e.get("fails", 0)
     if not isinstance(fails, int) or isinstance(fails, bool) or fails < 0 or not isinstance(e.get("told", False), bool):
         return None
     return {"kind": e["kind"], "since": e.get("since"), "notice": e.get("notice"), "todo": list(todo),
-            "sent": e.get("sent"), "told": e.get("told", False), "fails": fails,
+            "sent": sent, "told": e.get("told", False), "fails": fails,
             "read_at": e.get("read_at") if num(e.get("read_at")) else None}
 
 

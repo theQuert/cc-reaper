@@ -150,8 +150,14 @@ class PauseChainRemoved(unittest.TestCase):
     resource-watch.sh, so its judge is gone too; lines an older script wrote are simply not snapshot lines."""
 
     def test_no_event_judging_remains(self):
-        for gone in ("judge_events", "holds_lease", "EVENT"):
+        for gone in ("holds_lease", "EVENT"):
             self.assertFalse(hasattr(judge, gone), gone)
+
+    def test_judge_events_is_a_shim_that_judges_nothing(self):
+        # The ops-dispatch spot-check (spotcheck.d/host.py) still calls judge_events on the installed copy;
+        # removing the name would turn every spot-check round into a checker error.
+        lines = [event("pause"), event("pause"), snap(swap="19.5GB", hot="1", markers="ALERT:swap")]
+        self.assertEqual(judge.judge_events(lines, CFG), [])
 
     def test_old_event_lines_are_ignored_not_judged(self):
         lines = [event("pause"), snap(), event("pause"), event("resume"), event("resume"),

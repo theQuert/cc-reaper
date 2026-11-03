@@ -131,6 +131,12 @@ def judge_line(line, cfg, ncpu, phys_gb):
     return misses
 
 
+def judge_events(lines, cfg):
+    """The pause chain is gone (stima-api#7079), so there are no events to judge. Kept because the
+    ops-dispatch spot-check (~/handoffs/ops-dispatch/spotcheck.d/host.py) still calls it on the installed copy."""
+    return []
+
+
 def judge_log(lines, cfg, ncpu, phys_gb):
     out = []
     for line in lines:
