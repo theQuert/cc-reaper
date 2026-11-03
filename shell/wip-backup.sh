@@ -17,15 +17,19 @@
 #     force-updates that one ref, refs/wip/<label>/<branch>, nothing else. A clean worktree
 #     whose HEAD is already the remote branch has nothing to back up and pushes nothing.
 # An mtime gate keeps a tick with nothing changed from doing git work (stima-api#7073). Per
-# worktree a stamp in the state dir holds HEAD after its last successful snapshot or skip,
-# and its mtime is when that run began. A worktree is skipped, before any git read other than
-# HEAD, when HEAD still equals the stamp and `find` (.git and node_modules pruned, files AND
+# worktree a stamp in the state dir holds HEAD and the branch name after its last successful
+# snapshot or skip, and its mtime is when that snapshot began (not when it was recorded: an edit
+# made during the snapshot or the push stays newer than the stamp). A worktree is skipped, before
+# any git read other than HEAD, when HEAD and the branch still equal the stamp and `find`
+# (.git and node_modules pruned, files AND
 # directories so a deletion counts, -newer the stamp) finds nothing. It never looks at
 # .git/index or HEAD mtime: unstaged and untracked edits are exactly what is backed up. When
 # every active worktree of a repository is skipped and its hourly cleanup is not due, there
 # is no ls-remote either. Every WIP_FULL_EVERY-th run (6, hourly) snapshots all, gate off;
 # a worktree the gate would have skipped that differs is logged `gate-miss`, and the next
-# WIP_FULL_EVERY runs snapshot all. WIP_GATE=0 turns the gate off.
+# WIP_FULL_EVERY runs snapshot all. WIP_GATE=0 turns the gate off. The gate does not look at the
+# remote: a remote WIP ref or branch that was deleted or force-pushed behind a quiet worktree is
+# repaired by the next full run (at most an hour), not by a gated one.
 # One `git ls-remote` per repository per run reads the branches and this label's WIP refs.
 #
 # A WIP ref is deleted (the ref only; no branch is ever deleted, local or remote) when no
@@ -124,18 +128,19 @@ is_recent() {  # $1 = worktree path: any file changed inside the window, .git an
 
 stamp_of() { printf '%s/%s.wt' "$STATE" "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"; }
 
-gate_ok() {  # $1 = worktree: HEAD as at the last good run and nothing newer than its stamp
+gate_ok() {  # $1 = worktree, $2 = branch: HEAD and branch as at the last good run and nothing newer than its stamp
   local st head
   st="$(stamp_of "$1")"
   [ -f "$st" ] || return 1
   head="$(git -C "$1" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" || return 1
-  [ "$head" = "$(cat "$st" 2>/dev/null)" ] || return 1
+  [ "$head $2" = "$(cat "$st" 2>/dev/null)" ] || return 1
   [ -z "$(find "$1" \( -name .git -o -name node_modules \) -prune -o -newer "$st" -print -quit 2>/dev/null)" ]
 }
 
-record_sync() {  # $1 = worktree, $2 = HEAD: this run's start time (the stamp's mtime) and HEAD
+record_sync() {  # $1 = worktree, $2 = HEAD, $3 = branch: the stamp holds them, dated when the snapshot began
   [ "$DRY" = 1 ] && return 0
-  printf '%s\n' "$2" > "$TMP/stamp.new" && mv -f "$TMP/stamp.new" "$(stamp_of "$1")"
+  printf '%s %s\n' "$2" "$3" > "$TMP/stamp.new" && touch -r "$TMP/start" "$TMP/stamp.new" &&
+    mv -f "$TMP/stamp.new" "$(stamp_of "$1")"
 }
 
 # Build the snapshot of worktree $1 (HEAD $2); prints the tree id.
@@ -174,17 +179,17 @@ remote_sha() {  # $1 = full ref name; from this repository's ls-remote listing
 backup_worktree() {  # $1 = repo, $2 = worktree, $3 = branch, $4 = why
   local repo="$1" wt="$2" branch="$3" why="$4" head tree ref rsha commit
   ref="refs/wip/$LABEL/$branch"; RESULT=""
-  : > "$TMP/stamp.new"  # taken before the snapshot: an edit during it is newer than the stamp
+  : > "$TMP/start"  # taken before the snapshot: an edit during it or the push is newer than the stamp
   head="$(git -C "$wt" rev-parse -q --verify 'HEAD^{commit}')" || { log "skip $wt: no HEAD"; return 0; }
   tree="$(snapshot_tree "$wt" "$head")" || { log "FAIL snapshot $wt"; FAILED=1; return 0; }
   if [ "$tree" = "$(git -C "$wt" rev-parse "$head^{tree}")" ] &&
      [ "$(remote_sha "refs/heads/$branch")" = "$head" ]; then
-    SAME=$((SAME + 1)); RESULT=same; record_sync "$wt" "$head"; return 0  # clean and pushed: the branch itself is the backup
+    SAME=$((SAME + 1)); RESULT=same; record_sync "$wt" "$head" "$branch"; return 0  # clean and pushed: the branch itself is the backup
   fi
   rsha="$(remote_sha "$ref")"
   if [ -n "$rsha" ] && [ "$(git -C "$wt" rev-parse -q --verify "$rsha^{tree}" 2>/dev/null)" = "$tree" ] &&
      [ "$(git -C "$wt" rev-parse -q --verify "$rsha^1" 2>/dev/null)" = "$head" ]; then
-    SAME=$((SAME + 1)); RESULT=same; record_sync "$wt" "$head"; return 0
+    SAME=$((SAME + 1)); RESULT=same; record_sync "$wt" "$head" "$branch"; return 0
   fi
   if [ -z "$(git -C "$wt" config user.email)" ]; then
     export GIT_AUTHOR_NAME=wip-backup GIT_COMMITTER_NAME=wip-backup
@@ -200,7 +205,7 @@ backup_worktree() {  # $1 = repo, $2 = worktree, $3 = branch, $4 = why
   # shellcheck disable=SC2086
   if git -C "$repo" $NET push -q --no-progress "$REMOTE" "+$commit:$ref" 2>"$TMP/push.err"; then
     log "pushed $(basename "$repo") $ref ${commit:0:12} ($why)"; PUSHED=$((PUSHED + 1)); RESULT=differs
-    record_sync "$wt" "$head"
+    record_sync "$wt" "$head" "$branch"
   else
     log "FAIL push $(basename "$repo") $ref: $(tr '\n' ' ' < "$TMP/push.err" | cut -c1-200)"; FAILED=1
   fi
@@ -259,7 +264,7 @@ backup_repo() {  # $1 = a primary checkout
           case "$SKIP" in *" $branch "*) why="" ;; esac
           if [ -n "$why" ]; then
             mode=0
-            if [ "$GATE" = 1 ] && gate_ok "$wt"; then mode=$([ "$FULL" = 1 ] && echo 2 || echo 1); fi
+            if [ "$GATE" = 1 ] && gate_ok "$wt" "$branch"; then mode=$([ "$FULL" = 1 ] && echo 2 || echo 1); fi
             printf '%s\t%s\t%s\t%s\n' "$wt" "$branch" "$why" "$mode" >> "$TMP/todo"
           fi
         fi
@@ -281,7 +286,7 @@ backup_repo() {  # $1 = a primary checkout
     backup_worktree "$repo" "$wt" "$branch" "$why"
     if [ "$mode" = 2 ] && [ "$RESULT" = differs ]; then  # the gate would have skipped it
       log "gate-miss $wt: nothing newer than its stamp, yet the snapshot differs"
-      MISSES=$((MISSES + 1)); echo "$FULL_EVERY" > "$STATE/full-remaining"
+      MISSES=$((MISSES + 1)); [ "$DRY" = 1 ] || echo "$FULL_EVERY" > "$STATE/full-remaining"
     fi
   done < "$TMP/todo"
   rm -f "$TMP/del.failed"

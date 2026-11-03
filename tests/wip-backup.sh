@@ -221,5 +221,37 @@ check "gate: a full run with no miss spends one of the armed runs and skips noth
 rm -rf "$WIP_STATE_DIR"; run; run
 check "gate: WIP_GATE=0 never skips" 'WIP_GATE=0 run; grep -q "gated=0" "$WORK/out"'
 
+# ---------------------------------------------------------------- review repairs (stima-api#7073)
+# An edit made while the push runs is newer than the stamp, so the next round must take it.
+MR="$WORK/mid-remote.git"; MP="$HOME/GitHub/mid"
+git "${F[@]}" init -q --bare "$MR"; git "${F[@]}" init -q "$MP"; git -C "$MP" remote add origin "$MR"
+echo a > "$MP/a.txt"; git -C "$MP" add -A && git "${F[@]}" -C "$MP" commit -qm init && git -C "$MP" push -q origin main
+git -C "$MP" worktree add -q -b feat/mid "$WORK/m1" main
+printf '#!/bin/sh\n/bin/sleep 1\necho during-push > "%s/m1/a.txt"\n/bin/sleep 1\n' "$WORK" > "$MP/.git/hooks/pre-push"
+chmod +x "$MP/.git/hooks/pre-push"
+export WIP_REPOS="$MP" WIP_STATE_DIR="$WORK/mstate"
+mref() { git --git-dir="$MR" rev-parse -q --verify "$1" 2>/dev/null; }
+echo before > "$WORK/m1/a.txt"; echo recent > "$WORK/m1/b.txt"  # b.txt keeps the worktree inside the recent window
+run
+rm -f "$MP/.git/hooks/pre-push"
+check "mid-push: the first round pushed the content it snapshotted" \
+  '[ "$(git --git-dir="$MR" show "$(mref refs/wip/macmini/feat/mid):a.txt")" = before ] && [ "$(cat "$WORK/m1/a.txt")" = during-push ]'
+run
+check "mid-push: an edit made during the push is not gated and is in the next round" \
+  'grep -q "pushed=1 unchanged=0 gated=0" "$WORK/out" && [ "$(git --git-dir="$MR" show "$(mref refs/wip/macmini/feat/mid):a.txt")" = during-push ]'
+sleep 1; run
+check "mid-push: and then it is gated again" 'grep -q "pushed=0 unchanged=1 gated=1" "$WORK/out"'
+# The gate also keys on the branch: a rename with the same HEAD is a new ref to back up.
+git -C "$WORK/m1" branch -m feat/mid feat/mid2
+run
+check "gate: a branch renamed with the same HEAD is not gated and gets its own WIP ref" \
+  'grep -q "gated=0" "$WORK/out" && [ -n "$(mref refs/wip/macmini/feat/mid2)" ]'
+# --dry-run changes no state, a gate-miss included.
+sleep 1; echo sneaky > "$WORK/m1/a.txt"; touch -t "$OLD" "$WORK/m1/a.txt"
+echo 5 > "$WIP_STATE_DIR/run-count"; echo 0 > "$WIP_STATE_DIR/full-remaining"
+run --dry-run
+check "dry run: a gate-miss is reported but full-remaining is not armed" \
+  'grep -q "gate-miss=1" "$WORK/out" && [ "$(cat "$WIP_STATE_DIR/full-remaining")" = 0 ] && [ "$(cat "$WIP_STATE_DIR/run-count")" = 5 ]'
+
 echo "wip-backup: $PASSED passed, $FAILURES failed"
 [ "$FAILURES" -eq 0 ]
