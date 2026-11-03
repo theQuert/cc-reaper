@@ -145,41 +145,18 @@ class Line(unittest.TestCase):
         self.assertTrue(self.j("2026-10-30T01:07:01 load=1/1/1 cpu_idle=% mem_free=% compressor=GB disk_free=GB/%"))
 
 
-class Events(unittest.TestCase):
-    def j(self, lines, cfg=CFG):
-        return judge.judge_events(lines, cfg)
+class PauseChainRemoved(unittest.TestCase):
+    """stima-api #7079: the pause chain (one events.log line per change of the pause state) is gone from
+    resource-watch.sh, so its judge is gone too; lines an older script wrote are simply not snapshot lines."""
 
-    def test_pause_then_resume_is_fine(self):
-        self.assertEqual(self.j([event("pause"), snap(swap="19.5GB"), event("resume"), snap()]), [])
+    def test_no_event_judging_remains(self):
+        for gone in ("judge_events", "holds_lease", "EVENT"):
+            self.assertFalse(hasattr(judge, gone), gone)
 
-    def test_two_pauses_in_a_row(self):
-        self.assertTrue(any("two DISK-PAUSE" in m for m in self.j([event("pause"), snap(), event("pause")])))
-
-    def test_two_resumes_in_a_row(self):
-        self.assertTrue(any("two DISK-RESUME" in m for m in self.j([event("resume"), event("resume")])))
-
-    def test_modes_are_separate(self):
-        self.assertEqual(self.j([event("pause", "shadow"), event("pause", "emitted")]), [])
-
-    def test_swap_after_a_resume(self):
-        # a line without swap_hot keeps the size-only rule
-        self.assertTrue(any("newest event is DISK-RESUME" in m
-                            for m in self.j([event("pause"), event("resume"), snap(swap="19.5GB")])))
-
-    def test_high_but_calm_swap_after_a_resume_holds_nothing(self):
-        self.assertEqual(self.j([event("pause"), event("resume"), snap(swap="20.9GB", hot="0")]), [])
-        self.assertEqual(self.j([event("resume"), snap(swap="22.5GB", hot="?")]), [], "unknown is not counted")
-        self.assertTrue(any("newest event is DISK-RESUME" in m
-                            for m in self.j([event("resume"), snap(swap="20.9GB", hot="1")])))
-
-    def test_emergency_and_flag_rate_after_a_resume(self):
-        cfg = dict(CFG, CC_RW_DISK_EMERGENCY_GB=25.0, CC_RW_RATE_FLAG_GBH=12.0)
-        self.assertTrue(self.j([event("resume"), snap(free=24.0)], cfg))
-        self.assertTrue(self.j([event("resume"), snap(rate="13.0GB/h")], cfg))
-        self.assertEqual(self.j([event("resume"), snap(rate="11.0GB/h")], cfg), [])
-
-    def test_no_event_yet_judges_nothing(self):
-        self.assertEqual(self.j([snap(swap="19.5GB")]), [])
+    def test_old_event_lines_are_ignored_not_judged(self):
+        lines = [event("pause"), snap(), event("pause"), event("resume"), event("resume"),
+                 snap(swap="19.5GB", hot="1", markers="ALERT:swap")]
+        self.assertEqual(judge.judge_log(lines, CFG, NCPU, PHYS), [])
 
 
 if __name__ == "__main__":
