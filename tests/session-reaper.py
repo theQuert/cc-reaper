@@ -1161,6 +1161,11 @@ class WaitingUntil(unittest.TestCase):
         both = self.WAIT + "\nSESSION-DONE: nothing left"
         self.assertFalse(reaper.said_waiting(dict(last_text=both, text_at=2, prompt_at=1)))  # a done reply is done
 
+    def test_a_waiting_line_before_the_compact_line_is_still_a_waiting_session(self):
+        # Every reply ends on a `/compact <keep-list>` line (Context Rule), so the alarm is normally second to last.
+        text = self.WAIT + "\n\n`/compact PR #7106 head abc, check-by 2026-10-31T09:00Z`"
+        self.assertTrue(reaper.said_waiting(dict(last_text=text, text_at=2, prompt_at=1)))
+
     def test_open_prs_reads_each_worktree_branch(self):
         reaper._pr_cache.clear()
         self.addCleanup(reaper._pr_cache.clear)
@@ -2041,6 +2046,12 @@ class DoneMarker(unittest.TestCase):
         out = reaper.write_done_markers(self.cfg, [self.s(last_text="Tests pass.\n\nSESSION-DONE: nothing left")],
                                         self.now)
         self.assertEqual(len(out), 3)
+
+    def test_a_done_line_followed_by_a_compact_line_is_not_done_and_marks_nothing(self):
+        text = "Tests pass.\nSESSION-DONE: nothing left\n\n`/compact PR #7106 merged abc`"
+        self.assertFalse(reaper.said_done(self.s(last_text=text)))
+        self.assertEqual(reaper.write_done_markers(self.cfg, [self.s(last_text=text)], self.now), [])
+        self.assertEqual(self.marks(), [])
 
     def test_a_tool_call_after_the_text_marks_nothing(self):
         self.assertEqual(reaper.write_done_markers(self.cfg, [self.s(text_at=0, prompt_at=0)], self.now), [])

@@ -1429,17 +1429,15 @@ def stall_mark(cfg, sid, now=None):
         return ""
 
 
-def _ends_on(s, rx):
-    """The reply that ends the transcript, written after the last prompt, has a bare `rx` line as its LAST non-blank
-    line, outside a code fence (``` or ~~~) and not in an indented (4 spaces or a tab) code block."""
+def _ends_on(s, rx, window=1):
+    """The reply that ends the transcript, written after the last prompt, has a bare `rx` line among its last `window`
+    non-blank lines (1: the last one), outside a code fence (``` or ~~~) and not in an indented (4 spaces or a tab)
+    code block."""
     lines = [ln for ln in (s.get("last_text") or "").splitlines() if ln.strip()]
-    if not lines:
-        return False
-    last = lines[-1]
-    fenced = sum(ln.lstrip().startswith(("```", "~~~")) for ln in lines[:-1]) % 2
-    return (not fenced and not last.lstrip().startswith(("```", "~~~"))
-            and not last.startswith(("    ", "\t"))
-            and bool(rx.match(last))
+    tail = lines[-window:]
+    fenced = sum(ln.lstrip().startswith(("```", "~~~")) for ln in lines[:len(lines) - len(tail)]) % 2
+    return (not fenced and not any(ln.lstrip().startswith(("```", "~~~")) for ln in tail)
+            and any(rx.match(ln) and not ln.startswith(("    ", "\t")) for ln in tail)
             and (s.get("text_at") or 0) > (s.get("prompt_at") or 0))
 
 
@@ -1450,7 +1448,7 @@ def said_done(s):
 
 def said_waiting(s):
     """The newest reply ends on `SESSION-STATE: WAITING_UNTIL=<iso>` and does not also say it is done (EL-T2520)."""
-    return not said_done(s) and _ends_on(s, WAIT_RE)
+    return not said_done(s) and _ends_on(s, WAIT_RE, window=3)
 
 
 def waiting_keeps(s, cfg, now):
