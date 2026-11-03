@@ -48,7 +48,7 @@ until a person looks. This is the cheap detector for that, and it calls no model
 
 live-sessions.json  each run writes STALL_LIVE_FILE (~/.cc-reaper/state/live-sessions.json, 0600): version,
   written_at and, per live session, id, pane, pid, the pane's screen fingerprint and its screen only when it changed
-  in this run. `read_live_snapshot` is the reader: it returns None when the file is missing, unreadable, of another
+  in this run; a session that was live but not read in this run is there with "unread": true and no fingerprint. `read_live_snapshot` is the reader: it returns None when the file is missing, unreadable, of another
   version or older than STALL_LIVE_MAX_AGE_SECONDS (180), and a caller then reads for itself. Nothing acts on a
   snapshot past its age.
 
@@ -400,7 +400,8 @@ def write_live(path, live, panes, changed, now):
     changed in this run. Written 0600 (a screen can hold anything)."""
     sessions = []
     for d, pane, ps in live:
-        if ps is None:
+        if ps is None:  # live but not read this run: say so, so a reader reads it for itself
+            sessions.append({"id": d["sessionId"], "pane": pane, "pid": d.get("pid"), "fingerprint": None, "unread": True})
             continue
         p = panes.get(pane) or {}
         e = {"id": d["sessionId"], "pane": pane, "pid": d.get("pid"), "fingerprint": p.get("hash")}
@@ -415,10 +416,13 @@ def write_live(path, live, panes, changed, now):
     os.replace(tmp, path)
 
 
-def read_live_snapshot(path, now=None, max_age=180.0):
+def read_live_snapshot(path, now=None, max_age=None, config=None):
     """The shared live-sessions snapshot, or None when it is missing, unreadable, malformed, of another version,
-    from the future or older than max_age seconds: a reader then reads for itself and never acts on it."""
+    from the future or older than max_age seconds (default: STALL_LIVE_MAX_AGE_SECONDS from `config`, else the
+    reaper's config file): a reader then reads for itself and never acts on it."""
     now = time.time() if now is None else now
+    if max_age is None:
+        max_age = _minutes(load_config(config or reaper.CONFIG), "STALL_LIVE_MAX_AGE_SECONDS")
     try:
         d = json.loads(Path(path).read_text())
     except (OSError, ValueError):

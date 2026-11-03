@@ -579,6 +579,34 @@ class Runs(unittest.TestCase):
             run.assert_called_once_with(["tmux", "capture-pane", "-p", "-t", "%1"], timeout=10)
 
 
+class RunsWithProbe(Runs):
+    """The production default is STALL_PROBE=1: the whole Runs group (fingerprints, marks, fleet, inbox) again with it on."""
+
+    def write_config(self, apply="1", fleet_min="2", extra=""):
+        Runs.write_config(self, apply, fleet_min, extra + "STALL_PROBE=1\n")
+
+    def start(self, panes):
+        f = Runs.start(self, panes)
+        plain_set, tick = f.set, iter(range(1, 10**6))
+
+        def set_and_touch(pane_id, spec_):  # tmux bumps window_activity when a pane's output changes
+            plain_set(pane_id, spec_)
+            f.act[pane_id] = ACT_OLD + next(tick)
+        f.set = set_and_touch
+        return f
+
+    @unittest.skip("covered under the probe by ProbeRuns: f.fail / f.empty only reach display and capture-pane")
+    def test_a_failed_read_keeps_the_event_and_the_mark_and_reports_nothing_again(self):
+        pass
+
+    def test_never_types_into_a_pane(self):
+        f = self.start({"%1": ("a", WEEKLY), "%2": ("b", DISCONNECTED), "%3": ("c", INTERRUPTED), "%4": ("d", HEALTHY)})
+        self.run_once()
+        self.run_once("--apply")
+        self.assertEqual({c[1] for c in f.calls}, {"list-panes", "capture-pane"})
+        self.assertFalse([c for c in f.calls if "send-keys" in c or "send" in c[1]])
+
+
 class ProbeRuns(unittest.TestCase):
     """stima-api#7073: one list-panes stands in for the per-pane display + capture; a pane is captured only when its
     activity or cursor moved, every STALL_FULL_EVERY-th run captures all (the spot-check), and each run writes the
@@ -627,6 +655,17 @@ class ProbeRuns(unittest.TestCase):
         self.assertEqual(self.subs(f), {"list-panes": 1, "capture-pane": 1})
         self.assertEqual(self.inbox_text().count("STALL busy"), 1)
         self.assertEqual(self.inbox_text().count("STALL quiet"), 0)
+
+    def test_activity_alone_is_a_change_with_the_cursor_unmoved(self):
+        self.write_config(extra="STALL_PROBE=1\n")
+        f = self.start({"%1": ("quiet", HEALTHY), "%2": ("busy", HEALTHY)})
+        self.run_once()
+        f.calls.clear()
+        f.set("%2", (WEEKLY[0], HEALTHY[1], HEALTHY[2]))  # new text, the cursor exactly where it was
+        f.act["%2"] = ACT_OLD + 5
+        self.run_once()
+        self.assertEqual(self.subs(f), {"list-panes": 1, "capture-pane": 1})
+        self.assertEqual(self.inbox_text().count("STALL busy"), 1)
 
     def test_a_moved_cursor_alone_is_a_change(self):
         self.write_config(extra="STALL_PROBE=1\n")
@@ -716,6 +755,29 @@ class ProbeRuns(unittest.TestCase):
         self.run_once()
         self.assertEqual([x["pane"] for x in self.live()["sessions"] if "screen" in x], ["%2"])
 
+    def test_an_unread_session_is_recorded_as_unread(self):
+        self.write_config(extra="STALL_PROBE=1\n")
+        f = self.start({"%1": ("a", HEALTHY), "%2": ("b", HEALTHY)})
+        self.run_once()
+        del f.panes["%2"]  # live in the session files, gone from tmux's list: unread
+        self.run_once()
+        by = {x["pane"]: x for x in self.live()["sessions"]}
+        self.assertEqual(sorted(by), ["%1", "%2"])
+        self.assertNotIn("unread", by["%1"])
+        self.assertEqual((by["%2"]["unread"], by["%2"]["id"], by["%2"]["fingerprint"]), (True, f.sids["%2"], None))
+
+    def test_the_snapshot_age_limit_is_read_from_the_config(self):
+        path, now = self.tmp / "live.json", 1_800_000_000.0
+        path.write_text(json.dumps({"version": 1, "written_at": now - 100, "sessions": []}))
+        self.write_config(extra="STALL_LIVE_MAX_AGE_SECONDS=300\n")
+        self.assertIsNotNone(stall.read_live_snapshot(path, now, config=self.cfg))
+        self.write_config(extra="STALL_LIVE_MAX_AGE_SECONDS=60\n")
+        self.assertIsNone(stall.read_live_snapshot(path, now, config=self.cfg))  # 100s old, limit 60s
+        self.write_config()
+        self.assertIsNotNone(stall.read_live_snapshot(path, now, config=self.cfg))  # the default, 180
+        self.assertIsNone(stall.read_live_snapshot(path, now + 100, config=self.cfg))  # 200s old
+        self.assertIsNotNone(stall.read_live_snapshot(path, now + 100, 300, config=self.cfg))  # explicit wins
+
     def test_a_stale_missing_or_damaged_snapshot_is_no_snapshot(self):
         path = self.tmp / "live.json"
         now = 1_800_000_000.0
@@ -748,6 +810,7 @@ class ProbeRuns(unittest.TestCase):
 class PromptRuns(unittest.TestCase):
     """A prompt on screen is aged from its first sighting and flagged past STALL_PROMPT_MINUTES, once per instance."""
     table = None
+    tmux_used = {"display", "capture-pane"}
     setUp, write_config, start, run_once, inbox_text = Runs.setUp, Runs.write_config, Runs.start, Runs.run_once, Runs.inbox_text
 
     def age(self, minutes, field="first"):
@@ -776,7 +839,7 @@ class PromptRuns(unittest.TestCase):
         self.assertNotIn("r.git", text)  # no screen text reaches the inbox
         self.assertNotIn("fine", text)
         self.assertIn("would push ci", self.printed)  # STALL_PUSH unset: the push is shadow
-        self.assertEqual({c[1] for c in f.calls}, {"display", "capture-pane"})  # never answered, never typed
+        self.assertEqual({c[1] for c in f.calls}, self.tmux_used)  # never answered, never typed
 
     def test_an_ask_user_question_menu_is_flagged(self):
         self.start({"%1": ("security", ASK_USER)})
@@ -812,7 +875,7 @@ class PromptRuns(unittest.TestCase):
         self.age(10)
         self.run_once()
         self.assertEqual(self.prompt_blocks("sre"), 2)
-        self.assertEqual({c[1] for c in f.calls}, {"display", "capture-pane"})  # never answered, never typed
+        self.assertEqual({c[1] for c in f.calls}, self.tmux_used)  # never answered, never typed
 
     def test_a_menu_read_before_the_question_was_kept_is_read_again(self):
         self.write_config(apply="0", extra="STALL_PROMPT_APPLY=1\n")
@@ -883,7 +946,7 @@ class PromptRuns(unittest.TestCase):
             f.set("%1", HEALTHY); self.run_once()
             f.set("%1", ASK_USER); self.run_once(); self.age(10); self.run_once()  # a new instance: one more
             self.assertEqual(ping.call_count, 3)
-        self.assertEqual({c[1] for c in f.calls}, {"display", "capture-pane"})  # never answered, never typed
+        self.assertEqual({c[1] for c in f.calls}, self.tmux_used)  # never answered, never typed
 
     def test_a_failed_push_is_a_failure_and_retried_until_it_goes_out_whatever_the_inbox(self):
         self.push_config()
@@ -1136,6 +1199,16 @@ class PromptRuns(unittest.TestCase):
         self.assertIn("prompt alert inbox write failed", self.printed)
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(self.prompt_blocks("ci"), 1)
+
+
+class PromptRunsWithProbe(PromptRuns):
+    """PromptRuns again with the production default STALL_PROBE=1."""
+    tmux_used = {"list-panes", "capture-pane"}
+
+    def write_config(self, apply="1", fleet_min="2", extra=""):
+        Runs.write_config(self, apply, fleet_min, extra + "STALL_PROBE=1\n")
+
+    start = RunsWithProbe.start
 
 
 class ReaperKeepsStalledSessions(unittest.TestCase):
