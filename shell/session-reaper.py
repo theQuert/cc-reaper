@@ -1059,33 +1059,109 @@ SID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 DONE_MARKER = "claude-task-done"
 
 
-def write_done_markers(cfg, sessions, now):
+def _owned_dir(name, dir_fd=None):
+    """An fd for directory `name` (relative to dir_fd when given), opened without following a link and owned by this
+    user; None for anything else. Every step from the root down is opened this way, so a link swapped into the shared
+    /tmp tree between a check and the write is never followed (stima-api#7106 security review)."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        if os.fstat(fd).st_uid == os.getuid():
+            return fd
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def _mark(dir_fd, label, sid, text_at, body, written, skipped):
+    """Write the marker inside the open directory dir_fd, never through a link; an existing marker for this session
+    no older than its reply is left as it is."""
+    try:
+        fd = os.open(DONE_MARKER, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        try:
+            st = os.fstat(fd)
+            if (st.st_uid == os.getuid() and st.st_mtime >= text_at
+                    and os.read(fd, 4096).decode(errors="replace").startswith(f"session={sid}\n")):
+                return
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        pass
+    except OSError as e:  # ELOOP: a link at the marker path
+        skipped.append(f"{label}/{DONE_MARKER}: not written ({e.strerror or e})")
+        return
+    try:
+        fd = os.open(DONE_MARKER, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    except OSError as e:
+        skipped.append(f"{label}/{DONE_MARKER}: not written ({e.strerror or e})")
+        return
+    try:
+        if os.fstat(fd).st_uid != os.getuid():
+            skipped.append(f"{label}/{DONE_MARKER}: not written (not owned by this user)")
+            return
+        os.write(fd, body.encode())
+    finally:
+        os.close(fd)
+    written.append(f"{label}/{DONE_MARKER}")
+
+
+def write_done_markers(cfg, sessions, now, skipped=None):
     """stima-api#7106: mark the scratchpads and job directory of every session whose newest reply, written after its
-    last prompt, says SESSION-DONE. Only existing directories, never a link; a marker already naming the session and
-    no older than that reply is left as it is. Returns the markers written."""
+    last prompt, says SESSION-DONE. Only existing directories this user owns, reached without following a link from
+    a root that is itself no link and this user's; a marker already naming the session and no older than that reply
+    is left as it is. Returns the markers written; what was refused is appended to `skipped`."""
+    skipped = [] if skipped is None else skipped
     if cfg.get("DONE_MARKER", "on") != "on":
         return []
-    root = Path(os.path.expanduser(cfg.get("SCRATCH_ROOT") or f"/tmp/claude-{os.getuid()}"))
-    jobs = Path(os.path.expanduser(cfg.get("JOBS_DIR") or "~/.claude/jobs"))
+    root = os.path.expanduser(cfg.get("SCRATCH_ROOT") or f"/tmp/claude-{os.getuid()}")
+    jobs = os.path.expanduser(cfg.get("JOBS_DIR") or "~/.claude/jobs")
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    done = [s for s in sessions
+            if SID_RE.fullmatch(s.get("sid") or "") and s.get("text_at") and s["text_at"] >= s.get("prompt_at", 0)
+            and DONE_RE.search(s.get("last_text") or "")]
     written = []
-    for s in sessions:
-        sid = s.get("sid") or ""
-        if not SID_RE.fullmatch(sid) or not s.get("text_at") or s["text_at"] < s.get("prompt_at", 0):
+    if not done:
+        return written
+    for top, kind in ((root, "scratch"), (jobs, "jobs")):
+        if not os.path.lexists(top):
             continue
-        if not DONE_RE.search(s.get("last_text") or ""):
+        top_fd = _owned_dir(top)
+        if top_fd is None:
+            skipped.append(f"{top}: a link, not a directory or not this user's; nothing marked under it")
             continue
-        for d in [Path(p) for p in sorted(glob.glob(str(root / "*" / sid)))] + [jobs / sid[:8]]:
-            m = d / DONE_MARKER
-            if d.is_symlink() or not d.is_dir() or m.is_symlink():
-                continue
+        try:
+            parents = [(top_fd, top)]
+            if kind == "scratch":
+                parents = []
+                for name in sorted(os.listdir(top_fd)):
+                    fd = _owned_dir(name, top_fd)
+                    if fd is not None:
+                        parents.append((fd, f"{top}/{name}"))
             try:
-                if m.read_text().startswith(f"session={sid}\n") and m.stat().st_mtime >= s["text_at"]:
-                    continue
-            except OSError:
-                pass
-            m.write_text(f"session={sid}\nat={stamp}\n")
-            written.append(str(m))
+                for s in done:
+                    sid = s["sid"]
+                    leaf = sid if kind == "scratch" else sid[:8]
+                    for pfd, plabel in parents:
+                        if not os.path.lexists(os.path.join(plabel, leaf)):
+                            continue
+                        fd = _owned_dir(leaf, pfd)
+                        if fd is None:
+                            skipped.append(f"{plabel}/{leaf}: a link, not a directory or not this user's; not marked")
+                            continue
+                        try:
+                            _mark(fd, f"{plabel}/{leaf}", sid, s["text_at"], f"session={sid}\nat={stamp}\n",
+                                  written, skipped)
+                        finally:
+                            os.close(fd)
+            finally:
+                for pfd, _ in parents:
+                    if pfd != top_fd:
+                        os.close(pfd)
+        finally:
+            os.close(top_fd)
     return written
 
 
@@ -2445,7 +2521,9 @@ def main(argv=None):
         failures.append(f"idle list: {type(e).__name__}: {e}")
     try:
         if apply:
-            notes += [f"done marker written: {m}" for m in write_done_markers(cfg, gathered, now)]
+            refused = []
+            notes += [f"done marker written: {m}" for m in write_done_markers(cfg, gathered, now, refused)]
+            notes += [f"done marker skipped: {m}" for m in refused]
     except Exception as e:  # a marker that could not be written only delays a reclaim
         notes.append(f"done marker: {type(e).__name__}: {e}")
     signal.alarm(0)

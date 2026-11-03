@@ -2287,13 +2287,74 @@ class DoneMarker(unittest.TestCase):
         bad.mkdir()
         self.assertEqual(reaper.write_done_markers(self.cfg, [self.s(sid="*")], self.now), [])
 
-    def test_a_link_is_never_marked(self):
+    def test_a_linked_session_directory_is_never_marked_and_is_logged(self):
         elsewhere = self.tmp / "elsewhere"
         elsewhere.mkdir()
         shutil.rmtree(self.pads[0])
         self.pads[0].symlink_to(elsewhere)
-        reaper.write_done_markers(self.cfg, [self.s()], self.now)
+        skipped = []
+        out = reaper.write_done_markers(self.cfg, [self.s()], self.now, skipped)
         self.assertFalse((elsewhere / "claude-task-done").exists())
+        self.assertNotIn(str(self.pads[0] / "claude-task-done"), out)
+        self.assertIn(str(self.pads[1] / "claude-task-done"), out)
+        self.assertEqual(skipped, [f"{self.pads[0]}: a link, not a directory or not this user's; not marked"])
+
+    def test_a_link_at_the_marker_path_leaves_its_target_untouched_and_is_logged(self):
+        target = self.tmp / "victim"
+        target.write_text("precious\n")
+        old = self.now - 7200
+        os.utime(target, (old, old))  # older than the reply, so a path-based write would rewrite it
+        (self.pads[0] / "claude-task-done").symlink_to(target)
+        skipped = []
+        out = reaper.write_done_markers(self.cfg, [self.s()], self.now, skipped)
+        self.assertEqual(target.read_text(), "precious\n")
+        self.assertTrue((self.pads[0] / "claude-task-done").is_symlink())
+        self.assertNotIn(str(self.pads[0] / "claude-task-done"), out)
+        self.assertEqual(len(skipped), 1)
+        self.assertTrue(skipped[0].startswith(f"{self.pads[0]}/claude-task-done: not written ("), skipped)
+
+    def test_a_link_swapped_in_after_the_read_is_not_followed_by_the_write(self):
+        target = self.tmp / "victim"
+        target.write_text("precious\n")
+        real_open = os.open
+        def racing_open(path, flags, *a, **k):
+            # The read finds no marker; a link appears before the write.
+            if path == "claude-task-done" and not flags & os.O_WRONLY:
+                os.symlink(target, self.pads[0] / "claude-task-done")
+                raise FileNotFoundError(2, "No such file or directory")
+            return real_open(path, flags, *a, **k)
+        skipped = []
+        with mock.patch.object(reaper.os, "open", side_effect=racing_open):
+            reaper.write_done_markers(self.cfg, [self.s()], self.now, skipped)
+        self.assertEqual(target.read_text(), "precious\n")
+        self.assertTrue(any(x.startswith(f"{self.pads[0]}/claude-task-done: not written (") for x in skipped), skipped)
+
+    def test_a_linked_root_marks_nothing_under_it_and_is_logged(self):
+        real = self.tmp / "real-scratch"
+        (self.tmp / "scratch").rename(real)
+        (self.tmp / "scratch").symlink_to(real)
+        skipped = []
+        out = reaper.write_done_markers(self.cfg, [self.s()], self.now, skipped)
+        self.assertEqual(list(real.rglob("claude-task-done")), [])
+        self.assertEqual(out, [str(self.job / "claude-task-done")])
+        self.assertIn(f"{self.tmp / 'scratch'}: a link, not a directory or not this user's; nothing marked under it",
+                      skipped)
+
+    def test_a_root_owned_by_someone_else_marks_nothing_under_it(self):
+        real_fstat = os.fstat
+        root = str(self.tmp / "scratch")
+        root_ino = os.lstat(root).st_ino
+        def fstat(fd):
+            st = real_fstat(fd)
+            if st.st_ino == root_ino:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, os.getuid() + 1) + tuple(st)[5:])
+            return st
+        skipped = []
+        with mock.patch.object(reaper.os, "fstat", side_effect=fstat):
+            out = reaper.write_done_markers(self.cfg, [self.s()], self.now, skipped)
+        self.assertEqual(out, [str(self.job / "claude-task-done")])
+        self.assertEqual([p for p in self.marks() if "/scratch/" in p], [])
+        self.assertTrue(any(x.startswith(f"{root}: ") for x in skipped), skipped)
 
     def test_no_directory_is_created(self):
         shutil.rmtree(self.tmp / "jobs")
