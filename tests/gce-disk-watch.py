@@ -70,7 +70,8 @@ class Base(unittest.TestCase):
             key.parent.mkdir()
             key.write_text("k")
             key.with_name(key.name + ".pub").write_text("k.pub")
-        cfg.update(GDW_SSH_KEY=str(key),
+        # The shipped cadence (30/60 min) is exercised by class Cadence; every other test reads each host each run.
+        cfg.update(GDW_READ_EVERY_MINUTES="0", GDW_KNOWN_EVERY_MINUTES="0", GDW_SSH_KEY=str(key),
                    GDW_INBOX=str(self.tmp / "handoffs" / "neo-inbox.md"),
                    GDW_EVENTS_LOG=str(self.tmp / "handoffs" / "ops-dispatch" / "events.log"),
                    GDW_STATE=str(self.tmp / "state" / "gce-disk-watch.json"),
@@ -471,6 +472,101 @@ class Review(Base):
     def test_gcloud_is_given_the_checked_key(self):
         argv = gdw.gcloud_argv(self.cfg(), "stima-ci-1")
         self.assertEqual(argv[argv.index("--ssh-key-file") + 1], str(self.tmp / "ssh" / "google_compute_engine"))
+
+
+class Cadence(Base):
+    """GDW_READ_EVERY_MINUTES / GDW_KNOWN_EVERY_MINUTES: a host not due is not read and keeps its state."""
+
+    def cad(self, outputs, **over):
+        over.setdefault("GDW_READ_EVERY_MINUTES", "30")
+        over.setdefault("GDW_KNOWN_EVERY_MINUTES", "60")
+        over.setdefault("GDW_KNOWN_UNREADABLE", "stima-ci-1 stima-ci-deploy-1")
+        return self.run_once(outputs, **over)
+
+    def test_shipped_defaults(self):
+        cfg = gdw.load_config(self.tmp / "absent.conf", env={})
+        self.assertEqual((cfg["GDW_READ_EVERY_MINUTES"], cfg["GDW_KNOWN_EVERY_MINUTES"]), ("30", "60"))
+
+    def test_hosts_are_read_on_their_own_cadence_and_not_due_spawns_nothing(self):
+        refused = {"stima-ci-1": (255, "", None), "stima-ci-deploy-1": (255, "", None)}
+        reads = []
+        for _ in range(7):  # 0, 10, ... 60 minutes
+            _, lines, runner = self.cad(refused)
+            reads.append(sorted(c[0] for c in runner.calls))
+            self.clock.t += 600
+        self.assertEqual(len(reads[0]), 5)  # first run reads all
+        for i in (1, 2):
+            self.assertEqual(reads[i], [])  # nothing due inside 30 min
+        self.assertEqual(reads[3], ["stima-ci-2", "stima-ci-3", "stima-ci-ctl-1"])  # 30 min: readable hosts only
+        self.assertEqual(reads[4], [])
+        self.assertEqual(reads[6], sorted(HOSTS))  # 60 min: all, known ones included
+        total = sum(len(r) for r in reads)
+        self.assertEqual(total, 5 + 3 + 5 + 0)  # versus 35 reads at every run
+        _, lines, _ = self.cad(refused)
+        self.assertTrue(any(l.endswith("host stima-ci-2 not-due kind=ok") for l in lines))
+        self.assertIn("read=0 not_due=5", self.summary(lines))
+
+    def test_slack_lets_a_slightly_early_start_read(self):
+        self.cad({})
+        self.clock.t += 30 * 60 - 60  # 60 s early, inside the 120 s slack
+        _, _, runner = self.cad({})
+        self.assertIn("stima-ci-2", [c[0] for c in runner.calls])
+
+    def test_a_not_due_host_keeps_its_state_and_a_disk_high_read_alerts_when_due(self):
+        self.cad({}, GDW_APPLY="1")
+        self.clock.t += 600
+        _, lines, runner = self.cad({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
+        self.assertEqual(runner.calls, [])  # the full disk is not seen until the host is due
+        self.assertEqual(self.events(), [])
+        self.clock.t += 20 * 60
+        _, lines, _ = self.cad({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
+        self.assertEqual(len(self.events()), 1)  # first read after due tells at once
+        self.assertIn("P0 GCE-DISK stima-ci-ctl-1 disk-high", self.events()[0])
+        # While disk-high it is read every run (never delayed) and stays told once.
+        self.clock.t += 600
+        _, _, runner = self.cad({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
+        self.assertEqual([c[0] for c in runner.calls], ["stima-ci-ctl-1"])
+        self.assertEqual(len(self.events()), 1)
+        # Not-due hosts keep ok: no recovery or alert invented from them.
+        self.assertNotIn("recovered", "\n".join(self.events()))
+
+    def test_replay_loses_no_would_alert(self):
+        """The same 24 h of reads at every run and at the shipped cadence tell the same would-alerts."""
+        timeline = lambda i: {"stima-ci-2": (0, CTL1_FULL, None)} if 12 <= i < 30 else {}
+        def replay(every):
+            tmp = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, tmp, True)
+            self.tmp_saved, self.tmp = self.tmp, tmp
+            self.clock.t = 1_800_000_000.0
+            alerts, reads = 0, 0
+            for i in range(144):
+                _, lines, runner = self.run_once(timeline(i), GDW_READ_EVERY_MINUTES=every, GDW_KNOWN_EVERY_MINUTES=every)
+                alerts += sum("would alert" in l for l in lines)
+                reads += len(runner.calls)
+                self.clock.t += 600
+            self.tmp = self.tmp_saved
+            return alerts, reads
+        base_alerts, base_reads = replay("0")
+        slow_alerts, slow_reads = replay("30")
+        self.assertEqual(base_alerts, 1)
+        self.assertEqual(slow_alerts, base_alerts)
+        self.assertEqual(base_reads, 144 * 5)
+        self.assertLess(slow_reads, base_reads / 2)
+
+    def test_a_pending_write_makes_the_host_due(self):
+        self.cad({}, GDW_APPLY="1")
+        st = json.loads((self.tmp / "state" / "gce-disk-watch.json").read_text())
+        st["apply"]["stima-ci-2"].update(kind="disk-high", notice="alert", todo=["events"], told=False)
+        (self.tmp / "state" / "gce-disk-watch.json").write_text(json.dumps(st))
+        self.clock.t += 600
+        _, _, runner = self.cad({}, GDW_APPLY="1")
+        self.assertEqual([c[0] for c in runner.calls], ["stima-ci-2"])
+
+    def test_a_failing_readable_host_is_read_every_run(self):
+        self.cad({"stima-ci-2": (255, "", None)})
+        self.clock.t += 600
+        _, _, runner = self.cad({"stima-ci-2": (255, "", None)})
+        self.assertEqual([c[0] for c in runner.calls], ["stima-ci-2"])
 
 
 if __name__ == "__main__":

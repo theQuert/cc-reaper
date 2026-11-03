@@ -24,6 +24,9 @@ to local files (and a local notification).
           unless GDW_REALERT_INBOX=1), one `<ts> P0 GCE-DISK <host> <kind> ...` line in GDW_EVENTS_LOG and a
           macOS notification. Every write goes to a local path. A write that fails is logged ERROR and stays
           pending in the state, so the next run retries that channel alone.
+  cadence a host is read at most every GDW_READ_EVERY_MINUTES (30; GDW_KNOWN_EVERY_MINUTES, 60, for a known-unreadable
+          one). A host not due keeps its stored kind and state, is logged `not-due` and spawns nothing. A host that is
+          disk-high, unreadable (not by design) or has a write pending is due every run, so a tell is never delayed.
   record  every run logs one line per host and one summary line (hosts, read, high, unreadable, would-alert,
           alerted, recovered, failures): the spot-check record.
 
@@ -64,6 +67,9 @@ DEFAULTS = {
     "GDW_NOTIFY": "1",  # 0: no macOS notification even with GDW_APPLY=1
     "GDW_UNREADABLE_ROUNDS": "2",  # consecutive unreadable reads before `unreadable` is told (one IAP blip is not)
     "GDW_KNOWN_UNREADABLE": "",  # hosts read every round whose failed read is logged, never told (access refused by design)
+    "GDW_READ_EVERY_MINUTES": "30",  # a readable host is read at most this often (0: every run)
+    "GDW_KNOWN_EVERY_MINUTES": "60",  # a GDW_KNOWN_UNREADABLE host is read at most this often (0: every run)
+    "GDW_DUE_SLACK_SECONDS": "120",  # a host is due this much early, so a launchd start that runs a little soon does not skip a slot
     "GDW_SSH_KEY": "~/.ssh/google_compute_engine",  # must exist with its .pub: gcloud is never let generate one
 }
 CONFIG = Path.home() / ".cc-reaper" / "gce-disk-watch.conf"
@@ -314,6 +320,19 @@ class Watch:
             word = "recovered" if notice == "recover" else kind
             self.notifier("GCE disk", f"{host} {word} {numbers(r)}")
 
+    def is_due(self, host, book, now):
+        """True when this host is read this run: never read, past its interval, or in a state that must be watched
+        closely (disk-high, a failing read that is not by design, a tell still pending)."""
+        e = valid_entry(book.get(host))
+        if e is None or e["read_at"] is None or e["todo"] or e["kind"] == HIGH:
+            return True
+        known = host in self.cfg["GDW_KNOWN_UNREADABLE"].split()
+        if e["fails"] > 0 and not known:
+            return True
+        key = "GDW_KNOWN_EVERY_MINUTES" if known else "GDW_READ_EVERY_MINUTES"
+        gap = max(0.0, number(self.cfg, key)) * 60 - max(0.0, number(self.cfg, "GDW_DUE_SLACK_SECONDS"))
+        return now - e["read_at"] >= gap or e["read_at"] > now
+
     def one_host(self, host, r, book, now, every, rounds, counts, failures):
         read_kind = r["kind"]
         counts["read"] += r["metrics"] is not None
@@ -342,6 +361,7 @@ class Watch:
             if kind != OK and not entry["todo"] and entry["sent"] is not None and now - entry["sent"] >= every:
                 entry.update(notice="realert", todo=self.channels("realert"))
         entry["fails"] = fails
+        entry["read_at"] = now
         # Only this mode's channels: a stored todo (a hand edit, the other mode's) never reaches another channel.
         allowed = set(self.channels(entry["notice"])) if entry["notice"] else set()
         entry["todo"] = [c for c in entry["todo"] if c in allowed]
@@ -371,7 +391,7 @@ class Watch:
         state_path = path_of(self.cfg, "GDW_STATE")
         state = load_state(state_path)
         book = state.setdefault(mode, {})  # shadow and apply keep separate books: a switch to apply alerts afresh
-        failures, counts = [], {"read": 0, HIGH: 0, UNREADABLE: 0, "would": 0, "alerted": 0, "recovered": 0}
+        failures, counts = [], {"read": 0, HIGH: 0, UNREADABLE: 0, "would": 0, "alerted": 0, "recovered": 0, "not_due": 0}
         bad = [h for h in hosts if not NAME_RE.fullmatch(h)]
         for h in bad:
             failures.append(f"host name refused: {h!r}")
@@ -380,14 +400,19 @@ class Watch:
             if not NAME_RE.fullmatch(self.cfg[key]):
                 failures.append(f"{key} refused: {self.cfg[key]!r}")
                 hosts = []
-        if hosts and not self.has_ssh_key():
-            readings = {h: {"kind": UNREADABLE, "metrics": None, "reason": "no-ssh-key"} for h in hosts}
+        due = [h for h in hosts if self.is_due(h, book, now)]
+        if due and not self.has_ssh_key():
+            readings = {h: {"kind": UNREADABLE, "metrics": None, "reason": "no-ssh-key"} for h in due}
         else:
-            readings = read_hosts(self.cfg, hosts, self.runner) if hosts else {}
+            readings = read_hosts(self.cfg, due, self.runner) if due else {}
         rounds = max(1, int(number(self.cfg, "GDW_UNREADABLE_ROUNDS")))
         every = max(1.0, number(self.cfg, "GDW_REALERT_MINUTES")) * 60
         unread = []
         for host in hosts:
+            if host not in readings:
+                counts["not_due"] += 1
+                self.log(f"host {host} not-due kind={(valid_entry(book.get(host)) or {'kind': OK})['kind']}")
+                continue
             r = readings[host]
             if r["kind"] == UNREADABLE:
                 known = " known" if host in self.cfg["GDW_KNOWN_UNREADABLE"].split() else ""
@@ -406,7 +431,7 @@ class Watch:
             failures.append(f"state write failed: {e}")
         self.log(f"{mode}: {len(hosts)} hosts, {counts['read']} read, {counts[HIGH]} high, {counts[UNREADABLE]} unreadable, "
                  f"{counts['would']} would-alert, {counts['alerted']} alerted, {counts['recovered']} recovered, "
-                 f"{len(failures)} failures" + (f"; unreadable: {' '.join(unread)}" if unread else ""))
+                 f"{len(failures)} failures, read={len(readings)} not_due={counts['not_due']}" + (f"; unreadable: {' '.join(unread)}" if unread else ""))
         for f in failures:
             self.log(f"ERROR {f}")
         return 1 if failures else 0
@@ -428,7 +453,8 @@ def valid_entry(e):
     if not isinstance(fails, int) or isinstance(fails, bool) or fails < 0 or not isinstance(e.get("told", False), bool):
         return None
     return {"kind": e["kind"], "since": e.get("since"), "notice": e.get("notice"), "todo": list(todo),
-            "sent": e.get("sent"), "told": e.get("told", False), "fails": fails}
+            "sent": e.get("sent"), "told": e.get("told", False), "fails": fails,
+            "read_at": e.get("read_at") if num(e.get("read_at")) else None}
 
 
 def load_state(path):
