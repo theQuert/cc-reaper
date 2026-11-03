@@ -3,7 +3,9 @@
 # about (stima-api#5886), instead of every worktree on the machine.
 #   A  old, landed, clean; an unreadable recent transcript's project directory names it  -> kept
 #   F  old, landed, clean; a torn live session record's raw cwd names it                 -> kept
-#      (its transcript, found by the session id in the raw text, is ten days old and readable)
+#      (its transcript, found by the session id in the raw text, is ten days old and readable),
+#      by a cwd claim: a live record that stays torn claims only its cwd and its transcript
+#      (stima-api#7106), so it is no longer an unknown record
 #   B  old, landed, clean; nothing names it                       -> freed per tree, kept by global
 #   C  recent, landed, clean; nothing names it                    -> kept by its own recency
 #   D  old, dirty (would go to refs/wip first)                    -> never freed while a record is unknown
@@ -11,8 +13,10 @@
 # CC_WJ_UNKNOWN_SESSION_SCOPE=tree under CC_WJ_NEW_RULES_MODE=spotcheck (default), auto, and
 # CC_WJ_UNKNOWN_SESSION_SCOPE=global. Then, with trees G and H, a live record that can work in any
 # tree by absolute path (stima-api#5886 review): its transcript names H from a cwd elsewhere; it
-# has no transcript at all (every tree kept); its cwd is a symlink into G; and a torn record that
-# appears only after the inventory, caught right before removal. Real git repositories and a
+# has no transcript at all (since stima-api#7106 only its cwd is kept; with no cwd either, every
+# tree); its cwd is a symlink into G; a torn record that appears only after the inventory, caught
+# right before removal; and the read race behind the torn reads (stima-api#7106): a record removed
+# by its exiting session between the listing and the read, and one whole on its second read. Real git repositories and a
 # local bare "origin"; lsof and gh are stubs. TAP-style; set WJ_SCRIPT to test another copy of
 # the janitor.
 set -uo pipefail
@@ -155,8 +159,9 @@ REC_F="session-unknown:claude-session:$live_pid.json"
 CC_WJ_NEW_RULES_MODE=auto wj > "$T/auto.txt"; auto_rc=$?
 check "auto: A, which the unreadable transcript's project directory names, is kept by it" \
   judged "$T/auto.txt" A "KEEP($REC_A)"
-check "auto: F, which the torn session record's raw cwd names, is kept by it" \
-  judged "$T/auto.txt" F "KEEP($REC_F)"
+check "auto: F, which the torn session record's raw cwd names, is kept by its cwd claim" \
+  judged "$T/auto.txt" F "KEEP(active-session)"
+check "  and the torn record is not an unknown record" bash -c '! grep -qF "KEEP($1)" "$2"' _ "$REC_F" "$T/auto.txt"
 check "auto: old clean landed B, which nothing names, is removable" judged "$T/auto.txt" B REMOVABLE
 check "auto: recent C is kept by its own recency" bash -c 'grep -A3 "/wt-C$" "$1" | grep -q "classification: KEEP(session-unknown:"' _ "$T/auto.txt"
 check "auto: dirty D is not sent to refs/wip while a record is unknown" \
@@ -166,7 +171,8 @@ check "auto: the transcript is logged once, with the trees it kept" \
   test "$(grep -c "worktree-janitor: KEEP($REC_A) scope=tree:" "$T/auto.txt")" -eq 1
 check "  and that line names A and C" bash -c 'grep -F "KEEP($1) scope=tree:" "$2" | grep -F "$3/wt-A" | grep -qF "$3/wt-C"' _ "$REC_A" "$T/auto.txt" "$T"
 check "  and what attributed it" bash -c 'grep -F "KEEP($1) scope=tree:" "$2" | grep -qF "projdir=-"' _ "$REC_A" "$T/auto.txt"
-check "auto: the torn record is logged once" test "$(grep -c "worktree-janitor: KEEP($REC_F) scope=tree:" "$T/auto.txt")" -eq 1
+check "auto: the torn record is logged once, with the cwd it claims" \
+  test "$(grep -c "worktree-janitor: live Claude session record $live_pid.json could not be parsed; it claims only cwd $T/wt-F and 1 transcript(s)" "$T/auto.txt")" -eq 1
 refute "auto: no line says no worktree can be shown free of active sessions" \
   grep -qF "no worktree can be shown free of active sessions" "$T/auto.txt"
 check "auto: the run still exits 1, since a record could not be read" test "$auto_rc" -eq 1
@@ -246,25 +252,43 @@ torn() { # <session id> <cwd>
 SID_N="0000aaaa-0000-4000-8000-00000000001a"
 torn "$SID_N" "$PRIMARY"; transcript "$SID_N" "$PRIMARY" "$T/wt-H/src/main.go"
 CC_WJ_NEW_RULES_MODE=auto wj > "$T/named.txt"
-check "live, transcript names H by path: H is kept by the record" judged "$T/named.txt" H "KEEP($REC_L)"
+check "live, transcript names H by path: H is kept by the record's transcript claim" judged "$T/named.txt" H "KEEP(active-session)"
 check "  and G, which nothing names, is removable" judged "$T/named.txt" G REMOVABLE
 
-# No transcript to search: the record may be about any tree.
+# No transcript to search, a cwd in the primary checkout: before stima-api#7106 the record could
+# be about any tree and kept every one; now it claims its cwd only (the issue's spec), and a tree
+# its process does not stand in goes.
 SID_X="0000aaaa-0000-4000-8000-00000000001b"
 torn "$SID_X" "$PRIMARY"
 CC_WJ_NEW_RULES_MODE=auto wj > "$T/notranscript.txt"
 for n in G H; do
-  check "live, no transcript: $n is kept by the record" judged "$T/notranscript.txt" "$n" "KEEP($REC_L)"
+  check "live, no transcript, cwd elsewhere: $n is removable" judged "$T/notranscript.txt" "$n" REMOVABLE
+done
+check "  and the log says it claims only that cwd" \
+  grep -qF "record $live_pid.json could not be parsed; it claims only cwd $PRIMARY and 0 transcript(s)" "$T/notranscript.txt"
+SPOT_X="$T/spot-notranscript.txt"
+wj > "$SPOT_X"
+for n in G H; do
+  check "spotcheck, no transcript, cwd elsewhere: $n is removable too (a claim, not an unknown)" \
+    judged "$SPOT_X" "$n" REMOVABLE
+done
+
+# No cwd anywhere: the raw text carries none and lsof gives none for the process. Nothing narrows
+# it, so the record may still be about any tree.
+printf '{"pid":%s,"sessionId":"%s","na' "$live_pid" "$SID_X" > "$SESSIONS/$live_pid.json"
+CC_WJ_NEW_RULES_MODE=auto wj > "$T/nocwd.txt"
+for n in G H; do
+  check "live, no transcript, no cwd: $n is kept by the record" judged "$T/nocwd.txt" "$n" "KEEP($REC_L)"
 done
 check "  and the log says it may be about any tree" \
-  bash -c 'grep -F "KEEP($1) scope=tree:" "$2" | grep -qF "global=-"' _ "$REC_L" "$T/notranscript.txt"
+  bash -c 'grep -F "KEEP($1) scope=tree:" "$2" | grep -qF "global=-"' _ "$REC_L" "$T/nocwd.txt"
 
 # A cwd given through a symlink into G.
 SID_S="0000aaaa-0000-4000-8000-00000000001c"
 ln -s "$T/wt-G" "$T/link-to-G"
 torn "$SID_S" "$T/link-to-G/sub"; transcript "$SID_S" "$PRIMARY" "$PRIMARY/README.md"
 CC_WJ_NEW_RULES_MODE=auto wj > "$T/symlink.txt"
-check "cwd through a symlink into G: G is kept by the record" judged "$T/symlink.txt" G "KEEP($REC_L)"
+check "cwd through a symlink into G: G is kept by the record's cwd claim" judged "$T/symlink.txt" G "KEEP(active-session)"
 check "  and H is removable" judged "$T/symlink.txt" H REMOVABLE
 
 # A record that parses but whose pid is not the live process its file is named for (or that has
@@ -291,7 +315,7 @@ done
 rm -f "$SESSIONS/$live_pid.json"
 mkdir -p "$T/codex-locks"
 export TORN_AFTER_SCAN="$SESSIONS/$live_pid.json"
-export TORN_TEXT="{\"pid\":$live_pid,\"sessionId\":\"0000aaaa-0000-4000-8000-00000000001d\",\"cwd\":\"$PRIMARY\",\"na"
+export TORN_TEXT="{\"pid\":$live_pid,\"sessionId\":\"0000aaaa-0000-4000-8000-00000000001d\",\"cwd\":\"$T/wt-G\",\"na"
 cat > "$STUBS/lsof" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in
@@ -305,11 +329,15 @@ STUB
 chmod +x "$STUBS/lsof"
 CC_WJ_CODEX_LOCKS="$T/codex-locks" CC_WJ_NEW_RULES_MODE=auto wj --apply > "$T/late.txt"
 check "late record: the stub wrote it during the run" test -e "$TORN_AFTER_SCAN.done"
-for n in A G H; do
-  check "late record: auto --apply keeps landed clean $n" test -d "$T/wt-$n"
+check "late record: auto --apply keeps landed clean G, the tree its cwd names" test -d "$T/wt-G"
+check "  kept by its cwd claim" grep -qF -- "claims cwd $T/wt-G" "$T/late.txt"
+for n in A H; do
+  check "late record: auto --apply removes landed clean $n, which the record does not stand in" test ! -e "$T/wt-$n"
 done
-check "  the first removal candidate kept by the rescan right before removal" \
-  grep -qF -- "→ kept: $REC_L; an unreadable session record may be about it" "$T/late.txt"
+# Put back what the late case removed, for the cases below.
+G -C "$PRIMARY" worktree prune
+for n in A D F H; do [ -d "$T/wt-$n" ] || G -C "$PRIMARY" worktree add -q "$T/wt-$n" "$n"; done
+unset TORN_AFTER_SCAN
 
 # An active Codex claim with two state rows: one rollout path holds a space, so it cannot be
 # passed on as a word. The other is readable and names only the primary checkout. The dropped
@@ -342,6 +370,63 @@ for n in G H; do
   check "Codex claim with a rollout path holding a space: $n is kept by the claim" \
     judged "$T/codex-space.txt" "$n" "KEEP($REC_Q)"
 done
+
+# ─── The read race behind "could not be parsed" (stima-api#7106) ───────────────
+#
+# A jq stub stands in for the race: for the record RACE_FILE it acts once, then runs the real jq.
+#   gone   the record is removed and its process ends between the listing and the read
+#   whole  the first read finds it torn, and it is whole by the next read
+REAL_JQ="$(command -v jq)"; export REAL_JQ
+cat > "$STUBS/jq" <<'STUB'
+#!/usr/bin/env bash
+last=""; for a in "$@"; do last="$a"; done
+if [ -n "${RACE_FILE:-}" ] && [ "$last" = "$RACE_FILE" ] && [ ! -e "$RACE_FILE.raced" ]; then
+  : > "$RACE_FILE.raced"
+  case "$RACE_MODE" in
+    gone) rm -f "$RACE_FILE"; kill "$RACE_PID" 2>/dev/null; wait "$RACE_PID" 2>/dev/null; sleep 0.3
+      echo "jq: error: Could not open file $RACE_FILE: No such file or directory" >&2; exit 2 ;;
+    whole) printf '%s\n' "$RACE_WHOLE" > "$RACE_FILE"; echo "jq: parse error: Unfinished string" >&2; exit 5 ;;
+  esac
+fi
+exec "$REAL_JQ" "$@"
+STUB
+chmod +x "$STUBS/jq"
+cat > "$STUBS/lsof" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" -d cwd "*) cat "$LSOF_CWD_FILE" ;;
+  *) cat "$LSOF_OPEN_FILE" ;;
+esac
+STUB
+chmod +x "$STUBS/lsof"
+reage() { age A D E F G H; }
+
+python3 -c 'import time; time.sleep(600)' </dev/null >/dev/null 2>&1 &
+race_pid=$!
+SID_R="0000aaaa-0000-4000-8000-00000000003a"
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s"}\n' "$race_pid" "$SID_R" "$T/wt-G" > "$SESSIONS/$race_pid.json"
+RACE_FILE="$SESSIONS/$race_pid.json" RACE_MODE=gone RACE_PID="$race_pid" CC_WJ_NEW_RULES_MODE=auto \
+  wj > "$T/race-gone.txt"; race_rc=$?
+check "race gone: the stub removed the record mid-read" test -e "$SESSIONS/$race_pid.json.raced"
+for n in G H; do
+  check "race gone: $n is removable, the record of an ended session claims nothing" judged "$T/race-gone.txt" "$n" REMOVABLE
+done
+refute "race gone: nothing says a record could not be parsed" grep -qF "could not be parsed" "$T/race-gone.txt"
+check "race gone: the run exits 0, nothing was unreadable" test "$race_rc" -eq 0
+
+python3 -c 'import time; time.sleep(600)' </dev/null >/dev/null 2>&1 &
+race_pid2=$!
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","na' "$race_pid2" "$SID_R" "$T/wt-G" > "$SESSIONS/$race_pid2.json"
+RACE_FILE="$SESSIONS/$race_pid2.json" RACE_MODE=whole \
+  RACE_WHOLE="{\"pid\":$race_pid2,\"sessionId\":\"$SID_R\",\"cwd\":\"$T/wt-G\"}" CC_WJ_NEW_RULES_MODE=auto \
+  wj > "$T/race-whole.txt"; race_rc=$?
+check "race whole: the stub tore the first read" test -e "$SESSIONS/$race_pid2.json.raced"
+refute "race whole: nothing says a record could not be parsed" grep -qF "could not be parsed" "$T/race-whole.txt"
+check "race whole: the run exits 0" test "$race_rc" -eq 0
+# Its pid is on no command line here, so the whole record binds to no session and claims nothing,
+# as any readable record whose command line lacks its id: what matters is that it was read.
+check "race whole: H is removable" judged "$T/race-whole.txt" H REMOVABLE
+kill "$race_pid2" 2>/dev/null; rm -f "$SESSIONS/$race_pid2.json"
 
 if [ "$failures" -eq 0 ]; then echo "# all passed"; else echo "# $failures failed"; fi
 [ "$failures" -eq 0 ]
