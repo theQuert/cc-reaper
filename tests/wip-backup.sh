@@ -168,5 +168,58 @@ check "an idle machine with a fresh cleanup stamp makes no remote call" \
 rm -rf "$WIP_STATE_DIR"; run
 check "an unreachable remote is one FAIL line and exit 1" '[ "$(cat "$WORK/rc")" = 1 ] && grep -q "FAIL ls-remote proj" "$WORK/out"'
 
+# ---------------------------------------------------------------- the mtime gate (stima-api#7073)
+GR="$WORK/gate-remote.git"; GP="$HOME/GitHub/gate"
+git "${F[@]}" init -q --bare "$GR"; git "${F[@]}" init -q "$GP"; git -C "$GP" remote add origin "$GR"
+mkdir -p "$GP/dir"; echo a > "$GP/a.txt"; echo d1 > "$GP/dir/d1.txt"; echo d2 > "$GP/dir/d2.txt"
+git -C "$GP" add -A && git "${F[@]}" -C "$GP" commit -qm init && git -C "$GP" push -q origin main
+git -C "$GP" worktree add -q -b feat/g1 "$WORK/g1" main
+export WIP_REPOS="$GP" WIP_STATE_DIR="$WORK/gstate"
+gref() { git --git-dir="$GR" rev-parse -q --verify refs/wip/macmini/feat/g1 2>/dev/null; }
+gshow() { git --git-dir="$GR" show "$(gref):$1" 2>/dev/null; }
+echo e1 > "$WORK/g1/a.txt"
+run
+G1="$(gref)"
+check "gate: first run (no stamp) snapshots and pushes" '[ -n "$G1" ] && grep -q "pushed=1 unchanged=0 gated=0" "$WORK/out"'
+check "gate: the done line carries took=Ns" 'grep -Eq "done: .* took=[0-9]+s" "$WORK/out"'
+sleep 1
+git -C "$GP" remote set-url origin "$WORK/nowhere.git"
+run
+check "gate: nothing changed means no snapshot and no ls-remote (an unreachable remote is not even tried)" \
+  '[ "$(cat "$WORK/rc")" = 0 ] && ! grep -q "FAIL" "$WORK/out" && grep -q "pushed=0 unchanged=1 gated=1" "$WORK/out" && [ "$(gref)" = "$G1" ]'
+git -C "$GP" remote set-url origin "$GR"
+sleep 1; echo e2 > "$WORK/g1/a.txt"
+run
+check "gate: an edited file after the stamp is in the next snapshot" '[ "$(gshow a.txt)" = e2 ] && grep -q "pushed=1 .*gated=0" "$WORK/out"'
+sleep 1; echo fresh > "$WORK/g1/dir/created.txt"
+run
+check "gate: a file created after the stamp is in the next snapshot" '[ "$(gshow dir/created.txt)" = fresh ]'
+sleep 1; rm "$WORK/g1/dir/d1.txt"
+run
+check "gate: a file deleted after the stamp is gone from the next snapshot (directory mtime counts)" \
+  '! git --git-dir="$GR" cat-file -e "$(gref):dir/d1.txt" 2>/dev/null && [ "$(gshow dir/d2.txt)" = d2 ]'
+sleep 1; echo 1 > "$WIP_STATE_DIR/run-count"; run   # run 2: not a full run
+check "gate: and then it is gated again" 'grep -q "pushed=0 unchanged=1 gated=1 gate-miss=0" "$WORK/out"'
+# New commit: HEAD differs from the stamp, so no skip even with no newer file.
+sleep 1; git "${F[@]}" -C "$WORK/g1" commit -q --allow-empty -m moved
+run
+check "gate: a HEAD that moved is not skipped" 'grep -q "gated=0" "$WORK/out" && [ "$(git --git-dir="$GR" rev-parse "$(gref)^1")" = "$(git -C "$WORK/g1" rev-parse HEAD)" ]'
+# Seeded gate-miss: an edit whose mtime is older than the stamp (the gate cannot see it); the hourly full run must.
+sleep 1; echo sneaky > "$WORK/g1/a.txt"; touch -t "$OLD" "$WORK/g1/a.txt"
+run
+check "gate: the seeded edit is invisible to a gated run" '[ "$(gshow a.txt)" = e2 ] && grep -q "gated=1" "$WORK/out"'
+echo 5 > "$WIP_STATE_DIR/run-count"    # the next run is the sixth: a full run
+run
+check "gate: the full run snapshots all, finds the edit and logs gate-miss" \
+  '[ "$(gshow a.txt)" = sneaky ] && grep -q "gate-miss $WORK/g1" "$WORK/out" && grep -q "gate-miss=1" "$WORK/out"'
+check "gate: a miss arms the next six runs to snapshot all" '[ "$(cat "$WIP_STATE_DIR/full-remaining")" = 6 ]'
+echo sneaky2 > "$WORK/g1/a.txt"; touch -t "$OLD" "$WORK/g1/a.txt"
+run
+check "gate: the run after a miss is a full run (gate off), and a second miss re-arms it" '[ "$(gshow a.txt)" = sneaky2 ] && grep -q "gated=0 gate-miss=1" "$WORK/out" && [ "$(cat "$WIP_STATE_DIR/full-remaining")" = 6 ]'
+run
+check "gate: a full run with no miss spends one of the armed runs and skips nothing" 'grep -q "pushed=0 unchanged=1 gated=0 gate-miss=0" "$WORK/out" && [ "$(cat "$WIP_STATE_DIR/full-remaining")" = 5 ]'
+rm -rf "$WIP_STATE_DIR"; run; run
+check "gate: WIP_GATE=0 never skips" 'WIP_GATE=0 run; grep -q "gated=0" "$WORK/out"'
+
 echo "wip-backup: $PASSED passed, $FAILURES failed"
 [ "$FAILURES" -eq 0 ]
