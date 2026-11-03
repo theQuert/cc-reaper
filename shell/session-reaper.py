@@ -33,6 +33,7 @@ import faulthandler
 import fcntl
 import fnmatch
 import glob
+import importlib.util
 import json
 import os
 import re
@@ -41,6 +42,7 @@ import signal
 import subprocess
 import sys
 import time
+import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -96,6 +98,14 @@ DEFAULTS = {
     # wait on a check-by it posted itself; module docstring) does not keep an idle session. `shadow` reports `would-close: oracle:not-mine`
     # and closes nothing (SCRIPT-SAFE-RULE: run it for three reaper reports, then switch to `apply`); `off` neither.
     "ORACLE_NOT_MINE": "shadow",
+    # stima-api #7061: where the lock, sessions.json and the shadow round counter live; empty: ~/.cc-reaper/state.
+    "STATE_DIR": "",
+    # `on`: every sweep judges each session with session_state.py (WORKING, PUSH, WAITING_PERSON, DONE, UNKNOWN), writes
+    # sessions.json and lets decide() read it; `off`: neither (the reaper then decides as before #7061).
+    "SESSION_STATE": "on",
+    # Clean shadow rounds in a row after which the sweep itself writes `<FLAG>=apply` into the policy (ORACLE_NOT_MINE for
+    # a claimed session the state calls DONE, NOCLAIM_DONE for a claim-less one), with a line in the report.
+    "SHADOW_CLEAN_ROUNDS": "5",
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
@@ -123,7 +133,8 @@ BLOCKED_RE = re.compile(r"BLOCKED:#(\d{3,6})")
 NAMED_RE = re.compile(r"(?<![\w/])#(\d{3,6})\b")
 SOFT_KEEP = ("claim-unknown", "waiting")  # `waiting-keyword` also starts with `waiting`
 ISSUE_FALLBACKS = 6  # single `gh issue view` calls a run may make after a batch failed
-ISSUE_RE = re.compile(r"(?:^|/)(\d{3,6})(?:-|$)")
+# stima-api #7061: a hyphen also starts the number, so `claude-7023-no-signature` claims #7023 (21 of 97 branches missed it)
+ISSUE_RE = re.compile(r"(?:^|[/-])(\d{3,6})(?:-|$)")
 PATH_RE = re.compile(r"(?:~|/)[\w./@+-]+")
 # Keep reasons added after the first 48 h of live reaping: a row kept only by these is one the
 # earlier gates would have reaped, which is what the report-only comparison looks for.
@@ -936,7 +947,10 @@ def attached_pane(table, sid, session_ids):
     return matches[0] if len(matches) == 1 else None
 
 
-def gather(cfg, now):
+def gather(cfg, now, include_bg=False):
+    """The live sessions the reaper judges. With include_bg (session_state.py, stima-api #7061) a background session
+    no pane attaches to is returned too, marked `unattached` with no pane, and still listed in SKIPPED as `kind:bg`:
+    the reaper's sweep drops it (it never closes a bg session), the state producer judges it."""
     table = ps_table()
     wts = worktrees(cfg)
     found = []
@@ -968,6 +982,8 @@ def gather(cfg, now):
             bound = attached_pane(table, d.get("sessionId") or "", session_ids)
             if not bound:
                 _skip(d, f, "kind:bg", True, now)
+                if include_bg and d.get("sessionId"):
+                    found.append(_record(cfg, now, table, wts, f, d, None, None, None))
                 continue
             pane, state, attach_pid = bound
         else:
@@ -979,39 +995,49 @@ def gather(cfg, now):
         if not is_ancestor(table, state["pane_pid"], attach_pid if kind == "bg" else pid):
             _skip(d, f, f"pane-ancestor-mismatch:{pane}", True, now)
             continue  # a pane that no longer holds this claude
-        sid, cwd = d["sessionId"], d.get("cwd", "")
-        owned = [w for w in wts if w["marker"] == sid
-                 or (cwd + "/").startswith(str(w["path"]) + "/")]
-        claims, repos = [], []
-        for w in owned:
-            m = ISSUE_RE.search(w["branch"])
-            repo = gh_repo(w["repo"]) if m else ""
-            repos.append(repo)
-            if m and repo and (repo, m.group(1)) not in claims:
-                claims.append((repo, m.group(1)))
-        found.append({
-            "kind": kind, "attach_pid": attach_pid,
-            "file": str(f), "pid": pid, "sid": sid, "cwd": cwd, "name": d.get("name", ""),
-            "tmux": state["session"], "pane": pane, "status": d.get("status"),
-            "status_at": d.get("statusUpdatedAt"), "start": table[pid][1],
-            "fg": foreground(attach_pid if kind == "bg" else pid),
-            "vim": vim_mode(),
-            "idle_min": (now - d.get("statusUpdatedAt", now * 1000) / 1000) / 60,
-            "bg_shells": [p for p, (pp, _, cmd) in table.items()
-                          if pp == pid and "shell-snapshots/" in cmd],
-            "scheduled": (Path(cwd) / ".claude" / "scheduled_tasks.json").exists(),
-            "sub_active": subagent_activity(sid, now, float(cfg["SUBAGENT_QUIET_MINUTES"])),
-            "screen_tail": "\n".join(state["screen"].rstrip("\n").split("\n")[-15:]),
-            "owned": owned, "claims": claims, "descendants": len(descendants(table, pid)),
-            "claim_why": "" if claims else claim_why(owned, repos),
-            "never_kill": never_kill_hit(table, state["pane_pid"], pid, cfg),
-            **transcript_facts(transcript_path(sid), now),
-        })
-        found[-1]["relay_pending"] = relay_pending(cfg, claims, now)
+        found.append(_record(cfg, now, table, wts, f, d, pane, state, attach_pid))
     for s in found:
         s["other_sids"] = [o["sid"] for o in found if o is not s and o["sid"]]
         s["other_claims"] = {ref for o in found if o is not s for ref in o["claims"]}
     return found
+
+
+def _record(cfg, now, table, wts, f, d, pane, state, attach_pid):
+    """One gathered session. `state` None: a background session no pane attaches to (no screen, no tmux name)."""
+    kind, pid = d.get("kind"), d.get("pid")
+    sid, cwd = d["sessionId"], d.get("cwd", "")
+    owned = [w for w in wts if w["marker"] == sid
+             or (cwd + "/").startswith(str(w["path"]) + "/")]
+    claims, repos = [], []
+    for w in owned:
+        m = ISSUE_RE.search(w["branch"])
+        repo = gh_repo(w["repo"]) if m else ""
+        repos.append(repo)
+        if m and repo and (repo, m.group(1)) not in claims:
+            claims.append((repo, m.group(1)))
+    s = {
+        "kind": kind, "attach_pid": attach_pid,
+        "file": str(f), "pid": pid, "sid": sid, "cwd": cwd, "name": d.get("name", ""),
+        "tmux": state["session"] if state else (d.get("name") or sid[:8]), "pane": pane or "",
+        "status": d.get("status"),
+        "status_at": d.get("statusUpdatedAt"), "start": table[pid][1],
+        "fg": foreground(attach_pid if kind == "bg" else pid) if state else False,
+        "vim": vim_mode(),
+        "idle_min": (now - d.get("statusUpdatedAt", now * 1000) / 1000) / 60,
+        "bg_shells": [p for p, (pp, _, cmd) in table.items()
+                      if pp == pid and "shell-snapshots/" in cmd],
+        "scheduled": (Path(cwd) / ".claude" / "scheduled_tasks.json").exists(),
+        "sub_active": subagent_activity(sid, now, float(cfg["SUBAGENT_QUIET_MINUTES"])),
+        "screen_tail": "\n".join(state["screen"].rstrip("\n").split("\n")[-15:]) if state else "",
+        "owned": owned, "claims": claims, "descendants": len(descendants(table, pid)),
+        "claim_why": "" if claims else claim_why(owned, repos),
+        "never_kill": never_kill_hit(table, state["pane_pid"] if state else pid, pid, cfg),
+        **transcript_facts(transcript_path(sid), now),
+    }
+    if state is None:
+        s["unattached"] = True
+    s["relay_pending"] = relay_pending(cfg, claims, now)
+    return s
 
 
 def protected(cfg, *names):
@@ -1172,7 +1198,143 @@ def decide(s, cfg, now=None):
                 s["oracle_not_mine_shadow"] = dict(trial["oracle_not_mine"])
         except Exception as e:  # a report-only trial must not turn a kept session into an error
             s["oracle_not_mine_error"] = f"{type(e).__name__}: {e}"
+    return state_keeps(s, cfg, keep)
+
+
+# Keep reasons the session's state (session_state.py, stima-api #7061) answers: on a DONE state the oracle's word on
+# each claim replaces them. Every other reason still keeps the session: protected, never-kill, vim-mode, not-foreground,
+# a subagent, a shell, a loop or scheduled task, a child process, a stall mark, a handoff, uncommitted or unpushed work.
+STATE_SOFT = ("claim-unknown", "issue-unknown:", "issue-open:", "check-by-", "owed-step:", "waiting", "idle:",
+              "open-pr", "alarm-passed", "named-claim:")
+STATE_COLUMNS = ("ORACLE_NOT_MINE", "NOCLAIM_DONE")
+
+
+def state_column(s):
+    """Which flag decides a close on the session's state: ORACLE_NOT_MINE when the state names a claim, NOCLAIM_DONE
+    when it names none; "" unless the state is DONE."""
+    st = s.get("state")
+    if not isinstance(st, dict) or st.get("state") != "DONE":
+        return ""
+    return "ORACLE_NOT_MINE" if st.get("claims") else "NOCLAIM_DONE"
+
+
+def state_keeps(s, cfg, keep):
+    """`keep` after the state: a DONE session kept only by STATE_SOFT reasons closes under `<column>=apply`, and is a
+    `would-close` row (s["state_shadow"]) under `shadow`. An applied close keeps every claim (a not-mine comment, no
+    release) unless the oracle says the issue is closed, so the dispatcher can resume the session at its next step."""
+    col = state_column(s)
+    if not col or not keep or any(not k.startswith(STATE_SOFT) for k in keep):
+        return keep
+    if cfg.get(col) == "apply":
+        refs = {str(n) for _, n in s.get("claims") or ()}
+        s.setdefault("oracle_not_mine", {}).update(
+            {str(c["issue"]): _cell(f"state DONE: {c.get('oracle_step') or 'unread'}", 120)
+             for c in s["state"]["claims"] if str(c["issue"]) in refs and c.get("oracle_step") != "closed"})
+        s["state_close"] = col
+        return []
+    if cfg.get(col) == "shadow":
+        s["state_shadow"] = col
     return keep
+
+
+def state_dir(cfg):
+    return Path(os.path.expanduser(cfg["STATE_DIR"])) if cfg.get("STATE_DIR") else HOME / ".cc-reaper" / "state"
+
+
+def load_session_state():
+    """session_state.py beside this file, or (None, why): a reaper installed without it decides as before #7061."""
+    try:
+        path = Path(__file__).resolve().with_name("session_state.py")
+        spec = importlib.util.spec_from_file_location("session_state", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod, ""
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+STATE_ROWS = []  # the records of the last produce_state(), for the report
+
+
+def produce_state(cfg, gathered, now, sdir):
+    """Judge every gathered session (bg ones a pane does not attach to included) with session_state.py, attach each
+    record as s["state"] for decide(), and write sessions.json. Returns report notes."""
+    STATE_ROWS.clear()
+    ss, why = load_session_state()
+    if not ss:
+        return [f"session_state unavailable ({why}): every session decided without a state"]
+    records = ss.judge_all(types.SimpleNamespace(**globals()), gathered, cfg, now, int(cfg.get("PREFETCH_WORKERS", "8")))
+    for s, rec in zip(gathered, records):
+        s["state"] = rec
+    STATE_ROWS.extend(records)
+    unjudged = [{"label": label, "why": why} for label, why, live in SKIPPED if live and why != "kind:bg"]
+    ss.write(ss.document(records, now, unjudged), ss.default_path(sdir))
+    return []
+
+
+def state_table():
+    rows = [f"| {_cell(x['name'], 60)} | `{x['sid'][:8]}` | {x['kind']} | {x['status']} {x['idle_min']:.0f}m | "
+            f"{x['state']} | {_cell(', '.join(x['reasons']), 300) or '-'} |" for x in STATE_ROWS]
+    return ["| session | id | kind | status idle | state | why |", "|---|---|---|---|---|---|", *rows] if rows else []
+
+
+def shadow_rounds(cfg, config_path, seen, sdir, now):
+    """The clean-round counter of each STATE_COLUMNS flag still at `shadow` (SCRIPT-SAFE-RULE, stima-api #7061).
+
+    A round's would-close set is the kept sessions that flag would close under `apply` (the state's DONE, and the
+    #7001/EL-T24 trials). The next sweep checks them against what happened: a session still there whose status changed
+    (busy, or a newer statusUpdatedAt: someone or something used it after it was called finished) is a miss, and a miss
+    resets the streak; a round with no miss and at least one would-close session counts clean; a session gone counts
+    nothing against it. At SHADOW_CLEAN_ROUNDS clean rounds in a row the sweep appends `<FLAG>=apply` to the policy file
+    and says so in the report. Returns report lines; the counter lives in STATE_DIR/state-shadow-rounds.json."""
+    path = sdir / "state-shadow-rounds.json"
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("shape")
+    except (OSError, ValueError):
+        data = {}
+    need = int(cfg.get("SHADOW_CLEAN_ROUNDS") or 5)
+    current = {s["sid"]: s for s, _, _ in seen}
+    lines, stamp = [], time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
+    for col in STATE_COLUMNS:
+        if cfg.get(col) != "shadow":
+            continue
+        c = data.setdefault(col, {"streak": 0, "misses": [], "last": {}})
+        prev, misses = c.get("last") or {}, []
+        for sid, was in prev.items():
+            s = current.get(sid)
+            if s and (s["status"] != "idle" or s.get("status_at") != was.get("status_at")):
+                misses.append({"at": stamp, "sid": sid[:8], "name": was.get("name"),
+                               "was": f"idle {was.get('idle_min')}m", "now": f"{s['status']} {s['idle_min']:.0f}m"})
+        if misses:
+            c["streak"] = 0
+            c["misses"] = (c.get("misses") or [])[-50:] + misses
+        elif prev:
+            c["streak"] = int(c.get("streak") or 0) + 1
+        would = {}
+        for s, keep, outcome in seen:
+            hit = s.get("state_shadow") == col or (col == "ORACLE_NOT_MINE" and s.get("oracle_not_mine_shadow")) \
+                or (col == "NOCLAIM_DONE" and s.get("noclaim_done_shadow"))
+            if hit and keep and outcome != "error":
+                would[s["sid"]] = {"name": s["tmux"], "status_at": s.get("status_at"), "idle_min": round(s["idle_min"])}
+        c["last"] = would
+        missed = "; ".join(f"{m['name']} ({m['was']} -> {m['now']})" for m in misses) or "none"
+        lines.append(f"- {col}=shadow: {c['streak']}/{need} clean rounds; candidates now: "
+                     f"{', '.join(v['name'] for v in would.values()) or 'none'}; misses this round: {missed}")
+        if c["streak"] >= need and not c.get("flipped_at"):
+            try:
+                with open(config_path, "a") as fh:
+                    fh.write(f"\n# stima-api #7061: written by session-reaper {stamp} after {c['streak']} clean shadow "
+                             f"rounds ({len(c.get('misses') or [])} misses before them; list: {path})\n{col}=apply\n")
+                c["flipped_at"] = stamp
+                lines.append(f"- FLIP: {col}=apply written to {config_path} after {c['streak']} clean rounds")
+            except OSError as e:
+                lines.append(f"- FLIP of {col} not written to {config_path}: {e}")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n")
+    os.replace(tmp, path)
+    return lines
 
 
 def noclaim_done(s, cfg, now):
@@ -1981,6 +2143,8 @@ def report_line(s, keep, outcome):
             + (" (shadow)" if s.get("oracle_not_mine_shadow") else "")] if nm else []
     why += ["FALSE_WAITING: " + ",".join(s["false_waiting"])] if s.get("false_waiting") else []
     why += [f"would-close: no claim, {s['noclaim_done_shadow']} (shadow)"] if s.get("noclaim_done_shadow") else []
+    why += [f"would-close: state DONE ({s['state_shadow']} shadow)"] if s.get("state_shadow") else []
+    why += [f"state DONE ({s['state_close']} apply)"] if s.get("state_close") else []
     if s.get("claim_why"):  # name why no claim was found
         keep = [f"claim-unknown({s['claim_why']})" if k == "claim-unknown" else k for k in keep]
     blocked = [", ".join(f"blocked: #{n}" for n in s["blocked"])] if s.get("blocked") else []
@@ -2007,16 +2171,18 @@ def main(argv=None):
     if args.idle_minutes is not None:
         cfg["IDLE_MINUTES"] = args.idle_minutes
     apply = args.apply or cfg["APPLY"] == "1"
-    state_dir = HOME / ".cc-reaper" / "state"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    lock = open(state_dir / "session-reaper.lock", "w")
+    sdir = state_dir(cfg)
+    sdir.mkdir(parents=True, exist_ok=True)
+    lock = open(sdir / "session-reaper.lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("session-reaper: another run holds the lock")
         return 0
     now = time.time()
-    rows, failures, reaped, seen, stale, notes = [], [], 0, [], [], []
+    rows, failures, reaped, seen, stale, notes, rounds = [], [], 0, [], [], [], []
+    swept = state_on = False
+    STATE_ROWS.clear()
     # #6477, 2026-10-29: RUN_BUDGET is checked between sessions, so a run blocked inside one call (pid 22262, 30 min
     # at load 187) still wrote no report. A hard deadline raises in the sweep, whose handler records it, and the
     # report is written; SIGUSR1 dumps the stack to the log to show where a run is blocked.
@@ -2038,9 +2204,16 @@ def main(argv=None):
     except Exception as e:
         failures.append(f"recover exiting: {type(e).__name__}: {e}")
     try:
-        sessions = sorted(gather(cfg, now), key=lambda x: judge_order(x, cfg))
+        gathered = gather(cfg, now, include_bg=True)
+        sessions = sorted([x for x in gathered if not x.get("unattached")], key=lambda x: judge_order(x, cfg))
         if not args.only:
             prefetch(sessions, cfg, now)
+            if cfg.get("SESSION_STATE", "on") == "on":
+                try:
+                    notes += produce_state(cfg, gathered, now, sdir)
+                    state_on = bool(STATE_ROWS)
+                except Exception as e:  # no state: decide() keeps deciding as before #7061
+                    failures.append(f"session state: {type(e).__name__}: {e}")
         for s in sessions:
             if args.only and s["tmux"] != args.only:
                 continue
@@ -2063,7 +2236,7 @@ def main(argv=None):
                         sv = shadow_verdict(s, cfg, keep, now)
                         s["blocked"], s["would_close"] = sv["blocked"], sv["would_close"]
                         outcome = ("would-close" if sv["would_close"] or s.get("noclaim_done_shadow") or s.get("done_grace_shadow")
-                                   or s.get("oracle_not_mine_shadow") else outcome)
+                                   or s.get("oracle_not_mine_shadow") or s.get("state_shadow") else outcome)
                     except Exception as e:  # a report-only verdict must not fail the sweep
                         notes.append(f"{s['tmux']} ({s['sid']}): shadow verdict: {type(e).__name__}: {e}")
                 if not keep and apply:
@@ -2083,8 +2256,14 @@ def main(argv=None):
                 failures.append(f"{s['tmux']} ({s['sid']}): {type(e).__name__}: {e}")
             rows.append(report_line(s, keep, outcome))
             seen.append((s, keep, outcome))
+        swept = True
     except Exception as e:
         failures.append(f"sweep aborted: {type(e).__name__}: {e}")
+    try:
+        if swept and state_on and not args.only:  # one round per whole sweep that had a state
+            rounds = shadow_rounds(cfg, args.config, seen, sdir, now)
+    except Exception as e:  # the counter must not stop the report
+        failures.append(f"shadow rounds: {type(e).__name__}: {e}")
     try:
         if not args.only:  # a one-session run would overwrite the list with that session alone
             idle_list(cfg, seen, now)
@@ -2114,6 +2293,10 @@ def main(argv=None):
     dead = sum(1 for _, _, is_live in SKIPPED if not is_live)
     report += ["", "## Skipped live sessions (not judged)", *(live or ["none"]),
                f"({dead} session files with no live process not listed)"]
+    if STATE_ROWS:
+        report += ["", "## Session state (session_state.py, stima-api #7061)", "", *state_table()]
+    if rounds:
+        report += ["", "## Shadow rounds (ORACLE_NOT_MINE, NOCLAIM_DONE)", *rounds]
     if notes:
         report += ["", "## Shadow notes", *[f"- {n}" for n in notes]]
     if stale:
