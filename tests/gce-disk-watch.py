@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Isolated tests for gce-disk-watch: the gcloud call is a stub runner and the notification a stub notifier, every
-path is a temp path, nothing reaches a GCE host or the real inbox. Covers the df parse (ctl-1's real full output of
+path is a temp path, nothing reaches a GCE host. Covers the df parse (ctl-1's real full output of
 2026-10-30), the judge, unreadable and timeout reads, one alert per state change, the re-alert window, the recovery
-line, shadow against apply, a failed write kept pending, and that the only remote command is the df read."""
+line, shadow against apply, a failed notification kept pending, that the alert is a log line and a notification and
+nothing under handoffs (stima-api #7079), and that the only remote command is the df read."""
 
 import importlib.util
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -62,6 +64,16 @@ class Base(unittest.TestCase):
         self.notify_fails = False
         gdw.print = lambda *a, **k: None  # the log file and Watch.lines carry every line; keep the test output quiet
         self.addCleanup(delattr, gdw, "print")
+        # #7079: an alert is a log line and a notification. Any write to an inbox or handoffs path is a failure.
+        real_append = gdw.append
+
+        def guarded(path, text):
+            self.assertNotIn("handoffs", str(path))
+            self.assertNotIn("inbox", str(path))
+            return real_append(path, text)
+
+        gdw.append = guarded
+        self.addCleanup(setattr, gdw, "append", real_append)
 
     def cfg(self, **over):
         cfg = gdw.load_config(self.tmp / "absent.conf", env={})
@@ -72,8 +84,6 @@ class Base(unittest.TestCase):
             key.with_name(key.name + ".pub").write_text("k.pub")
         # The shipped cadence (30/60 min) is exercised by class Cadence; every other test reads each host each run.
         cfg.update(GDW_READ_EVERY_MINUTES="0", GDW_KNOWN_EVERY_MINUTES="0", GDW_SSH_KEY=str(key),
-                   GDW_INBOX=str(self.tmp / "handoffs" / "neo-inbox.md"),
-                   GDW_EVENTS_LOG=str(self.tmp / "handoffs" / "ops-dispatch" / "events.log"),
                    GDW_STATE=str(self.tmp / "state" / "gce-disk-watch.json"),
                    GDW_LOG=str(self.tmp / "logs" / "gce-disk-watch.log"))
         cfg.update(over)
@@ -90,13 +100,11 @@ class Base(unittest.TestCase):
         rc = w.run(HOSTS)
         return rc, w.lines, runner
 
-    def inbox(self):
-        p = self.tmp / "handoffs" / "neo-inbox.md"
-        return p.read_text() if p.exists() else ""
-
-    def events(self):
-        p = self.tmp / "handoffs" / "ops-dispatch" / "events.log"
-        return p.read_text().splitlines() if p.exists() else []
+    def alerts(self):
+        """The alert, still and recovery lines the log channel wrote, without the log's timestamp prefix."""
+        p = self.tmp / "logs" / "gce-disk-watch.log"
+        lines = p.read_text().splitlines() if p.exists() else []
+        return [l.split(" gce-disk-watch ", 1)[1] for l in lines if re.search(r" gce-disk-watch GCE-DISK (ALERT|STILL|RECOVERED) ", l)]
 
     def summary(self, lines):
         return [l for l in lines if " hosts, " in l][-1]
@@ -187,50 +195,47 @@ class Runs(Base):
             rc, lines, _ = self.run_once(full, GDW_APPLY="1")
             self.assertEqual(rc, 0)
             self.assertIn("0 alerted", self.summary(lines))
-        self.assertEqual(self.inbox().count("## EL-T24-GCE-DISK stima-ci-ctl-1"), 1)
-        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.alerts()), 1)
         self.assertEqual(len(self.notes), 1)
         self.clock.t += 600  # a different bad state is a new state change
         self.run_once({"stima-ci-ctl-1": (255, "", None)}, GDW_APPLY="1")
-        self.assertEqual(self.inbox().count("## EL-T24-GCE-DISK stima-ci-ctl-1"), 1)  # held at disk-high for one round
+        self.assertEqual(len(self.alerts()), 1)  # held at disk-high for one round
         self.clock.t += 600
         self.run_once({"stima-ci-ctl-1": (255, "", None)}, GDW_APPLY="1")
-        self.assertEqual(self.inbox().count("## EL-T24-GCE-DISK stima-ci-ctl-1"), 2)
-        self.assertIn("kind=unreadable", self.inbox())
+        self.assertEqual(len(self.alerts()), 2)
+        self.assertIn("kind=unreadable", self.alerts()[1])
 
     def test_re_alert_window(self):
         full = {"stima-ci-ctl-1": (0, CTL1_FULL, None)}
         self.run_once(full, GDW_APPLY="1")
         self.clock.t += 119 * 60
         self.run_once(full, GDW_APPLY="1")
-        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.alerts()), 1)
         self.clock.t += 60
         _, lines, _ = self.run_once(full, GDW_APPLY="1")
-        self.assertEqual(len(self.events()), 2)
-        self.assertIn("P0 GCE-DISK stima-ci-ctl-1 disk-high", self.events()[1])
+        self.assertEqual(len(self.alerts()), 2)
+        self.assertIn("GCE-DISK STILL host=stima-ci-ctl-1 kind=disk-high", self.alerts()[1])
         self.assertIn("1 alerted", self.summary(lines))
-        self.assertEqual(self.inbox().count("## EL-T24-GCE-DISK"), 1)  # the inbox gets state changes only
         self.assertEqual(len(self.notes), 2)
         self.clock.t += 60
         self.run_once(full, GDW_APPLY="1")
-        self.assertEqual(len(self.events()), 2)  # the window restarts at the re-alert
+        self.assertEqual(len(self.alerts()), 2)  # the window restarts at the re-alert
         self.clock.t += 120 * 60
-        self.run_once(full, GDW_APPLY="1", GDW_REALERT_INBOX="1")
-        self.assertEqual(self.inbox().count("## EL-T24-GCE-DISK"), 2)
-        self.assertIn("GCE-DISK STILL host=stima-ci-ctl-1", self.inbox())
+        self.run_once(full, GDW_APPLY="1")
+        self.assertEqual(len(self.alerts()), 3)
+        self.assertIn("GCE-DISK STILL host=stima-ci-ctl-1", self.alerts()[2])
 
     def test_recovery_line_once(self):
         self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
         for _ in range(3):
             self.clock.t += 600
             _, lines, _ = self.run_once({}, GDW_APPLY="1")
-        self.assertEqual(self.inbox().count("GCE-DISK RECOVERED host=stima-ci-ctl-1"), 1)
-        self.assertEqual([l.split(" ", 1)[1] for l in self.events()][1:],
-                         ["INFO GCE-DISK stima-ci-ctl-1 recovered used=41% avail=28.9GB inodes=7%"])
+        self.assertEqual(len([a for a in self.alerts() if a.startswith("GCE-DISK RECOVERED host=stima-ci-ctl-1")]), 1)
+        self.assertRegex(self.alerts()[1], r"^GCE-DISK RECOVERED host=stima-ci-ctl-1 kind=\S+ used=41% avail=28\.9GB inodes=7% ")
         self.assertEqual(len(self.notes), 2)
         self.assertIn("0 recovered", self.summary(lines))
         # A healthy host never says it recovered.
-        self.assertNotIn("stima-ci-1 ", self.inbox() + "\n".join(self.events()))
+        self.assertNotIn("host=stima-ci-1 ", "\n".join(self.alerts()))
 
     def test_shadow_writes_nothing_outside_its_log(self):
         self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)})
@@ -243,51 +248,58 @@ class Runs(Base):
         self.assertEqual(written, ["logs/gce-disk-watch.log", "state/gce-disk-watch.json"])
         self.assertIn("would alert stima-ci-ctl-1 disk-high", (self.tmp / "logs" / "gce-disk-watch.log").read_text())
 
-    def test_apply_writes_inbox_events_and_notification(self):
+    def test_apply_logs_the_alert_and_notifies_and_writes_nothing_under_handoffs(self):
         rc, lines, _ = self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
         self.assertEqual(rc, 0)
-        self.assertIn("\n## EL-T24-GCE-DISK stima-ci-ctl-1\n\nGCE-DISK ALERT host=stima-ci-ctl-1 kind=disk-high "
-                      "used=100% avail=0.0GB inodes=8% project=stima-ci-runners zone=asia-east1-b at=", self.inbox())
-        ev = self.events()
-        self.assertEqual(len(ev), 1)
-        self.assertRegex(ev[0], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} P0 GCE-DISK stima-ci-ctl-1 disk-high "
-                                r"used=100% avail=0\.0GB inodes=8%$")
+        a = self.alerts()
+        self.assertEqual(len(a), 1)
+        self.assertRegex(a[0], r"^GCE-DISK ALERT host=stima-ci-ctl-1 kind=disk-high used=100% avail=0\.0GB inodes=8% "
+                               r"project=stima-ci-runners zone=asia-east1-b at=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual(self.notes, [("GCE disk", "stima-ci-ctl-1 disk-high used=100% avail=0.0GB inodes=8%")])
         self.assertIn("1 alerted", self.summary(lines))
         self.assertNotIn("would alert", "\n".join(lines))
         st = json.loads((self.tmp / "state" / "gce-disk-watch.json").read_text())
         self.assertEqual(set(st), {"apply"})
+        written = sorted(str(p.relative_to(self.tmp)) for p in self.tmp.rglob("*") if p.is_file() and p.parent.name != "ssh")
+        self.assertEqual(written, ["logs/gce-disk-watch.log", "state/gce-disk-watch.json"])  # no handoffs, no inbox, no events.log
+
+    def test_the_removed_inbox_and_events_keys_are_ignored_and_never_written(self):
+        cfg = gdw.load_config(self.tmp / "absent.conf", env={"GDW_INBOX": str(self.tmp / "handoffs" / "neo-inbox.md"),
+                                                              "GDW_EVENTS_LOG": str(self.tmp / "handoffs" / "events.log"),
+                                                              "GDW_REALERT_INBOX": "1"})
+        self.assertFalse({"GDW_INBOX", "GDW_EVENTS_LOG", "GDW_REALERT_INBOX"} & set(cfg))
+        self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1", GDW_INBOX=str(self.tmp / "handoffs" / "neo-inbox.md"),
+                      GDW_EVENTS_LOG=str(self.tmp / "handoffs" / "events.log"), GDW_REALERT_INBOX="1")
+        self.assertFalse((self.tmp / "handoffs").exists())
 
     def test_a_switch_from_shadow_to_apply_alerts_afresh(self):
         self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)})
         self.clock.t += 600
         self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
-        self.assertEqual(self.inbox().count("## EL-T24-GCE-DISK stima-ci-ctl-1"), 1)
+        self.assertEqual(len(self.alerts()), 1)
 
-    def test_a_failed_write_keeps_state_and_retries_that_channel_alone(self):
+    def test_a_failed_notification_keeps_state_and_retries_that_channel_alone(self):
         full = {"stima-ci-ctl-1": (0, CTL1_FULL, None)}
-        blocker = self.tmp / "handoffs"
-        blocker.write_text("not a directory")  # the inbox and events log cannot be written under a file
+        self.notify_fails = True
         rc, lines, _ = self.run_once(full, GDW_APPLY="1")
         self.assertEqual(rc, 1)
-        self.assertIn("ERROR stima-ci-ctl-1: inbox write failed", "\n".join(lines))
-        self.assertIn("ERROR stima-ci-ctl-1: events write failed", "\n".join(lines))
+        self.assertIn("ERROR stima-ci-ctl-1: notify write failed", "\n".join(lines))
         self.assertIn("0 alerted", self.summary(lines))
-        self.assertIn("2 failures", self.summary(lines))
-        self.assertEqual(len(self.notes), 1)  # the notification still went out
+        self.assertIn("1 failures", self.summary(lines))
+        self.assertEqual(len(self.alerts()), 1)  # the log line still went out
         st = json.loads((self.tmp / "state" / "gce-disk-watch.json").read_text())["apply"]["stima-ci-ctl-1"]
-        self.assertEqual(st["todo"], ["inbox", "events"])
-        blocker.unlink()
+        self.assertEqual(st["todo"], ["notify"])
+        self.notify_fails = False
         self.clock.t += 600
         rc, lines, _ = self.run_once(full, GDW_APPLY="1")
         self.assertEqual(rc, 0)
-        self.assertEqual(self.inbox().count("## EL-T24-GCE-DISK stima-ci-ctl-1"), 1)
-        self.assertEqual(len(self.events()), 1)
-        self.assertEqual(len(self.notes), 1)  # the channel that worked is not repeated
+        self.assertEqual(len(self.alerts()), 1)  # the channel that worked is not repeated
+        self.assertEqual(len(self.notes), 1)
         self.assertIn("1 alerted", self.summary(lines))
         self.clock.t += 600
         self.run_once(full, GDW_APPLY="1")
-        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertEqual(len(self.notes), 1)
 
     def test_a_failed_notification_is_retried(self):
         self.notify_fails = True
@@ -297,7 +309,7 @@ class Runs(Base):
         self.clock.t += 600
         self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
         self.assertEqual(len(self.notes), 1)
-        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.alerts()), 1)
 
     def test_a_bad_host_name_is_refused_and_never_reaches_gcloud(self):
         runner = Runner({})
@@ -341,31 +353,31 @@ class Review(Base):
     def test_one_transient_unreadable_read_is_not_told_and_a_second_is(self):
         blip = {"stima-ci-1": (255, "", None)}
         _, lines, _ = self.run_once(blip, GDW_APPLY="1")
-        self.assertEqual(self.events(), [])
+        self.assertEqual(self.alerts(), [])
         self.assertEqual(self.state()["apply"]["stima-ci-1"]["fails"], 1)
         self.clock.t += 600
         self.run_once({}, GDW_APPLY="1")  # it read fine: the counter resets, nothing was told, nothing recovers
         self.assertEqual(self.state()["apply"]["stima-ci-1"]["fails"], 0)
         self.clock.t += 600
         self.run_once(blip, GDW_APPLY="1")
-        self.assertEqual(self.events(), [])  # 1, 0, 1: never two in a row
+        self.assertEqual(self.alerts(), [])  # 1, 0, 1: never two in a row
         self.clock.t += 600
         _, lines, _ = self.run_once(blip, GDW_APPLY="1")
-        self.assertEqual(len(self.events()), 1)
-        self.assertIn("P0 GCE-DISK stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255", self.events()[0])
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("GCE-DISK ALERT host=stima-ci-1 kind=unreadable used=? avail=? inodes=? reason=exit-255", self.alerts()[0])
         self.assertIn("host stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255 fails=2/2", "\n".join(lines))
 
     def test_disk_high_still_alerts_on_the_first_read_and_a_blip_does_not_recover_it(self):
         self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
-        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.alerts()), 1)
         self.clock.t += 600
         self.run_once({"stima-ci-ctl-1": (None, "", "timeout")}, GDW_APPLY="1")
-        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.alerts()), 1)
         self.assertEqual(self.state()["apply"]["stima-ci-ctl-1"]["kind"], "disk-high")
 
     def test_rounds_of_one_tells_the_first_unreadable_read(self):
         self.run_once({"stima-ci-1": (255, "", None)}, GDW_APPLY="1", GDW_UNREADABLE_ROUNDS="1")
-        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.alerts()), 1)
 
     def test_a_known_unreadable_host_is_read_every_round_and_never_told_unreadable(self):
         refused = {"stima-ci-1": (255, "", None)}
@@ -373,35 +385,34 @@ class Review(Base):
             _, lines, runner = self.run_once(refused, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
             self.clock.t += 600
         self.assertIn("stima-ci-1", [c[0] for c in runner.calls])  # still read
-        self.assertEqual(self.events(), [])
-        self.assertEqual(self.inbox(), "")
+        self.assertEqual(self.alerts(), [])
         self.assertIn("host stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255 known-unreadable", "\n".join(lines))
         self.assertIn("unreadable: stima-ci-1(exit-255 known)", self.summary(lines))
         # Not every host: an unlisted one still tells after its rounds.
         self.run_once({"stima-ci-2": (255, "", None)}, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
         self.clock.t += 600
         self.run_once({"stima-ci-2": (255, "", None)}, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
-        self.assertEqual(len(self.events()), 1)
-        self.assertIn("P0 GCE-DISK stima-ci-2 unreadable", self.events()[0])
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("GCE-DISK ALERT host=stima-ci-2 kind=unreadable", self.alerts()[0])
 
     def test_a_stored_unreadable_state_on_a_known_host_clears_without_a_recovery(self):
         refused = {"stima-ci-1": (255, "", None)}
         self.run_once(refused, GDW_APPLY="1")
         self.clock.t += 600
         self.run_once(refused, GDW_APPLY="1")
-        self.assertEqual(len(self.events()), 1)  # told before it was listed
+        self.assertEqual(len(self.alerts()), 1)  # told before it was listed
         self.clock.t += 600
         self.run_once(refused, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
-        self.assertEqual(len(self.events()), 1)  # no `recovered`: nothing recovered
+        self.assertEqual(len(self.alerts()), 1)  # no `recovered`: nothing recovered
         self.assertEqual(self.state()["apply"]["stima-ci-1"]["kind"], "ok")
         self.clock.t += 7200
         self.run_once(refused, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
-        self.assertEqual(len(self.events()), 1)  # and no re-alert
+        self.assertEqual(len(self.alerts()), 1)  # and no re-alert
 
     def test_a_known_unreadable_host_that_reads_full_still_alerts(self):
         self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-ctl-1")
-        self.assertEqual(len(self.events()), 1)
-        self.assertIn("disk-high", self.events()[0])
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("disk-high", self.alerts()[0])
 
     def test_the_shipped_policy_lists_the_two_refused_hosts_and_the_default_lists_none(self):
         self.assertEqual(self.cfg()["GDW_KNOWN_UNREADABLE"], "")
@@ -410,20 +421,18 @@ class Review(Base):
 
     def test_a_damaged_entry_never_crashes_the_round_and_the_host_alerts_again(self):
         damaged = [{"kind": "disk-high", "sent": "yesterday", "todo": [], "notice": "alert", "told": True},
-                   {"kind": "disk-high", "todo": ["inbox"], "told": True},  # todo without a notice
+                   {"kind": "disk-high", "todo": ["log"], "told": True},  # todo without a notice
                    {"kind": "disk-high", "todo": ["rm -rf"], "notice": "alert"},
                    {"kind": "full", "notice": "alert"}, {"kind": "disk-high", "fails": "2"}, "not a dict", [1, 2]]
         for bad in damaged:
             with self.subTest(bad=bad):
-                for f in (self.tmp / "handoffs").glob("**/*"):
-                    if f.is_file():
-                        f.unlink()
+                (self.tmp / "logs" / "gce-disk-watch.log").unlink(missing_ok=True)
                 self.write_state({"apply": {"stima-ci-ctl-1": bad}})
                 self.clock.t += 600
                 rc, lines, _ = self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
                 self.assertEqual(rc, 0)
-                self.assertEqual(len(self.events()), 1)
-                self.assertIn("GCE-DISK ALERT host=stima-ci-ctl-1 kind=disk-high", self.inbox())
+                self.assertEqual(len(self.alerts()), 1)
+                self.assertIn("GCE-DISK ALERT host=stima-ci-ctl-1 kind=disk-high", self.alerts()[0])
                 self.assertEqual(self.state()["apply"]["stima-ci-ctl-1"]["todo"], [])
 
     def test_an_error_in_one_host_is_a_counted_failure_not_an_aborted_round(self):
@@ -445,6 +454,17 @@ class Review(Base):
         self.assertIn("ERROR stima-ci-2: round failed (TypeError): state reset for this host", "\n".join(lines))
         self.assertNotIn("stima-ci-2", self.state()["apply"])
 
+    def test_a_stored_inbox_or_events_pending_write_is_dropped_never_sent(self):
+        self.write_state({"apply": {"stima-ci-ctl-1": {"kind": "disk-high", "since": 1.0, "notice": "alert",
+                                                        "todo": ["inbox", "events", "notify"], "sent": None,
+                                                        "told": False, "fails": 0}}})
+        self.clock.t += 600
+        rc, lines, _ = self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.notes), 1)  # the one live channel in that todo
+        self.assertEqual(self.state()["apply"]["stima-ci-ctl-1"]["todo"], [])
+        self.assertFalse((self.tmp / "handoffs").exists())
+
     def test_shadow_never_delivers_a_stored_apply_channel(self):
         self.write_state({"shadow": {"stima-ci-ctl-1": {"kind": "disk-high", "since": 1.0, "notice": "alert",
                                                          "todo": ["inbox", "events", "notify"], "sent": None,
@@ -452,6 +472,7 @@ class Review(Base):
         rc, lines, _ = self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)})
         self.assertEqual(rc, 0)
         self.assertFalse((self.tmp / "handoffs").exists())
+        self.assertEqual(self.alerts(), [])
         self.assertEqual(self.notes, [])
         self.assertEqual(self.state()["shadow"]["stima-ci-ctl-1"]["todo"], [])
 
@@ -517,18 +538,18 @@ class Cadence(Base):
         self.clock.t += 600
         _, lines, runner = self.cad({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
         self.assertEqual(runner.calls, [])  # the full disk is not seen until the host is due
-        self.assertEqual(self.events(), [])
+        self.assertEqual(self.alerts(), [])
         self.clock.t += 20 * 60
         _, lines, _ = self.cad({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
-        self.assertEqual(len(self.events()), 1)  # first read after due tells at once
-        self.assertIn("P0 GCE-DISK stima-ci-ctl-1 disk-high", self.events()[0])
+        self.assertEqual(len(self.alerts()), 1)  # first read after due tells at once
+        self.assertIn("GCE-DISK ALERT host=stima-ci-ctl-1 kind=disk-high", self.alerts()[0])
         # While disk-high it is read every run (never delayed) and stays told once.
         self.clock.t += 600
         _, _, runner = self.cad({"stima-ci-ctl-1": (0, CTL1_FULL, None)}, GDW_APPLY="1")
         self.assertEqual([c[0] for c in runner.calls], ["stima-ci-ctl-1"])
-        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.alerts()), 1)
         # Not-due hosts keep ok: no recovery or alert invented from them.
-        self.assertNotIn("recovered", "\n".join(self.events()))
+        self.assertNotIn("recovered", "\n".join(self.alerts()))
 
     def test_replay_loses_no_would_alert(self):
         """The same 24 h of reads at every run and at the shipped cadence tell the same would-alerts."""
@@ -556,7 +577,7 @@ class Cadence(Base):
     def test_a_pending_write_makes_the_host_due(self):
         self.cad({}, GDW_APPLY="1")
         st = json.loads((self.tmp / "state" / "gce-disk-watch.json").read_text())
-        st["apply"]["stima-ci-2"].update(kind="disk-high", notice="alert", todo=["events"], told=False)
+        st["apply"]["stima-ci-2"].update(kind="disk-high", notice="alert", todo=["log"], told=False)
         (self.tmp / "state" / "gce-disk-watch.json").write_text(json.dumps(st))
         self.clock.t += 600
         _, _, runner = self.cad({}, GDW_APPLY="1")

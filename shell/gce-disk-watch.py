@@ -20,10 +20,9 @@ to local files (and a local notification).
           back as `ok`, so the host is told again), never stops the others.
   tell    once per host per state change; while it stays, again at most every GDW_REALERT_MINUTES (120); one
           `recovered` line when it clears. Shadow by default (GDW_APPLY=0): a `would alert` line in the log and
-          nothing else. GDW_APPLY=1: one `## EL-T24-GCE-DISK <host>` block in GDW_INBOX (state changes only,
-          unless GDW_REALERT_INBOX=1), one `<ts> P0 GCE-DISK <host> <kind> ...` line in GDW_EVENTS_LOG and a
-          macOS notification. Every write goes to a local path. A write that fails is logged ERROR and stays
-          pending in the state, so the next run retries that channel alone.
+          nothing else. GDW_APPLY=1: one `GCE-DISK ALERT|STILL|RECOVERED host=<host> ...` line in the log and a
+          macOS notification. Nothing is written to any inbox or event log. Every write goes to a local path. A
+          write that fails is logged ERROR and stays pending in the state, so the next run retries that channel alone.
   cadence a host is read at most every GDW_READ_EVERY_MINUTES (30; GDW_KNOWN_EVERY_MINUTES, 60, for a known-unreadable
           one). A host not due keeps its stored kind and state, is logged `not-due` and spawns nothing. A host that is
           disk-high, unreadable (not by design) or has a write pending is due every run, so a tell is never delayed.
@@ -46,9 +45,8 @@ import sys
 import time
 from pathlib import Path
 
-HEADER = "EL-T24-GCE-DISK"
 DEFAULTS = {
-    "GDW_APPLY": "0",  # 0: shadow (log only). 1: inbox, events log and notification
+    "GDW_APPLY": "0",  # 0: shadow (log only). 1: the alert log line and the notification
     "GDW_HOSTS": "stima-ci-1 stima-ci-2 stima-ci-3 stima-ci-ctl-1 stima-ci-deploy-1",
     "GDW_PROJECT": "stima-ci-runners",
     "GDW_ZONE": "asia-east1-b",
@@ -59,9 +57,6 @@ DEFAULTS = {
     "GDW_HOST_TIMEOUT_SECONDS": "90",
     "GDW_RUN_TIMEOUT_SECONDS": "240",
     "GDW_REALERT_MINUTES": "120",
-    "GDW_REALERT_INBOX": "0",  # 0: a re-alert goes to the events log and the notification, the inbox gets state changes
-    "GDW_INBOX": "~/handoffs/neo-inbox.md",
-    "GDW_EVENTS_LOG": "~/handoffs/ops-dispatch/events.log",
     "GDW_STATE": "~/.cc-reaper/state/gce-disk-watch.json",
     "GDW_LOG": "~/.cc-reaper/logs/gce-disk-watch.log",
     "GDW_NOTIFY": "1",  # 0: no macOS notification even with GDW_APPLY=1
@@ -79,7 +74,8 @@ GIB = 1 << 30
 OK, HIGH, UNREADABLE = "ok", "disk-high", "unreadable"
 KINDS = (OK, HIGH, UNREADABLE)
 NOTICES = (None, "alert", "recover", "realert")
-CHANNELS = ("shadow", "inbox", "events", "notify")
+CHANNELS = ("shadow", "log", "notify")
+LEGACY_CHANNELS = ("inbox", "events")  # pending writes a state file from before #7079 may still hold; dropped, never sent
 
 
 # ---------- config ----------
@@ -236,25 +232,14 @@ def numbers(r):
     return f"used={m['used_pct']}% avail={m['avail_kb'] * 1024 / GIB:.1f}GB inodes={inodes}"
 
 
-def stamp(now):
-    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
-
-
 def utc(now):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
 
 
-def inbox_block(cfg, host, notice, kind, r, now):
+def alert_line(cfg, host, notice, kind, r, now):
     word = "RECOVERED" if notice == "recover" else ("STILL" if notice == "realert" else "ALERT")
-    return (f"\n## {HEADER} {host}\n\n"
-            f"GCE-DISK {word} host={host} kind={kind} {numbers(r)} project={cfg['GDW_PROJECT']} "
-            f"zone={cfg['GDW_ZONE']} at={utc(now)}\n")
-
-
-def events_line(host, notice, kind, r, now):
-    if notice == "recover":
-        return f"{stamp(now)} INFO GCE-DISK {host} recovered {numbers(r)}\n"
-    return f"{stamp(now)} P0 GCE-DISK {host} {kind} {numbers(r)}\n"
+    return (f"GCE-DISK {word} host={host} kind={kind} {numbers(r)} project={cfg['GDW_PROJECT']} "
+            f"zone={cfg['GDW_ZONE']} at={utc(now)}")
 
 
 def append(path, text):
@@ -293,10 +278,7 @@ class Watch:
     def channels(self, notice):
         if not self.apply:
             return ["shadow"]
-        ch = []
-        if notice != "realert" or self.cfg["GDW_REALERT_INBOX"] == "1":
-            ch.append("inbox")
-        ch.append("events")
+        ch = ["log"]
         if self.cfg["GDW_NOTIFY"] == "1":
             ch.append("notify")
         return ch
@@ -312,10 +294,8 @@ class Watch:
         if channel == "shadow":
             verb = "would recover" if notice == "recover" else ("would re-alert" if notice == "realert" else "would alert")
             self.log(f"shadow: {verb} {host} {'recovered' if notice == 'recover' else kind} {numbers(r)}")
-        elif channel == "inbox":
-            append(path_of(self.cfg, "GDW_INBOX"), inbox_block(self.cfg, host, notice, kind, r, now))
-        elif channel == "events":
-            append(path_of(self.cfg, "GDW_EVENTS_LOG"), events_line(host, notice, kind, r, now))
+        elif channel == "log":
+            self.log(alert_line(self.cfg, host, notice, kind, r, now))
         elif channel == "notify":
             word = "recovered" if notice == "recover" else kind
             self.notifier("GCE disk", f"{host} {word} {numbers(r)}")
@@ -444,9 +424,10 @@ def valid_entry(e):
     if not isinstance(e, dict) or e.get("kind") not in KINDS or e.get("notice") not in NOTICES:
         return None
     todo = e.get("todo", [])
-    if not isinstance(todo, list) or not all(isinstance(c, str) and c in CHANNELS for c in todo) \
+    if not isinstance(todo, list) or not all(isinstance(c, str) and (c in CHANNELS or c in LEGACY_CHANNELS) for c in todo) \
             or (todo and e.get("notice") is None):
         return None
+    todo = [c for c in todo if c in CHANNELS]
     if not (e.get("sent") is None or num(e.get("sent"))) or not (e.get("since") is None or num(e.get("since"))):
         return None
     fails = e.get("fails", 0)
@@ -475,7 +456,7 @@ def save_state(path, state):
 def main(argv=None, runner=gcloud_runner, notifier=osascript_notify):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", default=None, help="KEY=VALUE policy (default: $GDW_CONFIG or ~/.cc-reaper/gce-disk-watch.conf)")
-    ap.add_argument("--apply", action="store_true", help="write the inbox, events log and notification (default: GDW_APPLY)")
+    ap.add_argument("--apply", action="store_true", help="write the alert log line and the notification (default: GDW_APPLY)")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     if args.apply:
