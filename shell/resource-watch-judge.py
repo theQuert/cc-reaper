@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Judge resource-watch's own log against the thresholds resource-watch itself runs with (EL-T24).
+"""Judge resource-watch's own log against the thresholds resource-watch itself runs with.
 
-The spot-check that re-judges resource-watch (ops-dispatch spotcheck.d/host.py) carried its own copy of the
+A spot-check that re-judged resource-watch carried its own copy of the
 thresholds and drifted: it expected ALERT:disk-low under 40 GB while the script raises it under 60, and had no
 swap value on the line to check ALERT:swap against. This module is the one judge, installed beside the script:
 
@@ -14,10 +14,7 @@ swap value on the line to check ALERT:swap against. This module is the one judge
                   AND still being written: macOS never shrinks swap, so size alone is not the flag): ALERT:swap
                   exactly when swap_hot=1, either way when swap_hot=?. A line without swap_hot (written before
                   it existed) keeps the size-only rule.
-  judge_events()  the pause chain in a run of lines: a DISK-PAUSE never follows a DISK-PAUSE (nor a RESUME a
-                  RESUME) in one mode, and no snapshot whose own numbers hold a lease (swap, emergency, flag rate)
-                  comes while the newest event says DISK-RESUME.
-  judge_log()     both, over the newest lines of a log.
+  judge_log()     judge_line() over the newest lines of a log.
 
 Read-only: it reads a plist and a log, and never runs the script.
 
@@ -54,7 +51,6 @@ LINE = re.compile(
     r"compressor=(?P<comp>[\d.]+)GB disk_free=(?P<free>[\d.]+)GB/(?P<pct>[\d.]+)%"
     r"(?P<fields> swap=(?:(?P<swap>[\d.]+)GB|\?) rate=(?:(?P<rate>-?[\d.]+)GB/h|\?)(?: swap_hot=(?P<hot>[01?]))?)?"
     r"(?P<rest>.*)$")
-EVENT = re.compile(r"^\S+ EVENT (?P<mode>shadow|emitted)\b.*?: (?P<kind>DISK-PAUSE on|DISK-RESUME): ")
 # Markers whose truth is on the line itself. disk-drop, disk-act-*, reclaim-stalled read state the line
 # does not carry, so they are not judged here.
 JUDGED = {"load", "disk", "disk-low", "disk-emergency", "mem", "swap", "disk-rate"}
@@ -76,7 +72,7 @@ def config(plist=PLIST, env=None):
 
 
 def is_snapshot(line):
-    """A snapshot line (load=...), as opposed to an INFO/WARN/ERROR/EVENT line the script also writes."""
+    """A snapshot line (load=...), as opposed to an INFO/WARN/ERROR line the script also writes."""
     parts = line.split(" ", 2)
     return len(parts) > 1 and parts[1].startswith("load=")
 
@@ -111,16 +107,6 @@ def implied(x, cfg, ncpu, phys_gb):
     return want
 
 
-def holds_lease(x, cfg):
-    """True when the line's own numbers write a pause flag this round (a lower bound: disk-stop is a dispatch's,
-    disk-rate-high outlives an unmeasured round, and swap_hot=? leaves swap-high as it was, so a line can be
-    paused without this). Swap counts by swap_hot, or by size on a line from before that field."""
-    num = lambda k: x[k] is not None
-    return (bool(swap_hot(x, cfg))
-            or (cfg["CC_RW_DISK_EMERGENCY_GB"] > 0 and float(x["free"]) < cfg["CC_RW_DISK_EMERGENCY_GB"])
-            or (num("rate") and cfg["CC_RW_RATE_FLAG_GBH"] > 0 and float(x["rate"]) > cfg["CC_RW_RATE_FLAG_GBH"]))
-
-
 def judge_line(line, cfg, ncpu, phys_gb):
     """Misses for one snapshot line; [] when it agrees with itself. A line that is not a snapshot is not judged."""
     if not is_snapshot(line):
@@ -129,7 +115,7 @@ def judge_line(line, cfg, ncpu, phys_gb):
     if not x:
         return [f"unparsable resource-watch line: {line[:80]}"]
     misses, judged = [], JUDGED
-    if x["fields"] is None:  # a line from before EL-T24: one miss, and the rest judged without swap and rate
+    if x["fields"] is None:  # a line from before the swap/rate fields: one miss, and the rest judged without swap and rate
         misses.append(f"{x['ts']} carries no swap=/rate= fields, so ALERT:swap and ALERT:disk-rate cannot be judged")
         judged = JUDGED - {"swap", "disk-rate"}
     have = set(re.findall(r"ALERT:([\w-]+)", x["rest"])) & judged
@@ -146,33 +132,16 @@ def judge_line(line, cfg, ncpu, phys_gb):
 
 
 def judge_events(lines, cfg):
-    """Misses in the pause chain over `lines`, oldest first."""
-    misses, last = [], {}  # mode -> newest kind told in that mode
-    newest = None  # (mode, kind) of the newest event in any mode
-    for line in lines:
-        e = EVENT.match(line)
-        if e:
-            if last.get(e["mode"]) == e["kind"]:
-                misses.append(f"two {e['kind']} lines in a row ({e['mode']}), the second at {line.split(' ', 1)[0]}: "
-                              "the dedupe did not hold")
-            last[e["mode"]] = e["kind"]
-            newest = (e["mode"], e["kind"])
-            continue
-        if not is_snapshot(line):
-            continue
-        x = LINE.match(line)
-        if x and newest and newest[1] == "DISK-RESUME" and holds_lease(x, cfg):
-            misses.append(f"{x['ts']} holds heavy leases by its own numbers (swap={x['swap'] or '?'} "
-                          f"free={x['free']} rate={x['rate'] or '?'}) while the newest event is DISK-RESUME "
-                          f"({newest[0]})")
-    return misses
+    """The pause chain is gone (stima-api#7079), so there are no events to judge. Kept because the
+    ops-dispatch spot-check (~/handoffs/ops-dispatch/spotcheck.d/host.py) still calls it on the installed copy."""
+    return []
 
 
 def judge_log(lines, cfg, ncpu, phys_gb):
     out = []
     for line in lines:
         out.extend(judge_line(line, cfg, ncpu, phys_gb))
-    return out + judge_events(lines, cfg)
+    return out
 
 
 def _sysctl(name):
