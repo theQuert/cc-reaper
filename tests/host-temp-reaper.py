@@ -233,7 +233,7 @@ class ReaperTest(unittest.TestCase):
                 self.leftover("tmpheld0001", 4 * DAY),
                 self.leftover("node-compile-cache", 9 * DAY),       # not a tool temp name
                 self.leftover("tmpTOOLONG123", 4 * DAY),
-                self.leftover("tmp_scratch", 4 * DAY),               # a person's name: no digit
+                self.leftover("tmp-scratch", 4 * DAY),               # a person's name, in no tool's shape
                 self.leftover("tmp.AbCdEf1234", 4 * DAY, file=True),  # a generic name: dirs only
                 self.leftover("nimbus-prod-config", 4 * DAY)]       # not a known nimbus test
         self.holders.add(self.root / "tmpheld0001")
@@ -243,6 +243,78 @@ class ReaperTest(unittest.TestCase):
         for path in kept:
             self.assertTrue(path.exists(), path)
         self.assertEqual(counts["leftover"], [11, 11])
+
+    # stima-api#7106: the seventh kind, the tmp shapes the leftover rule leaves alone.
+    def test_only_old_unheld_tmp_dirs_the_leftover_rule_leaves_are_removed(self):
+        gone = [self.leftover("tmp_sriaqhi", 2 * DAY + HOUR),         # a Python sandbox: no digit, an underscore
+                self.leftover("tmp___6x43l", 3 * DAY),                # leftover-shaped? no: three underscores, a digit
+                self.leftover("tmp_scratch", 4 * DAY),                # the shape is all there is to go on
+                self.leftover("tmpAbCdEfGh", 2 * DAY + HOUR),         # upper case
+                self.leftover("tmp.abcdefghij", 2 * DAY + HOUR)]      # mktemp, all lower case
+        kept = [self.leftover("tmp_youngun", 2 * DAY - HOUR),         # 48 h not yet up
+                self.leftover("tmp_deepchg", 3 * DAY, inner_age=HOUR),  # changed deep inside
+                self.leftover("tmp_heldone", 3 * DAY),                # an open file or cwd inside (snapshot)
+                self.leftover("tmp_lsofsee", 3 * DAY),                # lsof +D finds a holder
+                self.leftover("tmp_cmdline", 3 * DAY),                # named on a command line
+                self.leftover("tmp_toolong1", 3 * DAY),               # nine characters
+                self.leftover("tmp.abcdefghi", 3 * DAY),              # nine characters
+                self.leftover("tmp_isafile", 3 * DAY, file=True)]     # directories only
+        self.rows.append((77, 1, 10, f"python3 -m pytest --basetemp=/x/{'tmp_cmdline'}"))
+        self.holders.add(self.root / "tmp_heldone")
+        lsof_held = {self.root / "tmp_lsofsee"}
+        out = io.StringIO()
+        with mock.patch.object(reaper, "held", side_effect=lambda path: path in lsof_held), \
+             mock.patch.object(reaper, "holders", side_effect=lambda root, rows: {"tmp_heldone"}), \
+             mock.patch("sys.stdout", out):
+            counts = self.run_clean()
+        for path in gone:
+            self.assertFalse(path.exists(), path)
+        for path in kept:
+            self.assertTrue(path.exists(), path)
+        self.assertEqual(counts["tmpdir"], [4, 4])
+        self.assertEqual(counts["leftover"], [1, 1])  # tmp___6x43l has a digit: the leftover rule's, at a day
+        self.assertRegex(out.getvalue(), r"REMOVED tmpdir tmp_sriaqhi bytes=\d+")
+        self.assertRegex(out.getvalue(), r"tmpdir: 4 removed of 4, bytes=[1-9]\d*, not reached=0")
+
+    def test_a_tmp_dir_link_is_never_followed(self):
+        target = self.leftover("tmp_targetx", 3 * DAY)
+        (self.root / "tmp_linkone").symlink_to(target)
+        old = time.time() - 3 * DAY
+        os.utime(self.root / "tmp_linkone", (old, old), follow_symlinks=False)  # as old as a real one
+        counts = self.run_clean()
+        self.assertEqual(counts["tmpdir"], [1, 1])
+        self.assertTrue((self.root / "tmp_linkone").is_symlink())
+
+    def test_an_inconclusive_lsof_keeps_a_tmp_dir(self):
+        path = self.leftover("tmp_unsurex", 3 * DAY)
+        with mock.patch.object(reaper, "held", side_effect=REAL_HELD), \
+             mock.patch.object(reaper.subprocess, "run", side_effect=OSError("no lsof")):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["tmpdir"], [0, 0])
+
+    def test_no_holder_snapshot_keeps_every_tmp_dir(self):
+        path = self.leftover("tmp_nosnapx", 3 * DAY)
+        with mock.patch.object(reaper, "holders", return_value=None):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["tmpdir"], [0, 0])
+
+    def test_past_its_budget_a_run_leaves_the_rest_for_the_next(self):
+        path = self.leftover("tmp_budgetx", 3 * DAY)
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            counts = reaper.reap(self.root, self.logs, clean=True, idle_seconds=HOUR, tmpdir_budget=-1,
+                                 send=lambda pid, sig: None)
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["tmpdir"], [0, 0])
+        self.assertIn("not reached=1", out.getvalue())
+
+    def test_tmp_dirs_are_only_listed_without_clean(self):
+        path = self.leftover("tmp_listedx", 3 * DAY)
+        counts = reaper.reap(self.root, self.logs, clean=False, jobs_dir=self.jobs)
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["tmpdir"], [1, 0])
 
     def test_a_leftover_reaching_another_filesystem_is_kept(self):
         path = self.leftover("go-build79", DAY + HOUR)
