@@ -146,8 +146,8 @@ SPOTCHECK_LOG="${BYPRODUCT_SPOTCHECK_LOG:-$HOME/.cc-reaper/logs/spotcheck-reclai
 # `tmux list-panes`. Space-separated; a name that resolves to nothing protects nothing.
 PROTECT_SESSION_NAMES="${BYPRODUCT_PROTECT_SESSIONS:-homepage uiux verify-signin-redesign}"
 TMUX_BIN="${BYPRODUCT_TMUX_BIN:-tmux}"
-# The narrow stand-in for "a later `claude --resume` might want it": a session cc-reaper or
-# Neo closed (recorded in closed-sessions.md with its id) keeps its scratchpad for this many
+# The narrow stand-in for "a later `claude --resume` might want it": a session cc-reaper
+# closed (recorded in closed-sessions.md with its id) keeps its scratchpad for this many
 # days after the entry. A resumed session reads its own transcript, not the scratchpad; what
 # it can still want is a background task's output, which the 24h tree-idle window already
 # covers for the session's normal life, so two days is the margin for a resume the next day.

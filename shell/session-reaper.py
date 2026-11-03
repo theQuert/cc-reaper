@@ -61,15 +61,10 @@ DEFAULTS = {
     "WAITING_EXTRA": "",  # extra regex alternatives that mean "waiting on a person"
     "SUBAGENT_QUIET_MINUTES": "30",  # a subagent or workflow transcript written this recently is still running
     "PROMPT_RE": r"\(y/n\)|do you want to proceed|waiting for input|NEEDS_HUMAN",  # on screen: asks a person
-    "RELAY_DIR": "",  # pending <issue>-*.json requests for a claimed issue keep the session; empty: off
-    "RELAY_MAX_AGE_HOURS": "48",  # an older request no longer counts as pending
     "HANDOFF_ROOT": "",  # a path under it named in the last message must exist; empty: off
     "REAPED_DIR": "~/.cc-reaper/state/reaped",  # one record per reaped tmux name, written before /exit
     "IDLE_LIST_HOURS": "0",  # list idle/shell sessions with no claimed issue idle this long; 0: off
     "IDLE_LIST_FILE": "~/.cc-reaper/state/idle-sessions.md",  # rewritten every sweep with that list
-    "IDLE_LIST_INBOX": "",  # a path: append the list once per local day under ## key=IDLE-SESSIONS-<date>; empty: off
-    "DONE_INBOX": "~/handoffs/neo-inbox.md",  # a session whose newest header here is DONE (>= IDLE_MINUTES old) is done; empty: off
-    "DONE_INBOX_SHADOW": "",  # report-only: with DONE_INBOX off, mark kept sessions DONE_INBOX=<this> would reap
     "CHECKBY_ORACLE": "/Users/stimaclaw/GitHub/stima-api/scripts/ci/delivery_state.py",  # --json: pending_check_by, due_check
     "CHECKBY_REPO": "theQuert/stima-api",  # the only repo the oracle reads; a claim elsewhere is UNKNOWN (kept)
     "ORACLE_ROOT": "/Users/stimaclaw/GitHub/stima-api",  # checkout whose `scripts/ci/delivery_state.py N --brief` judges an idle session's open claims
@@ -85,13 +80,6 @@ DEFAULTS = {
     # `shadow` reports `would-close: done grace (shadow)` and closes nothing; `apply` uses it; `off` neither.
     "DONE_GRACE": "off",
     "DONE_GRACE_MINUTES": "5",
-    # EL-T2482: a path (ops-dispatch's events.log) that gets `ROUTE nudge <tmux> <fingerprint>` for an idle session kept
-    # only by its own open work; ops-dispatch sends the message. Empty: off. NUDGE_STATE dedups. See nudge_events().
-    "NUDGE_EVENTS": "",
-    "NUDGE_STATE": "~/.cc-reaper/state/nudged.json",  # space-separated fnmatch patterns over tmux and session names never listed
-    # A claim-less session whose newest inbox header (DONE_INBOX, else DONE_INBOX_SHADOW) is DONE (EL-T24): `shadow`
-    # reports it `would-close` and closes nothing; `apply` counts it as done; `off` neither. See noclaim_done().
-    "NOCLAIM_DONE": "shadow",
     # Space- or comma-separated pids: a session whose process tree holds one is kept (`never-kill:<pid>`) and its
     # pane is never killed. The environment variable of the same name wins over this value.
     "CC_NEVER_KILL_PIDS": "70987 4565",
@@ -109,7 +97,7 @@ DEFAULTS = {
     "STATE_DONE": "shadow",
     # Clean shadow rounds in a row (each with a candidate, at least 3 distinct sessions over the streak, 25+ min apart,
     # counted only on the live config at APPLY=1) after which the sweep writes `<FLAG>=apply` for that one source
-    # (STATE_DONE, ORACLE_NOT_MINE, NOCLAIM_DONE) into the live policy, with a line in the report.
+    # (STATE_DONE, ORACLE_NOT_MINE) into the live policy, with a line in the report.
     "SHADOW_CLEAN_ROUNDS": "5",
     # stima-api#7106: `on`: at APPLY, a session whose newest reply (written after its last prompt) has a SESSION-DONE
     # line gets `claude-task-done` (session=<id>, at=<UTC>) in its scratchpads (<SCRATCH_ROOT>/*/<id>) and in
@@ -597,7 +585,7 @@ def oracle_not_mine(brief):
     `-> stop <reason>` header with the oracle's `  stop: <reason> (reported)` line and a `wake:` line (the stop is on
     the issue and a person or a record wakes it), or a `-> wait` header whose last line is the oracle's `check-by
     scheduled for <iso>; the stranded-step dispatcher wakes the session then`. An `agent` step, a stop the session has
-    not reported yet (`; post once with <marker>`: it still owes that comment or its RELAY-ASK), a stop nothing wakes,
+    not reported yet (`; post once with <marker>`: it still owes that comment), a stop nothing wakes,
     and a wait with no check-by yet are the session's."""
     if not brief:
         return None
@@ -713,48 +701,6 @@ def claim_time(repo, num, sid):
     return _claim_cache[key]
 
 
-INBOX_HEADER_RE = re.compile(r"^## .*?(\w+) · (\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d) TPE · (.+?)\s*$")
-
-
-def inbox_done_header(path, names):
-    """(epoch, key) of the newest inbox header written by one of `names` when it is DONE; None otherwise.
-    Only header lines are examined; any read or parse failure is None."""
-    names = {n for n in names if n}
-    if not path or not names:
-        return None
-    newest = None
-    try:
-        with open(os.path.expanduser(path), errors="replace") as f:
-            for line in f:
-                if line.startswith("## ") and " · " in line and line.rstrip().rsplit(" · ", 1)[1] in names:
-                    newest = line.rstrip()
-    except OSError:
-        return None
-    m = INBOX_HEADER_RE.match(newest or "")
-    if not m or m.group(1) != "DONE":
-        return None
-    y, mo, d, h, mi = (int(x) for x in m.group(2, 3, 4, 5, 6))
-    try:
-        at = calendar.timegm((y, mo, d, h, mi, 0, 0, 0, 0)) - 8 * 3600  # Asia/Taipei is UTC+8
-    except (ValueError, OverflowError):
-        return None
-    return at, newest[3:].split(None, 1)[0]
-
-
-def inbox_done(cfg, names, now, claim_at=None):
-    """True when the newest inbox header written by one of `names` is DONE and old enough.
-    The header must be later than the newest claim (`claim_at()` -> epoch or None; None: not done).
-    Only header lines are examined; any read or parse failure means not done."""
-    hit = inbox_done_header(cfg.get("DONE_INBOX"), names)
-    if not hit:
-        return False
-    at = hit[0]
-    if now - at < float(cfg["IDLE_MINUTES"]) * 60:
-        return False
-    claimed = claim_at() if claim_at else None
-    return claimed is not None and at > claimed
-
-
 # ---------- transcript ----------
 
 def transcript_path(sid):
@@ -829,7 +775,7 @@ def transcript_facts(path, now):
             continue
         if e.get("type") == "user" and not e.get("isSidechain"):
             # A prompt: a person's or a peer's message, anything but a tool result. Meta entries count too (a peer
-            # message is one), which only makes a prompt look newer: fail-closed for noclaim_done().
+            # message is one), which only makes a prompt look newer: fail-closed for the done-grace and state gates.
             c = e.get("message", {}).get("content")
             if isinstance(c, str) or any(isinstance(b, dict) and b.get("type") != "tool_result"
                                          for b in (c if isinstance(c, list) else [])):
@@ -861,25 +807,6 @@ def subagent_activity(sid, now, quiet_minutes):
             except OSError:
                 continue
     return recent
-
-
-def relay_pending(cfg, claims, now):
-    """Claimed issues with a relay request still waiting: `<issue>-*.json` at the top of RELAY_DIR
-    (answered ones are renamed `.done` or moved to a subdirectory), younger than RELAY_MAX_AGE_HOURS."""
-    if not cfg["RELAY_DIR"]:
-        return []
-    root = Path(os.path.expanduser(cfg["RELAY_DIR"]))
-    max_age = float(cfg["RELAY_MAX_AGE_HOURS"]) * 3600
-    out = []
-    for _, num in claims:
-        for f in root.glob(f"{num}-*.json"):
-            try:
-                if now - f.stat().st_mtime < max_age:
-                    out.append(num)
-                    break
-            except OSError:
-                continue
-    return out
 
 
 def missing_handoffs(cfg, text):
@@ -1051,7 +978,6 @@ def _record(cfg, now, table, wts, f, d, pane, state, attach_pid):
     }
     if state is None:
         s["unattached"] = True
-    s["relay_pending"] = relay_pending(cfg, claims, now)
     return s
 
 
@@ -1169,72 +1095,6 @@ def protected(cfg, *names):
     return any(fnmatch.fnmatch(n, p) for p in cfg["PROTECT"].split() for n in names if n)
 
 
-OPEN_WORK = ("owed-step:", "uncommitted:", "unpushed:", "check-by-open")  # decide()/worktree_state() keep reasons
-NUDGE_FOR = OPEN_WORK[:3]  # a pending check-by alone is not: checkby_state says OPEN before it is due, the router wakes it
-
-
-def nudge_events(cfg, seen, now):
-    """EL-T2482: an idle session at an empty prompt kept ONLY by open work of its own (an owed oracle step, an
-    uncommitted or unpushed worktree, plus at most an open check-by) gets one `ROUTE nudge <tmux> <fingerprint>` line
-    in NUDGE_EVENTS, and ops-dispatch sends it a message. Once per fingerprint (session id + reasons): it stays
-    remembered while the session is kept by those same reasons, busy or not, and is forgotten only when a judged
-    session's reasons change, so it nudges again only on new open work. A session not judged this sweep (budget,
-    error, skipped by gather, aborted sweep) keeps what was remembered. No name is skipped but PROTECT (EL-T2490: uiux
-    and homepage are nudged like every session; NEVER_CLOSE only stops a close). Types nothing into any pane."""
-    if not cfg["NUDGE_EVENTS"]:
-        return []
-    st = Path(os.path.expanduser(cfg["NUDGE_STATE"]))
-    try:
-        sent = {str(x) for x in json.loads(st.read_text())}
-    except (OSError, ValueError, TypeError):
-        sent = set()
-    seen_sids, judged, cur, new = set(), set(), set(), []
-    seen_sids |= {(SKIPPED_INFO.get(label) or {}).get("sid") for label, _, live in SKIPPED if live} - {None}  # live, not gathered
-    for s, keep, outcome in seen:
-        seen_sids.add(s["sid"][:8])
-        # decide() names open work only for a session idle past IDLE_MINUTES (busy gets status:busy, a short idle
-        #  idle:N<..min, an owed step only past the threshold), so only such a session can say its work changed
-        if (outcome == "error" or any(k.startswith("unjudged:") for k in keep) or s["status"] != "idle"
-                or s["idle_min"] < float(cfg["IDLE_MINUTES"])):
-            continue
-        judged.add(s["sid"][:8])
-        if not keep or not all(k.startswith(OPEN_WORK) for k in keep) or not any(k.startswith(NUDGE_FOR) for k in keep):
-            continue
-        fp = f"{s['sid'][:8]}:" + ",".join(sorted(keep))
-        if fp in sent:  # already nudged for exactly this: remembered, busy or idle
-            cur.add(fp)
-            continue
-        names = [n for n in (s["tmux"], s.get("name")) if n]
-        if protected(cfg, *names):
-            continue
-        state = pane_state(s["pane"]) if s.get("pane") else None
-        if not state or not empty_prompt(state):  # working, a menu, or a draft in the input: not idle at ❯
-            continue
-        cur.add(fp)
-        new.append((s["tmux"], fp))
-    # an ended session's sid leaves the sweep; drop it then (not on an empty, aborted sweep)
-    keep_sent = {fp for fp in sent if fp.split(":", 1)[0] not in judged
-                 and (not seen_sids or fp.split(":", 1)[0] in seen_sids)} | cur
-
-    def save(fps):
-        st.parent.mkdir(parents=True, exist_ok=True)
-        tmp = st.with_name(st.name + ".tmp")
-        tmp.write_text(json.dumps(sorted(fps)))
-        os.replace(tmp, st)
-    save(keep_sent)  # at most once: remembered before the line is written
-    if new:
-        try:
-            path = Path(os.path.expanduser(cfg["NUDGE_EVENTS"]))
-            path.parent.mkdir(parents=True, exist_ok=True)
-            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
-            with open(path, "a") as f:
-                f.writelines(f"{stamp} ROUTE nudge {t} {fp}\n" for t, fp in new)
-        except OSError as e:  # not routed: forget them so the next sweep tries again
-            save(keep_sent - {fp for _, fp in new})
-            raise OSError(f"{e}; not routed: {', '.join(fp for _, fp in new)}") from e
-    return [fp for _, fp in new]
-
-
 def idle_list(cfg, seen, now):
     """Report-only list of long-idle sessions without a claim (for a person); decides nothing."""
     hours = float(cfg["IDLE_LIST_HOURS"])
@@ -1254,18 +1114,6 @@ def idle_list(cfg, seen, now):
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join([f"# idle sessions {stamp}", "", f"idle >= {cfg['IDLE_LIST_HOURS']} h, no claimed issue", "",
                               *body]) + "\n")
-    inbox = cfg["IDLE_LIST_INBOX"]
-    day = time.strftime("%Y-%m-%d", time.localtime(now))
-    posted = HOME / ".cc-reaper" / "state" / "idle-list-posted.txt"
-    if inbox and (not posted.exists() or posted.read_text().strip() != day):
-        path = Path(os.path.expanduser(inbox))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
-            f.write("\n".join(["", f"## key=IDLE-SESSIONS-{day}", "", *body]) + "\n")
-        posted.parent.mkdir(parents=True, exist_ok=True)
-        tmp = posted.with_name(posted.name + ".tmp")
-        tmp.write_text(day + "\n")
-        os.replace(tmp, posted)
 
 
 def waiting_re(cfg):
@@ -1273,18 +1121,8 @@ def waiting_re(cfg):
     return re.compile(WAITING_RE.pattern + ("|" + extra if extra else ""), re.I)
 
 
-def _newest_claim(s):
-    ts = [claim_time(r, n, s["sid"]) for r, n in s["claims"]]
-    return None if None in ts else max(ts)
-
-
 def decide(s, cfg, now=None):
-    """Return the list of reasons that keep the session; empty means reap.
-
-    With DONE_INBOX off and DONE_INBOX_SHADOW set (stima-api #6535), a kept session with a claim is decided a second
-    time as if DONE_INBOX were that path; when that would reap it, `inbox_done_shadow` is set for the report
-    (`would-close: inbox DONE (shadow)`) and nothing else changes. That is how the inbox-DONE close path earns its
-    clean rounds before it is switched on (EL-FLOW-P2-2106, SCRIPT-SAFE-RULE)."""
+    """Return the list of reasons that keep the session; empty means reap."""
     keep = _decide(s, cfg, now)
     # EL-T2520: an alarm with open work is FALSE_WAITING (report-only; never closed): the continue path fires on it.
     if said_waiting(s) and s["status"] == "idle":
@@ -1301,18 +1139,6 @@ def decide(s, cfg, now=None):
             s["done_grace_shadow"] = not _decide(dict(s), dict(cfg, DONE_GRACE="apply"), now)
         except Exception as e:  # a report-only trial must not turn a kept session into an error
             s["done_grace_error"] = f"{type(e).__name__}: {e}"
-    shadow = cfg.get("DONE_INBOX_SHADOW")
-    if keep and shadow and not cfg.get("DONE_INBOX") and s["claims"]:
-        s["inbox_done_shadow"] = not _decide(dict(s), dict(cfg, DONE_INBOX=shadow), now)
-    # EL-T24: the same second decide for a claim-less session under NOCLAIM_DONE=shadow. It can change the verdict
-    # only where `claim-unknown` kept the session, so only those pay for it.
-    if keep and cfg.get("NOCLAIM_DONE") == "shadow" and not s["claims"] and "claim-unknown" in keep:
-        trial = dict(s)
-        try:
-            if not _decide(trial, dict(cfg, NOCLAIM_DONE="apply"), now) and trial.get("noclaim_done"):
-                s["noclaim_done_shadow"] = trial["noclaim_done"]
-        except Exception as e:  # a report-only trial must not turn a kept session into an error
-            s["noclaim_shadow_error"] = f"{type(e).__name__}: {e}"
     # stima-api #7001: the same second decide under ORACLE_NOT_MINE=apply, for a session kept only by claims the oracle
     # cannot place (`issue-unknown`, a check-by it reads as open). Nothing else changes.
     if (keep and cfg.get("ORACLE_NOT_MINE") == "shadow" and s["claims"]
@@ -1334,7 +1160,7 @@ def decide(s, cfg, now=None):
 STATE_SOFT = ("claim-unknown", "issue-unknown:", "issue-open:", "check-by-", "open-pr", "alarm-passed",
               "named-claim:")
 # Each shadow source has its own clean-round counter and flips only its own flag (stima-api #7061 review, finding 9).
-SHADOW_SOURCES = ("STATE_DONE", "ORACLE_NOT_MINE", "NOCLAIM_DONE")
+SHADOW_SOURCES = ("STATE_DONE", "ORACLE_NOT_MINE")
 ROUND_MIN_SECONDS = 25 * 60  # a round counts only this long after the last counted one (launchd runs every 30 min)
 ROUND_MIN_SESSIONS = 3  # distinct candidate sessions a streak must have seen before its flag flips
 
@@ -1352,14 +1178,13 @@ def never_close(s, cfg):
 
 def state_gates(s, cfg, keep, now):
     """Why a DONE state may not release this session, or "" when every existing gate passes. The gates are the
-    reaper's own, called, not copied: noclaim_done() for a claim-less session (NEVER_CLOSE, no child process, the
-    inbox DONE header, a clean cwd), claim_class() under ORACLE_NOT_MINE=apply for each claim (NEVER_CLOSE, a stop
+    reaper's own, called, not copied: for a claim-less session none (it is released only by its own `SESSION-DONE:` line,
+    which decide() reads; the inbox DONE header that used to release it is gone, stima-api #7079), claim_class() under ORACLE_NOT_MINE=apply for each claim (NEVER_CLOSE, a stop
     with a check-by not CLEAR, a wait not bound to this session), and shadow_verdict()'s BLOCKED:#N."""
     if never_close(s, cfg):
         return "never-close"
     if not s["claims"]:
-        if not noclaim_done(s, cfg, now):
-            return "noclaim-done"
+        return "no-claim"
     else:
         trial = dict(s, oracle_not_mine={})
         mine = [w["marker"] for w in s["owned"] if w.get("marker")]
@@ -1505,9 +1330,7 @@ def round_refused(cfg, config_path, idle_override):
 def _source_hit(s, src):
     if src == "STATE_DONE":
         return s.get("state_shadow") == "STATE_DONE"
-    if src == "ORACLE_NOT_MINE":
-        return bool(s.get("oracle_not_mine_shadow"))
-    return bool(s.get("noclaim_done_shadow"))
+    return bool(s.get("oracle_not_mine_shadow"))
 
 
 def shadow_rounds(cfg, config_path, seen, sdir, now, idle_override=False):
@@ -1516,7 +1339,7 @@ def shadow_rounds(cfg, config_path, seen, sdir, now, idle_override=False):
     A round counts only on the live CONFIG at APPLY=1 with no --idle-minutes (round_refused()), and only
     ROUND_MIN_SECONDS after the last counted round. Each source keeps its own counter: its would-close set is the kept
     sessions it would close under `apply` (STATE_DONE: the state's DONE with every gate passing; ORACLE_NOT_MINE: the
-    #7001 trial; NOCLAIM_DONE: the EL-T24 trial). The next counted round checks them: a session still there whose
+    #7001 trial). The next counted round checks them: a session still there whose
     status changed (busy, or a newer statusUpdatedAt) is a miss, and a miss resets that source's streak; a round whose
     previous set had at least one candidate and no miss counts clean; a session gone counts nothing against it. At
     SHADOW_CLEAN_ROUNDS clean rounds in a row that saw at least ROUND_MIN_SESSIONS distinct sessions, the sweep appends
@@ -1583,37 +1406,6 @@ def shadow_rounds(cfg, config_path, seen, sdir, now, idle_override=False):
     return lines
 
 
-def noclaim_done(s, cfg, now):
-    """Why a claim-less session counts as done, or "" (EL-T24). The idle dispatch, sec-p1 and apertis-ops sessions
-    work in the primary checkout with no worktree, so they have no claim and were kept by `claim-unknown` for good.
-
-    Done when the newest inbox header the session wrote (DONE_INBOX, else DONE_INBOX_SHADOW, matched on the tmux
-    and session names as inbox_done() does) is DONE, at least IDLE_MINUTES old and not older than the session's
-    newest prompt (a later task voids it); and nothing is left: no worktree claim, no issue its text names whose
-    oracle claimant is this session, no live child process, no background shell, loop or scheduled task, no
-    uncommitted or unpushed work in an owned worktree or the cwd, and not NEVER_CLOSE. Every other gate in
-    _decide() still applies; this only answers `claim-unknown`. Any failure to read is "" (kept)."""
-    names = [n for n in (s["tmux"], s.get("name")) if n]
-    if (s["claims"] or s.get("descendants") != 0 or s["bg_shells"] or s["loop"] or s["crons"] > 0 or s["scheduled"]
-            or any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in names)):
-        return ""
-    hit = inbox_done_header(cfg.get("DONE_INBOX") or cfg.get("DONE_INBOX_SHADOW"), names)
-    if not hit:
-        return ""
-    at, key = hit
-    prompt_at = s.get("prompt_at") or 0
-    # The header has minute precision: a prompt in the header's own minute may have come after it, so it keeps.
-    if now - at < float(cfg["IDLE_MINUTES"]) * 60 or not prompt_at or prompt_at >= at:
-        return ""
-    cwd = s.get("cwd")
-    extra = [{"path": Path(cwd)}] if cwd and not any(str(w["path"]) == cwd for w in s["owned"]) else []
-    if any(worktree_state(w, cfg) for w in [*s["owned"], *extra]):
-        return ""
-    if oracle_claims(s, cfg, now):
-        return ""
-    return f"inbox {key} DONE"
-
-
 def stall_mark(cfg, sid, now=None):
     """Fingerprints stall-watch.py currently sees on this session ("" when none, stale, over its cap, or unreadable).
 
@@ -1659,8 +1451,8 @@ def said_waiting(s):
 
 
 def waiting_keeps(s, cfg, now):
-    """What keeps an alarm from being pure (EL-T2520): it stands in for claim-unknown, so it carries noclaim_done()'s
-    gates (minus the inbox header) and adds the alarm's own: unread or past, an open PR, no worktree to read PRs from."""
+    """What keeps an alarm from being pure (EL-T2520): it stands in for claim-unknown, so it carries the gates the claim-less
+    close paths use (no child process, not NEVER_CLOSE, a clean cwd, no named claim) and adds the alarm's own: unread or past, an open PR, no worktree to read PRs from."""
     m = next((WAIT_RE.match(ln) for ln in reversed((s.get("last_text") or "").splitlines()) if WAIT_RE.match(ln)), None)
     try:
         due = calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M")) if m else 0
@@ -1785,17 +1577,10 @@ def _decide(s, cfg, now=None):
             keep.append("waiting-keyword")
     if s.get("sub_active"):
         keep.append("subagent-active")
-    if s.get("relay_pending"):
-        keep.append("handoff-pending:relay#" + ",#".join(s["relay_pending"]))
     if cfg["PROMPT_RE"] and re.search(cfg["PROMPT_RE"], s.get("screen_tail", ""), re.I):
         keep.append("handoff-pending:prompt")
     keep.extend("handoff-missing:" + os.path.basename(p) for p in missing_handoffs(cfg, s["last_text"]))
-    done = bool(DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])
-                or (s["claims"] and inbox_done(cfg, (s.get("name"), s["tmux"]), now if now is not None else time.time(),
-                                            lambda: _newest_claim(s))))
-    if not done and not s["claims"] and cfg.get("NOCLAIM_DONE") == "apply":
-        s["noclaim_done"] = noclaim_done(s, cfg, now if now is not None else time.time())
-        done = bool(s["noclaim_done"])
+    done = bool(DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"]))
     if done:
         if s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg) and s["claims"]:
             # A claim the oracle now names another live session for (the issue was handed over) carries that
@@ -2381,14 +2166,12 @@ def report_line(s, keep, outcome):
     background_only = "yes" if keep and set(keep) <= BACKGROUND_ONLY else "-"
     new_only = "yes" if keep and all(k.startswith(NEW_GATES) for k in keep) else "-"
     why = [f"would-close: {s['would_close']}"] if s.get("would_close") else []
-    why += ["would-close: inbox DONE (shadow)"] if s.get("inbox_done_shadow") else []
     why += ["would-close: done grace (shadow)"] if s.get("done_grace_shadow") else []
     nm = s.get("oracle_not_mine_shadow") or s.get("oracle_not_mine") or {}
     why += [("would-close: " if s.get("oracle_not_mine_shadow") else "") + "oracle:not-mine "
             + "; ".join(f"#{n} {_cell(w, 120)}" for n, w in nm.items())
             + (" (shadow)" if s.get("oracle_not_mine_shadow") else "")] if nm else []
     why += ["FALSE_WAITING: " + ",".join(s["false_waiting"])] if s.get("false_waiting") else []
-    why += [f"would-close: no claim, {s['noclaim_done_shadow']} (shadow)"] if s.get("noclaim_done_shadow") else []
     why += [f"would-close: state DONE ({s['state_shadow']} shadow)"] if s.get("state_shadow") else []
     why += [f"state DONE ({s['state_close']} apply)"] if s.get("state_close") else []
     why += [f"state DONE held: {_cell(s['state_held'], 120)}"] if s.get("state_held") else []
@@ -2478,14 +2261,12 @@ def main(argv=None):
                     notes.append(f"{s['tmux']} ({s['sid']}): DONE_GRACE shadow: {s['done_grace_error']}")
                 if s.get("oracle_not_mine_error"):
                     notes.append(f"{s['tmux']} ({s['sid']}): ORACLE_NOT_MINE shadow: {s['oracle_not_mine_error']}")
-                if s.get("noclaim_shadow_error"):
-                    notes.append(f"{s['tmux']} ({s['sid']}): NOCLAIM_DONE shadow: {s['noclaim_shadow_error']}")
                 outcome = "keep" if keep else ("reap" if apply else "would-reap")
                 if keep:  # shadow only: the outcome label changes, nothing below acts on it
                     try:
                         sv = shadow_verdict(s, cfg, keep, now)
                         s["blocked"], s["would_close"] = sv["blocked"], sv["would_close"]
-                        outcome = ("would-close" if sv["would_close"] or s.get("noclaim_done_shadow") or s.get("done_grace_shadow")
+                        outcome = ("would-close" if sv["would_close"] or s.get("done_grace_shadow")
                                    or s.get("oracle_not_mine_shadow") or s.get("state_shadow") else outcome)
                     except Exception as e:  # a report-only verdict must not fail the sweep
                         notes.append(f"{s['tmux']} ({s['sid']}): shadow verdict: {type(e).__name__}: {e}")
@@ -2528,12 +2309,6 @@ def main(argv=None):
         notes.append(f"done marker: {type(e).__name__}: {e}")
     signal.alarm(0)
     faulthandler.cancel_dump_traceback_later()
-    try:  # after the alarm is off, so the deadline cannot cut it between the state write and the event line
-        if not args.only:
-            for fp in nudge_events(cfg, seen, now):
-                notes.append(f"nudge routed: {fp}")
-    except Exception as e:  # a nudge must not stop the report
-        failures.append(f"nudge: {type(e).__name__}: {e}")
     mode = "apply" if apply else "report-only"
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
     report = [f"# session-reaper {mode} {stamp}", "",

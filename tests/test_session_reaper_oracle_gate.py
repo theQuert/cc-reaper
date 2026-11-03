@@ -18,7 +18,7 @@ spec.loader.exec_module(reaper)
 
 NOW = reaper.calendar.timegm((2026, 11, 2, 16, 0, 0, 0, 0, 0))
 REPO = "theQuert/stima-api"
-BASE = dict(reaper.DEFAULTS, PROTECT="keep-*", IDLE_MINUTES="60", DONE_INBOX="", STALL_MARK_DIR="",
+BASE = dict(reaper.DEFAULTS, PROTECT="keep-*", IDLE_MINUTES="60", STALL_MARK_DIR="",
             CHECKBY_REPO=REPO, NEVER_CLOSE="uiux* homepage*")
 
 SID = "0a1b2c3d-1111-2222-3333-444455556666"

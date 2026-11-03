@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("session_reaper", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
 
-CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", DONE_INBOX="", STALL_MARK_DIR="")
+CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", STALL_MARK_DIR="")
 
 
 def session(**kw):
@@ -277,7 +277,7 @@ class OracleBrief(unittest.TestCase):
 
 
 class DoneCheckBy(unittest.TestCase):
-    """Inbox DONE as a done marker, and the check-by-open keep gate (EL-FLOW-P2-2106)."""
+    """The check-by-open keep gate (EL-FLOW-P2-2106) and the removed inbox DONE path (stima-api #7079)."""
     # 2026-10-25 22:00 TPE == 14:00 UTC
     NOW = reaper.calendar.timegm((2026, 10, 25, 14, 0, 0, 0, 0, 0))
 
@@ -285,12 +285,9 @@ class DoneCheckBy(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         self.inbox = Path(d) / "neo-inbox.md"
-        self.cfg = dict(CFG, DONE_INBOX=str(self.inbox), CHECKBY_REPO="o/r")
+        self.cfg = dict(CFG, CHECKBY_REPO="o/r")
         self.checkby = "CLEAR"
         self.claim = reaper.calendar.timegm((2026, 10, 25, 10, 0, 0, 0, 0, 0))  # 18:00 TPE
-
-    def write(self, *headers):
-        self.inbox.write_text("# inbox\n\nbody\n" + "\n".join(f"## {h}\n\ntext\n" for h in headers))
 
     def keep(self, **kw):
         kw.setdefault("last_text", "all good")
@@ -303,51 +300,26 @@ class DoneCheckBy(unittest.TestCase):
              mock.patch.object(reaper, "worktree_state", return_value=[]):
             return reaper.decide(session(**kw), self.cfg, self.NOW)
 
-    def test_old_inbox_done_by_the_session_is_reaped(self):
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
-        self.assertEqual(self.keep(), [])
+    def test_an_inbox_done_header_closes_nothing_and_the_inbox_is_never_opened(self):
+        """#7079: no neo-inbox read. A DONE header that used to reap the session is not looked at, even when the
+        removed DONE_INBOX / DONE_INBOX_SHADOW settings still sit in a deployed config."""
+        self.inbox.write_text("# inbox\n\nbody\n## K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch\n\ntext\n")
+        real_open = open
 
-    def test_done_older_than_the_newest_claim_is_not_done(self):
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
-        self.claim = reaper.calendar.timegm((2026, 10, 25, 12, 30, 0, 0, 0, 0))  # 20:30 TPE
-        self.assertEqual(self.keep(), ["issue-unknown:#2"])
+        def guarded(path, *a, **k):
+            if "neo-inbox" in str(path):
+                raise AssertionError(f"read the inbox {path}")
+            return real_open(path, *a, **k)
+        self.cfg = dict(self.cfg, DONE_INBOX=str(self.inbox), DONE_INBOX_SHADOW=str(self.inbox))
+        with mock.patch("builtins.open", side_effect=guarded):
+            self.assertEqual(self.keep(), ["issue-unknown:#2"])
+        for gone in ("inbox_done", "inbox_done_header", "INBOX_HEADER_RE"):
+            self.assertFalse(hasattr(reaper, gone), gone)
+        for gone in ("DONE_INBOX", "DONE_INBOX_SHADOW"):
+            self.assertNotIn(gone, reaper.DEFAULTS)
 
-    def test_unknown_claim_time_is_not_done(self):
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
-        self.claim = None
-        self.assertEqual(self.keep(), ["issue-unknown:#2"])
-
-    def test_inbox_done_without_a_claimed_issue_is_ignored(self):
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
-        self.assertEqual(self.keep(claims=[]), ["claim-unknown"])
-
-    def test_a_recent_inbox_done_keeps_the_session(self):
-        self.write("K1 DONE · 2026-10-25 21:30 TPE · ops-dispatch")
-        self.assertEqual(self.keep(), ["issue-unknown:#2"])
-
-    def test_a_later_ack_by_the_same_session_is_not_done(self):
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch",
-                   "K2 ACK · 2026-10-25 20:30 TPE · ops-dispatch")
-        self.assertEqual(self.keep(), ["issue-unknown:#2"])
-
-    def test_another_sessions_done_does_not_count(self):
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · other-session")
-        self.assertEqual(self.keep(), ["issue-unknown:#2"])
-
-    def test_a_later_done_by_another_session_does_not_hide_this_ones(self):
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch",
-                   "K2 ACK · 2026-10-25 20:30 TPE · other-session")
-        self.assertEqual(self.keep(), [])
-
-    def test_unreadable_or_unparsable_inbox_is_not_done(self):
-        self.assertEqual(self.keep(), ["issue-unknown:#2"])  # file absent
-        self.write("K1 DONE · yesterday-ish · ops-dispatch")
-        self.assertEqual(self.keep(), ["issue-unknown:#2"])
-
-    def test_open_check_by_keeps_an_inbox_done_session(self):
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
-        self.checkby = "OPEN"
-        self.assertEqual(self.keep(), ["check-by-open"])
+    def test_a_session_done_line_still_closes_a_claimed_session(self):
+        self.assertEqual(self.keep(last_text="SESSION-DONE: shipped"), [])
 
     def test_open_check_by_keeps_a_session_done_line_session(self):
         self.checkby = "OPEN"
@@ -356,49 +328,6 @@ class DoneCheckBy(unittest.TestCase):
     def test_gh_failure_keeps_check_by_unknown(self):
         self.checkby = "UNKNOWN"
         self.assertEqual(self.keep(last_text="SESSION-DONE: shipped"), ["check-by-unknown"])
-
-    def shadow(self, **kw):
-        """DONE_INBOX off, DONE_INBOX_SHADOW on: (keep, inbox_done_shadow) for one decide."""
-        self.cfg = dict(CFG, DONE_INBOX="", DONE_INBOX_SHADOW=str(self.inbox), CHECKBY_REPO="o/r")
-        kw.setdefault("last_text", "all good")
-        kw.setdefault("name", "ops-dispatch")
-        kw.setdefault("claims", [("o/r", "2")])
-        s = session(**kw)
-        with mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
-             mock.patch.object(reaper, "oracle_brief", return_value=None), \
-             mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.checkby), \
-             mock.patch.object(reaper, "claim_time", side_effect=lambda r, n, sid: self.claim), \
-             mock.patch.object(reaper, "worktree_state", return_value=[]):
-            keep = reaper.decide(s, self.cfg, self.NOW)
-        return keep, s.get("inbox_done_shadow")
-
-    def test_shadow_marks_but_never_reaps_an_inbox_done_session(self):
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
-        keep, marked = self.shadow()
-        self.assertEqual(keep, ["issue-unknown:#2"])
-        self.assertTrue(marked)
-        line = reaper.report_line(session(pid=1, descendants=0, claims=[("o/r", "2")], inbox_done_shadow=True), keep, "keep")
-        self.assertIn("would-close: inbox DONE (shadow)", line)
-
-    def test_shadow_does_not_mark_what_the_live_path_would_keep(self):
-        self.write("K1 DONE · 2026-10-25 21:30 TPE · ops-dispatch")  # too recent
-        self.assertEqual(self.shadow(), (["issue-unknown:#2"], False))
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
-        self.checkby = "OPEN"  # the shadow decide reads the check-by, as the live one would
-        self.assertEqual(self.shadow(), (["issue-unknown:#2"], False))
-
-    def test_shadow_is_off_when_the_live_path_is_on_or_unset(self):
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · ops-dispatch")
-        self.cfg = dict(CFG, DONE_INBOX=str(self.inbox), DONE_INBOX_SHADOW=str(self.inbox))
-        s = session(name="ops-dispatch", claims=[("o/r", "2")])
-        with mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
-             mock.patch.object(reaper, "oracle_brief", return_value=None), \
-             mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.checkby), \
-             mock.patch.object(reaper, "claim_time", side_effect=lambda r, n, sid: self.claim), \
-             mock.patch.object(reaper, "worktree_state", return_value=[]):
-            self.assertEqual(reaper.decide(s, self.cfg, self.NOW), [])
-        self.assertNotIn("inbox_done_shadow", s)
-        self.assertEqual(self.keep(claims=[]), ["claim-unknown"])
 
     def test_check_by_is_not_read_for_a_session_that_is_not_idle_long_enough(self):
         with mock.patch.object(reaper, "checkby_state", side_effect=AssertionError("fetched")), \
@@ -601,9 +530,9 @@ class JudgeOrder(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=0\nDONE_INBOX=\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+        cfgfile.write_text(f"APPLY=0\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
         extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
-                     fg=True, sub_active=0, relay_pending=[], screen_tail="")
+                     fg=True, sub_active=0, screen_tail="")
         sessions = [session(tmux="busy", name="busy", status="busy", idle_min=1, sid="b" * 10, **extra),
                     session(tmux="done", name="done", idle_min=300, sid="d" * 10, **extra)]
         judged = []
@@ -950,7 +879,7 @@ class NewKeepGates(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
-        self.cfg = dict(CFG, RELAY_DIR=str(self.tmp / "relay"), HANDOFF_ROOT=str(self.tmp / "handoffs"),
+        self.cfg = dict(CFG, HANDOFF_ROOT=str(self.tmp / "handoffs"),
                         REAPED_DIR=str(self.tmp / "reaped"))
 
     def keep(self, **kw):
@@ -971,20 +900,18 @@ class NewKeepGates(unittest.TestCase):
         self.assertIn("subagent-active", self.keep(sub_active=1))
         self.assertEqual(self.keep(sub_active=0), [])
 
-    def test_a_pending_relay_request_for_a_claimed_issue_keeps_the_session(self):
+    def test_a_pending_relay_request_keeps_nothing_any_more(self):
+        """#7079: no relay requests exist, so no RELAY_DIR read and no handoff-pending:relay gate; the other gates are
+        unchanged (the prompt and missing-handoff tests below)."""
         relay = self.tmp / "relay"
-        (relay / "done").mkdir(parents=True)
-        now = time.time()
+        relay.mkdir()
         (relay / "41-sign.json").write_text("{}")
-        (relay / "42-sign.json.done").write_text("{}")
-        (relay / "done" / "43-sign.json").write_text("{}")
-        old = relay / "44-sign.json"
-        old.write_text("{}")
-        os.utime(old, (now - 3 * 86400, now - 3 * 86400))
-        claims = [("o/r", n) for n in ("41", "42", "43", "44", "45")]
-        self.assertEqual(reaper.relay_pending(self.cfg, claims, now), ["41"])
-        self.assertEqual(reaper.relay_pending(dict(self.cfg, RELAY_DIR=""), claims, now), [])
-        self.assertIn("handoff-pending:relay#41", self.keep(relay_pending=["41"]))
+        self.cfg = dict(self.cfg, RELAY_DIR=str(relay))  # a deployed config may still carry the key
+        self.assertEqual(self.keep(), [])
+        self.assertEqual(self.keep(relay_pending=["41"]), [])  # a stale key on a session is not read
+        self.assertFalse(hasattr(reaper, "relay_pending"))
+        for gone in ("RELAY_DIR", "RELAY_MAX_AGE_HOURS"):
+            self.assertNotIn(gone, reaper.DEFAULTS)
 
     def test_a_question_to_a_person_on_screen_keeps_the_session(self):
         self.assertIn("handoff-pending:prompt", self.keep(screen_tail="Do you want to proceed?\n❯ 1. Yes"))
@@ -1031,7 +958,7 @@ class DoneGrace(unittest.TestCase):
         kw.setdefault("text_at", 2000)
         kw.setdefault("prompt_at", 1000)
         self.s = session(**kw)
-        cfg = dict(CFG, DONE_GRACE=mode, NOCLAIM_DONE="off", CHECKBY_REPO="o/r")
+        cfg = dict(CFG, DONE_GRACE=mode, CHECKBY_REPO="o/r")
         brief = lambda r, n, c, now: self.brief
         with mock.patch.object(reaper, "issue_state", side_effect=lambda r, n: self.states[n]), \
              mock.patch.object(reaper, "oracle_brief", side_effect=brief), \
@@ -1074,7 +1001,7 @@ class DoneGrace(unittest.TestCase):
              mock.patch.object(reaper, "oracle_brief", return_value=handed), \
              mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.checkby), \
              mock.patch.object(reaper, "worktree_state", return_value=[]):
-            cfg = dict(CFG, NOCLAIM_DONE="off", CHECKBY_REPO="o/r")
+            cfg = dict(CFG, CHECKBY_REPO="o/r")
             live = session(claims=[("o/r", "1")], other_sids=("pr-drain-1",))
             gone = session(claims=[("o/r", "1")], other_sids=())
             self.assertEqual(reaper.decide(live, cfg, 3000), [])
@@ -1141,7 +1068,7 @@ class WaitingUntil(unittest.TestCase):
         kw.setdefault("owned", [dict(self.WT)])
         kw.setdefault("cwd", "/x/wt")
         self.s = session(**kw)
-        cfg = dict(CFG, DONE_GRACE=mode, NOCLAIM_DONE="off", CHECKBY_REPO="o/r")
+        cfg = dict(CFG, DONE_GRACE=mode, CHECKBY_REPO="o/r")
         with mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
              mock.patch.object(reaper, "oracle_brief", side_effect=lambda r, n, c, now: self.brief), \
              mock.patch.object(reaper, "checkby_state", return_value="OPEN"), \
@@ -1175,7 +1102,7 @@ class WaitingUntil(unittest.TestCase):
         self.assertEqual(self.s["false_waiting"], ["unpushed:wt"])
 
     def test_a_claim_less_alarm_carries_the_noclaim_gates(self):
-        """Review of 4764bdf: the alarm stands in for claim-unknown, so every noclaim_done() gate but the inbox holds."""
+        """Review of 4764bdf: the alarm stands in for claim-unknown, so every noclaim_clear() gate but the SESSION-DONE line holds."""
         self.assertEqual(self.run_decide("apply", owned=[], cwd="/repo"), ["open-pr-unknown:no-worktree"])
         self.assertEqual(self.s["false_waiting"], ["open-pr-unknown:no-worktree"])
         self.assertEqual(self.run_decide("apply", descendants=1), ["child-process"])
@@ -1292,141 +1219,19 @@ class WaitingUntil(unittest.TestCase):
         self.assertEqual(calls, ["1001", "1002", "1003", "1004", "1005"])
 
 
-class Nudge(unittest.TestCase):
-    """EL-T2482: an idle session at an empty prompt kept only by its own open work gets one ROUTE nudge per fingerprint."""
-    SEP = "─" * 20
+class NudgeRemoved(unittest.TestCase):
+    """stima-api #7079: the ROUTE nudge (a line in ops-dispatch's events.log for an idle session kept by open work) is
+    gone; the reaper writes no events log and carries no nudge state."""
 
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp)
-        self.cfg = dict(CFG, NUDGE_EVENTS=str(self.tmp / "events.log"), NUDGE_STATE=str(self.tmp / "nudged.json"))
-        self.now = time.mktime((2026, 10, 30, 15, 0, 0, 0, 0, -1))
-        self.screen = f"{self.SEP}\n❯ \n{self.SEP}"
-        p = mock.patch.object(reaper, "pane_state", lambda pane: {"screen": self.screen, "cx": 2, "cy": 1})
-        p.start()
-        self.addCleanup(p.stop)
-
-    def run_once(self, keep, **kw):
-        s = session(sid="abcdef0123", pane="%1", **kw)
-        return reaper.nudge_events(self.cfg, [(s, keep, "keep")], self.now)
-
-    def events(self):
-        f = self.tmp / "events.log"
-        return f.read_text().splitlines() if f.exists() else []
-
-    def test_open_work_at_an_empty_prompt_routes_once(self):
-        self.assertEqual(self.run_once(["owed-step:#6702", "unpushed:wt"]), ["abcdef01:owed-step:#6702,unpushed:wt"])
-        self.assertRegex(self.events()[0], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} ROUTE nudge work abcdef01:owed-step:#6702,unpushed:wt$")
-        self.assertEqual(self.run_once(["owed-step:#6702", "unpushed:wt"]), [], "same fingerprint: no second nudge")
-        self.assertEqual(len(self.events()), 1)
-
-    def test_a_fingerprint_that_clears_nudges_again_when_it_returns(self):
-        self.run_once(["owed-step:#1"])
-        reaper.nudge_events(self.cfg, [(session(sid="abcdef0123", pane="%1"), [], "keep")], self.now)  # judged, no work
-        self.assertEqual(self.run_once(["owed-step:#1"]), ["abcdef01:owed-step:#1"])
-
-    def test_busy_or_a_draft_after_a_nudge_does_not_forget_it(self):
-        self.run_once(["owed-step:#1"])
-        # what decide() really returns once the session works on it (review: a busy row never carries owed-step)
-        self.assertEqual(self.run_once(["status:busy", "issue-open:#1"], status="busy", idle_min=0), [])
-        self.assertEqual(self.run_once(["idle:20<60min", "issue-open:#1"], idle_min=20), [])
-        self.screen = f"{self.SEP}\n❯ half a reply\n{self.SEP}"
-        self.assertEqual(self.run_once(["owed-step:#1"]), [])
-        self.screen = f"{self.SEP}\n❯ \n{self.SEP}"
-        self.assertEqual(self.run_once(["owed-step:#1"]), [], "same work, idle again: still once")
-
-    def test_decide_then_nudge_end_to_end_nudges_once_across_a_busy_spell(self):
-        cfg = dict(self.cfg, CHECKBY_ORACLE="")
-        brief = lambda r, n, c, now: f"next: agent repair #{n} claimant: sid-x"
-        with mock.patch.object(reaper, "oracle_brief", brief), \
-                mock.patch.object(reaper, "classify_claim", lambda *a, **k: ("owed", False)), \
-                mock.patch.object(reaper, "issue_state", lambda r, n: "OPEN"):
-            routed = []
-            for st, idle in (("idle", 90), ("busy", 0), ("idle", 20), ("idle", 90)):
-                s = session(sid="abcdef0123", pane="%1", status=st, idle_min=idle, last_text="working",
-                            claims=[("o/r", "7")])
-                keep = reaper.decide(s, cfg)
-                routed += reaper.nudge_events(cfg, [(s, keep, "keep")], self.now)
-        self.assertEqual(routed, ["abcdef01:owed-step:#7"])
-
-    def test_an_ended_session_is_dropped_from_the_state(self):
-        self.run_once(["owed-step:#1"])
-        other = session(sid="99999999xx", tmux="other", name="other")
-        reaper.nudge_events(self.cfg, [(other, ["status:busy"], "keep")], self.now)
-        self.assertEqual(json.loads((self.tmp / "nudged.json").read_text()), [])
-
-    def test_a_live_session_gather_skipped_keeps_its_fingerprint(self):
-        self.run_once(["owed-step:#1"])
-        other = session(sid="99999999xx", tmux="other", name="other")
-        with mock.patch.object(reaper, "SKIPPED", [("work", "pane-missing", True)]), \
-                mock.patch.object(reaper, "SKIPPED_INFO", {"work": {"sid": "abcdef01"}}):
-            reaper.nudge_events(self.cfg, [(other, ["status:busy"], "keep")], self.now)
-        self.assertEqual(json.loads((self.tmp / "nudged.json").read_text()), ["abcdef01:owed-step:#1"])
-
-    def test_a_failed_event_write_forgets_the_fingerprint(self):
-        self.cfg["NUDGE_EVENTS"] = str(self.tmp)  # a directory: open() fails
-        with self.assertRaises(OSError) as cm:
-            self.run_once(["owed-step:#1"])
-        self.assertIn("abcdef01:owed-step:#1", str(cm.exception))
-        self.assertEqual(json.loads((self.tmp / "nudged.json").read_text()), [])
-
-    def test_a_busy_session_is_nudged_once_it_is_idle_at_the_prompt(self):
-        self.assertEqual(self.run_once(["owed-step:#1"], status="busy"), [])
-        self.assertEqual(self.run_once(["owed-step:#1"]), ["abcdef01:owed-step:#1"])
-
-    def test_a_session_not_judged_this_sweep_keeps_its_fingerprint(self):
-        self.run_once(["owed-step:#1"])
-        for seen in ([], [(session(sid="abcdef0123"), ["unjudged:run-budget"], "keep")],
-                     [(session(sid="abcdef0123"), [], "error")]):
-            reaper.nudge_events(self.cfg, seen, self.now)
-            self.assertEqual(self.run_once(["owed-step:#1"]), [], seen)
-
-    def test_a_pending_check_by_alone_is_not_a_nudge(self):
-        self.assertEqual(self.run_once(["check-by-open"]), [])
-        self.assertEqual(self.run_once(["check-by-open", "unpushed:wt"]), ["abcdef01:check-by-open,unpushed:wt"])
-
-    def test_a_corrupt_state_file_counts_as_empty(self):
-        (self.tmp / "nudged.json").write_text("{not json")
-        self.assertEqual(self.run_once(["owed-step:#1"]), ["abcdef01:owed-step:#1"])
-        self.assertEqual(json.loads((self.tmp / "nudged.json").read_text()), ["abcdef01:owed-step:#1"])
-
-    def test_no_pane_or_an_unreadable_pane_is_not_a_nudge(self):
-        s = session(sid="abcdef0123")  # no "pane" key
-        self.assertEqual(reaper.nudge_events(self.cfg, [(s, ["owed-step:#1"], "keep")], self.now), [])
-        with mock.patch.object(reaper, "pane_state", lambda pane: None):
-            self.assertEqual(self.run_once(["owed-step:#1"]), [])
-
-    def test_any_other_keep_reason_is_not_a_nudge(self):
-        for keep in (["owed-step:#1", "check-by-unknown"], ["unpushed:wt", "unchecked:wt"], ["owed-step:#1", "waiting"], ["uncommitted:wt", "protected"], ["subagent-active"], [],
-                     ["owed-step:#1", "loop-pending"], ["claim-unknown"]):
-            self.assertEqual(self.run_once(keep), [], keep)
-
-    def test_not_idle_long_enough_or_not_idle_is_not_a_nudge(self):
-        self.assertEqual(self.run_once(["owed-step:#1"], idle_min=30), [])
-        self.assertEqual(self.run_once(["owed-step:#1"], status="busy"), [])
-
-    def test_uiux_and_homepage_are_nudged_like_every_session_and_only_protect_skips(self):
-        for name in ("uiux", "homepage"):  # EL-T2490: NEVER_CLOSE (default uiux* homepage*) stops a close, not a nudge
-            self.assertEqual(self.run_once(["owed-step:#1"], tmux=name, name=name), ["abcdef01:owed-step:#1"], name)
-            reaper.nudge_events(self.cfg, [(session(sid="abcdef0123", pane="%1"), [], "keep")], self.now)
-        self.assertEqual(self.run_once(["owed-step:#1"], tmux="keep-me", name="keep-me"), [], "PROTECT keep-*")
-
-    def test_a_draft_or_a_menu_on_screen_is_not_idle_at_the_prompt(self):
-        self.screen = f"{self.SEP}\n❯ #24 head 9ccc7b4 待 merge\n{self.SEP}"
-        with mock.patch.object(reaper, "pane_state", lambda pane: {"screen": self.screen, "cx": 30, "cy": 1}):
-            self.assertEqual(self.run_once(["owed-step:#1"]), [])
-        for text in (reaper.MENU_TEXT, *reaper.DIALOG_TEXT):
-            self.screen = f"{self.SEP}\n❯ \n{self.SEP}\n{text}"
-            self.assertEqual(self.run_once(["owed-step:#1"]), [], text)
-
-    def test_off_by_default(self):
-        self.cfg["NUDGE_EVENTS"] = ""
-        self.assertEqual(self.run_once(["owed-step:#1"]), [])
-        self.assertEqual(self.events(), [])
+    def test_no_nudge_code_or_settings_remain(self):
+        self.assertFalse(hasattr(reaper, "nudge_events"))
+        for gone in ("NUDGE_EVENTS", "NUDGE_STATE"):
+            self.assertNotIn(gone, reaper.DEFAULTS)
+        self.assertNotIn("ROUTE", Path(reaper.__file__).read_text())
 
 
 class IdleList(unittest.TestCase):
-    """The idle list is a report: who is listed, once-a-day inbox posting, off by default."""
+    """The idle list is a report: who is listed, off by default; it posts to no inbox."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -1434,8 +1239,7 @@ class IdleList(unittest.TestCase):
         p = mock.patch.object(reaper, "HOME", self.tmp)
         p.start()
         self.addCleanup(p.stop)
-        self.cfg = dict(CFG, IDLE_LIST_HOURS="6", IDLE_LIST_FILE=str(self.tmp / "list.md"),
-                        IDLE_LIST_INBOX=str(self.tmp / "inbox.md"), IDLE_LIST_EXCLUDE="skip-*")
+        self.cfg = dict(CFG, IDLE_LIST_HOURS="6", IDLE_LIST_FILE=str(self.tmp / "list.md"), IDLE_LIST_EXCLUDE="skip-*")
         self.now = time.mktime((2026, 10, 16, 12, 0, 0, 0, 0, -1))
 
     def listed(self, cfg=None, now=None, **kw):
@@ -1458,19 +1262,18 @@ class IdleList(unittest.TestCase):
         self.assertFalse(self.listed(idle_min=420, status="busy"))
         self.assertFalse(self.listed(idle_min=420, outcome="reaped, verified"))
 
-    def test_inbox_section_is_appended_once_per_day(self):
-        inbox = self.tmp / "inbox.md"
-        self.listed(idle_min=420)
-        self.listed(idle_min=420)
-        self.assertEqual(inbox.read_text().count("## key=IDLE-SESSIONS-2026-10-16"), 1)
-        self.assertIn("abcdef01", inbox.read_text())
-        self.listed(idle_min=420, now=self.now + 86400)
-        self.assertEqual(inbox.read_text().count("## key=IDLE-SESSIONS-"), 2)
-        self.assertIn("## key=IDLE-SESSIONS-2026-10-17", inbox.read_text())
+    def test_the_list_is_a_file_only_and_nothing_is_posted_to_an_inbox(self):
+        """#7079: the once-a-day IDLE_LIST_INBOX post is gone; a deployed config that still names it is ignored."""
+        cfg = dict(self.cfg, IDLE_LIST_INBOX=str(self.tmp / "inbox.md"))
+        self.assertNotIn("IDLE_LIST_INBOX", reaper.DEFAULTS)
+        self.listed(cfg=cfg, idle_min=420)
+        self.listed(cfg=cfg, idle_min=420, now=self.now + 86400)
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["list.md"])
+        self.assertNotIn("IDLE-SESSIONS", (self.tmp / "list.md").read_text())
 
-    def test_an_empty_list_posts_none(self):
+    def test_an_empty_list_says_none(self):
         self.listed(idle_min=10)
-        self.assertIn("\nnone\n", (self.tmp / "inbox.md").read_text())
+        self.assertIn("\nnone\n", (self.tmp / "list.md").read_text())
 
     def test_off_by_default_writes_nothing(self):
         self.assertEqual(reaper.DEFAULTS["IDLE_LIST_HOURS"], "0")
@@ -1621,8 +1424,7 @@ class ShadowVerdict(unittest.TestCase):
         cases = {"background child": dict(bg_shells=[1]), "not idle long enough": dict(idle_min=30),
                  "busy": dict(status="busy"), "protected": dict(tmux="keep-me"), "uiux": dict(tmux="uiux-1"),
                  "homepage by name": dict(name="Homepage"), "subagent": dict(sub_active=2),
-                 "loop": dict(loop=True), "scheduled": dict(crons=1), "prompt": dict(screen_tail="do you want to proceed"),
-                 "relay": dict(relay_pending=["9"])}
+                 "loop": dict(loop=True), "scheduled": dict(crons=1), "prompt": dict(screen_tail="do you want to proceed")}
         for label, kw in cases.items():
             with self.subTest(label):
                 _, v = self.view(last_text=self.SEC_P1, **kw)
@@ -1751,7 +1553,7 @@ class SkippedAndApply(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp)
         (self.tmp / "sessions").mkdir()
         self.cfgfile = self.tmp / "conf"
-        self.cfgfile.write_text(f"APPLY=1\nDONE_INBOX=\nREPORT={self.tmp / 'report.md'}\nREAPED_DIR={self.tmp / 'reaped'}\n"
+        self.cfgfile.write_text(f"APPLY=1\nREPORT={self.tmp / 'report.md'}\nREAPED_DIR={self.tmp / 'reaped'}\n"
                                 f"IDLE_LIST_HOURS=0\n")
 
     def write(self, fname, **d):
@@ -1789,7 +1591,7 @@ class SkippedAndApply(unittest.TestCase):
     def test_apply_reports_would_close_and_closes_nothing(self):
         s = session(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0, fg=True,
                     last_text="Authorization fix merged. No open scope: the reaper can close this session.", name="sec-p1", tmux="sec-p1",
-                    sid="abcdef0123", sub_active=0, relay_pending=[], screen_tail="")
+                    sid="abcdef0123", sub_active=0, screen_tail="")
         boom = AssertionError("closed a would-close session")
         with mock.patch.object(reaper, "HOME", self.tmp), mock.patch.object(reaper, "gather", return_value=[s]), \
              mock.patch.object(reaper, "recover_exiting", return_value=[]), \
@@ -1809,8 +1611,8 @@ class SkippedAndApply(unittest.TestCase):
 
 
 class NoClaimDone(unittest.TestCase):
-    """EL-T24: a claim-less session whose newest inbox header is DONE is `would-close` under NOCLAIM_DONE=shadow and
-    done under NOCLAIM_DONE=apply; every other gate still keeps it."""
+    """stima-api #7079: the claim-less inbox DONE path (NOCLAIM_DONE, EL-T24) is gone. A claim-less session is judged
+    by its own evidence only: its `SESSION-DONE:` line."""
     NOW = reaper.calendar.timegm((2026, 10, 25, 14, 0, 0, 0, 0, 0))  # 22:00 TPE
     PROMPT = reaper.calendar.timegm((2026, 10, 25, 11, 30, 0, 0, 0, 0))  # 19:30 TPE
 
@@ -1818,141 +1620,82 @@ class NoClaimDone(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         self.inbox = Path(d) / "neo-inbox.md"
-        self.write("K1 DONE · 2026-10-25 20:00 TPE · dispatch")
+        self.inbox.write_text("# inbox\n\nbody\n## K1 DONE · 2026-10-25 20:00 TPE · dispatch\n\ntext\n")
         self.wt = []
         self.briefs = {}
 
-    def write(self, *headers):
-        self.inbox.write_text("# inbox\n\nbody\n" + "\n".join(f"## {h}\n\ntext\n" for h in headers))
+    def test_the_inbox_path_and_its_settings_are_gone(self):
+        self.assertFalse(hasattr(reaper, "noclaim_done"))
+        self.assertNotIn("NOCLAIM_DONE", reaper.DEFAULTS)
+        self.assertNotIn("NOCLAIM_DONE", reaper.SHADOW_SOURCES)
+        self.assertEqual(reaper.SHADOW_SOURCES, ("STATE_DONE", "ORACLE_NOT_MINE"))
 
-    def run_decide(self, mode="shadow", cfg=None, **kw):
-        base = dict(name="dispatch", tmux="dispatch", last_text="Reported the result to the inbox.", claims=[],
+    def test_a_done_inbox_header_does_not_close_a_claim_less_session_and_nothing_reads_it(self):
+        real_open = open
+
+        def guarded(path, *a, **k):
+            if "neo-inbox" in str(path):
+                raise AssertionError(f"read the inbox {path}")
+            return real_open(path, *a, **k)
+        s = session(name="dispatch", tmux="dispatch", last_text="Reported the result to the inbox.", claims=[],
                     owned=[], cwd="/w/primary", descendants=0, prompt_at=self.PROMPT)
-        s = session(**dict(base, **kw))
-        s.setdefault("other_sids", [])
-        cfg = dict(dict(CFG, DONE_INBOX="", DONE_INBOX_SHADOW=str(self.inbox), NOCLAIM_DONE=mode), **(cfg or {}))
-        with mock.patch.object(reaper, "worktree_state", side_effect=lambda w, c: list(self.wt) + w.get("problems", [])), \
-             mock.patch.object(reaper, "oracle_brief", side_effect=lambda r, n, c, at: self.briefs.get(n)), \
-             mock.patch.object(reaper, "issue_state", return_value="OPEN"):
+        cfg = dict(CFG, DONE_INBOX=str(self.inbox), DONE_INBOX_SHADOW=str(self.inbox), NOCLAIM_DONE="apply")
+        with mock.patch("builtins.open", side_effect=guarded), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "oracle_brief", return_value=None):
             keep = reaper.decide(s, cfg, self.NOW)
-            verdict = reaper.shadow_verdict(s, cfg, keep, self.NOW) if keep else None
-        return keep, s, verdict
-
-    def test_shadow_marks_would_close_and_keeps_the_session(self):
-        keep, s, _ = self.run_decide()
         self.assertEqual(keep, ["claim-unknown"])
-        self.assertEqual(s["noclaim_done_shadow"], "inbox K1 DONE")
-        line = reaper.report_line(dict(s, pid=1, claim_why="no-worktree"), keep, "would-close")
-        self.assertIn("| would-close | claim-unknown(no-worktree), would-close: no claim, inbox K1 DONE (shadow) |", line)
-
-    def test_shadow_is_the_default(self):
-        self.assertEqual(reaper.DEFAULTS["NOCLAIM_DONE"], "shadow")
-
-    def test_apply_counts_it_as_done(self):
-        keep, s, _ = self.run_decide(mode="apply")
-        self.assertEqual(keep, [])
-        self.assertEqual(s["noclaim_done"], "inbox K1 DONE")
-
-    def test_off_does_neither(self):
-        keep, s, _ = self.run_decide(mode="off")
-        self.assertEqual(keep, ["claim-unknown"])
+        self.assertNotIn("noclaim_done", s)
         self.assertNotIn("noclaim_done_shadow", s)
+        line = reaper.report_line(dict(s, pid=1, claim_why="no-worktree"), keep, "keep")
+        self.assertNotIn("inbox", line)
 
-    def test_the_live_inbox_path_wins_over_the_shadow_path(self):
-        other = self.inbox.with_name("other.md")
-        other.write_text("## K9 ACK · 2026-10-25 20:30 TPE · dispatch\n")
-        keep, s, _ = self.run_decide(mode="apply", cfg=dict(DONE_INBOX=str(other)))
-        self.assertEqual(keep, ["claim-unknown"])
-
-    def test_each_gate_still_keeps_it(self):
-        cases = {
-            "live child process": dict(descendants=2),
-            "unknown child count": dict(descendants=None),
-            "background shell": dict(bg_shells=[9]),
-            "loop": dict(loop=True),
-            "cron": dict(crons=1),
-            "scheduled": dict(scheduled=True),
-            "protected": dict(tmux="keep-me"),
-            "never-close name": dict(tmux="uiux-2", name="uiux-2"),
-            "waiting on a person": dict(last_text="Staged; needs Leo's approval."),
-            "question": dict(asking=True),
-            "busy": dict(status="busy"),
-            "idle too short": dict(idle_min=30),
-            "unpushed owned worktree": dict(owned=[{"path": Path("/w/a"), "problems": ["unpushed:a"], "marker": ""}]),
-            "never-kill": dict(never_kill=[70987]),
-            "no prompt time": dict(prompt_at=0),
-            "a prompt after the DONE": dict(prompt_at=reaper.calendar.timegm((2026, 10, 25, 12, 30, 0, 0, 0, 0))),
-            "a worktree claim": dict(claims=[("o/r", "2")]),
-        }
-        for label, kw in cases.items():
-            with self.subTest(label):
-                keep, s, v = self.run_decide(**kw)
-                self.assertTrue(keep)
-                self.assertFalse(s.get("noclaim_done_shadow"))
-                self.assertEqual((v or {}).get("would_close", ""), "")
-                keep, s, _ = self.run_decide(mode="apply", **kw)
-                self.assertTrue(keep, label)
-
-    def test_a_dirty_cwd_keeps_it(self):
-        self.wt = ["uncommitted:primary"]
-        keep, s, _ = self.run_decide(mode="apply")
-        self.assertIn("claim-unknown", keep)
-        keep, s, _ = self.run_decide()
-        self.assertFalse(s.get("noclaim_done_shadow"))
-
-    def test_the_inbox_header_must_be_done_old_enough_and_this_sessions(self):
-        for headers in (["K1 DONE · 2026-10-25 21:30 TPE · dispatch"],  # younger than IDLE_MINUTES
-                        ["K1 DONE · 2026-10-25 20:00 TPE · dispatch", "K2 ACK · 2026-10-25 20:10 TPE · dispatch"],
-                        ["K1 DONE · 2026-10-25 20:00 TPE · other"],
-                        ["K1 PROGRESS · 2026-10-25 20:00 TPE · dispatch"]):
-            with self.subTest(headers):
-                self.write(*headers)
-                keep, s, _ = self.run_decide(mode="apply")
+    def test_a_claim_less_session_the_state_calls_done_is_not_released_by_it(self):
+        """The inbox DONE header was the claim-less release; without it the session's own `SESSION-DONE:` line (read by
+        decide() before the state) is the only one."""
+        state = {"state": "DONE", "claims": [], "reasons": []}
+        for mode in ("shadow", "apply"):
+            with self.subTest(mode):
+                s = session(name="dispatch", tmux="dispatch", last_text="Reported the result.", claims=[], owned=[],
+                            cwd="/w/primary", descendants=0, prompt_at=self.PROMPT, state=state)
+                with mock.patch.object(reaper, "worktree_state", return_value=[]), \
+                     mock.patch.object(reaper, "oracle_brief", return_value=None):
+                    keep = reaper.decide(s, dict(CFG, STATE_DONE=mode), self.NOW)
                 self.assertEqual(keep, ["claim-unknown"])
-        self.inbox.unlink()
-        self.assertEqual(self.run_decide(mode="apply")[0], ["claim-unknown"])
+                self.assertEqual(s.get("state_held"), "no-claim")
+                self.assertNotIn("state_shadow", s)
+                self.assertNotIn("state_close", s)
 
-    def test_a_prompt_in_the_minute_of_the_header_keeps_it(self):
-        keep, _, _ = self.run_decide(mode="apply", prompt_at=reaper.calendar.timegm((2026, 10, 25, 12, 0, 40, 0, 0, 0)))
-        self.assertEqual(keep, ["claim-unknown"])
-
-    def test_an_issue_its_text_names_with_this_session_as_claimant_keeps_it(self):
-        self.briefs = {"6200": MINE.replace("#9", "#6200")}
-        keep, s, _ = self.run_decide(mode="apply", last_text="Follow-up in #6200.")
-        self.assertEqual(keep, ["claim-unknown"])
-        self.briefs = {"6200": OTHER}
-        keep, s, _ = self.run_decide(mode="apply", last_text="Follow-up in #6200.")
-        self.assertEqual(keep, [])
-
-    def test_sweep_reports_would_close_and_closes_nothing_in_shadow_then_closes_on_apply(self):
+    def test_a_sweep_with_the_old_settings_closes_nothing_and_writes_no_events_log(self):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         s = session(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
                     fg=True, last_text="Reported.", name="dispatch", tmux="dispatch", sid="abcdef0123", sub_active=0,
-                    relay_pending=[], screen_tail="", prompt_at=self.PROMPT, claim_why="no-worktree")
-        for mode, reaped in (("shadow", False), ("apply", True)):
-            with self.subTest(mode):
-                cfgfile = tmp / "conf"
-                cfgfile.write_text(f"APPLY=1\nDONE_INBOX=\nDONE_INBOX_SHADOW={self.inbox}\nNOCLAIM_DONE={mode}\n"
-                                   f"REPORT={tmp / 'report.md'}\nREAPED_DIR={tmp / 'reaped'}\nIDLE_LIST_HOURS=0\n"
-                                   f"STALL_MARK_DIR=\n")
-                with mock.patch.object(reaper, "HOME", tmp), mock.patch.object(reaper, "gather", return_value=[dict(s)]), \
-                     mock.patch.object(reaper, "recover_exiting", return_value=[]), \
-                     mock.patch.object(reaper, "worktree_state", return_value=[]), \
-                     mock.patch.object(reaper, "time") as fake_time, \
-                     mock.patch.object(reaper, "reap", return_value=("skipped:prompt-not-empty", [])) as reap, \
-                     mock.patch.object(reaper, "alert"):
-                    fake_time.time.return_value = self.NOW
-                    fake_time.monotonic.side_effect = time.monotonic
-                    fake_time.strftime.side_effect = time.strftime
-                    fake_time.localtime.side_effect = time.localtime
-                    reaper.main(["--config", str(cfgfile)])
-                self.assertEqual(reap.called, reaped)
-                row = [l for l in (tmp / "report.md").read_text().splitlines() if l.startswith("| dispatch")][0]
-                if reaped:
-                    self.assertIn("| skipped:prompt-not-empty |", row)
-                else:
-                    self.assertIn("| would-close | claim-unknown(no-worktree), would-close: no claim, inbox K1 DONE (shadow)", row)
+                    screen_tail="", prompt_at=self.PROMPT, claim_why="no-worktree")
+        events = tmp / "ops-dispatch" / "events.log"
+        cfgfile = tmp / "conf"
+        cfgfile.write_text(f"APPLY=1\nDONE_INBOX={self.inbox}\nDONE_INBOX_SHADOW={self.inbox}\nNOCLAIM_DONE=apply\n"
+                           f"NUDGE_EVENTS={events}\nNUDGE_STATE={tmp / 'nudged.json'}\nRELAY_DIR={tmp / 'relay'}\n"
+                           f"IDLE_LIST_INBOX={tmp / 'idle-inbox.md'}\n"
+                           f"REPORT={tmp / 'report.md'}\nREAPED_DIR={tmp / 'reaped'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+        with mock.patch.object(reaper, "HOME", tmp), mock.patch.object(reaper, "gather", return_value=[dict(s)]), \
+             mock.patch.object(reaper, "recover_exiting", return_value=[]), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "time") as fake_time, \
+             mock.patch.object(reaper, "reap", return_value=("reaped", [])) as reap, \
+             mock.patch.object(reaper, "alert"):
+            fake_time.time.return_value = self.NOW
+            fake_time.monotonic.side_effect = time.monotonic
+            fake_time.strftime.side_effect = time.strftime
+            fake_time.localtime.side_effect = time.localtime
+            reaper.main(["--config", str(cfgfile)])
+        self.assertFalse(reap.called)
+        row = [l for l in (tmp / "report.md").read_text().splitlines() if l.startswith("| dispatch")][0]
+        self.assertIn("claim-unknown(no-worktree)", row)
+        self.assertNotIn("inbox", row)
+        for path in (events, tmp / "nudged.json", tmp / "idle-inbox.md", tmp / "relay"):
+            self.assertFalse(path.exists(), path)
+        self.assertFalse(any("handoffs" in str(p) for p in tmp.rglob("*")))
 
 
 class ClaimWhy(unittest.TestCase):
@@ -2104,7 +1847,7 @@ class BackgroundAttached(unittest.TestCase):
         self.state = dict(session="audit-pane", session_id="$1", pane_pid=20, cx=2, cy=0,
                           alone=True, screen="❯ ")
         self.cfg = dict(CFG, APPLY="1", PROTECT="", REPORT=str(self.tmp / "report.md"),
-                        DONE_GRACE="apply", NOCLAIM_DONE="apply", CC_NEVER_KILL_PIDS="")
+                        DONE_GRACE="apply", CC_NEVER_KILL_PIDS="")
         self.panes = (0, "%1\n")
 
     def mocked(self):
@@ -2114,7 +1857,7 @@ class BackgroundAttached(unittest.TestCase):
         for name, value in {"ps_table": self.table, "worktrees": [], "pane_state": self.state,
                             "foreground": True, "vim_mode": False, "subagent_activity": False,
                             "transcript_path": None, "transcript_facts": dict(last_text="SESSION-DONE: nothing left",
-                            loop=False, crons=0, asking=False), "relay_pending": [], "worktree_state": [],
+                            loop=False, crons=0, asking=False), "worktree_state": [],
                             "recover_exiting": [], "load_config": self.cfg}.items():
             stack.enter_context(mock.patch.object(reaper, name, return_value=value))
         stack.enter_context(mock.patch.dict(os.environ, {"CC_NEVER_KILL_PIDS": ""}))
@@ -2223,7 +1966,7 @@ class Unjudged(unittest.TestCase):
                          ("c", dict(kind="bg", pid=99, sessionId="dddddddd44", name="gone"))):
             (tmp / "sessions" / f"{fname}.json").write_text(json.dumps(d))
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=1\nDONE_INBOX=\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
         table = {11: (1, "B", "claude"), 12: (1, "C", "claude")}
         with mock.patch.object(reaper, "HOME", tmp), mock.patch.object(reaper, "SESSIONS_DIR", tmp / "sessions"), \
              mock.patch.object(reaper, "ps_table", return_value=table), \

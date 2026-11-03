@@ -22,25 +22,25 @@ until a person looks. This is the cheap detector for that, and it calls no model
                               instead?" result) just above an idle, empty prompt, counted only when "Login
                               successful" is on that screen or STALL_FLEET_MIN panes show it at once (a single
                               Esc by a person is not an account switch)
-  report  once per event, deduped by (pane, fingerprint, session id): one block appended to STALL_INBOX under
-          `## EL-T801-CI-HARDEN STALL <session-name>` with the exact `claude --resume <id> --remote-control
-          <name>` a person or Neo runs. An event ends when its fingerprint leaves the screen, so a later
-          stall in the same pane is a new event. Shadow by default: it prints what it would report and
-          writes nothing to the inbox until STALL_APPLY=1 (or --apply).
+  report  once per event, deduped by (pane, fingerprint, session id): one `STALL <session-name> ...` line in this
+          script's log (~/.cc-reaper/logs/stall-watch.log) with the exact `claude --resume <id> --remote-control
+          <name>` a person runs. Nothing is written to any inbox: the log line and the mark are the report. An event
+          ends when its fingerprint leaves the screen, so a later stall in the same pane is a new event. Shadow by
+          default: it prints `would report` and writes no mark until STALL_APPLY=1 (or --apply).
   mark    only with STALL_APPLY=1 (a mark holds the reaper, so shadow never writes one): a file per stalled
           session id in STALL_MARK_DIR, refreshed every run while the stall lasts and ignored by the session
           reaper STALL_MARK_HOURS after its last refresh or STALL_MARK_MAX_HOURS after the event was first
           seen. The reaper keeps the session with the reason `stalled:<fingerprint>`.
-  prompt  (EL-T921-CI-CONFIRM-CLEAR) a permission prompt ("Do you want to proceed?" with "1. Yes" ... "N. No"), plan
+  prompt  a permission prompt ("Do you want to proceed?" with "1. Yes" ... "N. No"), plan
           approval ("Would you like to proceed?"), folder trust ("1. Yes, I trust this folder" / "2. No, exit") or an
           AskUserQuestion menu ("☐ <header>", options, "Enter to select · ↑/↓ to navigate") live at the bottom of a
           pane, with no input box below it, is aged from its first sighting per (session id, prompt fingerprint) in
           the state file. Past STALL_PROMPT_MINUTES (10) it is flagged with its age: with apply (STALL_APPLY=1, or
           STALL_PROMPT_APPLY=1 alone, which leaves marks and STALL entries in shadow; cc-reaper #128) one
-          `## EL-T921-PROMPT-STALL <session>` block in STALL_INBOX, in shadow one `would alert prompt` line, once per
-          prompt instance (one inbox entry per state change). While the same prompt stays, a `still on screen` log
-          line at most every STALL_PROMPT_REALERT_MINUTES (120), never a second inbox entry. No push channel to the
-          founder's device: a new prompt alert also pings the Better Stack founder-decision heartbeat's /fail once
+          `PROMPT-STALL <session> ...` log line, in shadow one `would alert prompt` line, once per prompt
+          instance. While the same prompt stays, a `still on screen` log line at most every
+          STALL_PROMPT_REALERT_MINUTES (120). The log is not a push channel to the founder's device: a new prompt
+          alert also pings the Better Stack founder-decision heartbeat's /fail once
           (STALL_PUSH=1, #130; numbers, kind and session name only), which pages the founder. An
           AskUserQuestion block names its question as menu="..." (one line, 80 characters, no backtick or quote);
           the other kinds carry no screen text, since their region can hold a command line. The prompt is
@@ -54,7 +54,7 @@ live-sessions.json  each run writes STALL_LIVE_FILE (~/.cc-reaper/state/live-ses
 
 HARD RULE (stima-api #5212): nothing here types into another agent's pane. The only tmux calls are `display`,
 `capture-pane` and `list-panes` (all read-only); `tmux_ro` refuses every other subcommand, send-keys included. Re-enabling Remote Control
-(or resuming) is a person's or Neo's step, given in the report.
+(or resuming) is a person's step, given in the log line.
 """
 
 import argparse
@@ -76,18 +76,15 @@ _spec = importlib.util.spec_from_file_location("session_reaper", Path(__file__).
 reaper = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(reaper)
 
-HEADER = "EL-T801-CI-HARDEN STALL"
-PROMPT_HEADER = "EL-T921-PROMPT-STALL"  # its own inbox key: not under the dispatch key, so it never reopens that one
 DEFAULTS = {
-    "STALL_APPLY": "0",  # 0: shadow (print what would be reported). 1: append to STALL_INBOX
-    "STALL_INBOX": "~/handoffs/neo-inbox.md",
+    "STALL_APPLY": "0",  # 0: shadow (print what would be reported, write no mark). 1: log the report and write marks
     "STALL_STATE": "~/.cc-reaper/state/stall-watch.json",  # pane hashes and the events already seen
     "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # one <session id>.json per stalled session
     "STALL_MARK_MAX_HOURS": "48",  # no mark past this long after the event was first seen, however often it is refreshed
     "STALL_FLEET_MIN": "2",  # panes showing interrupted-idle at once that stand in for "Login successful"
     "STALL_PROMPT_MINUTES": "10",  # a permission prompt or AskUserQuestion menu on screen this long is flagged (0: off)
     "STALL_PROMPT_REALERT_MINUTES": "120",  # the same prompt still on screen is flagged again at most this often
-    "STALL_PROMPT_APPLY": "0",  # 1: prompt alerts go to STALL_INBOX while STALL_APPLY stays shadow (#128)
+    "STALL_PROMPT_APPLY": "0",  # 1: prompt alerts are logged (and pushed) while STALL_APPLY stays shadow (#128)
     "STALL_PUSH": "0",  # 1: a live prompt alert also pings STALL_PUSH_KEY's URL + /fail once (#130); 0: `would push`
     "STALL_PUSH_ENV": "~/ci-runner/heartbeats.env",
     "STALL_PUSH_KEY": "HEARTBEAT_FOUNDER_DECISION",  # Better Stack: an incident on it pages the founder
@@ -119,7 +116,7 @@ INTERRUPT_RE = re.compile(LEAD + r"(?:\[Request interrupted by user[^\]]*\]|Inte
 LOGIN_RE = re.compile(BULLET + r"Login successful\b", re.I)
 INTERRUPT_MAX_GAP = 8  # lines between the marker and the prompt line (the prompt box's border and blank lines)
 
-# Interactive prompts nobody may answer (EL-T921-CI-CONFIRM-CLEAR). Each is matched only as the live menu at the bottom
+# Interactive prompts nobody may answer. Each is matched only as the live menu at the bottom
 # of the screen: the question, its numbered options, at most PROMPT_TAIL non-blank lines below the last of them (the
 # footer and Claude Code's bottom rule) and no `❯` input line below them (a live menu replaces the input box), so a
 # transcript that quotes the words, even as the last text above an idle input box, is not a prompt.
@@ -243,7 +240,7 @@ def _menu_head(region):
     return SECRET_RE.sub("[redacted]", text)[:80]
 
 
-# What a question may quote that must not reach an inbox mirrored on GitHub: known key shapes, NAME=value for a
+# What a question may quote that must not reach the log or the founder push: known key shapes, NAME=value for a
 # token-like name, and any long unbroken key-like run.
 SECRET_RE = re.compile(
     r"(?i)\b(?:sk|pk|rk|whsec)[-_][\w-]{8,}|\b(?:ghp|gho|ghs|ghu|ghr|github_pat|xox[abprs])[-_][\w-]{8,}|\bAKIA[0-9A-Z]{12,}"
@@ -367,7 +364,7 @@ def live_sessions(prev_panes=None, probe=False, full=True):
             continue
         pane = d["tmux"].rsplit(".", 1)[-1]
         if not SID_RE.fullmatch(str(d.get("sessionId") or "")):
-            continue  # the id goes into a file name, a shell command and the inbox: only [\w-]+
+            continue  # the id goes into a file name, a shell command and the log: only [\w-]+
         reused = False
         if probed is None:
             state = reaper.pane_state(pane)
@@ -443,7 +440,7 @@ def atomic_write(path, text):
 
 
 def one_line(text):
-    """One line with no backtick: the name sits in a markdown code span (the recovery command) and a header."""
+    """One line with no backtick: the name sits in a markdown code span (the recovery command) and a log line."""
     return re.sub(r"\s+", " ", (text or "").replace("`", "'")).strip()
 
 
@@ -473,29 +470,21 @@ def resume_command(sid, name):
     return f"claude --resume {shlex.quote(sid)} --remote-control {shlex.quote(name)}"
 
 
-def inbox_block(name, sid, fps, now):
+def stall_line(name, sid, fps, now):
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
-    return (f"\n## {HEADER} {name}\n\n"
-            f"STALL session={name} id={sid} fingerprint={','.join(fps)} detected={stamp}; "
-            f"recover (a person or Neo runs it; the detector types nothing): `{resume_command(sid, name)}`\n")
+    return (f"STALL {name} id={sid} fingerprint={','.join(fps)} detected={stamp}; "
+            f"recover (a person runs it; the detector types nothing): `{resume_command(sid, name)}`")
 
 
-def prompt_block(name, sid, pane, ev, now):
+def prompt_line(name, sid, pane, ev, now):
     """Numbers, the session name and a fixed kind only: no screen text (a command line can carry a secret, and text a
     session wrote must not steer the reader)."""
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(ev["first"]))
-    return (f"\n## {PROMPT_HEADER} {name}\n\n"
-            f"PROMPT session={name} id={sid} pane={pane} kind={ev['kind']} prompt={ev['fp']} "
+    return (f"PROMPT-STALL {name} id={sid} pane={pane} kind={ev['kind']} prompt={ev['fp']} "
             f"on-screen={int((now - ev['first']) // 60)}m since={stamp}"
             + (f' menu="{ev["head"]}"' if ev.get("kind") == "ask-user-question" and ev.get("head") else "")
             + "; "
-            f"a person answers it at the pane (the detector never answers, types nothing)\n")
-
-
-def append_inbox(path, text):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a") as f:
-        f.write(text)
+            f"a person answers it at the pane (the detector never answers, types nothing)")
 
 
 def load_state(path):
@@ -513,13 +502,12 @@ def load_state(path):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", default=str(reaper.CONFIG))
-    ap.add_argument("--apply", action="store_true", help="append reports to STALL_INBOX (default: shadow, unless STALL_APPLY=1)")
+    ap.add_argument("--apply", action="store_true", help="log reports and write marks (default: shadow, unless STALL_APPLY=1)")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     apply = args.apply or cfg["STALL_APPLY"] == "1"
     state_path = Path(os.path.expanduser(cfg["STALL_STATE"]))
     mark_dir = Path(os.path.expanduser(cfg["STALL_MARK_DIR"])) if cfg["STALL_MARK_DIR"] else None
-    inbox = Path(os.path.expanduser(cfg["STALL_INBOX"]))
     state_path.parent.mkdir(parents=True, exist_ok=True)
     lock = open(state_path.with_name(state_path.name + ".lock"), "w")
     try:
@@ -528,7 +516,7 @@ def main(argv=None):
         print("stall-watch: another run holds the lock")
         return 0
     try:
-        return sweep(cfg, apply, state_path, mark_dir, inbox)
+        return sweep(cfg, apply, state_path, mark_dir)
     finally:
         lock.close()
 
@@ -540,7 +528,7 @@ def probe_fields(ps):
     return {"act": ps["act"], "cur": [ps["cx"], ps["cy"]], "at": ps.get("at")}
 
 
-def sweep(cfg, apply, state_path, mark_dir, inbox):
+def sweep(cfg, apply, state_path, mark_dir):
     now = time.time()
     failures = []
     if mark_dir and shared_dir(mark_dir):
@@ -609,21 +597,17 @@ def sweep(cfg, apply, state_path, mark_dir, inbox):
         if not fresh:
             continue
         if apply:
-            try:
-                append_inbox(inbox, inbox_block(name, sid, fresh, now))
-                for fp in fresh:
-                    events[f"{pane}|{fp}|{sid}"]["reported"] = True
-                print(f"stall-watch: reported {name} ({sid[:8]}) {','.join(fresh)}")
-            except OSError as e:
-                failures.append(f"{name} ({sid}): inbox write failed: {e}")
+            for fp in fresh:
+                events[f"{pane}|{fp}|{sid}"]["reported"] = True
+            print(f"stall-watch: {stall_line(name, sid, fresh, now)}")
         else:
             would += 1
             for fp in fresh:
                 events[f"{pane}|{fp}|{sid}"]["shadow_logged"] = True
             print(f"stall-watch shadow: would report {name} ({sid[:8]}) {','.join(fresh)} -> {resume_command(sid, name)}")
-    try:  # after the STALL inbox writes and before the state write: nothing here may stop the state being saved
+    try:  # after the STALL reports and before the state write: nothing here may stop the state being saved
         papply = apply or cfg.get("STALL_PROMPT_APPLY") == "1"
-        prompt_events, seen, flagged, pwould = prompt_sweep(cfg, papply, state, prompts, kept, inbox, now, failures)
+        prompt_events, seen, flagged, pwould = prompt_sweep(cfg, papply, state, prompts, kept, now, failures)
     except Exception as e:  # noqa: BLE001 - reported as a failure (exit 1), never silent
         failures.append(f"prompt sweep failed ({type(e).__name__}): prompt state reset")
         prompt_events, seen, flagged, pwould = {}, 0, 0, 0
@@ -688,10 +672,10 @@ def _stored_prompts(state):
     return out
 
 
-def prompt_sweep(cfg, apply, state, prompts, kept, inbox, now, failures):
+def prompt_sweep(cfg, apply, state, prompts, kept, now, failures):
     """Age each on-screen prompt from its first sighting per (session id, fingerprint) and flag one on screen longer than
-    STALL_PROMPT_MINUTES. The inbox gets one block per prompt instance (one entry per state change; a `still waiting`
-    post is not one): with apply that block, in shadow a `would alert` line. While the same prompt stays, a log line
+    STALL_PROMPT_MINUTES. The log gets one line per prompt instance: with apply that line, in shadow a `would alert`
+    line. While the same prompt stays, a log line
     only, at most every STALL_PROMPT_REALERT_MINUTES. A prompt that left the screen is forgotten (a later one is a new
     instance); an unread session keeps what was known. Malformed stored entries are dropped, never raised on.
     Returns (events, on screen, flagged, would alert)."""
@@ -720,7 +704,7 @@ def prompt_sweep(cfg, apply, state, prompts, kept, inbox, now, failures):
         flagged += 1
         push = apply and cfg.get("STALL_PUSH") == "1"
         tries = ev.get("push_tries") if isinstance(ev.get("push_tries"), int) else 0
-        if push and not ev.get("pushed") and tries < PUSH_TRIES:  # its own record: neither the inbox nor a re-alert gates it
+        if push and not ev.get("pushed") and tries < PUSH_TRIES:  # its own record: a re-alert does not gate it
             ev["push_tries"] = tries + 1
             if founder_push(cfg, name, sid, pane, ev, now):
                 ev["pushed"] = now
@@ -730,25 +714,20 @@ def prompt_sweep(cfg, apply, state, prompts, kept, inbox, now, failures):
         if last is not None and now - last < every:
             continue
         line = (f"{name} ({sid[:8]}) pane={pane} kind={ev['kind']} prompt={ev['fp']} on-screen={int(age // 60)}m")
-        if last is not None:  # still on screen: the log only, never a second inbox entry
+        if last is not None:  # still on screen: a log line, never a second alert
             if apply:
                 ev["alerted"], ev["alerts"] = now, ev["alerts"] + 1
             else:
                 ev["shadow_at"] = now
-            print(f"stall-watch: prompt still on screen {line} (log only; inbox alerted once)")
+            print(f"stall-watch: prompt still on screen {line} (log only; alerted once)")
             continue
         if apply:
-            try:
-                append_inbox(inbox, prompt_block(name, sid, pane, ev, now))
-            except OSError as e:
-                failures.append(f"{name} ({sid}): prompt alert inbox write failed: {e}")
-                continue
             ev["alerted"], ev["alerts"] = now, ev["alerts"] + 1
-            print(f"stall-watch: prompt alert {line} -> {inbox}")
+            print(f"stall-watch: {prompt_line(name, sid, pane, ev, now)}")
         else:
             would += 1
             ev["shadow_at"] = now
-            print(f"stall-watch shadow: would alert prompt {line} -> {inbox}")
+            print(f"stall-watch shadow: would alert prompt {line}")
         if not push:
             print(f"stall-watch shadow: would push {name} ({sid[:8]}) via {cfg.get('STALL_PUSH_KEY') or ''}")
     return out, seen, flagged, would

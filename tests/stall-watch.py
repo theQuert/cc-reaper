@@ -283,13 +283,13 @@ class Runs(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
-        self.inbox = self.tmp / "neo-inbox.md"
+        self.reports = []  # the STALL / PROMPT-STALL lines printed to the log, one entry per line (#7079: no inbox)
         self.marks = self.tmp / "stalled"
         self.write_config()
 
     def write_config(self, apply="1", fleet_min="2", extra=""):
         self.cfg = self.tmp / "conf"
-        self.cfg.write_text(f"STALL_APPLY={apply}\nSTALL_INBOX={self.inbox}\nSTALL_STATE={self.tmp / 'state.json'}\n"
+        self.cfg.write_text(f"STALL_APPLY={apply}\nSTALL_STATE={self.tmp / 'state.json'}\n"
                             f"STALL_MARK_DIR={self.marks}\nSTALL_FLEET_MIN={fleet_min}\nSTALL_PROBE=0\nSTALL_LIVE_FILE={self.tmp / 'live.json'}\n{extra}")
 
     def start(self, panes):
@@ -304,29 +304,35 @@ class Runs(unittest.TestCase):
              mock.patch("builtins.print") as out:
             rc = stall.main(["--config", str(self.cfg), *flags])
         self.printed = "\n".join(" ".join(map(str, c.args)) for c in out.call_args_list)
+        for c in out.call_args_list:
+            line = " ".join(map(str, c.args))
+            if line.startswith(("stall-watch: STALL ", "stall-watch: PROMPT-STALL ")):
+                self.assertNotIn("\n", line)  # one report is one log line: a session name cannot start a second
+                self.reports.append(line[len("stall-watch: "):])
         return rc
 
-    def inbox_text(self):
-        return self.inbox.read_text() if self.inbox.exists() else ""
+    def report_text(self):
+        """Every STALL / PROMPT-STALL report line so far, one per line.."""
+        return "\n".join(self.reports) + ("\n" if self.reports else "")
 
     def test_each_fingerprint_is_reported_with_the_exact_resume_command(self):
         for fp, spec_ in {"weekly-limit": WEEKLY, "remote-disconnected": DISCONNECTED, "rate-limit-429": HTTP_429}.items():
             with self.subTest(fp):
-                self.inbox.unlink(missing_ok=True)
+                self.reports.clear()
                 (self.tmp / "state.json").unlink(missing_ok=True)
                 f = self.start({"%1": ("auth audit", spec_)})
                 self.assertEqual(self.run_once(), 0)
-                text = self.inbox_text()
+                text = self.report_text()
                 sid = f.sids["%1"]
-                self.assertIn("\n## EL-T801-CI-HARDEN STALL auth audit\n", text)
+                self.assertTrue(text.startswith("STALL auth audit id="), text)
                 self.assertIn(f"fingerprint={fp}", text)
                 self.assertIn(f"`claude --resume {sid} --remote-control 'auth audit'`", text)
-                self.assertEqual(text.count("## EL-T801-CI-HARDEN STALL"), 1)
+                self.assertEqual(len(self.reports), 1)
 
     def test_a_healthy_pane_reports_and_marks_nothing(self):
         self.start({"%1": ("work", HEALTHY)})
         self.assertEqual(self.run_once(), 0)
-        self.assertEqual(self.inbox_text(), "")
+        self.assertEqual(self.report_text(), "")
         self.assertEqual(list(self.marks.glob("*")), [])
         self.assertIn("0 marked", self.printed)
 
@@ -334,14 +340,14 @@ class Runs(unittest.TestCase):
         self.start({"%1": ("work", WEEKLY)})
         self.run_once()
         self.run_once()
-        self.assertEqual(self.inbox_text().count("## EL-T801-CI-HARDEN STALL work"), 1)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
 
     def test_a_changed_screen_with_the_same_fingerprint_is_the_same_event(self):
         f = self.start({"%1": ("work", WEEKLY)})
         self.run_once()
         f.set("%1", screen("● more output", "  ⎿  You've hit your weekly limit · resets Nov 2"))
         self.run_once()
-        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
 
     def test_a_cleared_stall_that_comes_back_is_a_new_event(self):
         f = self.start({"%1": ("work", WEEKLY)})
@@ -351,14 +357,14 @@ class Runs(unittest.TestCase):
         self.assertEqual(list(self.marks.glob("*")), [])
         f.set("%1", WEEKLY)
         self.run_once()
-        self.assertEqual(self.inbox_text().count("STALL work"), 2)
+        self.assertEqual(self.report_text().count("STALL work"), 2)
 
     def test_a_second_fingerprint_on_the_same_pane_is_a_second_report(self):
         f = self.start({"%1": ("work", WEEKLY)})
         self.run_once()
         f.set("%1", screen("Remote Control disconnected.", "You've hit your weekly limit"))
         self.run_once()
-        text = self.inbox_text()
+        text = self.report_text()
         self.assertEqual(text.count("STALL work"), 2)
         self.assertEqual(text.count("fingerprint=weekly-limit"), 1)
         self.assertIn("fingerprint=remote-disconnected", text)
@@ -367,7 +373,7 @@ class Runs(unittest.TestCase):
         self.start({"%1": ("one", WEEKLY), "%2": ("two", WEEKLY)})
         self.run_once()
         self.run_once()
-        text = self.inbox_text()
+        text = self.report_text()
         self.assertEqual((text.count("STALL one"), text.count("STALL two")), (1, 1))
 
     def test_an_unchanged_pane_is_not_rescanned_and_a_changed_one_is(self):
@@ -381,9 +387,9 @@ class Runs(unittest.TestCase):
             f.set("%1", WEEKLY)
             self.run_once()
             self.assertEqual(scan.call_count, 1)
-        self.assertEqual(self.inbox_text().count("STALL a"), 1)
+        self.assertEqual(self.report_text().count("STALL a"), 1)
 
-    def test_shadow_is_the_default_prints_once_and_writes_no_inbox(self):
+    def test_shadow_is_the_default_prints_once_and_reports_nothing(self):
         self.write_config(apply="0")
         self.start({"%1": ("work", WEEKLY)})
         self.run_once()
@@ -391,7 +397,7 @@ class Runs(unittest.TestCase):
         self.assertIn("--remote-control work", self.printed)
         self.run_once()
         self.assertNotIn("would report work", self.printed)  # logged once for the event
-        self.assertFalse(self.inbox.exists())
+        self.assertEqual(self.reports, [])
         self.assertFalse(self.marks.exists() and list(self.marks.glob("*")))  # a mark holds the reaper: never in shadow
 
     def test_apply_after_shadow_reports_the_stall_that_is_still_there(self):
@@ -400,47 +406,63 @@ class Runs(unittest.TestCase):
         self.run_once()
         self.write_config(apply="1")
         self.run_once()
-        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
 
     def test_the_apply_flag_overrides_a_shadow_config(self):
         self.write_config(apply="0")
         self.start({"%1": ("work", WEEKLY)})
         self.run_once("--apply")
-        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
 
-    def test_an_inbox_write_failure_is_not_marked_reported(self):
+    def test_a_report_is_a_log_line_and_nothing_is_written_under_handoffs(self):
         self.start({"%1": ("work", WEEKLY)})
-        with mock.patch.object(stall, "append_inbox", side_effect=OSError("disk")):
-            self.assertEqual(self.run_once(), 1)
-        self.assertIn("ERROR work", self.printed)
+        real_open = open
+
+        def guarded(file, *a, **k):
+            self.assertNotIn("inbox", str(file))
+            self.assertNotIn("handoffs", str(file))
+            return real_open(file, *a, **k)
+
+        with mock.patch("builtins.open", side_effect=guarded):
+            self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
+        self.assertFalse(hasattr(stall, "append_inbox"))  # the inbox writer is gone
+        self.assertNotIn("STALL_INBOX", stall.DEFAULTS)
+        self.assertEqual(self.run_once(), 0)  # reported once: the flag is set without a write that can fail
+        self.assertEqual(self.report_text().count("STALL work"), 1)
+
+    def test_the_removed_stall_inbox_key_in_an_installed_conf_is_ignored(self):
+        self.write_config(extra=f"STALL_INBOX={self.tmp / 'handoffs' / 'neo-inbox.md'}\n")
+        self.start({"%1": ("work", WEEKLY)})
         self.assertEqual(self.run_once(), 0)
-        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
+        self.assertFalse((self.tmp / "handoffs").exists())
 
     def test_a_session_name_cannot_inject_a_header_or_a_command(self):
         self.start({"%1": ("x\n## OTHER; rm -rf /", WEEKLY)})
         self.run_once()
-        text = self.inbox_text()
-        self.assertEqual(text.count("\n## "), 1)
+        text = self.report_text()
+        self.assertEqual(len(self.reports), 1)  # one line: the newline in the name did not start a second report
         self.assertIn("--remote-control 'x ## OTHER; rm -rf /'", text)
 
     def test_an_interrupt_alone_is_not_an_account_switch(self):
         self.start({"%1": ("work", INTERRUPTED)})
         self.run_once()
-        self.assertEqual(self.inbox_text(), "")
+        self.assertEqual(self.report_text(), "")
         self.assertEqual(list(self.marks.glob("*")), [])
 
     def test_an_interrupt_counts_with_login_text_or_a_fleet_of_them(self):
         self.start({"%1": ("one", INTERRUPTED), "%2": ("two", INTERRUPTED)})
         self.run_once()
-        text = self.inbox_text()
+        text = self.report_text()
         self.assertIn("STALL one", text)
         self.assertIn("STALL two", text)
         self.assertIn("fingerprint=interrupted-idle", text)
-        self.inbox.unlink()
+        self.reports.clear()
         (self.tmp / "state.json").unlink()
         self.start({"%1": ("solo", INTERRUPTED_LOGIN)})
         self.run_once()
-        self.assertIn("fingerprint=remote-disconnected,interrupted-idle", self.inbox_text())
+        self.assertIn("fingerprint=remote-disconnected,interrupted-idle", self.report_text())
 
     def test_marks_follow_the_stall_and_the_session_reaper_shows_the_reason(self):
         self.write_config(apply="0")
@@ -465,7 +487,7 @@ class Runs(unittest.TestCase):
                 self.start({"%1": ("work", spec_)})
                 self.run_once()
                 self.run_once()
-                self.assertEqual(self.inbox_text(), "")
+                self.assertEqual(self.report_text(), "")
                 self.assertEqual(list(self.marks.glob("*")), [])
 
     def test_a_mark_does_not_outlive_its_first_sighting_however_often_it_is_refreshed(self):
@@ -481,7 +503,7 @@ class Runs(unittest.TestCase):
         self.run_once()  # unchanged idle screen: refreshed, but past the cap from its first sighting
         self.assertFalse((self.marks / f"{sid}.json").exists())
         self.assertEqual(reaper.stall_mark(cfg, sid), "")
-        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
 
     def test_a_failed_read_keeps_the_event_and_the_mark_and_reports_nothing_again(self):
         f = self.start({"%1": ("work", WEEKLY)})
@@ -496,7 +518,7 @@ class Runs(unittest.TestCase):
             self.assertEqual(mark.read_text(), before)
             failing.discard("%1")
         self.run_once()
-        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
         self.assertEqual(mark.read_text().count(sid), 1)
 
     def test_a_missing_process_table_changes_nothing(self):
@@ -515,12 +537,12 @@ class Runs(unittest.TestCase):
         d["sessionId"] = "abc`reboot`"
         p.write_text(json.dumps(d))
         self.run_once()
-        self.assertEqual(self.inbox_text(), "")
+        self.assertEqual(self.report_text(), "")
 
     def test_a_backtick_in_the_name_cannot_close_the_code_span(self):
         self.start({"%1": ("my`name", WEEKLY)})
         self.run_once()
-        block = self.inbox_text()
+        block = self.report_text()
         self.assertEqual(block.count("`"), 2)
         import shlex
         command = block.split("`")[1]
@@ -580,7 +602,7 @@ class Runs(unittest.TestCase):
 
 
 class RunsWithProbe(Runs):
-    """The production default is STALL_PROBE=1: the whole Runs group (fingerprints, marks, fleet, inbox) again with it on."""
+    """The production default is STALL_PROBE=1: the whole Runs group (fingerprints, marks, fleet, reports) again with it on."""
 
     def write_config(self, apply="1", fleet_min="2", extra=""):
         Runs.write_config(self, apply, fleet_min, extra + "STALL_PROBE=1\n")
@@ -612,7 +634,7 @@ class ProbeRuns(unittest.TestCase):
     activity or cursor moved, every STALL_FULL_EVERY-th run captures all (the spot-check), and each run writes the
     shared live-sessions.json."""
     table = None
-    setUp, write_config, start, run_once, inbox_text = Runs.setUp, Runs.write_config, Runs.start, Runs.run_once, Runs.inbox_text
+    setUp, write_config, start, run_once, report_text = Runs.setUp, Runs.write_config, Runs.start, Runs.run_once, Runs.report_text
 
     def subs(self, f):
         out = {}
@@ -653,8 +675,8 @@ class ProbeRuns(unittest.TestCase):
         f.act["%2"] = ACT_OLD + 5
         self.run_once()
         self.assertEqual(self.subs(f), {"list-panes": 1, "capture-pane": 1})
-        self.assertEqual(self.inbox_text().count("STALL busy"), 1)
-        self.assertEqual(self.inbox_text().count("STALL quiet"), 0)
+        self.assertEqual(self.report_text().count("STALL busy"), 1)
+        self.assertEqual(self.report_text().count("STALL quiet"), 0)
 
     def test_activity_alone_is_a_change_with_the_cursor_unmoved(self):
         self.write_config(extra="STALL_PROBE=1\n")
@@ -665,7 +687,7 @@ class ProbeRuns(unittest.TestCase):
         f.act["%2"] = ACT_OLD + 5
         self.run_once()
         self.assertEqual(self.subs(f), {"list-panes": 1, "capture-pane": 1})
-        self.assertEqual(self.inbox_text().count("STALL busy"), 1)
+        self.assertEqual(self.report_text().count("STALL busy"), 1)
 
     def test_a_moved_cursor_alone_is_a_change(self):
         self.write_config(extra="STALL_PROBE=1\n")
@@ -697,7 +719,7 @@ class ProbeRuns(unittest.TestCase):
         self.run_once()  # the third run is the spot-check
         self.assertEqual(self.subs(f), {"list-panes": 1, "capture-pane": 2})
         self.assertIn("probe-miss=1", self.printed)
-        self.assertEqual(self.inbox_text().count("STALL b"), 1)  # and the spot-check still caught the stall
+        self.assertEqual(self.report_text().count("STALL b"), 1)  # and the spot-check still caught the stall
         self.run_once()
         self.assertIn("probe-miss=0", self.printed)
 
@@ -707,7 +729,7 @@ class ProbeRuns(unittest.TestCase):
         f.no_probe = True
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(self.subs(f), {"list-panes": 1, "display": 1, "capture-pane": 1})
-        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
 
     def test_a_session_whose_pane_left_tmux_is_unread_not_gone(self):
         self.write_config(extra="STALL_PROBE=1\n")
@@ -804,14 +826,14 @@ class ProbeRuns(unittest.TestCase):
         f = self.start({"%1": ("work", WEEKLY)})
         self.assertEqual(self.run_once(), 1)
         self.assertIn("live-sessions write failed", self.printed)
-        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
 
 
 class PromptRuns(unittest.TestCase):
     """A prompt on screen is aged from its first sighting and flagged past STALL_PROMPT_MINUTES, once per instance."""
     table = None
     tmux_used = {"display", "capture-pane"}
-    setUp, write_config, start, run_once, inbox_text = Runs.setUp, Runs.write_config, Runs.start, Runs.run_once, Runs.inbox_text
+    setUp, write_config, start, run_once, report_text = Runs.setUp, Runs.write_config, Runs.start, Runs.run_once, Runs.report_text
 
     def age(self, minutes, field="first"):
         """Move every prompt event's `field` back by `minutes`, as if that much time had passed."""
@@ -823,20 +845,20 @@ class PromptRuns(unittest.TestCase):
         path.write_text(json.dumps(st))
 
     def prompt_blocks(self, name):
-        return self.inbox_text().count(f"## EL-T921-PROMPT-STALL {name}\n")
+        return sum(r.startswith(f"PROMPT-STALL {name} ") for r in self.reports)
 
     def test_a_permission_prompt_is_flagged_with_its_age_after_the_threshold(self):
         f = self.start({"%1": ("ci", PERMISSION), "%2": ("fine", HEALTHY)})
         self.assertEqual(self.run_once(), 0)
         self.assertIn("1 prompts on screen, 0 prompts flagged", self.printed)
-        self.assertEqual(self.inbox_text(), "")
+        self.assertEqual(self.report_text(), "")
         self.age(11)
         self.assertEqual(self.run_once(), 0)
-        text = self.inbox_text()
+        text = self.report_text()
         self.assertEqual(self.prompt_blocks("ci"), 1)
         self.assertIn(f"id={f.sids['%1']} pane=%1 kind=permission", text)
         self.assertIn("on-screen=11m", text)
-        self.assertNotIn("r.git", text)  # no screen text reaches the inbox
+        self.assertNotIn("r.git", text)  # no screen text reaches the log
         self.assertNotIn("fine", text)
         self.assertIn("would push ci", self.printed)  # STALL_PUSH unset: the push is shadow
         self.assertEqual({c[1] for c in f.calls}, self.tmux_used)  # never answered, never typed
@@ -847,8 +869,8 @@ class PromptRuns(unittest.TestCase):
         self.age(30)
         self.run_once()
         self.assertEqual(self.prompt_blocks("security"), 1)
-        self.assertIn("kind=ask-user-question", self.inbox_text())
-        self.assertIn("on-screen=30m", self.inbox_text())
+        self.assertIn("kind=ask-user-question", self.report_text())
+        self.assertIn("on-screen=30m", self.report_text())
 
     def test_prompt_apply_alone_alerts_once_per_menu_names_its_question_and_leaves_marks_in_shadow(self):
         # cc-reaper #128: sre and ci sat on a menu for hours while STALL_APPLY=0 kept the prompt half in shadow.
@@ -857,10 +879,10 @@ class PromptRuns(unittest.TestCase):
         self.run_once()
         self.age(10)
         self.run_once()  # the first tick past the threshold alerts
-        text = self.inbox_text()
+        text = self.report_text()
         self.assertEqual(self.prompt_blocks("sre"), 1)
         self.assertIn('menu="Approve the boundary and merge once merge-gate is green?"', text)
-        self.assertNotIn("## EL-T801-CI-HARDEN STALL", text)  # the stall half stays shadow
+        self.assertFalse(any(r.startswith("STALL ") for r in self.reports))  # the stall half stays shadow
         self.assertFalse(self.marks.exists() and list(self.marks.glob("*")))  # and writes no mark
         self.run_once()  # the same screen hash: silent
         f.set("%1", ASK_MOVED)  # the cursor moved, the menu did not: still silent
@@ -888,7 +910,7 @@ class PromptRuns(unittest.TestCase):
         path.write_text(json.dumps(st))
         self.age(10)
         self.run_once()
-        self.assertIn('menu="Approve the boundary', self.inbox_text())
+        self.assertIn('menu="Approve the boundary', self.report_text())
 
     def test_shadow_then_prompt_apply_alerts_a_waiting_menu_exactly_once(self):
         self.write_config(apply="0")
@@ -923,7 +945,7 @@ class PromptRuns(unittest.TestCase):
         self.write_config(apply="0", extra=f"STALL_PROMPT_APPLY=1\nSTALL_PUSH=1\nSTALL_PUSH_ENV={env}\n")
 
     def test_one_founder_push_per_prompt_hash_and_none_while_it_stays(self):
-        # cc-reaper #130: the inbox alert reached no device; a P0 waited 7 h on a keypress.
+        # cc-reaper #130: the alert reached no device; a P0 waited 7 h on a keypress.
         self.push_config()
         f = self.start({"%1": ("sre", ASK_USER), "%2": ("ci", PERMISSION)})
         with mock.patch.object(stall, "_ping") as ping:
@@ -948,16 +970,16 @@ class PromptRuns(unittest.TestCase):
             self.assertEqual(ping.call_count, 3)
         self.assertEqual({c[1] for c in f.calls}, self.tmux_used)  # never answered, never typed
 
-    def test_a_failed_push_is_a_failure_and_retried_until_it_goes_out_whatever_the_inbox(self):
+    def test_a_failed_push_is_a_failure_and_retried_until_it_goes_out_whatever_the_alert_line(self):
         self.push_config()
         self.start({"%2": ("ci", PERMISSION)})
         with mock.patch.object(stall, "_ping", side_effect=[OSError("https://uptime.betterstack.com/secret"), None]) as ping:
             self.run_once(); self.age(10)
-            self.assertEqual(self.run_once(), 1)  # the inbox alert went out, the push did not: a failure, not silence
+            self.assertEqual(self.run_once(), 1)  # the alert line went out, the push did not: a failure, not silence
             self.assertIn("push failed (OSError)", self.printed)
             self.assertIn("founder push failed, try 1 of 5", self.printed)
             self.assertNotIn("secret", self.printed)
-            self.assertEqual(self.run_once(), 0)  # retried on the next tick, although the inbox was alerted already
+            self.assertEqual(self.run_once(), 0)  # retried on the next tick, although the line was alerted already
             self.run_once()
         self.assertEqual(ping.call_count, 2)
         self.assertEqual(self.prompt_blocks("ci"), 1)
@@ -975,14 +997,6 @@ class PromptRuns(unittest.TestCase):
         self.assertIn("push: no https URL under HEARTBEAT_FOUNDER_DECISION", said[0])
         self.assertEqual(self.prompt_blocks("sre"), 1)
 
-    def test_an_inbox_that_cannot_be_written_still_pushes(self):
-        self.push_config()
-        self.inbox.parent.mkdir(parents=True, exist_ok=True)
-        self.start({"%1": ("sre", ASK_USER)})
-        with mock.patch.object(stall, "_ping") as ping, mock.patch.object(stall, "append_inbox", side_effect=OSError("ro")):
-            self.run_once(); self.age(10); self.run_once()
-        self.assertEqual(ping.call_count, 1)
-
     def test_a_permission_prompt_carries_no_menu_text(self):
         self.write_config(apply="0", extra="STALL_PROMPT_APPLY=1\n")
         self.start({"%1": ("ci", PERMISSION)})
@@ -990,14 +1004,14 @@ class PromptRuns(unittest.TestCase):
         self.age(11)
         self.run_once()
         self.assertEqual(self.prompt_blocks("ci"), 1)
-        self.assertNotIn("menu=", self.inbox_text())
+        self.assertNotIn("menu=", self.report_text())
 
     def test_below_the_threshold_nothing_is_flagged(self):
         self.start({"%1": ("ci", PERMISSION)})
         self.run_once()
         self.age(9)
         self.run_once()
-        self.assertEqual(self.inbox_text(), "")
+        self.assertEqual(self.report_text(), "")
         self.assertIn("0 prompts flagged", self.printed)
         self.write_config(extra="STALL_PROMPT_MINUTES=5\n")
         self.run_once()
@@ -1008,10 +1022,10 @@ class PromptRuns(unittest.TestCase):
         self.run_once()
         self.age(600)
         self.run_once()
-        self.assertEqual(self.inbox_text(), "")
+        self.assertEqual(self.report_text(), "")
         self.assertIn("0 prompts on screen", self.printed)
 
-    def test_one_inbox_entry_per_prompt_and_a_log_only_re_alert_after_the_longer_interval(self):
+    def test_one_report_per_prompt_and_a_log_only_re_alert_after_the_longer_interval(self):
         f = self.start({"%1": ("ci", PERMISSION)})
         self.run_once()
         self.age(11)
@@ -1025,8 +1039,8 @@ class PromptRuns(unittest.TestCase):
         self.age(61, "alerted")  # 121 minutes since the alert
         self.run_once()
         self.assertIn("prompt still on screen ci", self.printed)
-        self.assertIn("(log only; inbox alerted once)", self.printed)
-        self.assertEqual(self.prompt_blocks("ci"), 1)  # no "still waiting" post (one ## entry per state change)
+        self.assertIn("(log only; alerted once)", self.printed)
+        self.assertEqual(self.prompt_blocks("ci"), 1)  # no "still waiting" report (one per state change)
         self.run_once()
         self.assertNotIn("still on screen", self.printed)  # and the log line keeps the interval too
         self.age(121, "alerted")
@@ -1052,7 +1066,7 @@ class PromptRuns(unittest.TestCase):
         self.run_once()
         self.age(11)
         self.run_once()
-        text = self.inbox_text()
+        text = self.report_text()
         self.assertEqual((self.prompt_blocks("trust"), self.prompt_blocks("plan"), self.prompt_blocks("quoted")), (1, 1, 0))
         self.assertIn("kind=folder-trust", text)
         self.assertIn("kind=plan-approval", text)
@@ -1060,7 +1074,7 @@ class PromptRuns(unittest.TestCase):
     def test_malformed_stored_prompts_never_raise_and_are_seen_afresh(self):
         f = self.start({"%1": ("ci", PERMISSION), "%2": ("security", ASK_USER), "%3": ("work", WEEKLY)})
         self.run_once()
-        self.assertEqual(self.inbox_text().count("STALL work"), 1)
+        self.assertEqual(self.report_text().count("STALL work"), 1)
         path = self.tmp / "state.json"
         st = json.loads(path.read_text())
         (k1, good), (k2, _) = sorted(st["prompts"].items())
@@ -1088,7 +1102,7 @@ class PromptRuns(unittest.TestCase):
                 self.assertIn("2 prompts on screen", self.printed)
                 # a bad prompts section costs nothing else: the pane hashes (no rescan) and the reported STALL event
                 self.assertIn("0 rescanned", self.printed)
-                self.assertEqual(self.inbox_text().count("STALL work"), 1)
+                self.assertEqual(self.report_text().count("STALL work"), 1)
                 st = json.loads(path.read_text())
 
     def test_a_malformed_pane_prompt_reading_never_raises(self):
@@ -1108,7 +1122,7 @@ class PromptRuns(unittest.TestCase):
         for v in ("nan", "inf", "ten", "-inf"):
             with self.subTest(v=v):
                 (self.tmp / "state.json").unlink(missing_ok=True)
-                self.inbox.unlink(missing_ok=True)
+                self.reports.clear()
                 self.write_config(extra=f"STALL_PROMPT_MINUTES={v}\nSTALL_PROMPT_REALERT_MINUTES={v}\n")
                 self.start({"%1": ("ci", PERMISSION)})
                 self.assertEqual(self.run_once(), 0)
@@ -1127,7 +1141,7 @@ class PromptRuns(unittest.TestCase):
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertEqual(len(st["panes"]), 2)
         self.assertEqual(st["prompts"], {})
-        self.assertEqual(self.inbox_text().count("STALL work"), 1)  # the STALL report before it still stands
+        self.assertEqual(self.report_text().count("STALL work"), 1)  # the STALL report before it still stands
 
     def test_a_prompt_that_leaves_the_screen_and_comes_back_is_a_new_instance(self):
         f = self.start({"%1": ("ci", PERMISSION)})
@@ -1155,7 +1169,7 @@ class PromptRuns(unittest.TestCase):
         self.assertIn("1 would alert", self.printed)
         self.run_once()
         self.assertNotIn("would alert prompt", self.printed)
-        self.assertFalse(self.inbox.exists())
+        self.assertEqual(self.reports, [])
         self.write_config(apply="1")
         self.run_once()  # apply after shadow still alerts the prompt that is there
         self.assertEqual(self.prompt_blocks("ci"), 1)
@@ -1187,18 +1201,8 @@ class PromptRuns(unittest.TestCase):
         self.start({"%1": ("ci", PERMISSION)})
         self.run_once()
         self.run_once()
-        self.assertEqual(self.inbox_text(), "")
+        self.assertEqual(self.report_text(), "")
         self.assertIn("0 prompts on screen", self.printed)
-
-    def test_a_failed_alert_write_is_retried_next_run(self):
-        self.start({"%1": ("ci", PERMISSION)})
-        self.run_once()
-        self.age(11)
-        with mock.patch.object(stall, "append_inbox", side_effect=OSError("disk")):
-            self.assertEqual(self.run_once(), 1)
-        self.assertIn("prompt alert inbox write failed", self.printed)
-        self.assertEqual(self.run_once(), 0)
-        self.assertEqual(self.prompt_blocks("ci"), 1)
 
 
 class PromptRunsWithProbe(PromptRuns):
@@ -1216,7 +1220,7 @@ class ReaperKeepsStalledSessions(unittest.TestCase):
         import os
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
-        cfg = dict(reaper.DEFAULTS, STALL_MARK_DIR=str(tmp), DONE_INBOX="", PROTECT="")
+        cfg = dict(reaper.DEFAULTS, STALL_MARK_DIR=str(tmp), PROTECT="")
         s = {"tmux": "w", "name": "w", "sid": "abc-123", "status": "idle", "idle_min": 500, "bg_shells": [], "loop": False,
              "crons": 0, "scheduled": False, "asking": False, "last_text": "SESSION-DONE: shipped", "claims": [], "owned": []}
         self.assertEqual(reaper.decide(dict(s), cfg), [])
