@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Removed
+- **cc-reaper no longer writes to Neo's inbox, reads relay requests or nudges sessions (stima-api #7079).** The Grok
+  bot keeps three abilities: it reads the Eng board, talks progress with the founder and opens tmux sessions on the
+  Mac mini. So the sinks and readers that served its dispatch role are gone: `session-reaper.py` drops the DONE
+  header in `~/handoffs/neo-inbox.md` (`DONE_INBOX`, `DONE_INBOX_SHADOW`), the `handoff-pending:relay#N` keep reason
+  and its `relay-requests/` read (`RELAY_DIR`, `RELAY_MAX_AGE_HOURS`), the idle-list inbox post
+  (`IDLE_LIST_INBOX`), the ROUTE/DONE nudges to `ops-dispatch/events.log` (`NUDGE_EVENTS`, `NUDGE_STATE`) and the
+  claim-less inbox DONE release (`NOCLAIM_DONE`): a claim-less session is now closed only by its own `SESSION-DONE:`
+  line. `stall-watch.py` reports `STALL` and `PROMPT-STALL` as log lines (`~/.cc-reaper/logs/stall-watch.log`)
+  instead of inbox blocks (`STALL_INBOX`); marks and the `STALL_PUSH` founder ping are unchanged.
+  `gce-disk-watch.py` logs `GCE-DISK ALERT|STILL|RECOVERED` lines and notifies (`GDW_INBOX`, `GDW_EVENTS_LOG`,
+  `GDW_REALERT_INBOX` removed; a stored `inbox` or `events` pending write is dropped, never sent).
+  `resource-watch.sh` drops the disk pause chain (`CC_RW_PAUSE_EVENTS`, `CC_RW_EVENTS_LOG`, the `DISK-PAUSE` and
+  `DISK-RESUME` events.log lines); the disk flags are still written. A left-over key in an installed conf is
+  ignored. Kept: session reaping by its own evidence, the oracle gate, the never-kill classes, the worktree janitor,
+  the disk watches and the `SESSION-DONE:` line.
+
 ### Added
 - **`gce-disk-watch.py` reads the GCE CI hosts' root disk from the Mac mini and tells a full or unreadable one
   once (EL-T24, shadow by default).** stima-ci-ctl-1's `/` sat at 100% on 2026-10-30 with nothing alerting,

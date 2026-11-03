@@ -464,7 +464,7 @@ Beyond process hygiene, cc-reaper ships three system-level janitors (added after
 
 | Script | Schedule | What it does |
 |---|---|---|
-| `resource-watch.sh` | every 3 min (launchd) | Single-pass snapshot (load / CPU idle / memory / disk) to `~/.cc-reaper/logs/resource-watch.log`; macOS notification when load > 2× cores, disk free < 15%, disk free fell 10 GB or more against the sample from about 30 minutes earlier (`ALERT:disk-drop`), or memory is critically tight. Per-metric 60-min cooldown. Also the disk guard: `ALERT:disk-low` under 60 GB free; under 40 GB the reclaim (`worktree-janitor.sh --scheduled`, then `reclaim-byproducts.sh`) starts detached under a lock, once per 30 minutes, and a round ends it by pid after 90 minutes; under 20 GB `ALERT:disk-emergency` and `~/.cc-reaper/state/disk-emergency`; a write rate over 10 GB/h (last hour) raises `ALERT:disk-rate`, over 20 GB/h also `~/.cc-reaper/state/disk-rate-high`. Each line carries `swap=<gb>GB rate=<gbh>GB/h`. A change between "any of `disk-emergency`, `disk-rate-high`, `swap-high`, `disk-stop` present" and "none" is told once, as `DISK-PAUSE on: ...` or `DISK-RESUME: all clear ...`: logged only (`CC_RW_PAUSE_EVENTS=shadow`, the default), or appended to `~/handoffs/ops-dispatch/events.log` with `CC_RW_PAUSE_EVENTS=on`. `resource-watch-judge.py` re-judges the log on the thresholds the LaunchAgent sets. |
+| `resource-watch.sh` | every 3 min (launchd) | Single-pass snapshot (load / CPU idle / memory / disk) to `~/.cc-reaper/logs/resource-watch.log`; macOS notification when load > 2× cores, disk free < 15%, disk free fell 10 GB or more against the sample from about 30 minutes earlier (`ALERT:disk-drop`), or memory is critically tight. Per-metric 60-min cooldown. Also the disk guard: `ALERT:disk-low` under 60 GB free; under 40 GB the reclaim (`worktree-janitor.sh --scheduled`, then `reclaim-byproducts.sh`) starts detached under a lock, once per 30 minutes, and a round ends it by pid after 90 minutes; under 20 GB `ALERT:disk-emergency` and `~/.cc-reaper/state/disk-emergency`; a write rate over 10 GB/h (last hour) raises `ALERT:disk-rate`, over 20 GB/h also `~/.cc-reaper/state/disk-rate-high`. Each line carries `swap=<gb>GB rate=<gbh>GB/h`. `resource-watch-judge.py` re-judges the log on the thresholds the LaunchAgent sets. |
 | `disk-janitor.sh --check` | hourly (launchd) | **Read-only**: disk free % + Time Machine local-snapshot pin detection (snapshots holding freed space hostage after big deletes), plus a **report** of stale scratch checkouts under `/private/tmp` — directories nothing has open, holding no git repository, older than `CC_DJ_TMP_AGE_DAYS` and over `CC_DJ_TMP_MIN_MB`. It names them and never removes them: `/private/tmp` is world-writable and age plus size does not establish that something is abandoned. It also runs the [growth watch](#growth-watch). Below `CC_DJ_ACT_FREE_GB` (30) free it **acts**, at most once per `CC_DJ_ACT_COOLDOWN_SECS` (3h) under a lock: the skills hook's go cache pressure trim (`reclaim-byproducts.sh --go-cache`), then `worktree-janitor.sh --trim-regenerable --apply` stopped after about `CC_DJ_ACT_TRIM_SECONDS` (900; the janitor is given half of it as its sweep budget, so it yields and keeps its cursors before that kill), and comments the before/after on `CC_DJ_ALERT_ISSUE` (`owner/repo#N`) when set. `CC_DJ_ACT_FREE_GB=off` turns that off. |
 | `disk-janitor.sh --clean` | Sunday 04:00 (launchd) | Cleans **rebuildable-only** targets: go build cache entries unused for `CC_DJ_GO_CACHE_TRIM_DAYS` (3) days - never the whole cache, nothing while a go build or test runs, and `off` where another reclaimer owns that cache - plus yarn / pip / brew / bun caches, the npm content cache (`npm cache clean --force`; a counted `SKIP` while an npm install, `ci`, `update` or `add` (or an alias) runs, while any process holds a file open under `~/.npm/_cacache`, or when the open-file listing fails; `CC_DJ_NPM_CACHE=off` turns it off), `~/.npm/_npx` installs unmodified for `CC_DJ_NPX_TRIM_DAYS` (14) days that no running process's command line, working directory or open file is inside, each rechecked just before removal and renamed to a tombstone first, and a tombstone a killed run left is removed by the next clean (nothing when a process or open-file listing fails; `off` turns it off), the Go module cache via `go clean -modcache` only below `CC_DJ_DISK_MIN_PCT` free and never while a go build, `go mod` / `get` / `list` / `work`, `gopls` or toolchain process runs (`CC_DJ_GO_MODCACHE=off` turns it off), Spotify / ShipIt / CoreSimulator caches, a **report** of docker dangling images and of unreferenced volumes with docker-generated-looking names, which are never deleted, TM snapshot thinning (dated `com.apple.TimeMachine.*` only, only when disk is below threshold). When the disk is below `CC_DJ_DISK_MIN_PCT`, it also delegates worktree-preserving cache trimming to `worktree-janitor.sh --trim-regenerable --apply`; holder, active-session, recent-claim and credential checks remain in that janitor. Tools are resolved from a known directory list, not the caller's `PATH`, because launchd supplies neither Homebrew nor Docker. Docker builder cache unused for at least 168 hours is pruned with `docker builder prune --force --filter until=168h`; images, containers and volumes are never removed. |
 | `worktree-janitor.sh` | every 6 hours by default, Claude/Codex SessionEnd, or manual | Inventories ordinary source roots plus `~/.claude/worktrees` and `~/.codex/worktrees`, deduplicated by git common directory. A worktree is REMOVABLE only when **all** checks succeed: only regenerable content remains; no process has a cwd or open file there; no verified-live Claude/Codex session claims it by cwd or structured tool call; no mapped harness activity falls within the **48-hour recent-session lease**; its work landed on the freshly fetched base by ancestry, content, or exact-head merged PR; it has been untouched for **48 hours**; and it is neither locked nor carrying a populated submodule. The same activity, content, HEAD, idle and git-state gates are repeated immediately before removal. Direct invocation is dry-run unless `--apply`; the installed policy separately opts SessionEnd and the scheduled run into apply. `--trim-regenerable` is a narrower pressure pass: it removes only ignored built-in cache directories from an unheld, unclaimed worktree and keeps the branch and worktree. It is report-only without `--apply`, and rechecks holders and claims before each directory. `--claims [id\|path]` exposes live and recent claims read-only; `--landed PATH` exposes the shared landed proof. The installer boots out and archives the legacy Claude worktree LaunchAgent so two destructive policies cannot race. Branches are never deleted and removal never uses `--force`. Policy lives in `~/.cc-reaper/worktree-janitor.conf`, not Claude or Codex settings. See [the reclamation method](docs/worktree-reclamation.md). |
@@ -813,13 +813,6 @@ the deployed config sets `APPLY=1`.**
 - **Never kill:** `CC_NEVER_KILL_PIDS` (environment, else the config; default `70987 4565`). A session
   whose pane tree (the pane's process, everything below it, and claude's own descendants) holds one is
   kept, and reap and the recovery of an `exiting` record re-check it before typing or killing.
-- **Claim-less inbox DONE (`NOCLAIM_DONE`, default `shadow`):** a session with no claim whose newest
-  header in `DONE_INBOX` (else `DONE_INBOX_SHADOW`) is `DONE`, at least `IDLE_MINUTES` old and not older
-  than its newest prompt, with no child process, background shell, loop, schedule, uncommitted or
-  unpushed work in an owned worktree or its cwd, no issue its text names that the oracle says it claims,
-  and not `NEVER_CLOSE`, is reported `would-close: no claim, inbox <KEY> DONE (shadow)`. `apply` counts
-  it as done (every other gate still applies); `off` drops it. A `SESSION-DONE:` line already closes a
-  claim-less session.
 - **Done** means the latest assistant text has a `SESSION-DONE: <summary>` line or says the topic
   is finished, or every issue the session claimed is closed. Claims come from worktrees whose
   `claude-task-worktree` marker names the session; the issue number is read from the branch.
@@ -856,7 +849,7 @@ each once, and marks them so the reaper keeps them. It runs every 2 minutes from
 `com.cc-reaper.stall-watch`, calls no model, and **only prints what it would report until the deployed
 config sets `STALL_APPLY=1`**. **It never types into a pane** (stima-api #5212): its only tmux calls are
 `display` and `capture-pane`, and `tmux_ro` raises on any other subcommand. Re-enabling Remote Control is
-a person's or Neo's step.
+a person's step.
 
 - **Detect:** each live interactive session's screen is hashed (with the cursor) and re-scanned only
   when the hash changed. Fingerprints: `weekly-limit` (`hit your weekly limit`), `remote-disconnected`
@@ -866,10 +859,9 @@ a person's or Neo's step.
   quoted text, `Read 429 lines`, `#429 merged` or `rate_limit.go` are not stalls; `interrupted-idle` (`[Request interrupted by
   user]` or `Interrupted · What should Claude do instead?` just above an empty prompt; it counts only with
   `Login successful` on that screen or `STALL_FLEET_MIN` panes at once, since one Esc is not a switch).
-- **Report:** once per event, keyed by (pane, fingerprint, session id), as a block under
-  `## EL-T801-CI-HARDEN STALL <session-name>` in `STALL_INBOX` with
-  `` `claude --resume <id> --remote-control <name>` ``. An event ends when its fingerprint leaves the
-  screen. Written by Python, never a shell heredoc.
+- **Report:** once per event, keyed by (pane, fingerprint, session id), as one `STALL <session-name> ...` line in
+  the log (`~/.cc-reaper/logs/stall-watch.log`) with `` `claude --resume <id> --remote-control <name>` ``.
+  Nothing is written to any inbox. An event ends when its fingerprint leaves the screen.
 - **Mark:** only with `STALL_APPLY=1` (a mark holds the reaper, so shadow never writes one):
   `STALL_MARK_DIR/<session id>.json`, refreshed each run; `session-reaper.py` then keeps the session with
   `stalled:<fingerprint>`. A mark expires `STALL_MARK_HOURS` (12) after its last refresh and
@@ -877,7 +869,7 @@ a person's or Neo's step.
   only files with the mark schema, and a shared directory (`~/.claude/sessions`, `~/.cc-reaper`, ...) is
   refused as `STALL_MARK_DIR`. A failed tmux read (timeout, empty capture) or a missing `ps` table keeps
   the previous pane, event and mark and reports nothing.
-- **Prompt left unanswered (EL-T921):** a permission prompt (`Do you want to proceed?` with `1. Yes` ...
+- **Prompt left unanswered:** a permission prompt (`Do you want to proceed?` with `1. Yes` ...
   `N. No`), plan approval (`Would you like to proceed?` ... `No, keep planning`), folder trust
   (`1. Yes, I trust this folder` / `2. No, exit`, or the older `Do you trust the files in this folder?`) or
   an AskUserQuestion menu (`☐ <header>`, numbered options, `Enter to select · ↑/↓ to navigate`) that is
@@ -885,16 +877,15 @@ a person's or Neo's step.
   (session id, prompt fingerprint); the fingerprint is the prompt's title, question and first option label,
   without the option cursor, preview box or wrap width. Past `STALL_PROMPT_MINUTES` (10; 0 is off) it is
   flagged with its age: with `STALL_APPLY=1`, or `STALL_PROMPT_APPLY=1` alone (marks and STALL entries stay
-  shadow; #128), one `## EL-T921-PROMPT-STALL <session-name>` block in `STALL_INBOX` (numbers, kind and session
+  shadow; #128), one `PROMPT-STALL <session-name> ...` log line (numbers, kind and session
   name; an AskUserQuestion also its question as `menu="…"`: one line, 80 characters, no quote, backtick, control or
   format character, key-like text `[redacted]`; other kinds carry no screen text), in shadow one `would alert prompt`
   line, once per prompt instance. While the same prompt stays it gets a `still on screen` log line at most
-  every `STALL_PROMPT_REALERT_MINUTES` (120), never a second inbox entry (one entry per state change). A
+  every `STALL_PROMPT_REALERT_MINUTES` (120), never a second alert. A
   prompt that leaves the screen is forgotten; a malformed stored entry is dropped and seen afresh. With
   `STALL_PUSH=1` (#130) a new prompt alert also pings `STALL_PUSH_KEY` (the Better Stack founder-decision heartbeat,
   read from `STALL_PUSH_ENV`) at `/fail` once, which pages the founder's device: numbers, kind and session name only,
-  the URL never printed; a failed push is a failure line and is retried once a tick, up to 5 ticks, whether or not
-  the inbox write worked. release-owner-driver's 5-minute success ping on the same heartbeat
+  the URL never printed; a failed push is a failure line and is retried once a tick, up to 5 ticks. release-owner-driver's 5-minute success ping on the same heartbeat
   resolves that incident after the page; a dedicated heartbeat removes that. The prompt is never answered.
 
 ```bash
@@ -935,10 +926,9 @@ model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper
 - **Tell:** once per host per state change; while the state stays, again at most every
   `GDW_REALERT_MINUTES` (120); one `recovered` line when it clears (only for a state that was told).
   Shadow (`GDW_APPLY=0`): a `would alert <host> <kind> used=..% avail=..GB inodes=..%` line in
-  `~/.cc-reaper/logs/gce-disk-watch.log`, nothing else. Apply: one `## EL-T24-GCE-DISK <host>` block
-  in `GDW_INBOX` (state changes only, unless `GDW_REALERT_INBOX=1`), one
-  `<ts> P0 GCE-DISK <host> <kind> used=.. avail=.. inodes=..` line (`INFO ... recovered` on recovery)
-  in `GDW_EVENTS_LOG`, and a macOS notification. Every write is to a local path. A write that fails
+  `~/.cc-reaper/logs/gce-disk-watch.log`, nothing else. Apply: one
+  `GCE-DISK ALERT|STILL|RECOVERED host=<host> kind=<kind> used=.. avail=.. inodes=..` log line and a
+  macOS notification (`GDW_NOTIFY=1`); nothing is written to an inbox or an event log. Every write is to a local path. A write that fails
   is logged `ERROR` and stays pending in `~/.cc-reaper/state/gce-disk-watch.json`, so the next run
   retries that channel alone. Shadow and apply keep separate state, so turning apply on tells a
   standing state afresh.
