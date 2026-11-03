@@ -431,7 +431,7 @@ _cc_dj_path_holder() {
 # candidate too, unused or not.
 _cc_dj_act_template_prune() {  # <step_before> [mode] [cap] [days]
   local step_before="$1" days="${4:-$CC_DJ_ACT_TEMPLATES_PRUNE_DAYS}" mode="${2:-$CC_DJ_NEW_STEPS_MODE}" cap="${3:-}"
-  local script store slog runid d name bytes verdict reason why
+  local script store slog runid d name bytes verdict reason why tomb
   local cand=0 removed=0 kept=0 would=0 would_bytes=0 removed_bytes=0
   _CC_DJ_STEP_LINES=""
   [ "$days" = off ] && return 0
@@ -478,8 +478,27 @@ _cc_dj_act_template_prune() {  # <step_before> [mode] [cap] [days]
       elif [ "$_CC_DJ_HOLDER" = unknown ]; then verdict=keep; reason=holder-unknown
       elif [ "$mode" = spotcheck ]; then verdict=would-remove
       elif [ -d "$d" ] && [ ! -L "$d" ]; then
-        rm -rf -- "$d" 2>/dev/null
-        if [ -e "$d" ]; then verdict=keep; reason=remove-failed; else verdict=removed; fi
+        # Out of apply's sight first, as the owner's own withdraw does (node-modules-template.sh
+        # cmd_apply): a concurrent apply sees the template or nothing, never half of one. The
+        # dot name keeps it off this list and off apply's. Then lsof again, on the renamed tree:
+        # an apply that began cloning before the rename still holds it, and gets it back.
+        tomb="$store/.pruning.$name.$$"
+        if ! mv -- "$d" "$tomb" 2>/dev/null; then
+          verdict=keep; reason=rename-failed
+        else
+          _cc_dj_path_holder "$tomb"
+          if [ "$_CC_DJ_HOLDER" != none ]; then
+            if [ ! -e "$d" ] && mv -- "$tomb" "$d" 2>/dev/null; then
+              verdict=keep; reason="$_CC_DJ_HOLDER-after-rename"
+            else
+              verdict=keep; reason=restore-failed
+              _cc_dj_log "ERROR template prune: $d was $_CC_DJ_HOLDER after its rename and could not be put back; it is at $tomb"
+            fi
+          else
+            rm -rf -- "$tomb" 2>/dev/null
+            if [ -e "$tomb" ]; then verdict=keep; reason=remove-failed; else verdict=removed; fi
+          fi
+        fi
       else
         verdict=keep; reason=changed-underfoot
       fi
@@ -506,7 +525,8 @@ _cc_dj_act_template_prune() {  # <step_before> [mode] [cap] [days]
 # The template prune's candidates, NUL-terminated, in name order: direct children of store $1
 # that are plain directories (a symlink is not -type d), not dot-prefixed (.adopting.* is an
 # adopt in progress), and unused $2 days; with a cap $3, also every one past the newest $3 by
-# mtime. Ages come from perl's lstat, not stat(1).
+# mtime that has been unused a day or more (one applied today stays, cap or not). Ages come from
+# perl's lstat, not stat(1).
 _cc_dj_template_candidates() {  # <store> <days> [cap]
   if [ -z "${3:-}" ]; then
     find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -mtime -"$2" -print0 2>/dev/null | sort -z
@@ -516,7 +536,8 @@ _cc_dj_template_candidates() {  # <store> <days> [cap]
     perl -0 -sne 'chomp; push @d, $_ if defined((lstat $_)[9]);
       END { my $now = time; my $i = 0;
             for (sort { (lstat $b)[9] <=> (lstat $a)[9] or $a cmp $b } @d) {
-              print "$_\0" if $i++ >= $cap || $now - (lstat $_)[9] >= $days * 86400 } }' -- -days="$2" -cap="$3" |
+              my $age = $now - (lstat $_)[9];
+              print "$_\0" if ($i++ >= $cap && $age >= 86400) || $age >= $days * 86400 } }' -- -days="$2" -cap="$3" |
     sort -z
 }
 
@@ -952,18 +973,8 @@ _cc_dj_check() {
     done <<< "$snapshots"
   fi
 
-  # Reported on every check, not only below threshold. This is the one target whose
-  # contents are somebody's abandoned work rather than a rebuildable cache, so the
-  # operator gets to see it accumulating well before free space forces the question.
-  _cc_dj_report_stale_tmp_dirs
-  # Hourly, because a headless-Chrome script can leave 10 GB of profiles in two days and
-  # the weekly clean is too late for it (2026-09-30). Each item is proved abandoned first.
-  _cc_dj_host_temp_reap
-  _cc_dj_chrome_clones clean
-  _cc_dj_builder_prune_daily
-  _cc_dj_template_prune_daily
-  _cc_dj_orbstack_report
-
+  # Told before the hourly reclaims below, not after: host temp alone may spend its 600 s
+  # tmpdir budget (stima-api#7106), and a filling disk must not wait that long for its notice.
   if [ "$free_pct" -lt "$CC_DJ_DISK_MIN_PCT" ]; then
     _cc_dj_log "check: BELOW threshold — free=${free_pct}% < ${CC_DJ_DISK_MIN_PCT}%"
     if [ -n "$snapshots" ]; then
@@ -979,6 +990,19 @@ _cc_dj_check() {
   else
     _cc_dj_log "check: OK — free=${free_pct}% >= ${CC_DJ_DISK_MIN_PCT}%"
   fi
+
+  # Reported on every check, not only below threshold. This is the one target whose
+  # contents are somebody's abandoned work rather than a rebuildable cache, so the
+  # operator gets to see it accumulating well before free space forces the question.
+  _cc_dj_report_stale_tmp_dirs
+  # Hourly, because a headless-Chrome script can leave 10 GB of profiles in two days and
+  # the weekly clean is too late for it (2026-09-30). Each item is proved abandoned first.
+  _cc_dj_host_temp_reap
+  _cc_dj_chrome_clones clean
+  _cc_dj_builder_prune_daily
+  _cc_dj_template_prune_daily
+  _cc_dj_orbstack_report
+
   # By GB, apart from the % notice above: 30 GB is 6% of this host's volume.
   _cc_dj_low_disk_act "$(_cc_dj_free_kb)"
   # The go build cache, whatever the free space: over its size ceiling, or under the soft floor.

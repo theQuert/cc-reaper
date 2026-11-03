@@ -385,6 +385,8 @@ if [ -n "${RACE_FILE:-}" ] && [ "$last" = "$RACE_FILE" ] && [ ! -e "$RACE_FILE.r
   case "$RACE_MODE" in
     gone) rm -f "$RACE_FILE"; kill "$RACE_PID" 2>/dev/null; wait "$RACE_PID" 2>/dev/null; sleep 0.3
       echo "jq: error: Could not open file $RACE_FILE: No such file or directory" >&2; exit 2 ;;
+    gonealive) rm -f "$RACE_FILE"
+      echo "jq: error: Could not open file $RACE_FILE: No such file or directory" >&2; exit 2 ;;
     whole) printf '%s\n' "$RACE_WHOLE" > "$RACE_FILE"; echo "jq: parse error: Unfinished string" >&2; exit 5 ;;
   esac
 fi
@@ -427,6 +429,29 @@ check "race whole: the run exits 0" test "$race_rc" -eq 0
 # as any readable record whose command line lacks its id: what matters is that it was read.
 check "race whole: H is removable" judged "$T/race-whole.txt" H REMOVABLE
 kill "$race_pid2" 2>/dev/null; rm -f "$SESSIONS/$race_pid2.json"
+
+# Review P3-2: the record is gone but its process lives on. Nothing proves only an exiting
+# session removes its record, so it claims the tree its process stands in (lsof's cwd for it).
+python3 -c 'import time; time.sleep(600)' </dev/null >/dev/null 2>&1 &
+race_pid3=$!
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s"}\n' "$race_pid3" "$SID_R" "$T/wt-G" > "$SESSIONS/$race_pid3.json"
+cat > "$STUBS/lsof" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" -p $PIDCWD_PID -d cwd "*) printf 'p%s\nn%s\n' "$PIDCWD_PID" "$PIDCWD_DIR" ;;
+  *" -d cwd "*) cat "$LSOF_CWD_FILE" ;;
+  *) cat "$LSOF_OPEN_FILE" ;;
+esac
+STUB
+chmod +x "$STUBS/lsof"
+RACE_FILE="$SESSIONS/$race_pid3.json" RACE_MODE=gonealive PIDCWD_PID="$race_pid3" PIDCWD_DIR="$T/wt-G" \
+  CC_WJ_NEW_RULES_MODE=auto wj > "$T/race-gonealive.txt"
+check "race gone, alive: the stub removed the record mid-read" test -e "$SESSIONS/$race_pid3.json.raced"
+check "race gone, alive: G, where its process stands, is kept" judged "$T/race-gonealive.txt" G "KEEP(active-session)"
+check "race gone, alive: H, which nothing names, is removable" judged "$T/race-gonealive.txt" H REMOVABLE
+check "race gone, alive: it says what the record claims" \
+  grep -qF "record $race_pid3.json could not be parsed; it claims only cwd $T/wt-G" "$T/race-gonealive.txt"
+kill "$race_pid3" 2>/dev/null
 
 if [ "$failures" -eq 0 ]; then echo "# all passed"; else echo "# $failures failed"; fi
 [ "$failures" -eq 0 ]

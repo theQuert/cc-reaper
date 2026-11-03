@@ -1212,8 +1212,9 @@ PY
 
 # The row of live Claude record $1, named for pid $2, as the scan reads it: pid, session id and
 # cwd, tab-separated. Asked up to CC_WJ_RECORD_READS times (3), CC_WJ_RECORD_RETRY_SECONDS (0.2)
-# apart. Status 0 with the row; 3 when the record is gone, or its process has exited, by the last
-# read; 1 when it is there, its process alive, and it still cannot be parsed.
+# apart. Status 0 with the row; 3 when its process has exited by the last read; 1 when its
+# process is alive and the record still cannot be parsed, or is gone: nothing proves a live
+# session removes its record only as it exits, so a live one claims the tree it stands in.
 #
 # Why (stima-api#7106): the janitor log's "could not be parsed" records (54 from 10-26 to 11-04,
 # 47627, 72744, 86655 and 50110 among them) each had a cwd from the live process and none from
@@ -1231,7 +1232,7 @@ _cc_wj_claude_record_row() { # <record file> <pid>
     row="$(jq -er '[((.pid // "") | tostring), (.sessionId // ""), (.cwd // "")] | @tsv' "$f" 2>/dev/null)" &&
       { printf '%s\n' "$row"; return 0; }
     if [ "$i" -ge "$reads" ]; then
-      { [ -e "$f" ] && kill -0 "$pid" 2>/dev/null; } || return 3
+      kill -0 "$pid" 2>/dev/null || return 3
       return 1
     fi
     i=$((i + 1))
@@ -1305,7 +1306,7 @@ _cc_wj_scan_claude_sessions() {
     }
     # Read as jq reads it, again a moment later when it fails (_cc_wj_claude_record_row): the
     # failures were records a session removes as it exits, read between `find` and `jq`.
-    # One gone with its process is no claim. One that still cannot be parsed, its process alive,
+    # One whose process has ended is no claim. One that still cannot be parsed or is gone, its process alive,
     # claims only the tree its process stands in, and the trees its transcript names
     # (_cc_wj_unparsed_claim); with no cwd to stand on, it keeps the worktrees it could be about,
     # as before: the cwd strings, the transcript of the session id its raw text carries, and with
@@ -3191,6 +3192,12 @@ _cc_wj_new_rules_mode() {
   esac
 }
 
+# A spot-checked new rule's line for the inventory: worktree $1, rule $2, entry $3.
+_cc_wj_newrule_note() {
+  [ -z "${_CC_WJ_NEWRULE_LOG:-}" ] ||
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$_CC_WJ_NEWRULE_LOG" 2>/dev/null || true
+}
+
 # The rule that discounts ignored entry $2 (porcelain path, no trailing slash) of worktree $1,
 # printed, or status 1. Asked only after every existing discount has declined the entry.
 _cc_wj_new_rule() {
@@ -3359,8 +3366,13 @@ _cc_wj_pins() {
           3:*) _cc_wj_pin '!!' "$rest/ (declared, but an archive: pattern may name a path inside it)" ;;
           *)
             if _cc_wj_build_output "$wt" "$rest" dir; then
-              _cc_wj_find_credential "$wt/$rest" 2 &&
+              if _cc_wj_find_credential "$wt/$rest" 2; then
                 _cc_wj_pin '!!' "$rest/ (build output, but holds a credential-shaped file)"
+              elif [ "$(_cc_wj_new_rules_mode)" != auto ]; then
+                # A new rule (stima-api#7106): spot-checked like the others until auto.
+                _cc_wj_newrule_note "$wt" build-output "$rest/"
+                _cc_wj_pin '!!' "$rest/"
+              fi
             else
               _cc_wj_pin '!!' "$rest/"
             fi ;;
@@ -3408,12 +3420,14 @@ _cc_wj_pins() {
             fi
             continue ;;
         esac
-        _cc_wj_build_output "$wt" "$rest" file && continue
-        if nr="$(_cc_wj_new_rule "$wt" "$rest")"; then
+        nr=""
+        if _cc_wj_build_output "$wt" "$rest" file; then nr=build-output
+        else nr="$(_cc_wj_new_rule "$wt" "$rest")" || nr=""
+        fi
+        if [ -n "$nr" ]; then
           [ "$(_cc_wj_new_rules_mode)" = auto ] && continue
           # Spot check: still kept, and the inventory is told which rule would discount it.
-          [ -z "${_CC_WJ_NEWRULE_LOG:-}" ] ||
-            printf '%s\t%s\t%s\n' "$wt" "$nr" "$rest" >> "$_CC_WJ_NEWRULE_LOG" 2>/dev/null || true
+          _cc_wj_newrule_note "$wt" "$nr" "$rest"
         fi
         _cc_wj_pin '!!' "$rest"
         ;;

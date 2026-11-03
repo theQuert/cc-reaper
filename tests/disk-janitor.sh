@@ -190,8 +190,9 @@ STUB
 chmod +x "$FAKE_BIN/ps"
 
 # lsof stub: the real lsof unless FAKE_LSOF_FAIL=1, an lsof that can report nothing.
-# FAKE_LSOF_HOLD=<path>: a `+D <path>` walk of exactly that path reports one open file, any
-# other `+D` walk reports nothing (the real lsof exits 1 for that too).
+# FAKE_LSOF_HOLD=<pattern>: a `+D <path>` walk of a path that shell pattern matches (a plain path
+# matches only itself) reports one open file, any other `+D` walk reports nothing (the real lsof
+# exits 1 for that too).
 cat > "$FAKE_BIN/lsof" <<'STUB'
 #!/usr/bin/env bash
 [ "${FAKE_LSOF_FAIL:-0}" = 1 ] && exit 1
@@ -209,7 +210,8 @@ if [ -n "${FAKE_LSOF_HOLD:-}" ]; then
   prev=""
   for a in "$@"; do
     if [ "$prev" = "+D" ]; then
-      if [ "$a" = "$FAKE_LSOF_HOLD" ]; then printf 'p4242\nn%s/node_modules/held-file\n' "$a"; exit 0; fi
+      # shellcheck disable=SC2254
+      case "$a" in $FAKE_LSOF_HOLD) printf 'p4242\nn%s/node_modules/held-file\n' "$a"; exit 0 ;; esac
       exit 1
     fi
     prev="$a"
@@ -715,6 +717,19 @@ _mk_daily; FAKE_LSOF_HOLD="$TPL/Darwin-arm64-t2" _daily_run
 expect_yes "daily: a held template is kept" test -d "$TPL/Darwin-arm64-t2"
 expect_yes "  and the log says why" grep -Eq 'path=.*t2 .*verdict=keep reason=held' "$SPOT"
 expect_no "  and the others still go" test -d "$TPL/Darwin-arm64-t1"
+# Review P2-2: a template is renamed out of apply's sight before it is deleted, and an apply that
+# began before the rename (it holds the renamed tree) gets it back whole.
+_mk_daily; : > "$MV_CAPTURE"; _daily_run
+expect_yes "daily: a template is renamed to a dot name before it is deleted" grep -q "Darwin-arm64-t1 $TPL/.pruning.Darwin-arm64-t1\." "$MV_CAPTURE"
+expect_no  "  and no renamed tree is left behind" bash -c 'ls -A "$1" | grep -q "^\.pruning\."' _ "$TPL"
+_mk_daily; FAKE_LSOF_HOLD="$TPL/.pruning.Darwin-arm64-t2.*" _daily_run
+expect_yes "daily: a template an apply holds after the rename is put back whole" test -f "$TPL/Darwin-arm64-t2/node_modules/f"
+expect_no  "  and nothing is left under the dot name" bash -c 'ls -A "$1" | grep -q "^\.pruning\."' _ "$TPL"
+expect_yes "  and the log says why" grep -Eq 'path=.*t2 .*verdict=keep reason=held-after-rename' "$SPOT"
+expect_no  "  and the others still go" test -d "$TPL/Darwin-arm64-t1"
+_mk_daily; CC_DJ_TEMPLATE_CAP=1 _daily_run
+expect_yes "daily: past the cap, a template used within the day stays (t5, 3 h)" test -d "$TPL/Darwin-arm64-t5"
+expect_no  "  and one unused two days goes (t3)" test -d "$TPL/Darwin-arm64-t3"
 _mk_daily; FAKE_LSOF_FAIL=1 _daily_run
 expect_yes "daily: an lsof that reports nothing keeps every candidate" \
   bash -c 'for n in t1 t2 t7; do [ -d "$1/Darwin-arm64-$n" ] || exit 1; done' _ "$TPL"

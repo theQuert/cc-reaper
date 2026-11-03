@@ -1092,6 +1092,8 @@ echo x > "$B_PRIMARY/plain/README"
 printf 'dist/\nbuild/\n__pycache__/\n/gosvc/app\n/gosvc/bin/\n' > "$B_PRIMARY/.gitignore"
 bgit add -A; bgit commit -qm base; bgit push -q origin main
 b_wt() { bgit worktree add -q "$B_ROOT/$1" -b "$1" origin/main 2>/dev/null; echo "$B_ROOT/$1"; }
+# A new rule: spot-checked by default (review P3-4), so the cases below decide with it on.
+export CC_WJ_NEW_RULES_MODE=auto
 
 W=$(b_wt wt-dist); mkdir -p "$W/web/dist"; echo 1 > "$W/web/dist/app.js"
 expect_yes "an ignored dist/ beside a package.json is discounted" undiscounted_is "$W" 0
@@ -1115,6 +1117,17 @@ W=$(b_wt wt-gobinmixed); mkdir -p "$W/gosvc/bin"; cp /bin/ls "$W/gosvc/bin/a"; e
 expect_yes "an ignored bin/ holding anything but executables keeps the worktree" undiscounted_is "$W" 1
 W=$(b_wt wt-gobinsub); mkdir -p "$W/gosvc/bin/sub"; cp /bin/ls "$W/gosvc/bin/sub/a"
 expect_yes "an ignored bin/ holding a directory keeps the worktree" undiscounted_is "$W" 1
+unset CC_WJ_NEW_RULES_MODE
+W="$B_ROOT/wt-dist"
+expect_yes "spotcheck (the default): build output still keeps the worktree" undiscounted_is "$W" 1
+newrule_logged() {
+  local log="$TMPDIR_ROOT/newrule-$2"; : > "$log"
+  _CC_WJ_NEWRULE_LOG="$log" _cc_wj_pins "$1" >/dev/null
+  grep -qxF "$1"$'\t'"build-output"$'\t'"$3" "$log"
+}
+expect_yes "  and the inventory is told the rule that would discount it" newrule_logged "$W" dist "web/dist/"
+expect_yes "spotcheck: an executable beside a go.mod keeps it too" undiscounted_is "$B_ROOT/wt-gobin" 1
+expect_yes "  and is logged by the same rule" newrule_logged "$B_ROOT/wt-gobin" gobin "gosvc/app"
 
 # ─── Bounded commands ─────────────────────────────────────────────────────────
 
