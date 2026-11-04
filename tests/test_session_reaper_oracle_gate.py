@@ -307,5 +307,25 @@ class Report(unittest.TestCase):
         self.assertEqual(reaper.summary(session(last_text="SESSION-DONE: shipped", oracle_not_mine={"2": "x"})), "shipped")
 
 
+class IssueRe(unittest.TestCase):
+    """The branch shapes that name an issue (the reaper's only claim source) and the ones that do not."""
+
+    def test_the_new_task_worktree_shape_names_its_issue(self):
+        # new-task-worktree.sh makes `claude-<N>-<slug>`; before stima-api #7001 the reaper read it as no-issue-branch,
+        # so such a session carried no claim, was always kept, and never fed the ORACLE_NOT_MINE shadow counter.
+        for branch, n in (("claude-7001-p0sla-marker", "7001"), ("claude/7001-selfclose-reaper", "7001"),
+                          ("fix-6374-x402-exposure-deploy-guard", "6374"), ("fix/6374-x402", "6374"),
+                          ("3302-x1-actuator-pool", "3302"), ("codex/5949", "5949")):
+            m = reaper.ISSUE_RE.search(branch)
+            self.assertIsNotNone(m, branch)
+            self.assertEqual(m.group(1), n, branch)
+
+    def test_a_number_deeper_in_the_name_is_no_issue(self):
+        for branch in ("canary-main-1031", "chore/uiux-sync-1026", "uiux-accept-1029", "claude/prompt-size-403-4389",
+                       "claude-acceptance-bc-20261103", "release-20261104", "v2-100-rc",
+                       "3309622ee115ae978d3b2517e8223e88307fe221"):
+            self.assertIsNone(reaper.ISSUE_RE.search(branch), branch)
+
+
 if __name__ == "__main__":
     unittest.main()

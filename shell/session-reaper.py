@@ -132,9 +132,11 @@ BLOCKED_RE = re.compile(r"BLOCKED:#(\d{3,6})")
 NAMED_RE = re.compile(r"(?<![\w/])#(\d{3,6})\b")
 SOFT_KEEP = ("claim-unknown", "waiting")  # `waiting-keyword` also starts with `waiting`
 ISSUE_FALLBACKS = 6  # single `gh issue view` calls a run may make after a batch failed
-# The number starts the branch or follows a `/`. A hyphen does not start it (stima-api #7061 review): `canary-main-1031`,
-# `chore/uiux-sync-1026` and `uiux-accept-1029` name no issue, and `claude/prompt-size-403-4389` is not #403.
-ISSUE_RE = re.compile(r"(?:^|/)(\d{3,6})(?:-|$)")
+# The number starts the branch, follows a `/`, or follows the branch's one leading word (`claude-7001-p0sla-marker`, the
+# shape new-task-worktree.sh makes; stima-api #7001). A hyphen deeper in the name does not start it (stima-api #7061
+# review): `canary-main-1031`, `chore/uiux-sync-1026` and `uiux-accept-1029` name no issue, and `claude/prompt-size-403-4389`
+# is not #403.
+ISSUE_RE = re.compile(r"(?:^|/|^[a-z]+-)(\d{3,6})(?:-|$)")
 PATH_RE = re.compile(r"(?:~|/)[\w./@+-]+")
 # Keep reasons added after the first 48 h of live reaping: a row kept only by these is one the
 # earlier gates would have reaped, which is what the report-only comparison looks for.
