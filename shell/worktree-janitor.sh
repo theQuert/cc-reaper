@@ -1210,10 +1210,81 @@ raise SystemExit(1)
 PY
 }
 
+# The row of live Claude record $1, named for pid $2, as the scan reads it: pid, session id and
+# cwd, tab-separated. Asked up to CC_WJ_RECORD_READS times (3), CC_WJ_RECORD_RETRY_SECONDS (0.2)
+# apart. Status 0 with the row; 3 when its process has exited by the last read; 1 when its
+# process is alive and the record still cannot be parsed, or is gone: nothing proves a live
+# session removes its record only as it exits, so a live one claims the tree it stands in.
+#
+# Why (stima-api#7106): the janitor log's "could not be parsed" records (54 from 10-26 to 11-04,
+# 47627, 72744, 86655 and 50110 among them) each had a cwd from the live process and none from
+# the record's text, so the file was empty or gone when it was read. A poll of ~/.claude/sessions
+# with this jq caught the cause: jq exit 2, `Could not open file`, the record removed between the
+# listing and the read by a session that was exiting. Every record that stayed parsed. `jq` is
+# /usr/bin/jq, on launchd's PATH too, and `-e` cannot fail on an @tsv string.
+_cc_wj_claude_record_row() { # <record file> <pid>
+  local f="$1" pid="$2" reads retry i=1 row
+  reads="${CC_WJ_RECORD_READS:-3}"
+  case "$reads" in ''|*[!0-9]*|0) reads=3 ;; esac
+  retry="${CC_WJ_RECORD_RETRY_SECONDS:-0.2}"
+  case "$retry" in ''|*[!0-9.]*|.*|*.*.*) retry=0.2 ;; esac
+  while :; do
+    row="$(jq -er '[((.pid // "") | tostring), (.sessionId // ""), (.cwd // "")] | @tsv' "$f" 2>/dev/null)" &&
+      { printf '%s\n' "$row"; return 0; }
+    if [ "$i" -ge "$reads" ]; then
+      kill -0 "$pid" 2>/dev/null || return 3
+      return 1
+    fi
+    i=$((i + 1))
+    sleep "$retry" 2>/dev/null || sleep 1
+  done
+}
+
+# A live record that still cannot be parsed claims the tree its process stands in - the cwd lsof
+# reports for pid $2, and any cwd string its raw text carries - and the transcript of the session
+# id its raw text or command line carries, searched as a readable record's is. Not every tree: a
+# parsed record with that cwd and transcript claims no more (stima-api#7106). Status 1, and nothing
+# claimed, when no cwd can be found: the caller keeps the old unknown, which may keep every tree.
+# Logged once per record per run.
+_CC_WJ_UNPARSED_NOTED=""
+_cc_wj_unparsed_claim() { # <record file> <pid> <projects dir>
+  local f="$1" pid="$2" projects="$3" c phys sid found t n=0 cwds="" claimed=""
+  for c in "$(_cc_wj_pid_cwd "$pid")" "$(_cc_wj_raw_cwd "$f")"; do
+    case "$c" in /|''|*$'\t'*|*$'\n'*) continue ;; /*) ;; *) continue ;; esac
+    c="${c%/}"
+    case $'\n'"$cwds" in *$'\n'"$c"$'\n'*) continue ;; esac
+    cwds="$cwds$c"$'\n'
+    _cc_wj_active_add_claim Claude "$c" "unparsed:${f##*/}"
+    # Resolved as a readable record's cwd is, so a symlinked spelling still names the tree.
+    phys="$(_cc_wj_unknown_phys "$c")" && [ -n "$phys" ] && [ "$phys" != "$c" ] &&
+      _cc_wj_active_add_claim Claude "$phys" "unparsed:${f##*/}"
+    claimed="${claimed:+$claimed }$c"
+  done
+  [ -n "$claimed" ] || return 1
+  if sid="$(_cc_wj_raw_session_id "" "$f" "$pid")" &&
+     found="$(_cc_wj_with_timeout 15 find "$projects" -type f -name "$sid.jsonl" -print 2>/dev/null)"; then
+    while IFS= read -r t; do
+      case "$t" in ''|*$'\t'*) continue ;; esac
+      _cc_wj_active_add_transcript Claude "$sid" "$t"; n=$((n + 1))
+    done <<UNPARSED_TRANSCRIPTS
+$found
+UNPARSED_TRANSCRIPTS
+  fi
+  case $'\n'"$_CC_WJ_UNPARSED_NOTED" in
+    *$'\n'"${f##*/}"$'\n'*) ;;
+    *)
+      _CC_WJ_UNPARSED_NOTED="${_CC_WJ_UNPARSED_NOTED}${f##*/}"$'\n'
+      _cc_wj_log_write "live Claude session record ${f##*/} could not be parsed; it claims only cwd $claimed and $n transcript(s)"
+      echo "worktree-janitor: live Claude session record ${f##*/} could not be parsed; it claims only cwd $claimed and $n transcript(s)" >&2
+      ;;
+  esac
+  return 0
+}
+
 _cc_wj_scan_claude_sessions() {
   local registry="${CC_WJ_CLAUDE_SESSIONS:-$HOME/.claude/sessions}"
   local projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
-  local f files base row pid sid cwd cmd resolved transcripts count transcript sname t
+  local f files base row pid sid cwd cmd resolved transcripts count transcript sname t rr
   local unknown_attrs=()
   [ -e "$registry" ] || return 0
   if [ ! -d "$registry" ] || [ ! -r "$registry" ] || [ ! -x "$registry" ]; then
@@ -1233,17 +1304,23 @@ _cc_wj_scan_claude_sessions() {
       _CC_WJ_ACTIVE_ERROR="jq is unavailable, so live Claude session claims cannot be checked"
       return 1
     }
-    # A record that cannot be read keeps the worktrees it could be about: the cwd its live
-    # process stands in, and any cwd string its raw text still carries.
-    # A live session can also work in any tree by absolute path from a cwd elsewhere, so the
-    # transcript of the session id its raw text carries is searched too; with no id or no
-    # readable transcript, the record keeps every tree.
-    row="$(jq -er '[((.pid // "") | tostring), (.sessionId // ""), (.cwd // "")] | @tsv' "$f" 2>/dev/null)" || {
+    # Read as jq reads it, again a moment later when it fails (_cc_wj_claude_record_row): the
+    # failures were records a session removes as it exits, read between `find` and `jq`.
+    # One whose process has ended is no claim. One that still cannot be parsed or is gone, its process alive,
+    # claims only the tree its process stands in, and the trees its transcript names
+    # (_cc_wj_unparsed_claim); with no cwd to stand on, it keeps the worktrees it could be about,
+    # as before: the cwd strings, the transcript of the session id its raw text carries, and with
+    # neither, every tree.
+    rr=0
+    row="$(_cc_wj_claude_record_row "$f" "$base")" || rr=$?
+    if [ "$rr" -eq 3 ]; then continue; fi
+    if [ "$rr" -ne 0 ]; then
+      _cc_wj_unparsed_claim "$f" "$base" "$projects" && continue
       _cc_wj_tail_attrs_claude "$(_cc_wj_raw_session_id "" "$f" "$base")"
       _cc_wj_unknown_add "claude-session:${f##*/}" "live Claude session record ${f##*/} could not be parsed" \
         live yes cwd "$(_cc_wj_pid_cwd "$base")" cwd "$(_cc_wj_raw_cwd "$f")" "${_CC_WJ_TAIL_ATTRS[@]}"
       continue
-    }
+    fi
     IFS=$'\t' read -r pid sid cwd <<< "$row"
     # The session's name, for CC_WJ_DENY_NAMES only. Read apart from the row above so a
     # missing or odd name can never fail the scan that every veto depends on.
@@ -2733,6 +2810,59 @@ CC_WJ_REGENERABLE="${CC_WJ_REGENERABLE:-node_modules .next .turbo .parcel-cache 
 # directory-keyed list can never reach either.
 CC_WJ_REGENERABLE_FILES="${CC_WJ_REGENERABLE_FILES:-next-env.d.ts tsconfig.tsbuildinfo .eslintcache}"
 
+# Build output, regenerable without a `.worktree-regenerable` declaration (stima-api#7106), but
+# only where its builder is beside it, because the names alone are generic (see dist/build above):
+#   - an ignored `dist/` or `build/` whose parent directory holds a package.json, pyproject.toml or
+#     setup.py: what `npm run build` or a Python build writes there;
+#   - Go build output: an ignored regular file that is a Mach-O or ELF executable, in a directory
+#     holding go.mod or in a `bin/` directly under one (`go build`, `go build -o bin/x`), and an
+#     ignored `bin/` beside a go.mod that holds nothing else.
+# Still ignored entries only (`!!`): an untracked `dist/` git does not ignore is work. A
+# credential-shaped file two levels down keeps the tree, as for the names above.
+CC_WJ_BUILD_OUTPUT_DIRS="${CC_WJ_BUILD_OUTPUT_DIRS:-dist build}"
+CC_WJ_BUILD_MANIFESTS="${CC_WJ_BUILD_MANIFESTS:-package.json pyproject.toml setup.py}"
+
+# 0 when file $1 starts like a Mach-O or ELF executable.
+_cc_wj_native_binary() {
+  local magic
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  magic="$(LC_ALL=C head -c 4 "$1" 2>/dev/null | LC_ALL=C od -An -tx1 2>/dev/null | tr -d ' \n')"
+  case "$magic" in
+    cffaedfe|cefaedfe|feedfacf|feedface|cafebabe|bebafeca|7f454c46) return 0 ;;
+  esac
+  return 1
+}
+
+# 0 when ignored entry $2 (porcelain path, no trailing slash) of worktree $1 is build output as
+# described above; $3 is dir or file.
+_cc_wj_build_output() { # <worktree> <entry> <dir|file>
+  local wt="$1" rest="$2" kind="$3" base parent m f n=0
+  base="${rest##*/}"
+  case "$rest" in */*) parent="$wt/${rest%/*}" ;; *) parent="$wt" ;; esac
+  [ ! -L "$wt/$rest" ] || return 1
+  if [ "$kind" = dir ]; then
+    case " $CC_WJ_BUILD_OUTPUT_DIRS " in
+      *" $base "*)
+        for m in $CC_WJ_BUILD_MANIFESTS; do
+          [ -f "$parent/$m" ] && return 0
+        done
+        return 1 ;;
+    esac
+    [ "$base" = bin ] && [ -f "$parent/go.mod" ] && [ -d "$wt/$rest" ] || return 1
+    # Executables only, and not many: one level, at most 50 entries. find, not a glob: this file
+    # is also sourced by zsh, where a glob matching nothing is an error.
+    while IFS= read -r -d '' f; do
+      n=$((n + 1)); [ "$n" -le 50 ] || return 1
+      _cc_wj_native_binary "$f" || return 1
+    done < <(find "$wt/$rest" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    [ "$n" -gt 0 ]
+    return
+  fi
+  _cc_wj_native_binary "$wt/$rest" || return 1
+  [ -f "$parent/go.mod" ] && return 0
+  [ "${parent##*/}" = bin ] && [ -f "${parent%/*}/go.mod" ]
+}
+
 # Credential-shaped names. Discounting a directory says everything below it is
 # machine-owned, which is true of a package tree and not of the `.env` somebody parked
 # inside one: porcelain collapses the directory to one line, so no name inside it is
@@ -3062,6 +3192,12 @@ _cc_wj_new_rules_mode() {
   esac
 }
 
+# A spot-checked new rule's line for the inventory: worktree $1, rule $2, entry $3.
+_cc_wj_newrule_note() {
+  [ -z "${_CC_WJ_NEWRULE_LOG:-}" ] ||
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$_CC_WJ_NEWRULE_LOG" 2>/dev/null || true
+}
+
 # The rule that discounts ignored entry $2 (porcelain path, no trailing slash) of worktree $1,
 # printed, or status 1. Asked only after every existing discount has declined the entry.
 _cc_wj_new_rule() {
@@ -3228,7 +3364,18 @@ _cc_wj_pins() {
           2:*) _cc_wj_pin '!!' "$rest/ (declared, but holds a credential-shaped file)" ;;
           *:0) _cc_wj_archive_walk "$wt" "$rest" "$archive_to" ;;
           3:*) _cc_wj_pin '!!' "$rest/ (declared, but an archive: pattern may name a path inside it)" ;;
-          *) _cc_wj_pin '!!' "$rest/" ;;
+          *)
+            if _cc_wj_build_output "$wt" "$rest" dir; then
+              if _cc_wj_find_credential "$wt/$rest" 2; then
+                _cc_wj_pin '!!' "$rest/ (build output, but holds a credential-shaped file)"
+              elif [ "$(_cc_wj_new_rules_mode)" != auto ]; then
+                # A new rule (stima-api#7106): spot-checked like the others until auto.
+                _cc_wj_newrule_note "$wt" build-output "$rest/"
+                _cc_wj_pin '!!' "$rest/"
+              fi
+            else
+              _cc_wj_pin '!!' "$rest/"
+            fi ;;
         esac
         ;;
       *)
@@ -3273,11 +3420,14 @@ _cc_wj_pins() {
             fi
             continue ;;
         esac
-        if nr="$(_cc_wj_new_rule "$wt" "$rest")"; then
+        nr=""
+        if _cc_wj_build_output "$wt" "$rest" file; then nr=build-output
+        else nr="$(_cc_wj_new_rule "$wt" "$rest")" || nr=""
+        fi
+        if [ -n "$nr" ]; then
           [ "$(_cc_wj_new_rules_mode)" = auto ] && continue
           # Spot check: still kept, and the inventory is told which rule would discount it.
-          [ -z "${_CC_WJ_NEWRULE_LOG:-}" ] ||
-            printf '%s\t%s\t%s\n' "$wt" "$nr" "$rest" >> "$_CC_WJ_NEWRULE_LOG" 2>/dev/null || true
+          _cc_wj_newrule_note "$wt" "$nr" "$rest"
         fi
         _cc_wj_pin '!!' "$rest"
         ;;
@@ -4746,6 +4896,7 @@ KEEP
   # first is examined whatever the clock says, so a phase whose setup alone outlasts the
   # budget still moves the cursor on. A yield is never a failure.
   local common cursor cursor_file phase=removal budget_hit=0 examined=0 wt_total=0 wt_index=0 elapsed=0 unexamined=0 repo_wts
+  local cycle_left=0 cycle_known=1 cycle_runs_file cycle_runs
   local repo_cursor_file="" progress_common="" rr rr_found=0 rr_after=() rr_through=()
   [ "$trim" -eq 1 ] && phase=trim
   # Repositories rotate too: the next apply run of a phase starts with the repository after
@@ -4801,7 +4952,8 @@ KEEP
     # Past the budget a repository is not locked, fetched or judged, only counted.
     if [ "$budget_hit" -eq 1 ]; then
       repo_wts="$(git -C "$repo" worktree list --porcelain 2>/dev/null | grep -c '^worktree ')"
-      [ "${repo_wts:-0}" -gt 1 ] && unexamined=$((unexamined + repo_wts - 1))
+      [ "${repo_wts:-0}" -gt 1 ] && unexamined=$((unexamined + repo_wts - 1)) &&
+        cycle_left=$((cycle_left + repo_wts - 1))
       continue
     fi
 
@@ -5607,12 +5759,50 @@ KEEP
 
     done < "$work/inventory"
 
+    # What this repository's cycle has not yet examined: the listed worktrees not in its cursor
+    # (largest order). Path order keeps no cycle, so the count is unknown there.
+    if [ "$apply" -eq 1 ] && [ -n "$cursor_file" ]; then
+      if [ "$_CC_WJ_ORDER" = largest ]; then
+        repo_wts=$(( wt_total - $(LC_ALL=C sort -u "$cursor_file" 2>/dev/null | grep -c .) ))
+        [ "$repo_wts" -ge 0 ] || repo_wts=0
+        cycle_left=$((cycle_left + repo_wts))
+      else
+        cycle_known=0
+      fi
+    fi
+
     [ -n "$lock" ] && _cc_wj_unlock "$lock"
   done
   if [ "$budget_hit" -eq 1 ]; then
     echo "worktree-janitor: $phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined; kept them for the next sweep, which $([ "$_CC_WJ_ORDER" = largest ] && echo "starts with those not yet examined in this cycle, largest first" || echo "resumes after the last examined")"
     _cc_wj_log_write "$phase phase budget exhausted: budget=${sweep_budget}s elapsed=${elapsed}s unexamined=$unexamined"
     [ -n "$progress_common" ] && _cc_wj_cursor_write "$repo_cursor_file" "$progress_common"
+  fi
+  # Every apply run says how many worktrees it left unexamined, 0 included, so "unexamined=0 at
+  # least once a day" can be read off the log (stima-api#7106), and how far its rotation is from a
+  # whole cycle: cycle_left is what no run of the current cycle has examined yet, and cycle_runs
+  # the apply runs since a run last ended with a whole cycle examined. Past four, a WARN: every
+  # worktree is meant to be examined within four runs, and the budget, not this line, is what
+  # would have to give.
+  if [ "$apply" -eq 1 ]; then
+    cycle_runs_file="$(_cc_wj_state_dir)/worktree-cycle-runs-$phase"
+    if [ "$cycle_known" -eq 1 ]; then
+      if [ "$cycle_left" -eq 0 ]; then
+        cycle_runs=0
+      else
+        cycle_runs="$(head -n 1 "$cycle_runs_file" 2>/dev/null)"
+        case "$cycle_runs" in ''|*[!0-9]*) cycle_runs=0 ;; esac
+        cycle_runs=$((10#$cycle_runs + 1))
+      fi
+      _cc_wj_cursor_write "$cycle_runs_file" "$cycle_runs"
+      _cc_wj_log_write "$phase phase examined=$examined unexamined=$unexamined cycle_left=$cycle_left cycle_runs=$cycle_runs"
+      if [ "$cycle_runs" -ge 4 ]; then
+        echo "worktree-janitor: WARN $phase phase: $cycle_left worktree(s) not examined in $cycle_runs runs of this cycle; every worktree is meant to be examined within four"
+        _cc_wj_log_write "WARN $phase phase: $cycle_left worktree(s) not examined in $cycle_runs runs of this cycle"
+      fi
+    else
+      _cc_wj_log_write "$phase phase examined=$examined unexamined=$unexamined cycle_left=? cycle_runs=?"
+    fi
   fi
   # Each unreadable record once, with what it kept. Global mode said so at the scan, as before.
   [ "$uk_scope" = global ] || _cc_wj_unknown_summary "$uk_scope"

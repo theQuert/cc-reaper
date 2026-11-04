@@ -35,6 +35,8 @@ jobs:
         run: python3 tests/gce-disk-watch.py
       - name: disk-janitor
         run: bash tests/disk-janitor.sh
+      - name: host-temp-reaper
+        run: python3 tests/host-temp-reaper.py
       - name: worktree-janitor
         # The no-pull-request probe calibrates against this repository's real pull requests via gh.
         env:

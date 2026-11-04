@@ -586,7 +586,7 @@ else
   fail "a non-numeric volume age refuses and reaps nothing (rc=$RC_VOLBAD)"
 fi
 
-OUT_NOGATE="$(BYPRODUCT_SCRATCH_ROOT="$WORK/f/scratch" BYPRODUCT_ARCHIVE_ROOT="$WORK/f/archive" \
+OUT_NOGATE="$(HOME="$WORK/f/home" BYPRODUCT_SCRATCH_ROOT="$WORK/f/scratch" BYPRODUCT_ARCHIVE_ROOT="$WORK/f/archive" \
   BYPRODUCT_DOCKER_BIN="$WORK/f/bin/docker" PATH_IN_USE_BIN="$WORK/f/bin/does-not-exist" \
   BYPRODUCT_LOG="$WORK/f/stray.log" BYPRODUCT_DEAD_CACHE_PATHS="$WORK/f/nothing" \
   bash "$SCRIPT" 2>&1)"; RC_NOGATE=$?
@@ -1945,6 +1945,161 @@ STUB
 rm -rf "$WORK/l/home/.claude/projects"
 OUT="$(CC_RB_NEW_RULES_MODE=auto run_real "$WORK/l" "$SCRIPT")"
 exists "$WORK/l" $SID7 && pass "a gate answer with a non-mention reason keeps the directory" || fail "deleted despite a non-mention reason"
+
+# ---------------------------------------------------------------- the done marker (stima-api#7106)
+#
+# session-reaper writes claude-task-done (session=<id>, at=<UTC>) into a scratchpad and job
+# directory when the session says SESSION-DONE. A marked directory goes on the next run whatever
+# its age, once nothing living owns it. Reused from live_fixture: 8888 is alive, 9999 held,
+# bbbb protected, dddd's transcript is written now. SIDM is new: dead, written just now, named
+# by a transcript, marked.
+SIDM=a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1
+TWO_H_AGO="$(date -v-2H +%Y%m%d%H%M 2>/dev/null || date -d '2 hours ago' +%Y%m%d%H%M)"
+mark() {  # <dir> <sid> [touch -t stamp]: the stamp ages the marker and the directory it was written into
+  printf 'session=%s\nat=2026-11-04T00:00:00Z\n' "$2" > "$1/claude-task-done"
+  [ -z "${3:-}" ] || touch -t "$3" "$1/claude-task-done" "$1"
+}
+# The reap cases run with the class on; it ships as spotcheck (review P3-4), pinned below.
+export CC_RB_DONE_MARKER=auto
+marked_fixture() {
+  local root="$1" sid
+  live_fixture "$root"
+  mkdir -p "$root/scratch/proj/$SIDM"; : > "$root/scratch/proj/$SIDM/out.txt"
+  printf 'it listed %s/proj/%s earlier\n' "$root/scratch" "$SIDM" >> "$root/home/.claude/projects/proj/00000000-0000-0000-0000-000000000000.jsonl"
+  mark "$root/scratch/proj/$SIDM" $SIDM
+  for sid in $SID8 $SID9 $SIDB; do mark "$root/scratch/proj/$sid" $sid; done
+  # Its transcript was written now, two hours after the marker: the session went on working.
+  mark "$root/scratch/proj/$SIDD" $SIDD "$TWO_H_AGO"
+  # A marker that names another session is no marker: the normal rules, touched now, kept.
+  mark "$root/scratch/proj/$SIDA" $SIDM
+  # A file written two hours after the marker.
+  mkdir -p "$root/scratch/proj/$SIDE"; mark "$root/scratch/proj/$SIDE" $SIDE "$TWO_H_AGO"; : > "$root/scratch/proj/$SIDE/later.txt"
+  # Job directories: the first eight of the session id.
+  mkdir -p "$root/home/.claude/jobs/${SIDM:0:8}/tmp" "$root/home/.claude/jobs/${SID8:0:8}" "$root/home/.claude/jobs/${SID7:0:8}"
+  printf '{"state":"done"}\n' > "$root/home/.claude/jobs/${SIDM:0:8}/state.json"
+  : > "$root/home/.claude/jobs/${SIDM:0:8}/tmp/blob"
+  mark "$root/home/.claude/jobs/${SIDM:0:8}" $SIDM
+  mark "$root/home/.claude/jobs/${SID8:0:8}" $SID8
+  mark "$root/home/.claude/jobs/${SID7:0:8}" $SIDM
+}
+
+marked_fixture "$WORK/m"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && fail "done marker: a marked, dead, unheld scratchpad touched just now was kept" \
+  || pass "done marker: a marked scratchpad goes whatever its age, and whoever names it (spotcheck new-rules mode)"
+check "  and the log says it was marked" "$OUT" "scratchpad reaped: .*$SIDM (marked done"
+check "done marker: a live session keeps its marked scratchpad" "$OUT" "scratchpad kept: .*$SID8 — marked done, but its session is alive"
+check "done marker: a held marked scratchpad is kept" "$OUT" "scratchpad kept: .*$SID9 — marked done, but held by pid 4242"
+check "done marker: a protected session keeps its marked scratchpad" "$OUT" "scratchpad kept: .*$SIDB — marked done, but belongs to a protected session"
+check "done marker: a transcript written after the marker keeps it" "$OUT" "scratchpad kept: .*$SIDD — marked done, but its session wrote a transcript after its done marker"
+check "done marker: a file written after the marker keeps it" "$OUT" "scratchpad kept: .*$SIDE — marked done, but written after its done marker"
+check "done marker: a marker naming another session is ignored" "$OUT" "scratchpad kept: .*$SIDA — touched within 24h"
+for sid in $SID8 $SID9 $SIDB $SIDD $SIDE $SIDA; do
+  exists "$WORK/m" $sid || fail "done marker: $sid was removed"
+done
+[ -d "$WORK/m/home/.claude/jobs/${SIDM:0:8}" ] && fail "done marker: the marked job directory was kept" \
+  || pass "done marker: a marked job directory of a dead session is removed whole"
+check "  and the log says so" "$OUT" "job dir reaped: .*/${SIDM:0:8} (marked done"
+[ -d "$WORK/m/home/.claude/jobs/${SID8:0:8}" ] && pass "done marker: a live session keeps its marked job directory" || fail "removed a live session's job directory"
+[ -d "$WORK/m/home/.claude/jobs/${SID7:0:8}" ] && pass "done marker: a job directory whose marker names another session is kept" || fail "removed a job directory marked for another session"
+check "  and says why" "$OUT" "job dir kept: .*/${SID7:0:8} — its done marker names session $SIDM"
+check "done marker: the ledger counts the job directories" "$OUT" "done jobs: 1 reaped, 2 kept"
+
+# Review P3-1: later work anywhere in the tree keeps it, and so does a tree moved in whole with its
+# old mtimes, which only the marked directory's own mtime shows.
+age_marked() {  # <root>: SIDM's marker, directory and contents two hours old, so "later" is now
+  find "$1/scratch/proj/$SIDM" -exec touch -t "$TWO_H_AGO" {} +
+}
+marked_fixture "$WORK/m"; age_marked "$WORK/m"
+mkdir -p "$WORK/m/scratch/proj/$SIDM/a/b"; : > "$WORK/m/scratch/proj/$SIDM/a/b/late.txt"
+# Only late.txt is new: every directory above it, the marked one too, is aged back.
+touch -t "$TWO_H_AGO" "$WORK/m/scratch/proj/$SIDM" "$WORK/m/scratch/proj/$SIDM/a" "$WORK/m/scratch/proj/$SIDM/a/b"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && pass "done marker: a file written two levels down after the marker keeps it" \
+  || fail "done marker: removed a tree with a nested file written after its marker"
+check "  and says why" "$OUT" "scratchpad kept: .*$SIDM — marked done, but written after its done marker"
+marked_fixture "$WORK/m"; age_marked "$WORK/m"
+mkdir -p "$WORK/m/moved/sub"; : > "$WORK/m/moved/sub/f"; find "$WORK/m/moved" -exec touch -t "$TWO_H_AGO" {} +
+mv "$WORK/m/moved" "$WORK/m/scratch/proj/$SIDM/moved"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && pass "done marker: a tree moved in whole after the marker keeps it" \
+  || fail "done marker: removed a tree moved in after its marker"
+check "  and says why" "$OUT" "scratchpad kept: .*$SIDM — marked done, but written after its done marker"
+marked_fixture "$WORK/m"; age_marked "$WORK/m"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && fail "done marker: an aged marked tree with nothing later was kept" \
+  || pass "done marker: aged, with nothing written after the marker, it goes"
+
+marked_fixture "$WORK/m"
+OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && [ -d "$WORK/m/home/.claude/jobs/${SIDM:0:8}" ] && pass "done marker: unset, it is spotcheck and removes nothing" \
+  || fail "done marker: the default removed a marked directory"
+check "  and logs what it would remove" "$OUT" "scratchpad spot-check: .*$SIDM .*marked done and removable"
+
+marked_fixture "$WORK/m"
+OUT="$(run "$WORK/m" "$SCRIPT")"
+check "done marker: a dry run says WOULD" "$OUT" "scratchpad WOULD be reaped: .*$SIDM (marked done)"
+exists "$WORK/m" $SIDM && [ -d "$WORK/m/home/.claude/jobs/${SIDM:0:8}" ] && pass "  and removes nothing" || fail "a dry run removed a marked directory"
+
+marked_fixture "$WORK/m"
+OUT="$(CC_RB_DONE_MARKER=spotcheck run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && pass "done marker: spotcheck removes nothing" || fail "done marker: spotcheck removed"
+check "  and logs it" "$OUT" "scratchpad spot-check: .*$SIDM .*marked done and removable"
+
+marked_fixture "$WORK/m"
+OUT="$(CC_RB_DONE_MARKER=off run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && [ -d "$WORK/m/home/.claude/jobs/${SIDM:0:8}" ] && pass "done marker: off reads no marker" || fail "done marker: off still reaped"
+check "  and the normal window keeps it" "$OUT" "scratchpad kept: .*$SIDM — touched within 24h"
+
+marked_fixture "$WORK/m"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$WORK/m/bin/lsof"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && [ -d "$WORK/m/home/.claude/jobs/${SIDM:0:8}" ] && pass "done marker: an unusable lsof keeps marked directories" || fail "done marker: removed with lsof unusable"
+check "  and says why" "$OUT" "scratchpad kept: .*$SIDM — marked done, but lsof is unusable"
+
+marked_fixture "$WORK/m"
+rm -rf "$WORK/m/home/.claude/sessions"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && pass "done marker: unreadable session records keep a marked scratchpad" || fail "done marker: removed with session records unreadable"
+
+marked_fixture "$WORK/m"
+: > "$WORK/m/lsof-hold-late"
+printf '%s %s\n' 4545 "$WORK/m/scratch/proj/$SIDM/out.txt" > "$WORK/m/lsof-held"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && pass "done marker: held at the pre-removal check, kept" || fail "done marker: removed a directory held at removal"
+check "  and says who" "$OUT" "scratchpad kept: .*$SIDM — marked done, but held by 4545 at removal"
+
+# Review r2 P2-A: a marker only ADDS a reason to remove. UU is the fixture's scratchpad no
+# transcript names, 40 days idle, which the idle rule reaps; whatever the marker path answers
+# (spotcheck keep, a transcript newer than the marker), the idle rule still judges it.
+UU=11111111-1111-1111-1111-111111111111
+TWO_D_AGO="$(date -v-2d +%Y%m%d%H%M 2>/dev/null || date -d '2 days ago' +%Y%m%d%H%M)"
+uu_transcript() {  # <root>: the session's own transcript, last written two days ago
+  : > "$1/home/.claude/projects/proj/$UU.jsonl"; touch -t "$TWO_D_AGO" "$1/home/.claude/projects/proj/$UU.jsonl"
+}
+marked_fixture "$WORK/m"
+OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $UU && fail "P2-A A: an unmarked 40-day-idle scratchpad was kept" || pass "P2-A A: no marker, 40 d idle: reaped by the idle rule"
+check "  and the log says reaped" "$OUT" "scratchpad reaped: .*$UU"
+marked_fixture "$WORK/m"; mark "$WORK/m/scratch/proj/$UU" $UU "$OLD_TS"
+OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $UU && fail "P2-A B: a spotcheck-kept marked scratchpad escaped the idle rule" \
+  || pass "P2-A B: 40 d old marker naming it, spotcheck: reaped by the idle rule"
+check "  and the spotcheck line says the idle rule still judges it" "$OUT" "scratchpad spot-check: .*$UU .*marked done and removable.*the idle rule still judges it"
+check "  and the idle rule reaped it" "$OUT" "scratchpad reaped: .*$UU"
+marked_fixture "$WORK/m"; mark "$WORK/m/scratch/proj/$UU" $UU "$OLD_TS"; uu_transcript "$WORK/m"
+OUT="$(CC_RB_DONE_MARKER=auto run_real "$WORK/m" "$SCRIPT")"
+check "P2-A C: auto, a transcript newer than the marker: the marker path keeps it" "$OUT" "scratchpad kept: .*$UU — marked done, but its session wrote a transcript after its done marker"
+exists "$WORK/m" $UU && fail "P2-A C: the idle rule never judged a marker-kept scratchpad (transcript 2 d ago)" \
+  || pass "P2-A C: and the idle rule reaps it (transcript 2 d ago, past the window)"
+marked_fixture "$WORK/m"; uu_transcript "$WORK/m"
+OUT="$(CC_RB_DONE_MARKER=auto run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $UU && fail "P2-A D: unmarked, transcript 2 d ago, auto: kept" || pass "P2-A D: no marker, transcript 2 d ago, auto: reaped"
+# The idle rule's own keeps survive a marker: written just now, it stays.
+marked_fixture "$WORK/m"; mark "$WORK/m/scratch/proj/$UU" $UU; touch "$WORK/m/scratch/proj/$UU/fresh"
+OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $UU && pass "P2-A: a marked scratchpad written just now is still kept by the idle rule (spotcheck)" || fail "P2-A: a marked, fresh scratchpad was removed"
+unset CC_RB_DONE_MARKER
 
 # ---------------------------------------------------------------- the transcript lookup (G3, #5886)
 #

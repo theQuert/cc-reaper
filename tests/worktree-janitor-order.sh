@@ -15,6 +15,7 @@ failures=0
 ok() { printf 'ok - %s\n' "$1"; }
 nok() { printf 'not ok - %s\n' "$1"; failures=$((failures + 1)); }
 check() { local name=$1; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else nok "$name"; fi; }
+refute() { local name=$1; shift; if "$@" >/dev/null 2>&1; then nok "$name"; else ok "$name"; fi; }
 same() { if [ "$2" = "$3" ]; then ok "$1"; else nok "$1 (got '$2', want '$3')"; fi; }
 
 T="$(cd "$(mktemp -d)" && pwd -P)"
@@ -137,6 +138,13 @@ check "budget: the cursor lists this cycle's examined trees" \
   test "$(cursor | paste -sd' ' -)" = "$WTS/wt-zbig $WTS/wt-homepage-x $WTS/wt-d"
 check "budget: the kept trees are all still there" \
   bash -c 'for n in zbig homepage-x d; do [ -d "$1/wt-$n" ] || exit 1; done' _ "$WTS"
+# stima-api#7106: every apply run logs what it left, 0 included, and how far the cycle is.
+lastphase() { grep -F "removal phase examined=" "$CC_WJ_LOG" | tail -n 1 | sed 's/^\[[^]]*\] //'; }
+check "budget: each cut run logs examined, unexamined, cycle_left and cycle_runs" \
+  test "$(grep -c "removal phase examined=1 unexamined=8 cycle_left=" "$CC_WJ_LOG")" -eq 3
+same "  and the third says six of the cycle are left after three runs" \
+  "$(lastphase)" "removal phase examined=1 unexamined=8 cycle_left=6 cycle_runs=3"
+refute "  and no WARN yet" grep -q "WARN removal phase" "$CC_WJ_LOG"
 
 out="$T/budget-unbounded.txt"
 BUDGET=0 wj_budget --apply > "$out"
@@ -146,6 +154,11 @@ check "  the removable tree was removed" test ! -e "$WTS/wt-rm1"
 check "  and its size row forgotten" test -z "$(cached rm1)"
 check "  and nothing a gate keeps was removed" \
   bash -c 'for n in a b c d e f zbig homepage-x; do [ -d "$1/wt-$n" ] || exit 1; done' _ "$WTS"
+same "  and it logs unexamined=0 and a whole cycle" "$(lastphase)" \
+  "removal phase examined=9 unexamined=0 cycle_left=0 cycle_runs=0"
+same "four runs covered every tree: three cut runs and this one examined all nine" \
+  "$(for f in "$T/budget-zbig.txt" "$T/budget-homepage-x.txt" "$T/budget-d.txt" "$out"; do examined "$f" | tr ' ' '\n'; done | sort -u | paste -sd' ' -)" \
+  "a b c d e f homepage-x rm1 zbig"
 
 out="$T/budget-newcycle.txt"
 wj_budget --apply > "$out"
@@ -158,9 +171,18 @@ wj_budget --apply > "$out" || rc=$?
 chmod 644 "$STATE"/worktree-cursor-removal-* 2>/dev/null
 same "budget: an unreadable cursor is an empty cycle, largest first" "$(examined "$out")" "zbig"
 check "  and fails nothing" test "$rc" -eq 0
+# Two more cut runs: the fourth run of a cycle that is still not whole says so.
+wj_budget --apply > "$T/budget-run3.txt"
+refute "budget: three runs into a cycle, no WARN" grep -q "WARN removal phase" "$CC_WJ_LOG"
+wj_budget --apply > "$T/budget-run4.txt"
+check "budget: four runs into a cycle with trees left, a WARN names them" \
+  grep -q "WARN removal phase: 5 worktree(s) not examined in 4 runs of this cycle" "$CC_WJ_LOG"
+check "  on stdout too" grep -q "WARN removal phase: 5 worktree(s) not examined in 4 runs" "$T/budget-run4.txt"
 
 CC_WJ_ORDER=path wj --apply > "$T/apply-path.txt"
 same "path --apply: the old order, from the start of the path list" "$(examined "$T/apply-path.txt")" "a b c d e f homepage-x zbig"
+same "  and it logs unexamined=0 with no cycle to count" "$(lastphase)" \
+  "removal phase examined=8 unexamined=0 cycle_left=? cycle_runs=?"
 
 # ─── A trim subtracts what it freed ──────────────────────────────────────────
 

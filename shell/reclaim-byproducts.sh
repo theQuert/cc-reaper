@@ -22,7 +22,10 @@
 #                directory no transcript names. Directories the old mention rule kept are
 #                newly removable, and CC_RB_NEW_RULES_MODE=spotcheck (the default) only
 #                LOGS those to ~/.cc-reaper/logs/spotcheck-reclaim-byproducts.log;
-#                `auto` removes them. UNKNOWN is treated as in use.
+#                `auto` removes them. UNKNOWN is treated as in use. A scratchpad (and a
+#                ~/.claude/jobs/<id> directory) its session marked done with
+#                claude-task-done (session-reaper, stima-api#7106) goes on the next run
+#                whatever its age, under the same liveness checks (CC_RB_DONE_MARKER).
 #   go cache     the entries Go itself would trim (`<hash>-a`/`-d` in the two-hex-digit
 #                subdirectories), sooner, and a size ceiling that takes the idlest entries
 #                first. This machine's one owner of that cache: cc-reaper's weekly trim
@@ -157,6 +160,26 @@ PROJECTS_DIR="${BYPRODUCT_PROJECTS_DIR:-$HOME/.claude/projects}"
 # where it stopped to the cursor file, and the next run starts after that entry, wrapping round.
 # A directory not reached this run is simply not judged: it is kept, never deleted. 0 = no budget.
 RB_STATE_DIR="${CC_RB_STATE_DIR:-$HOME/.cc-reaper/state}"
+# A scratchpad, or a $JOBS_DIR/<job> directory, whose session said it is done (stima-api#7106):
+# session-reaper writes `claude-task-done` (`session=<id>`, `at=<UTC>`) into both when the
+# session's newest reply carries a SESSION-DONE line. Such a directory is removed on the next run
+# whatever its age, once its session is not alive, no process holds anything under it (lsof must
+# be usable, and is asked again just before the removal), it is not a protected session's, and
+# neither it nor its session's transcript changed more than DONE_SLACK_SECONDS after the marker
+# (the reaper's own /exit lands after it; anything later is a session that went on working).
+# `auto` removes, `spotcheck` only logs what it would remove, `off` reads no marker.
+# spotcheck first, for one cycle, as every new deletion class here (CC_RB_NEW_RULES_MODE): it logs
+# what it would remove and removes nothing; auto lets it decide (stima-api#7106 review P3-4).
+DONE_MARKER_MODE="${CC_RB_DONE_MARKER:-spotcheck}"
+DONE_SLACK_SECONDS="${CC_RB_DONE_SLACK_SECONDS:-600}"
+case "$DONE_MARKER_MODE" in
+  auto|spotcheck|off) ;;
+  *) echo "byproducts: CC_RB_DONE_MARKER=$DONE_MARKER_MODE is not auto, spotcheck or off; using spotcheck" >&2; DONE_MARKER_MODE=spotcheck ;;
+esac
+case "$DONE_SLACK_SECONDS" in
+  ''|*[!0-9]*|??????*) echo "byproducts: CC_RB_DONE_SLACK_SECONDS=$DONE_SLACK_SECONDS is not a whole number of seconds; using 600" >&2; DONE_SLACK_SECONDS=600 ;;
+  *) DONE_SLACK_SECONDS=$((10#$DONE_SLACK_SECONDS)) ;;
+esac
 SCRATCH_BUDGET_SECONDS="${CC_RB_SCRATCH_BUDGET_SECONDS:-900}"
 SCRATCH_CURSOR="${CC_RB_SCRATCH_CURSOR:-$RB_STATE_DIR/reclaim-byproducts.scratch-cursor}"
 CODEX_SESSIONS_DIR="${BYPRODUCT_CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
@@ -834,6 +857,96 @@ scratch_order() {
   done
 }
 
+# ---- the done marker (stima-api#7106)
+
+# The session id the marker in directory $1 names (its first `session=` line), or status 1.
+done_marker_session() {
+  local m="$1/claude-task-done" s
+  [ -f "$m" ] && [ ! -L "$m" ] || return 1
+  s="$(sed -n 's/^session=//p' "$m" 2>/dev/null | head -n 1)"
+  is_session_id "$s" || return 1
+  printf '%s' "$s"
+}
+
+# Why marked directory $1 of session $2 must stay, or nothing when it may go. $3 = 1 when the
+# session records were read, $4 the live session ids, $5 the protected ones.
+done_keep_reason() {  # <dir> <sid> <live_ok> <live_set> <protected>
+  local d="$1" sid="$2" ref holders t
+  if [ -n "$5" ] && printf '%s\n' "$5" | grep -qxF "$sid"; then
+    printf 'belongs to a protected session (%s)' "$PROTECT_SESSION_NAMES"; return; fi
+  if [ "$3" -ne 1 ]; then printf 'session records could not be read, so its session cannot be ruled alive'; return; fi
+  if printf '%s\n' "$4" | grep -qxF "$sid"; then printf 'its session is alive'; return; fi
+  if [ "$LSOF_STATE" != ok ]; then printf 'lsof is unusable, so holders cannot be ruled out'; return; fi
+  holders="$(lsof_holders "$LSOF_SNAP" "$d" | tr '\n' ' ')"
+  if [ -n "${holders// /}" ]; then printf 'held by pid %s' "${holders% }"; return; fi
+  # A reference file DONE_SLACK_SECONDS after the marker: anything newer is later work.
+  ref="$(mktemp "${TMPDIR:-/tmp}/byproducts-done.XXXXXX")" || { printf 'no reference file for the marker time'; return; }
+  if ! perl -e '@s = stat $ARGV[0] or exit 1; $t = $s[9] + $ARGV[2]; utime $t, $t, $ARGV[1] or exit 1' \
+       "$d/claude-task-done" "$ref" "$DONE_SLACK_SECONDS" 2>/dev/null; then
+    rm -f "$ref"; printf 'the marker time could not be read'; return
+  fi
+  # The directory itself too: a tree moved in whole keeps its old mtimes, and only its new
+  # parent's mtime says it arrived. Writing the marker set that mtime to before the reference.
+  if [ -n "$("$FIND" "$d" ! -path "$d/claude-task-done" -newer "$ref" -print -quit 2>/dev/null)" ]; then
+    rm -f "$ref"; printf 'written after its done marker'; return
+  fi
+  for t in "$PROJECTS_DIR"/*/"$sid".jsonl; do
+    [ -f "$t" ] || continue
+    if [ -n "$("$FIND" "$t" -newer "$ref" -print -quit 2>/dev/null)" ]; then
+      rm -f "$ref"; printf 'its session wrote a transcript after its done marker'; return
+    fi
+  done
+  rm -f "$ref"
+}
+
+# Judge and remove marked directory $1 (session $2, label $3). Status 0 when it was removed (or
+# would be, on a dry run), and DONE_KB holds its size; 1 when it was kept.
+DONE_KB=0
+reap_done_marked() {  # <dir> <sid> <label> <live_ok> <live_set> <protected> [<spotcheck note>]
+  local d="$1" why kb
+  DONE_KB=0
+  lsof_snapshot  # here, not inside the $(...) below, so the run keeps one snapshot
+  why="$(done_keep_reason "$d" "$2" "$4" "$5" "$6")"
+  if [ -n "$why" ]; then log "$3 kept: $d — marked done, but $why"; return 1; fi
+  kb="$(kb_of "$d")"
+  if [ "$DONE_MARKER_MODE" = spotcheck ]; then
+    log "$3 spot-check: $d ($(as_gb "$kb")) is marked done and removable; logged only, not removed (CC_RB_DONE_MARKER=spotcheck)${7:+; $7}"
+    return 1
+  fi
+  if [ "$DRY" -eq 1 ]; then log "$3 WOULD be reaped: $d (marked done)"; DONE_KB=$kb; return 0; fi
+  if ! removal_precheck "$d" new; then
+    log "$3 kept: $d — marked done, but held by ${RB_REMOVE_HOLDERS% } at removal"; return 1
+  fi
+  rm -rf "$d" 2>/dev/null || { log "$3 could not be removed: $d" >&2; FAILED=1; return 1; }
+  log "$3 reaped: $d (marked done, $(as_gb "$kb"))"
+  DONE_KB=$kb
+  return 0
+}
+
+# $JOBS_DIR/<job> directories whose session marked them done (the job id is the first eight
+# characters of its session id). The finished-job tmp/ rule is reap_session_temp's.
+reap_done_jobs() {
+  [ "$DONE_MARKER_MODE" != off ] || return 0
+  [ -d "$JOBS_DIR" ] && [ ! -L "$JOBS_DIR" ] || return 0
+  local d name sid live_ok=0 live_set="" prot n=0 kept=0 bytes=0
+  # Its own snapshot: the scratchpad phase deleted its listing file when it ended.
+  LSOF_STATE=untaken; LSOF_SNAP=""
+  if live_set="$(live_session_ids)"; then live_ok=1; fi
+  prot="$(protected_session_ids)"
+  for d in "$JOBS_DIR"/*/; do
+    d="${d%/}"; name="${d##*/}"
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    sid="$(done_marker_session "$d")" || continue
+    case "$sid" in "$name"*) ;; *) log "job dir kept: $d — its done marker names session $sid"; kept=$((kept + 1)); continue ;; esac
+    if reap_done_marked "$d" "$sid" "job dir" "$live_ok" "$live_set" "$prot"; then
+      n=$((n + 1)); bytes=$((bytes + DONE_KB))
+    else kept=$((kept + 1)); fi
+  done
+  [ -z "$LSOF_SNAP" ] || rm -f "$LSOF_SNAP" 2>/dev/null
+  LSOF_STATE=untaken; LSOF_SNAP=""
+  log "done jobs: $n reaped, $kept kept, $(freed_mb "$bytes")"
+}
+
 # The time path-in-use.sh may spend on one directory: what is left of the phase's budget (at
 # least 1s, at most its own 600s default). Its answer for what it did not reach is UNKNOWN, and
 # UNKNOWN keeps the directory, so a stuck gate can no longer outlast the phase. No budget (0): its
@@ -915,6 +1028,18 @@ reap_scratchpads() {
     # Only a session directory. /tmp/claude-501 also holds loose probe files and
     # directories nobody names a session, and those are not this reaper's business.
     if ! is_session_id "$sid"; then kept=$((kept + 1)); continue; fi
+
+    # Marked done by its session (stima-api#7106): no idle window and no transcript mention,
+    # only liveness (done_keep_reason). The marker only ADDS a reason to remove: when
+    # reap_done_marked keeps the directory (spotcheck, a later write, a holder, a live session),
+    # the idle rule below still judges it, so a marker never subtracts the old reap.
+    if [ "$DONE_MARKER_MODE" != off ] && [ "$(done_marker_session "$d")" = "$sid" ]; then
+      if reap_done_marked "$d" "$sid" scratchpad "$live_ok" "$live_set" "$prot" \
+           "the idle rule still judges it"; then
+        reaped=$((reaped + 1)); bytes=$((bytes + DONE_KB))
+        continue
+      fi
+    fi
 
     window=$IDLE_HOURS
     if [ "$pressure" -eq 1 ] && ! printf '%s\n' "$live" | grep -qxF "$sid"; then
@@ -1882,6 +2007,7 @@ SWEPT=1
 log "-- go cache";   reap_go_cache
 log "-- scratchpads"; reap_scratchpads
 log "-- session temp"; reap_session_temp
+log "-- done jobs";   reap_done_jobs
 log "-- docker";      reap_docker
 log "-- archives";    reap_archives
 log "-- caches";      reap_caches

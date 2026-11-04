@@ -190,8 +190,9 @@ STUB
 chmod +x "$FAKE_BIN/ps"
 
 # lsof stub: the real lsof unless FAKE_LSOF_FAIL=1, an lsof that can report nothing.
-# FAKE_LSOF_HOLD=<path>: a `+D <path>` walk of exactly that path reports one open file, any
-# other `+D` walk reports nothing (the real lsof exits 1 for that too).
+# FAKE_LSOF_HOLD=<pattern>: a `+D <path>` walk of a path that shell pattern matches (a plain path
+# matches only itself) reports one open file, any other `+D` walk reports nothing (the real lsof
+# exits 1 for that too).
 cat > "$FAKE_BIN/lsof" <<'STUB'
 #!/usr/bin/env bash
 [ "${FAKE_LSOF_FAIL:-0}" = 1 ] && exit 1
@@ -209,7 +210,8 @@ if [ -n "${FAKE_LSOF_HOLD:-}" ]; then
   prev=""
   for a in "$@"; do
     if [ "$prev" = "+D" ]; then
-      if [ "$a" = "$FAKE_LSOF_HOLD" ]; then printf 'p4242\nn%s/node_modules/held-file\n' "$a"; exit 0; fi
+      # shellcheck disable=SC2254
+      case "$a" in $FAKE_LSOF_HOLD) printf 'p4242\nn%s/node_modules/held-file\n' "$a"; exit 0 ;; esac
       exit 1
     fi
     prev="$a"
@@ -299,6 +301,8 @@ _run_dj() {
     # The df stub reports kilobytes of free space, far under the act floor; only group 3d
     # turns the low-disk action on.
     export CC_DJ_ACT_FREE_GB="${CC_DJ_ACT_FREE_GB:-off}"
+    # The daily template prune likewise: only the group that tests it turns it on.
+    export CC_DJ_TEMPLATE_DAILY="${CC_DJ_TEMPLATE_DAILY:-off}"
     # The new act steps read these; a stray value from the caller's shell must not point
     # them at the real template store or the real sessions directory.
     unset NODE_MODULES_TEMPLATE_STORE
@@ -680,6 +684,69 @@ expect_yes "template: a non-numeric day count logs and skips the step" \
 _mk_store; : > "$SPOT"; _act_reset; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_TEMPLATE_STORE="$TPL" _run_act $((40 * 1048576))
 expect_yes "template: at 40 GB free nothing is judged or removed" test -d "$TPL/Darwin-arm64-aaaa"
 expect_no "template: and no spot-check line is written" grep -q 'template-prune' "$SPOT"
+
+# -- the daily template prune (stima-api#7106): every --check, once a day, 7 days and a cap of 4 --
+_mk_daily() {
+  rm -rf "$SANDBOX/tpl" "$SANDBOX/sessions"; mkdir -p "$SANDBOX/sessions"
+  local n
+  for n in t1 t2 t3 t4 t5 t6 t7; do mkdir -p "$TPL/Darwin-arm64-$n/node_modules"; echo x > "$TPL/Darwin-arm64-$n/node_modules/f"; done
+  touch -t 202601010000 "$TPL/Darwin-arm64-t1"                       # unused for months
+  touch -t "$(date -v-8d +%Y%m%d%H%M)" "$TPL/Darwin-arm64-t2"         # unused 8 days
+  touch -t "$(date -v-5d +%Y%m%d%H%M)" "$TPL/Darwin-arm64-t7"         # 5 days: the fifth newest
+  touch -t "$(date -v-2d +%Y%m%d%H%M)" "$TPL/Darwin-arm64-t3"
+  touch -t "$(date -v-1d +%Y%m%d%H%M)" "$TPL/Darwin-arm64-t4"
+  touch -t "$(date -v-3H +%Y%m%d%H%M)" "$TPL/Darwin-arm64-t5"         # t6: now
+  rm -f "$SANDBOX/state/template-prune-daily.stamp"
+}
+_daily_run() {  # [stamp mtime for the stat stub]
+  : > "$SANDBOX/dj.log"; : > "$SPOT"
+  CC_DJ_TEMPLATE_DAILY="${DAILY_MODE:-auto}" CC_DJ_TEMPLATE_STORE="$TPL" CC_DJ_SESSIONS_DIR="$SANDBOX/sessions" \
+    CC_DJ_ACT_TEMPLATE_SCRIPT="$SANDBOX/act-template" _run_dj --check 80 "${1:-0}"
+}
+_mk_daily; _daily_run
+for n in t1 t2; do expect_no "daily: a template unused 7+ days is removed ($n)" test -d "$TPL/Darwin-arm64-$n"; done
+expect_no "daily: past the newest four, the least recently used goes too (t7, 5 days)" test -d "$TPL/Darwin-arm64-t7"
+for n in t3 t4 t5 t6; do expect_yes "daily: the four newest stay ($n)" test -d "$TPL/Darwin-arm64-$n"; done
+expect_yes "daily: the log counts them" grep -q 'daily template prune: node-modules template prune (auto): removed 3, kept 0' "$SANDBOX/dj.log"
+expect_yes "daily: the spot-check log names the cap" grep -q 'step=template-prune start mode=auto .* unused_days=7 cap=4' "$SPOT"
+expect_yes "daily: and leaves its stamp" test -f "$SANDBOX/state/template-prune-daily.stamp"
+mkdir -p "$TPL/Darwin-arm64-t8"; touch -t 202601010000 "$TPL/Darwin-arm64-t8"
+_daily_run "$(date +%s)"   # the stat stub: the stamp was written just now
+expect_yes "daily: a second --check inside the day does not prune again" test -d "$TPL/Darwin-arm64-t8"
+_mk_daily; FAKE_LSOF_HOLD="$TPL/Darwin-arm64-t2" _daily_run
+expect_yes "daily: a held template is kept" test -d "$TPL/Darwin-arm64-t2"
+expect_yes "  and the log says why" grep -Eq 'path=.*t2 .*verdict=keep reason=held' "$SPOT"
+expect_no "  and the others still go" test -d "$TPL/Darwin-arm64-t1"
+# Review P2-2: a template is renamed out of apply's sight before it is deleted, and an apply that
+# began before the rename (it holds the renamed tree) gets it back whole.
+_mk_daily; : > "$MV_CAPTURE"; _daily_run
+expect_yes "daily: a template is renamed to a dot name before it is deleted" grep -q "Darwin-arm64-t1 $TPL/.pruning.Darwin-arm64-t1\." "$MV_CAPTURE"
+expect_no  "  and no renamed tree is left behind" bash -c 'ls -A "$1" | grep -q "^\.pruning\."' _ "$TPL"
+_mk_daily; FAKE_LSOF_HOLD="$TPL/.pruning.Darwin-arm64-t2.*" _daily_run
+expect_yes "daily: a template an apply holds after the rename is put back whole" test -f "$TPL/Darwin-arm64-t2/node_modules/f"
+expect_no  "  and nothing is left under the dot name" bash -c 'ls -A "$1" | grep -q "^\.pruning\."' _ "$TPL"
+expect_yes "  and the log says why" grep -Eq 'path=.*t2 .*verdict=keep reason=held-after-rename' "$SPOT"
+expect_no  "  and the others still go" test -d "$TPL/Darwin-arm64-t1"
+_mk_daily; CC_DJ_TEMPLATE_CAP=1 _daily_run
+expect_yes "daily: past the cap, a template used within the day stays (t5, 3 h)" test -d "$TPL/Darwin-arm64-t5"
+expect_no  "  and one unused two days goes (t3)" test -d "$TPL/Darwin-arm64-t3"
+_mk_daily; FAKE_LSOF_FAIL=1 _daily_run
+expect_yes "daily: an lsof that reports nothing keeps every candidate" \
+  bash -c 'for n in t1 t2 t7; do [ -d "$1/Darwin-arm64-$n" ] || exit 1; done' _ "$TPL"
+_mk_daily; printf '{"pid":1,"sessionId":"s1","name":"uiux","cwd":"%s"}\n' "$TPL/Darwin-arm64-t1/node_modules" > "$SANDBOX/sessions/1.json"
+_daily_run
+expect_yes "daily: a protected session's template is kept" test -d "$TPL/Darwin-arm64-t1"
+_mk_daily; DAILY_MODE=spotcheck _daily_run
+expect_yes "daily: spotcheck deletes nothing" bash -c 'for n in t1 t2 t7; do [ -d "$1/Darwin-arm64-$n" ] || exit 1; done' _ "$TPL"
+expect_yes "  and says what it would remove" grep -q 'would remove 3' "$SANDBOX/dj.log"
+_mk_daily; DAILY_MODE=off _daily_run
+expect_yes "daily: off runs nothing" test -d "$TPL/Darwin-arm64-t1" -a ! -f "$SANDBOX/state/template-prune-daily.stamp"
+_mk_daily; CC_DJ_TEMPLATE_CAP=0 _daily_run
+expect_yes "daily: a cap of 0 is refused, not read as 'remove all'" test -d "$TPL/Darwin-arm64-t6" -a -d "$TPL/Darwin-arm64-t1"
+expect_yes "  and logged" grep -q 'ERROR daily template prune: CC_DJ_TEMPLATE_CAP=0' "$SANDBOX/dj.log"
+_mk_daily; CC_DJ_TEMPLATE_CAP=10 _daily_run
+expect_yes "daily: under the cap only the 7-day rule removes" \
+  bash -c '[ ! -d "$1/Darwin-arm64-t1" ] && [ ! -d "$1/Darwin-arm64-t2" ] && [ -d "$1/Darwin-arm64-t7" ]' _ "$TPL"
 # -- go build cache age trim (rule go-build-age): only under 20 GB, spot-check by default ---
 # A sandbox cache: entries 3 h old and fresh ones in hex subdirectories, the top-level files Go
 # keeps, a README in a hex directory, non-hex and nested directories, and two symlinks that point

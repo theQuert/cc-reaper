@@ -2,7 +2,7 @@
 """Reclaim what headless-Chrome scripts, wrangler, failed test builds and finished
 background Claude jobs leave in this user's temp space.
 
-Six kinds, each proved abandoned before it is touched:
+Seven kinds, each proved abandoned before it is touched:
 
 - an orphaned headless Chrome: launched with --headless, --remote-debugging-port and a
   --user-data-dir directly under this user's temp directory, reparented to launchd (its
@@ -38,6 +38,17 @@ Six kinds, each proved abandoned before it is touched:
   on 2026-10-05, 10.3 GB of it untouched for a day. A day for the build tools and,
   since 2026-10-29, for the generic `tmp` names too: 115k test sandboxes 1-3 days old held
   most of $TMPDIR, and the holder check (open files, cwd, command lines) guards a live one.
+
+- any other `tmp[A-Za-z0-9_]{8}` or `tmp.[A-Za-z0-9]{10}` directory directly under the temp
+  directory (`TMPDIR_NAME`, stima-api#7106): the shapes the leftover rule leaves alone because
+  they look like a person's name (no digit), which on 2026-11-04 were 9,886 Python sandboxes
+  holding fake HOMEs (`tmp_sriaqhi/.claude`, `.local`, `Library`) and 45 lower-case `tmp.`
+  names, none removed by anything. Nothing under it changed for TMPDIR_IDLE_SECONDS (48 h),
+  no open file, cwd or command line of this user's processes reaches it, and `lsof +D`, asked
+  for each one just before it goes, finds no holder (an lsof that fails or writes anything to
+  stderr is a holder). One lsof +D is ~0.25 s, so a run spends at most `--tmpdir-budget-seconds`
+  on them and leaves the rest for the next; each removal and the run's total are logged with
+  their bytes.
 
 Every probe that fails or cannot decide keeps the item. Chrome is sent SIGTERM only, so
 it shuts down on its own terms. Tests drive the seams (`processes`, `listening_ports`,
@@ -92,6 +103,9 @@ LEFTOVER_MENTION = re.compile(r"(?<![A-Za-z0-9_.-])(tmp[a-z0-9_]{8}|tmp\.[A-Za-z
 # The per-user temp directory is the only root this rule may sweep: /tmp is shared with
 # other users and root, whose processes neither lsof -u nor this user's ps can vouch for.
 USER_TEMP_PREFIX = "/private/var/folders/"
+TMPDIR_NAME = re.compile(r"tmp[A-Za-z0-9_]{8}|tmp\.[A-Za-z0-9]{10}")
+TMPDIR_IDLE_SECONDS = 48 * 3600
+TMPDIR_BUDGET_SECONDS = 600
 # A fresh picture of what is open, at least this often while removing.
 HOLDERS_MAX_AGE = 60
 JOB_ID = re.compile(r"[0-9a-f]{8}$")
@@ -271,6 +285,18 @@ def holders(root, rows):
     return names
 
 
+def tree_bytes(path):
+    """Bytes allocated under path, links not followed; what a removal frees, near enough."""
+    total = 0
+    for top, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                total += os.lstat(os.path.join(top, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total + path.lstat().st_blocks * 512
+
+
 def orphan_chrome(row, root, idle_seconds):
     pid, ppid, elapsed, command = row
     if ppid != 1 or elapsed < idle_seconds or not CHROME_BINARY.match(command):
@@ -302,14 +328,15 @@ def finished_job(job, now):
         return False
 
 
-def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill, jobs_dir=None):
+def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill, jobs_dir=None,
+         tmpdir_budget=TMPDIR_BUDGET_SECONDS):
     """Return counts {kind: (candidates, acted)}; prints one line per item."""
     now = time.time() if now is None else now
     rows = processes()
     if rows is None:
         raise RuntimeError("ps failed; kept everything")
     counts = {"chrome": [0, 0], "profile": [0, 0], "wrangler": [0, 0], "build": [0, 0],
-              "jobvenv": [0, 0], "leftover": [0, 0]}
+              "jobvenv": [0, 0], "leftover": [0, 0], "tmpdir": [0, 0]}
 
     for row in rows:
         if not orphan_chrome(row, root, idle_seconds):
@@ -371,7 +398,7 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
         except OSError as error:
             print(f"KEEP build {path.name} ({error.strerror or error})")
 
-    held_names, held_at = None, 0
+    held_names, held_at, rows_now = None, 0, None
     sweep = root.is_dir() and str(root).startswith(USER_TEMP_PREFIX)
     for path in sorted(root.iterdir()) if sweep else []:
         try:
@@ -407,6 +434,41 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
             print(f"{'REMOVED' if clean else 'CANDIDATE'} leftover {path.name}")
         except OSError as error:
             print(f"KEEP leftover {path.name} ({error.strerror or error})")
+
+    # The seventh kind: TMPDIR_NAME directories the leftover rule does not take.
+    deadline, freed, deferred = time.monotonic() + tmpdir_budget, 0, 0
+    for path in sorted(root.iterdir()) if sweep else []:
+        try:
+            if not TMPDIR_NAME.fullmatch(path.name) or leftover_rule(path.name) is not None:
+                continue
+            if path.is_symlink() or not path.is_dir() or now - path.lstat().st_mtime < TMPDIR_IDLE_SECONDS:
+                continue
+            if time.monotonic() > deadline:
+                deferred += 1
+                continue
+            newest = newest_change(path)
+            if newest is None or now - newest < TMPDIR_IDLE_SECONDS:
+                continue
+            if held_names is None or rows_now is None or time.time() - held_at > HOLDERS_MAX_AGE:
+                rows_now = processes(env=True)
+                held_names = None if rows_now is None else holders(root, rows_now)
+                held_at = time.time()
+                if held_names is None:
+                    print("KEEP tmpdir (lsof could not answer; kept them all)")
+                    break
+            if path.name in held_names or any(path.name in r[3] for r in rows_now) or held(path):
+                continue
+            counts["tmpdir"][0] += 1
+            size = tree_bytes(path)
+            if clean:
+                shutil.rmtree(path)
+                counts["tmpdir"][1] += 1
+                freed += size
+            print(f"{'REMOVED' if clean else 'CANDIDATE'} tmpdir {path.name} bytes={size}")
+        except OSError as error:
+            print(f"KEEP tmpdir {path.name} ({error.strerror or error})")
+    print(f"tmpdir: {counts['tmpdir'][1]} removed of {counts['tmpdir'][0]}, bytes={freed}, "
+          f"not reached={deferred} (budget {tmpdir_budget}s)")
 
     jobs = jobs_dir.resolve() if jobs_dir is not None and jobs_dir.is_dir() else None
     for job in sorted(jobs.iterdir()) if jobs is not None else []:
@@ -445,12 +507,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("check", "clean"))
     parser.add_argument("--idle-minutes", type=int, default=60)
+    parser.add_argument("--tmpdir-budget-seconds", type=int, default=TMPDIR_BUDGET_SECONDS)
     args = parser.parse_args()
     if args.idle_minutes < 30:
         raise ValueError("idle limit must be at least 30 minutes")
     counts = reap(temp_root(), Path.home() / "Library/Preferences/.wrangler/logs",
                   clean=args.mode == "clean", idle_seconds=args.idle_minutes * 60,
-                  jobs_dir=Path.home() / ".claude/jobs")
+                  jobs_dir=Path.home() / ".claude/jobs", tmpdir_budget=args.tmpdir_budget_seconds)
     print("host temp: " + " ".join(f"{k}={v[1]}/{v[0]}" for k, v in counts.items()))
 
 
