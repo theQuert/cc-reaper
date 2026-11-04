@@ -15,8 +15,9 @@ Each session gets exactly one `state`:
                   background work. The threshold is the reaper's own idle_threshold(): a `SESSION-DONE:` line (or
                   `SESSION-STATE: IDLE_NO_WORK`) shortens it to DONE_GRACE_MINUTES only under DONE_GRACE=apply.
 
-Claims: the issue number in the branch of every worktree the session owns, the reaper's ISSUE_RE (the number starts
-the branch or follows a `/`: `claude/7023-x` names #7023, `claude-7023-x` and `canary-main-1031` name none); for a session with no branch claim, an issue its name or last reply names
+Claims: the issue number in the branch of every worktree the session owns, the reaper's branch_issue() (ISSUE_RE: the number
+starts the branch or follows a `/`, `claude/7023-x` names #7023; WORD_ISSUE_RE on a stima-api tree only: `claude-7023-x` names
+#7023 there and nothing on a skills or cc-reaper tree; `canary-main-1031` names none); for a session with no branch claim, an issue its name or last reply names
 whose oracle claimant (`delivery_state.py N --brief`, from the newest `Claimed by ... session` comment) is this
 session; for a `loop #N ...` background session, #N.
 

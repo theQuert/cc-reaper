@@ -135,6 +135,11 @@ ISSUE_FALLBACKS = 6  # single `gh issue view` calls a run may make after a batch
 # The number starts the branch or follows a `/`. A hyphen does not start it (stima-api #7061 review): `canary-main-1031`,
 # `chore/uiux-sync-1026` and `uiux-accept-1029` name no issue, and `claude/prompt-size-403-4389` is not #403.
 ISSUE_RE = re.compile(r"(?:^|/)(\d{3,6})(?:-|$)")
+# The shape new-task-worktree.sh makes, `claude-7001-p0sla-marker`: the number follows the branch's one leading word
+# (stima-api #7001). It names an issue only on a CHECKBY_REPO worktree, through branch_issue(), cfg CHECKBY_REPO: on a skills or cc-reaper
+# tree the number is still a stima-api issue, so it is nobody's claim there (a claim of a number the repo has no issue
+# for leaves the record exiting after the close, #148 review).
+WORD_ISSUE_RE = re.compile(r"^[a-z]+-(\d{3,6})(?:-|$)")
 PATH_RE = re.compile(r"(?:~|/)[\w./@+-]+")
 # Keep reasons added after the first 48 h of live reaping: a row kept only by these is one the
 # earlier gates would have reaped, which is what the report-only comparison looks for.
@@ -350,6 +355,20 @@ def gh_repo(repo):
     rc, url = run(["git", "-C", str(repo), "remote", "get-url", "origin"])
     m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url.strip())
     return m.group(1) if m else ""
+
+
+def branch_issue(branch, repo, checkby):
+    """The (repo, number) a worktree branch claims, or None: ISSUE_RE on any GitHub repo, WORD_ISSUE_RE only on
+    `checkby` (cfg CHECKBY_REPO). `repo` is the worktree path (its origin is read only when a shape matched) or an
+    `owner/name`."""
+    m = ISSUE_RE.search(branch or "")
+    word = None if m else WORD_ISSUE_RE.search(branch or "")
+    if not m and not word:
+        return None
+    name = repo if REPO_RE.fullmatch(str(repo)) else gh_repo(repo)
+    if not name or (word and name != checkby):
+        return None
+    return name, (m or word).group(1)
 
 
 _issue_cache = {}
@@ -844,7 +863,7 @@ def claim_why(owned, repos):
     number in the branch of a worktree the session owns (its marker, or the cwd inside it), on a GitHub repo."""
     if not owned:
         return "no-worktree"
-    if not any(ISSUE_RE.search(w["branch"]) for w in owned):
+    if not any(ISSUE_RE.search(w["branch"]) or WORD_ISSUE_RE.search(w["branch"]) for w in owned):
         return "no-issue-branch:" + ",".join(w["path"].name for w in owned)
     if not any(r for r in repos):
         return "no-github-remote"
@@ -952,11 +971,10 @@ def _record(cfg, now, table, wts, f, d, pane, state, attach_pid):
              or (cwd + "/").startswith(str(w["path"]) + "/")]
     claims, repos = [], []
     for w in owned:
-        m = ISSUE_RE.search(w["branch"])
-        repo = gh_repo(w["repo"]) if m else ""
-        repos.append(repo)
-        if m and repo and (repo, m.group(1)) not in claims:
-            claims.append((repo, m.group(1)))
+        claim = branch_issue(w["branch"], w["repo"], cfg["CHECKBY_REPO"])
+        repos.append(claim[0] if claim else "")
+        if claim and claim not in claims:
+            claims.append(claim)
     s = {
         "kind": kind, "attach_pid": attach_pid,
         "file": str(f), "pid": pid, "sid": sid, "cwd": cwd, "name": d.get("name", ""),
@@ -1734,8 +1752,8 @@ def foreign_prs(s, cfg):
             rc, txt = run(["gh", "pr", "view", n, "-R", repo, "--json", "headRefName", "-q", ".headRefName"], 30) \
                 if repo else (1, "")
             _pr_cache[key] = txt.strip() if rc == 0 else ""
-        m = ISSUE_RE.search(_pr_cache[key])
-        if m and (repo, m.group(1)) in s.get("other_claims", ()):
+        m = branch_issue(_pr_cache[key], repo, cfg["CHECKBY_REPO"]) if repo else None
+        if m and m in s.get("other_claims", ()):
             out.add(n)
     return out
 
