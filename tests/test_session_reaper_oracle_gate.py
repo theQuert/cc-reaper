@@ -310,20 +310,27 @@ class Report(unittest.TestCase):
 class IssueRe(unittest.TestCase):
     """The branch shapes that name an issue (the reaper's only claim source) and the ones that do not."""
 
-    def test_the_new_task_worktree_shape_names_its_issue(self):
+    STIMA, SKILLS = "theQuert/stima-api", "theQuert/skills"
+
+    def test_the_new_task_worktree_shape_names_its_issue_on_the_oracle_repo(self):
         # new-task-worktree.sh makes `claude-<N>-<slug>`; before stima-api #7001 the reaper read it as no-issue-branch,
         # so such a session carried no claim, was always kept, and never fed the ORACLE_NOT_MINE shadow counter.
         for branch, n in (("claude-7001-p0sla-marker", "7001"), ("claude/7001-selfclose-reaper", "7001"),
                           ("fix-6374-x402-exposure-deploy-guard", "6374"), ("fix/6374-x402", "6374"),
                           ("3302-x1-actuator-pool", "3302"), ("codex/5949", "5949")):
-            m = reaper.ISSUE_RE.search(branch)
-            self.assertIsNotNone(m, branch)
-            self.assertEqual(m.group(1), n, branch)
+            self.assertEqual(reaper.branch_issue(branch, self.STIMA, self.STIMA), (self.STIMA, n), branch)
+
+    def test_the_word_shape_names_nothing_on_another_repo(self):
+        # On a skills or cc-reaper tree the number is still a stima-api issue, nobody's claim there (#148 review).
+        self.assertIsNone(reaper.branch_issue("claude-7001-p0-apply", self.SKILLS, self.STIMA))
+        self.assertEqual(reaper.branch_issue("claude/7001-p0sla-skills", self.SKILLS, self.STIMA), (self.SKILLS, "7001"))
+        self.assertIsNone(reaper.branch_issue("claude-7001-p0-apply", "", self.STIMA))
 
     def test_a_number_deeper_in_the_name_is_no_issue(self):
         for branch in ("canary-main-1031", "chore/uiux-sync-1026", "uiux-accept-1029", "claude/prompt-size-403-4389",
                        "claude-acceptance-bc-20261103", "release-20261104", "v2-100-rc",
-                       "3309622ee115ae978d3b2517e8223e88307fe221"):
+                       "3309622ee115ae978d3b2517e8223e88307fe221", ""):
+            self.assertIsNone(reaper.branch_issue(branch, self.STIMA, self.STIMA), branch)
             self.assertIsNone(reaper.ISSUE_RE.search(branch), branch)
 
 
