@@ -208,7 +208,11 @@ fi
 # killed here. If you run such a daemon, either:
 #   - export CC_STOP_HOOK_DISABLE=1 in the user environment, or
 #   - extend MCP_WHITELIST above to include your daemon's command pattern.
-ps -eo pid=,ppid=,command= 2>/dev/null | awk -v set="$ORPHAN_PPIDS" 'index(set, " " $2 " ")' | while IFS= read -r line; do
+# One grep over the whole listing first: the per-line forks below (two awk, sed, grep,
+# is_ancestor) ran for every orphan on the host (477 at the 2026-11-05 audit, ~5 forks each,
+# p50 7 s, killed at the 15 s registration in 1 stop of 5); now they run only for the matches.
+TARGET_PATTERNS="[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"
+ps -eo pid=,ppid=,command= 2>/dev/null | awk -v set="$ORPHAN_PPIDS" 'index(set, " " $2 " ")' | grep -E "$TARGET_PATTERNS" | while IFS= read -r line; do
   _pid=$(echo "$line" | awk '{print $1}')
   _cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
   # Never kill an orphan parent itself (e.g. the `systemd --user` manager) —
@@ -217,7 +221,7 @@ ps -eo pid=,ppid=,command= 2>/dev/null | awk -v set="$ORPHAN_PPIDS" 'index(set, 
   # Same ancestor protection the PGID sweep gets: a `claude … --stream-json`
   # matched here can be the CLI this hook is running under.
   is_ancestor "$_pid" && continue
-  if echo "$_cmd" | grep -qE "[c]laude.*stream-json|[n]pm exec @upstash|[n]pm exec mcp-|[n]px.*mcp-server|[n]ode.*sequential-thinking|[w]orker-service\.cjs.*--daemon|[b]un.*worker-service"; then
+  if echo "$_cmd" | grep -qE "$TARGET_PATTERNS"; then
     echo "$_cmd" | grep -qE "$MCP_WHITELIST" && continue
     _cc_stop_kill "$_pid"
   fi
