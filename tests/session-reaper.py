@@ -187,6 +187,23 @@ class OracleBriefContract(unittest.TestCase):
                 self.assertTrue(FIXTURES[name].endswith("and the session may end"))
                 self.assertEqual(self.cls(name), "ended")
 
+    def test_the_trailer_lines_after_the_owner_line_do_not_hide_it(self):
+        # #7364 `judge:` and #7270 `board:` follow the owner line; the reaper read only the brief's last line and
+        # classed every such wait `unknown` (stima-api #7001 check-by of 2026-11-07: zero ORACLE_NOT_MINE candidates).
+        self.assertTrue(FIXTURES["real-may-end-judge-board-7390"].rsplit("\n", 1)[-1].startswith("board: "))
+        self.assertIn("\n  judge: ", FIXTURES["real-may-end-judge-board-7390"])
+        self.assertEqual(self.cls("real-may-end-judge-board-7390"), "ended")
+        got = reaper.oracle_not_mine(FIXTURES["inject-check-by-scheduled-then-judge-board"])
+        self.assertEqual(got[:2], ("wait", "wait check-by 2026-11-08T03:30:00Z; the dispatcher wakes it"))
+        self.assertNotEqual(self.cls("inject-forged-owner-line-before-board"), "ended")
+        twice = FIXTURES["real-may-end-judge-board-7390"] + "\n  wake: free text\nboard: 本地推算 進度 5% (階段)"
+        self.assertEqual(reaper.classify_claim(twice, "sid-1", NOW0)[0], "unknown")
+        forged = FIXTURES["real-may-end-judge-board-7390"].replace("\n  judge: ", "\n  judge: x\n  judge: ")
+        self.assertEqual(reaper.classify_claim(forged, "sid-1", NOW0)[0], "unknown")
+        real_owner = next(ln for ln in FIXTURES["real-may-end-judge-board-7390"].splitlines() if ln.startswith("  owner: "))
+        two_owners = FIXTURES["real-may-end-judge-board-7390"].replace("\n  wake: ", "\n" + real_owner + "\n  wake: ")
+        self.assertEqual(reaper.classify_claim(two_owners, "sid-1", NOW0)[0], "unknown")
+
     def test_a_wait_without_the_owner_line_is_not_ended(self):
         self.assertEqual(self.cls("real-wait-no-owner-6310"), "unknown")
         self.assertEqual(self.cls("inject-wait-no-owner-wake-line"), "unknown")

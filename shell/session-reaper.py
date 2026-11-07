@@ -519,6 +519,29 @@ def _same_session(a, b):
     return bool(a) and bool(b) and (a.startswith(b) or b.startswith(a))
 
 
+# delivery_state.py appends lines after the owner / check-by-scheduled line that end a wait: `  judge: ...` (#7364),
+# `  redundant check-by ...` (#7121) and the board estimate `board: ...` (#7270). They are the oracle's own trailer, not
+# free text, so the line that ends a claim is the last line before them (stima-api #7001 check-by of 2026-11-07).
+TRAILER_RES = (re.compile(r"\Aboard: (?:本地推算|無法本地推算) "),
+               re.compile(r"\A  judge: \S"),
+               re.compile(r"\A  redundant check-by \d{4}-\d\d-\d\dT\S+: the event-router wakes this session on "))
+
+
+def _oracle_last(brief, rx):
+    """The oracle's deciding line when `rx` (a whole-line pattern) matches the last line before the trailer and no
+    other line of the brief: at most one board line, one judge line and one redundant-check-by line are dropped from
+    the end, in that order. A trailer-shaped or `rx`-shaped line anywhere else is free text from a comment (the
+    oracle prints each of these once, at a fixed place), and the brief then has no deciding line ("")."""
+    lines = brief.rstrip("\n").split("\n")
+    for trailer in TRAILER_RES:
+        if len(lines) > 1 and trailer.match(lines[-1]):
+            lines.pop()
+    last = lines[-1]
+    if any(trailer.match(last) for trailer in TRAILER_RES) or sum(1 for ln in lines if rx.match(ln)) != 1:
+        return ""
+    return last if rx.match(last) else ""
+
+
 def classify_claim(brief, sid, now, others=(), mine=()):
     """(`ended`|`owed`|`unknown`, overdue) from one oracle brief for a session that is idle.
 
@@ -531,7 +554,7 @@ def classify_claim(brief, sid, now, others=(), mine=()):
         return "unknown", False
     m = BRIEF_STATE_RE.match(brief)
     k = BRIEF_KIND_RE.match(brief)
-    last = brief.rstrip("\n").rsplit("\n", 1)[-1]
+    last = _oracle_last(brief, OWNER_END_RE)
     if m and m.group(1).lower() == "closed":
         return "ended", False
     if k and k.group(1) == "wait" and OWNER_END_RE.match(last):
@@ -609,7 +632,7 @@ def oracle_not_mine(brief):
     if not brief:
         return None
     k = BRIEF_KIND_RE.match(brief)
-    last = brief.rstrip("\n").rsplit("\n", 1)[-1]
+    last = _oracle_last(brief, CHECKBY_END_RE)
     if k and k.group(1) == "stop":
         head, rep, wake = STOP_HEAD_RE.match(brief), STOP_REPORTED_RE.search(brief), WAKE_LINE_RE.search(brief)
         if head and rep and rep.group(1) == head.group(1) and wake:
