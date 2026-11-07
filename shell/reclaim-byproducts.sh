@@ -969,7 +969,7 @@ reap_scratchpads() {
   fi
   local reaped=0 kept=0 spot=0 bytes=0 d sid proj verdict rc reasons first
   local pressure=0 live="" free window=$IDLE_HOURS
-  local midx="" midx_ok=0 live_ok=0 live_set="" prot="" resum="" class mention holders kb why
+  local midx="" midx_ok=0 live_ok=0 live_set="" prot="" resum="" class mention mentioners="" m holders kb why
   RUN_ID="$(date +%Y%m%dT%H%M%S)-$$"
   free="$(free_gb)"
   if [ "$SCRATCH_PRESSURE_FREE_GB" -gt 0 ] && [ -n "$free" ] && [ "$free" -lt "$SCRATCH_PRESSURE_FREE_GB" ]; then
@@ -1078,7 +1078,8 @@ reap_scratchpads() {
       # The whole first field, never a substring of it: `grep -F proj/<sid>` also found
       # `-dash-proj/<sid>`, a different project's directory (stima-api#5886, found by the
       # per-path equivalence test). A project directory also starts with a dash.
-      mention="$(awk -F'\t' -v k="$proj/$sid" '$1 == k { print $2; exit }' "$midx")"
+      mentioners="$(awk -F'\t' -v k="$proj/$sid" '$1 == k { print $2 }' "$midx")"
+      mention="$(printf '%s\n' "$mentioners" | sed -n '1p')"
       [ -n "$mention" ] && class=new
     fi
     # Its session wrote a transcript inside the window: the session is active, whatever its
@@ -1125,6 +1126,17 @@ reap_scratchpads() {
       if [ "$LSOF_STATE" != ok ]; then why="lsof is unusable, so holders cannot be ruled out"
       elif [ "$live_ok" -ne 1 ]; then why="session records could not be read, so its session cannot be ruled alive"
       elif [ -n "$resum" ] && printf '%s\n' "$resum" | grep -qxF "$sid"; then why="closed within ${RESUME_DAYS}d and resumable (closed-sessions.md)"
+      fi
+      # A DIFFERENT session that names the directory and is alive, or is resumable, may still
+      # be working from it (stima-api#7106: a session closed hours earlier named it 4,522
+      # times). Only the directory's own session was asked above. Codex transcripts are not
+      # Claude session ids and match nothing here.
+      if [ -z "$why" ]; then
+        for m in $mentioners; do
+          m="${m%.jsonl}"
+          if printf '%s\n' "$live_set" | grep -qxF "$m"; then why="named by session $m, which is alive"; break; fi
+          if [ -n "$resum" ] && printf '%s\n' "$resum" | grep -qxF "$m"; then why="named by session $m, closed within ${RESUME_DAYS}d and resumable"; break; fi
+        done
       fi
       if [ -n "$why" ]; then
         log "scratchpad kept: $d — $why (named by ${mention:-a transcript})"
