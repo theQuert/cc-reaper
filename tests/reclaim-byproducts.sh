@@ -1816,6 +1816,11 @@ SIDD=dddddddd-dddd-dddd-dddd-dddddddddddd
 SIDE=eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee
 SIDF=ffffffff-ffff-ffff-ffff-ffffffffffff
 SIDG=12121212-1212-1212-1212-121212121212
+# stima-api#7106: dead, idle scratchpads named ONLY by another session's transcript - SIDH by
+# the resumable session $SIDC, SIDI by the alive session $SID8. They must be kept, not removable.
+SIDH=13131313-1313-1313-1313-131313131313
+SIDI=14141414-1414-1414-1414-141414141414
+SIDJ=15151515-1515-1515-1515-151515151515   # resumable (closed today); its own scratchpad does not exist
 live_fixture() {
   local root="$1" sid
   build_fixture "$root"
@@ -1826,6 +1831,12 @@ live_fixture() {
     printf 'it listed %s/proj/%s earlier\n' "$root/scratch" "$sid" >> "$root/home/.claude/projects/proj/00000000-0000-0000-0000-000000000000.jsonl"
   done
   touch "$root/scratch/proj/$SIDA/just-written"
+  for sid in $SIDH $SIDI; do
+    mkdir -p "$root/scratch/proj/$sid"; : > "$root/scratch/proj/$sid/out.txt"
+    touch -t "$OLD_TS" "$root/scratch/proj/$sid/out.txt" "$root/scratch/proj/$sid"
+  done
+  printf 'cd %s/proj/%s\n' "$root/scratch" "$SIDH" > "$root/home/.claude/projects/proj/$SIDJ.jsonl"
+  printf 'cd %s/proj/%s\n' "$root/scratch" "$SIDI" > "$root/home/.claude/projects/proj/$SID8.jsonl"
   mkdir -p "$root/scratch/-dash-proj/$SIDF"; : > "$root/scratch/-dash-proj/$SIDF/out.txt"
   touch -t "$OLD_TS" "$root/scratch/-dash-proj/$SIDF/out.txt" "$root/scratch/-dash-proj/$SIDF"
   printf 'it listed %s/-dash-proj/%s earlier\n' "$root/scratch" "$SIDF" >> "$root/home/.claude/projects/proj/00000000-0000-0000-0000-000000000000.jsonl"
@@ -1839,6 +1850,7 @@ live_fixture() {
   mkdir -p "$root/scratch/proj/$SIDG"; touch -t "$OLD_TS" "$root/scratch/proj/$SIDG"
   : > "$root/home/.claude/projects/proj/$SIDG.jsonl"
   printf '## %s Neo closed (claude --resume <sid>)\n- c %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$SIDC" > "$root/closed-sessions.md"
+  printf -- '- j %s\n' "$SIDJ" >> "$root/closed-sessions.md"
   printf '\n## %s session-reaper\n- e %s cwd=/x\n' "$(date -v-10d '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d '10 days ago' '+%Y-%m-%d %H:%M:%S')" "$SIDE" >> "$root/closed-sessions.md"
   printf '%s %s\n' 4242 "$root/scratch/proj/$SID9/out.txt" > "$root/lsof-held"
   cat > "$root/bin/path-in-use.sh" <<'STUB'
@@ -1846,7 +1858,7 @@ live_fixture() {
 printf '%s %s\n' "$1" "${PATH_IN_USE_WINDOW_HOURS:-unset}" >> "$(dirname "$0")/../piu-calls"
 case "$1" in
   *11111111-*) echo "free      $1"; exit 0 ;;
-  *-7777-*|*-8888-*|*-9999-*|*-aaaa-*|*-bbbb-*|*-cccc-*|*-dddd-*|*-eeee-*)
+  *-1313-*|*-1414-*|*-7777-*|*-8888-*|*-9999-*|*-aaaa-*|*-bbbb-*|*-cccc-*|*-dddd-*|*-eeee-*)
     echo "IN USE    $1"; echo "  a session active within 24h names it: 00000000-0000-0000-0000-000000000000.jsonl"; exit 1 ;;
 esac
 echo "free      $1"; exit 0
@@ -1872,6 +1884,8 @@ check "a scratchpad touched inside the window is kept" "$OUT" "scratchpad kept: 
 check "a protected session (by name) is kept" "$OUT" "scratchpad kept: .*$SIDB — belongs to a protected session"
 check "a session closed today is kept as resumable" "$OUT" "scratchpad kept: .*$SIDC — closed within 2d and resumable"
 check "a session that wrote a transcript inside the window is kept" "$OUT" "scratchpad kept: .*$SIDD — its session wrote a transcript"
+check "a scratchpad named only by a resumable session's transcript is kept (#7106)" "$OUT" "scratchpad kept: .*$SIDH — named by session $SIDJ, closed within 2d and resumable"
+check "a scratchpad named only by an alive session's transcript is kept (#7106)" "$OUT" "scratchpad kept: .*$SIDI — named by session $SID8, which is alive"
 check "one closed ten days ago is no longer protected (spotcheck: logged removable)" "$OUT" "spot-check: .*$SIDE"
 check "an unmentioned scratchpad whose session wrote a transcript is kept (the gate no longer searches transcripts)" "$OUT" \
   "scratchpad kept: .*$SIDG — its session wrote a transcript within 24h" "scratchpad reaped: .*$SIDG"
@@ -1884,7 +1898,7 @@ n="$(wc -l < "$WORK/l/lsof-calls" | tr -d ' ')"; r="$(printf '%s\n' "$OUT" | gre
 live_fixture "$WORK/l"
 OUT="$(CC_RB_NEW_RULES_MODE=auto run_real "$WORK/l" "$SCRIPT")"
 exists "$WORK/l" $SID7 && fail "auto: the named, dead, idle scratchpad was kept" || pass "auto: a named but dead scratchpad is removed"
-for sid in $SID8 $SID9 $SIDA $SIDB $SIDC $SIDD; do
+for sid in $SID8 $SID9 $SIDA $SIDB $SIDC $SIDD $SIDH $SIDI; do
   exists "$WORK/l" $sid && pass "auto: $sid stays" || fail "auto: $sid was removed"
 done
 [ -d "$WORK/l/scratch/-dash-proj/$SIDF" ] && fail "auto: a named scratchpad under a dash-led project directory was kept (grep read it as a flag?)" || pass "auto: a project directory that starts with a dash is matched, not parsed as an option"
