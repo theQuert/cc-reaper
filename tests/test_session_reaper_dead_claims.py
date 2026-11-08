@@ -204,6 +204,11 @@ class Alive(Base):
         self.run_pass(w)
         self.assertEqual(w.posted, [])
 
+    def test_a_live_name_keeps_a_codex_claim_too(self):
+        w = World({1: [claim("IC_1", SID_DEAD, "infra", 99, "codex")]})
+        self.run_pass(w)
+        self.assertEqual(w.posted, [])
+
     def test_name_match_ignores_case_and_edges(self):
         w = World({1: [claim("IC_1", SID_DEAD, " UIUX ", 99, "claude")]})
         self.run_pass(w)
