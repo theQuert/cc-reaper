@@ -175,12 +175,31 @@ class Judge(unittest.TestCase):
         brief = {"6837": WAIT_OWNER.replace("6945", "6837")}
         past = self.judge(loop, brief, {"6837": {"pending_check_by": "2026-11-03T01:00:00Z"}})
         self.assertEqual((past["state"], past["claims"][0]["source"]), ("DONE", "name"))
-        ahead = self.judge(loop, brief, {"6837": {"pending_check_by": "2027-02-01T08:00:00Z"}})
-        self.assertEqual((ahead["state"], ahead["reasons"]), ("WORKING", ["check-by-ahead:#6837 2027-02-01T08:00:00Z"]))
+        soon = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 1800))
+        ahead = self.judge(loop, brief, {"6837": {"pending_check_by": soon}})
+        self.assertEqual((ahead["state"], ahead["reasons"]), ("WORKING", ["check-by-ahead:#6837 " + soon]))
         self.assertEqual(self.judge(loop, brief, {})["state"], "UNKNOWN")  # the oracle could not say when it is due
         own = self.judge(loop, {"6837": AGENT_MINE.replace("sid-1", "1be6c43d-bg")}, {"6837": {"pending_check_by": ""}})
         self.assertEqual(own["state"], "WORKING")
         self.assertEqual(self.judge(dict(loop, name="merge-velocity wake 1103"))["state"], "DONE")
+
+    def test_check_by_ahead_keeps_a_loop_only_within_its_idle_threshold(self):
+        """stima-api#7061: a check-by many hours away holds a live slot and buys nothing (prompt cache TTL is 60 min)."""
+        iso = lambda m: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + m * 60))  # noqa: E731
+        loop = session(kind="bg", name="loop #6837 check-by", tmux="loop #6837 check-by", sid="1be6c43d-bg", idle_min=177.0)
+        brief = {"6837": WAIT_OWNER.replace("6945", "6837")}
+        far = self.judge(loop, brief, {"6837": {"pending_check_by": iso(21 * 60)}})
+        self.assertEqual(far["state"], "DONE")
+        near = self.judge(loop, brief, {"6837": {"pending_check_by": iso(30)}})
+        self.assertEqual((near["state"], near["reasons"]), ("WORKING", ["check-by-ahead:#6837 " + iso(30)]))
+        fresh = self.judge(dict(loop, idle_min=20.0), brief, {"6837": {"pending_check_by": iso(21 * 60)}})
+        self.assertEqual((fresh["state"], fresh["reasons"][0][:5]), ("WORKING", "idle:"))
+
+    def test_an_interactive_branch_claim_is_unchanged_by_a_far_check_by(self):
+        iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 21 * 3600))
+        s = session(claims=[(REPO, "6837")])
+        rec = self.judge(s, {"6837": WAIT_OWNER.replace("6945", "6837")}, {"6837": {"pending_check_by": iso}})
+        self.assertEqual((rec["state"], rec["claims"][0]["source"]), ("DONE", "branch"))
 
     def test_branch_claims_follow_a_slash_never_a_hyphen(self):
         # finding 1: the regex of f9fdaec; a hyphen never starts the number

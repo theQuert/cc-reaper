@@ -5,7 +5,8 @@ Each session gets exactly one `state`:
 
   WORKING         busy, background work of its own (a shell, a pending wakeup, a cron, a scheduled task, a subagent
                   written to lately, a child process, a never-kill pid in its tree), an oracle step that is this
-                  session's, a `loop #N` whose check-by is still ahead, or idle for less than its threshold.
+                  session's, a `loop #N` whose check-by is due within its idle threshold, or
+                  idle for less than its threshold.
   WAITING_PERSON  an oracle person-step on one of its claims (a stop it has reported), an open AskUserQuestion, or a
                   confirmation dialog on screen. Never a keyword in its text.
   UNKNOWN         a claim the oracle cannot place (unread brief, a claimant that is no live session, an unclaimed
@@ -158,7 +159,10 @@ def judge(s, r, cfg, now):
         bg += ["never-kill:" + ",".join(str(p) for p in s["never_kill"])] if s.get("never_kill") else []
         bg += [f"child-process:{s['descendants']}"] if (s.get("descendants") or 0) > 0 else []
         stalled = r.stall_mark(cfg, sid, now)
-        ahead = [c for c in rec["claims"] if c.get("check_by") and (r._iso_epoch(c["check_by"]) or 0) > now]
+        # a loop's check-by keeps it only when it falls due within the idle threshold: further out it holds a live slot
+        # for nothing (the prompt cache lives 60 min, so a later resume costs what a fresh wake does; stima-api#7061)
+        ahead = [c for c in rec["claims"]
+                 if c.get("check_by") and now < (r._iso_epoch(c["check_by"]) or 0) <= now + thr * 60]
         dirty = [w for w in rec["worktrees"] if w["dirty"] or w["unpushed"]]
         st, why = _state(s, rec, thr, own, person, unknown, stalled, ahead, dirty)
         rec["state"], rec["reasons"] = st, why
