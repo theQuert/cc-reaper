@@ -67,7 +67,7 @@ def _same(a, b):
     return bool(a) and bool(b) and (a.startswith(b) or b.startswith(a))
 
 
-def claim_step(r, brief, sid, mine_ids=(), other_sids=()):
+def claim_step(r, brief, sid, mine_ids=(), other_sids=(), loop=False):
     """(oracle_step, mine, person) for one claim from its `--brief` text; `r` is the reaper module.
 
     mine: True when the step is this session's (an agent step whose claimant is this session or a worktree marker it
@@ -104,6 +104,8 @@ def claim_step(r, brief, sid, mine_ids=(), other_sids=()):
             return step, True, False
         if any(_same(c.group(1), o) for o in other_sids):
             return step, False, False
+        if loop and step != "agent check-by":
+            return step, False, False  # a loop timer is not the step's claimant; a due `agent check-by` it serves stays open
         return step, None, False
     return step, None, False
 
@@ -134,7 +136,8 @@ def judge(s, r, cfg, now):
         mine_ids = [w["marker"] for w in s.get("owned") or () if w.get("marker")]
         own, person, unknown = [], [], []
         for repo, n, src in _claims(s, r, cfg, now, thr):
-            step, mine, pers = claim_step(r, r.oracle_brief(repo, n, cfg, now), sid, mine_ids, s.get("other_sids", ()))
+            step, mine, pers = claim_step(r, r.oracle_brief(repo, n, cfg, now), sid, mine_ids, s.get("other_sids", ()),
+                                         loop=src == "name")
             c = {"issue": int(n), "repo": repo, "source": src, "oracle_step": step, "mine": mine}
             if src == "name":  # a background loop: when its check-by falls due (None: the oracle could not say)
                 d = r.oracle_json(repo, n, cfg) if repo == cfg.get("CHECKBY_REPO") else None
