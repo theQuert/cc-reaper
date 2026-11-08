@@ -175,12 +175,31 @@ class Judge(unittest.TestCase):
         brief = {"6837": WAIT_OWNER.replace("6945", "6837")}
         past = self.judge(loop, brief, {"6837": {"pending_check_by": "2026-11-03T01:00:00Z"}})
         self.assertEqual((past["state"], past["claims"][0]["source"]), ("DONE", "name"))
-        ahead = self.judge(loop, brief, {"6837": {"pending_check_by": "2027-02-01T08:00:00Z"}})
-        self.assertEqual((ahead["state"], ahead["reasons"]), ("WORKING", ["check-by-ahead:#6837 2027-02-01T08:00:00Z"]))
+        soon = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 1800))
+        ahead = self.judge(loop, brief, {"6837": {"pending_check_by": soon}})
+        self.assertEqual((ahead["state"], ahead["reasons"]), ("WORKING", ["check-by-ahead:#6837 " + soon]))
         self.assertEqual(self.judge(loop, brief, {})["state"], "UNKNOWN")  # the oracle could not say when it is due
         own = self.judge(loop, {"6837": AGENT_MINE.replace("sid-1", "1be6c43d-bg")}, {"6837": {"pending_check_by": ""}})
         self.assertEqual(own["state"], "WORKING")
         self.assertEqual(self.judge(dict(loop, name="merge-velocity wake 1103"))["state"], "DONE")
+
+    def test_check_by_ahead_keeps_a_loop_only_within_its_idle_threshold(self):
+        """stima-api#7061: a check-by many hours away holds a live slot and buys nothing (prompt cache TTL is 60 min)."""
+        iso = lambda m: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + m * 60))  # noqa: E731
+        loop = session(kind="bg", name="loop #6837 check-by", tmux="loop #6837 check-by", sid="1be6c43d-bg", idle_min=177.0)
+        brief = {"6837": WAIT_OWNER.replace("6945", "6837")}
+        far = self.judge(loop, brief, {"6837": {"pending_check_by": iso(21 * 60)}})
+        self.assertEqual(far["state"], "DONE")
+        near = self.judge(loop, brief, {"6837": {"pending_check_by": iso(30)}})
+        self.assertEqual((near["state"], near["reasons"]), ("WORKING", ["check-by-ahead:#6837 " + iso(30)]))
+        fresh = self.judge(dict(loop, idle_min=20.0), brief, {"6837": {"pending_check_by": iso(21 * 60)}})
+        self.assertEqual((fresh["state"], fresh["reasons"][0][:5]), ("WORKING", "idle:"))
+
+    def test_an_interactive_branch_claim_is_unchanged_by_a_far_check_by(self):
+        iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 21 * 3600))
+        s = session(claims=[(REPO, "6837")])
+        rec = self.judge(s, {"6837": WAIT_OWNER.replace("6945", "6837")}, {"6837": {"pending_check_by": iso}})
+        self.assertEqual((rec["state"], rec["claims"][0]["source"]), ("DONE", "branch"))
 
     def test_branch_claims_follow_a_slash_never_a_hyphen(self):
         # finding 1: the regex of f9fdaec; a hyphen never starts the number
@@ -236,6 +255,34 @@ class Judge(unittest.TestCase):
         with mock.patch.object(reaper, "oracle_brief", return_value=brief), \
              mock.patch.object(reaper, "worktree_state", return_value=[]):
             self.assertEqual(reaper._decide(dict(s), CFG, NOW), ["issue-unknown:#6837"])
+
+
+class ClaimStepTrailer(unittest.TestCase):
+    """claim_step reads the deciding line before the oracle's trailer (stima-api#7061: `loop #3041 check-by` stayed UNKNOWN)."""
+    HEAD = ("delivery #9: serving-verified (none) -> wait check-by  [abc]\n  then acceptance: ...\n"
+            "  wake: 2026-11-09T01:00:00Z: ...\n")
+    OWNER = "  owner: tech.stima.stranded-step-dispatcher wakes it; no watcher needed, and the session may end"
+    JUDGE = "\n  judge: none (the session is woken)"
+    BOARD = "\nboard: \u672c\u5730\u63a8\u7b97 \u9032\u5ea6 5% (\u968e\u6bb5) \u968e\u6bb5 wait check-by \u958b\u59cb\u5be6\u4f5c \u7121 \u8017\u6642 \u7121"
+    RECORD = "  record `check-by 2026-11-09T01:00:00Z` on the issue: the wake is scheduled by that comment"
+
+    def step(self, brief):
+        return ss.claim_step(reaper, brief, "sid-x")
+
+    def test_owner_line_then_judge_and_board_ends_the_wait(self):
+        self.assertEqual(self.step(self.HEAD + self.OWNER + self.JUDGE + self.BOARD)[1], False)
+
+    def test_owner_line_then_board_only_ends_the_wait(self):
+        self.assertEqual(self.step(self.HEAD + self.OWNER + self.BOARD)[1], False)
+
+    def test_owner_line_alone_still_ends_the_wait(self):
+        self.assertEqual(self.step(self.HEAD + self.OWNER)[1], False)
+
+    def test_record_check_by_with_a_trailer_is_mine(self):
+        self.assertEqual(self.step(self.HEAD + self.RECORD + self.JUDGE + self.BOARD)[1], True)
+
+    def test_free_text_owner_line_mid_brief_ends_nothing(self):
+        self.assertIsNone(self.step(self.HEAD + self.OWNER + "\n  some other line" + self.BOARD)[1])
 
 
 class File(unittest.TestCase):
