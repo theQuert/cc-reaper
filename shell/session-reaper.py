@@ -105,6 +105,13 @@ DEFAULTS = {
     "DONE_MARKER": "on",
     "SCRATCH_ROOT": "",  # empty: /tmp/claude-<uid>
     "JOBS_DIR": "~/.claude/jobs",
+    # stima-api#7527: a claim whose claimant's name and id match no live tmux session and no live sessions.json entry, and
+    # that is silent for DEAD_CLAIMS_HOURS, gets one `Released by` comment. `apply`: post (when the run applies);
+    # `shadow`: list what it would post in the report; `off`: neither. At most DEAD_CLAIMS_MAX posts a run.
+    "DEAD_CLAIMS": "apply",
+    "DEAD_CLAIMS_HOURS": "6",
+    "DEAD_CLAIMS_MAX": "40",
+    "DEAD_CLAIMS_CACHE": "~/.cc-reaper/state/dead-claims-cache.json",  # issue -> claimant, kept while its updated_at holds
 }
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
@@ -2199,6 +2206,304 @@ def alert(cfg, lines):
         notify("session-reaper could not post the failure to " + cfg["TRACKING_ISSUE"])
 
 
+# ---------- dead claims (stima-api#7527) ----------
+# A claim whose claimant's name matches nothing alive is released with the comment the oracle already honours, so the
+# issue reads unclaimed and the stranded-step dispatcher can take its step. The test is the name (and the session id),
+# never the harness: a codex session, a custom name and a Claude session are judged alike.
+DEAD_CLAIM_PAGE = 50  # search results per page, as the rest of the reaper's GitHub reads
+DEAD_CLAIM_PAGES = 20  # search's own ceiling is 1000 results
+DEAD_CLAIM_BATCH = 25  # issues per GraphQL request: their comment bodies are the payload, not the aliases
+DEAD_CLAIM_FALLBACKS = 10  # `gh issue view` reads a run may spend on an issue with more than 100 comments
+DEAD_CLAIM_MARK = "session-reaper-dead-claim:"
+_oracle_module = []
+
+
+def load_oracle(cfg):
+    """stima-api's delivery_state module from ORACLE_ROOT (its claimant() is the one grammar for who holds an issue),
+    or None when it cannot be imported."""
+    if _oracle_module:
+        return _oracle_module[0]
+    root = Path(os.path.expanduser(cfg["ORACLE_ROOT"])) / "scripts" / "ci"
+    if not (root / "delivery_state.py").is_file():
+        return None
+    sys.path.insert(0, str(root))
+    try:
+        import delivery_state  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 (a checkout that cannot import is the same as none)
+        return None
+    finally:
+        sys.path.remove(str(root))
+    _oracle_module.append(delivery_state)
+    return delivery_state
+
+
+def read_tmux_names():
+    """Lowercased names of the tmux sessions that exist; None when tmux cannot say (not running, not installed, timed
+    out), which is not the same as an empty list."""
+    rc, out = tmux("list-sessions", "-F", "#{session_name}")
+    if rc != 0:
+        return None
+    return {line.strip().lower() for line in out.splitlines() if line.strip()}
+
+
+def read_state_live(cfg, now):
+    """(names, session ids) of the live entries of sessions.json (session_state.py, which the sweep rewrites every run);
+    None when the file is missing, broken, of another version or older than session_state.MAX_AGE_SECONDS."""
+    ss, _ = load_session_state()
+    if not ss:
+        return None
+    doc = ss.read(ss.default_path(state_dir(cfg)), now)
+    if doc is None:
+        return None
+    names, sids = set(), set()
+    for x in doc["sessions"]:
+        if not isinstance(x, dict):
+            continue
+        names |= {str(x[k]).strip().lower() for k in ("name", "tmux") if x.get(k)}
+        if x.get("sid"):
+            sids.add(str(x["sid"]).lower())
+    return names, sids
+
+
+def search_claimed(repo):
+    """[(number, updated_at)] of the open issues that have a `Claimed by` comment, newest update first: the oracle's own
+    claim_candidates() query (delivery_state.py), paged by 50. None when the list is partial or cannot be read."""
+    query = f'repo:{repo} is:issue is:open "Claimed by" in:comments'
+    jq = ('{total: .total_count, incomplete: .incomplete_results, raw: (.items | length), '
+          'items: [.items[] | select(.pull_request == null) | {n: .number, u: .updated_at}]}')
+    found, seen = [], 0
+    for page in range(1, DEAD_CLAIM_PAGES + 1):
+        rc, out = run(["gh", "api", "-X", "GET", "search/issues", "-f", "q=" + query, "-f", "sort=updated",
+                       "-f", "order=desc", "-f", f"per_page={DEAD_CLAIM_PAGE}", "-f", f"page={page}", "--jq", jq], 90)
+        try:
+            if rc != 0:
+                return None
+            got = json.loads(out)
+            if got["incomplete"] or int(got["total"]) > DEAD_CLAIM_PAGE * DEAD_CLAIM_PAGES:
+                return None
+            found += [(int(i["n"]), str(i["u"])) for i in got["items"]]
+            seen += int(got["raw"])
+        except (ValueError, TypeError, KeyError):
+            return None
+        if got["raw"] < DEAD_CLAIM_PAGE or seen >= int(got["total"]):
+            return found
+    return None
+
+
+def _comment_row(c):
+    return {"id": str(c.get("id") or ""), "createdAt": str(c.get("createdAt") or ""), "body": str(c.get("body") or "")}
+
+
+def read_comment_batches(repo, nums):
+    """{number: comments} for the issues it could read in full, oldest first, 25 per GraphQL request; an issue whose
+    last 100 comments are not all of them is read with `gh issue view` (a few a run), and one it cannot read is left
+    out. A failed request leaves its issues out too: they are read again next run."""
+    owner, name = repo.split("/")
+    got = {}
+    fallbacks = 0
+    for i in range(0, len(nums), DEAD_CLAIM_BATCH):
+        chunk = nums[i:i + DEAD_CLAIM_BATCH]
+        fields = " ".join(f"i{n}: issue(number: {n}) {{ comments(last: 100) {{ pageInfo {{ hasPreviousPage }} "
+                          f"nodes {{ id createdAt body }} }} }}" for n in chunk)
+        query = f"query($o: String!, $n: String!) {{ repository(owner: $o, name: $n) {{ {fields} }} }}"
+        rc, out = run(["gh", "api", "graphql", "-f", "o=" + owner, "-f", "n=" + name, "-f", "query=" + query], 120)
+        try:
+            data = json.loads(out)["data"]["repository"]
+            if not isinstance(data, dict):
+                raise ValueError("shape")
+        except (ValueError, TypeError, KeyError):
+            continue
+        for n in chunk:
+            conn = ((data.get(f"i{n}") or {}).get("comments")) or {}
+            try:
+                rows = [_comment_row(c) for c in conn["nodes"]]
+                partial = bool(conn["pageInfo"]["hasPreviousPage"])
+            except (KeyError, TypeError):
+                continue
+            if partial:
+                if fallbacks >= DEAD_CLAIM_FALLBACKS:
+                    continue
+                fallbacks += 1
+                full = fresh_comments(repo, n)
+                if full is None:
+                    continue
+                rows = full
+            got[n] = rows
+    return got
+
+
+def fresh_comments(repo, num):
+    """The issue's comments now, never the run's memo; None when gh could not say."""
+    _comments_cache.pop((repo, num), None)
+    rc, out = run(["gh", "issue", "view", str(num), "-R", repo, "--json", "comments", "-q", ".comments"], 60)
+    try:
+        rows = json.loads(out)
+        return [_comment_row(c) for c in rows] if rc == 0 and isinstance(rows, list) else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _gh_epoch(stamp):
+    try:
+        return calendar.timegm(time.strptime(str(stamp)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def _same_id(a, b):
+    a, b = str(a).lower(), str(b).lower()
+    return len(a) >= 8 and len(b) >= 8 and (a.startswith(b) or b.startswith(a))
+
+
+def dead_claim_key(label, claim_id):
+    return f"{label}:{claim_id}"
+
+
+def claim_facts(ds, comments, updated):
+    """What the pass keeps of an issue between runs: who the oracle says holds it, the id and time of that claim's
+    newest comment, the last time that session is heard from (its claim, or a later comment that names its id) and the
+    dedupe keys already released. `claimant` None: the issue reads unclaimed."""
+    facts = {"updated": updated, "claimant": None}
+    who = ds.claimant(comments)
+    if not who:
+        return facts
+    sid = str(who["session"]).lower()
+    at = claim = None
+    for i, c in enumerate(comments):
+        lines = [x for x in str(c["body"]).splitlines() if x.strip()]
+        if lines and CLAIM_LINE_RE.match(lines[0]) and claims_session(c["body"], sid):
+            at, claim = i, c
+    if claim is None:
+        return facts | {"claimant": who, "claim_id": "", "claim_at": None, "last_at": None, "marked": []}
+    claim_at = _gh_epoch(claim["createdAt"])
+    last = claim_at
+    for c in comments[at + 1:]:
+        t = _gh_epoch(c["createdAt"])
+        if t is not None and sid[:8] in c["body"].lower() and (last is None or t > last):
+            last = t
+    marked = sorted({m.group(1) for c in comments for m in re.finditer(re.escape(DEAD_CLAIM_MARK) + r"(\S+?) -->", c["body"])})
+    return facts | {"claimant": who, "claim_id": claim["id"], "claim_at": claim_at, "last_at": last, "marked": marked}
+
+
+def dead_claim_comment(who, label, claim_id, since):
+    sid, name = who["session"], (who.get("name") or "").strip()
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+    return (f"Released by {who.get('harness') or 'claude'} session {sid}" + (f" ({name})" if name else "")
+            + f": session {label} is not in the live session list since {at}\n\n"
+            f"session-reaper found no tmux session or sessions.json entry named `{label}` or carrying id `{sid}`, and "
+            "nothing from that session on this issue for 6 hours or more, so its claim is released and the issue reads "
+            "unclaimed. The issue, its labels and its check-by are untouched.\n\n"
+            f"<!-- {DEAD_CLAIM_MARK}{dead_claim_key(label, claim_id)} -->")
+
+
+def _load_json(path):
+    try:
+        data = json.loads(Path(path).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def release_dead_claims(cfg, now, apply, extra=((), ())):
+    """Release, with one comment each, the claims of open issues whose claimant matches nothing alive. Returns
+    {released, would, young, alive, deferred, unreadable, notes}. `apply` False (or DEAD_CLAIMS=shadow) lists what it
+    would release and writes nothing to GitHub; DEAD_CLAIMS=off does nothing. A live list it cannot read (tmux,
+    sessions.json), the oracle module or the issue list releases nothing and costs one note."""
+    mode = cfg.get("DEAD_CLAIMS", "apply")
+    out = {"released": [], "would": [], "young": [], "alive": 0, "deferred": [], "unreadable": "", "notes": []}
+    if mode == "off":
+        return out
+
+    def closed(why):
+        out["unreadable"] = why
+        out["notes"].append(f"dead claims: {why}; released nothing this round")
+        return out
+    names = read_tmux_names()
+    if names is None:
+        return closed("tmux not readable")
+    state = read_state_live(cfg, now)
+    if state is None:
+        return closed("sessions.json not readable or stale")
+    ds = load_oracle(cfg)
+    if ds is None:
+        return closed("oracle (delivery_state.py) not importable")
+    repo = cfg["CHECKBY_REPO"]
+    found = search_claimed(repo)
+    if found is None:
+        return closed("issue list not readable")
+    names |= state[0] | {str(x).strip().lower() for x in extra[0] if x}
+    sids = state[1] | {str(x).lower() for x in extra[1] if x}
+    cache_path = Path(os.path.expanduser(cfg["DEAD_CLAIMS_CACHE"]))
+    cache = _load_json(cache_path)
+    need = [n for n, u in found if (cache.get(str(n)) or {}).get("updated") != u]
+    got = read_comment_batches(repo, need) if need else {}
+    cache = {str(n): cache[str(n)] for n, _ in found if str(n) in cache}
+    for n, u in found:
+        if n in got:
+            cache[str(n)] = claim_facts(ds, got[n], u)
+    updated_of = dict(found)
+    unread = [n for n in updated_of if (cache.get(str(n)) or {}).get("updated") != updated_of[n]]
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache))
+    except OSError:
+        out["notes"].append("dead claims: cache not written")
+    if unread:
+        out["notes"].append(f"dead claims: {len(unread)} issue(s) not read this round: "
+                            + ", ".join(f"#{n}" for n in unread[:10]))
+    hours = float(cfg.get("DEAD_CLAIMS_HOURS", "6"))
+    cap = int(cfg.get("DEAD_CLAIMS_MAX", "40"))
+    due = []
+    for n, _ in found:
+        e = cache.get(str(n))
+        who = (e or {}).get("claimant")
+        if not who or e.get("updated") != updated_of[n]:
+            continue
+        label = (who.get("name") or "").strip() or str(who["session"])
+        if (label.lower() in names and who.get("name")) or any(_same_id(who["session"], s) for s in sids):
+            out["alive"] += 1
+        elif not e.get("claim_id") or e.get("last_at") is None:
+            out["notes"].append(f"dead claims: #{n} claimant {label}: claim comment not placed, left alone")
+        elif now - e["last_at"] < hours * 3600:
+            out["young"].append((n, label, e["last_at"]))
+        elif dead_claim_key(label, e["claim_id"]) in e.get("marked", []):
+            continue
+        else:
+            due.append((n, label, e["last_at"], who, e["claim_id"]))
+    for n, label, since, who, claim_id in due:
+        if mode != "apply" or not apply:
+            out["would"].append((n, label, since))
+        elif len(out["released"]) >= cap:
+            out["deferred"].append((n, label, since))
+        else:
+            fresh = fresh_comments(repo, n)  # the cache may be minutes old: the claim must still be this one
+            now_who = ds.claimant(fresh) if fresh is not None else None
+            if not now_who or now_who["session"] != who["session"] or any(
+                    DEAD_CLAIM_MARK + dead_claim_key(label, claim_id) in c["body"] for c in fresh):
+                continue
+            facts = claim_facts(ds, fresh, "")
+            if facts.get("claim_id") != claim_id or (facts["last_at"] or 0) != since:
+                continue
+            if comment((repo, str(n)), dead_claim_comment(who, label, claim_id, since)):
+                out["released"].append((n, label, since))
+                cache.get(str(n), {})["updated"] = ""  # our own comment moved the issue: read it again
+            else:
+                out["notes"].append(f"dead claims: could not post the release on #{n}")
+    try:
+        cache_path.write_text(json.dumps(cache))
+    except OSError:
+        pass
+    return out
+
+
+def dead_claim_lines(res, stamp=lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))):
+    lines = [f"released #{n}: session {label} not in the live session list since {stamp(t)}" for n, label, t in res["released"]]
+    lines += [f"would release #{n}: session {label} not in the live session list since {stamp(t)}" for n, label, t in res["would"]]
+    lines += [f"deferred #{n}: session {label} (per-run cap)" for n, label, t in res["deferred"]]
+    lines += [f"waiting #{n}: session {label} dead, last heard {stamp(t)} (under the grace)" for n, label, t in res["young"]]
+    return lines
+
+
 # ---------- main ----------
 
 def report_line(s, keep, outcome):
@@ -2239,6 +2544,9 @@ def main(argv=None):
     ap.add_argument("--apply", action="store_true", help="reap (default: report only, unless APPLY=1)")
     ap.add_argument("--only", help="consider only this tmux session")
     ap.add_argument("--idle-minutes", help="override IDLE_MINUTES")
+    ap.add_argument("--dead-claims-only", action="store_true",
+                    help="run only the dead-claim pass (stima-api#7527): list the claims it would release; post them "
+                         "only with --apply (the config's APPLY is ignored here)")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     if args.idle_minutes is not None:
@@ -2255,7 +2563,14 @@ def main(argv=None):
         print("session-reaper: another run holds the lock")
         return 0
     now = time.time()
+    if args.dead_claims_only:
+        res = release_dead_claims(cfg, now, args.apply)
+        print("\n".join([*dead_claim_lines(res), *res["notes"],
+                         f"dead claims: {len(res['released'])} released, {len(res['would'])} would release, "
+                         f"{len(res['deferred'])} deferred, {len(res['young'])} under the grace, {res['alive']} alive"]))
+        return 0
     rows, failures, reaped, seen, stale, notes, rounds, gathered = [], [], 0, [], [], [], [], []
+    dead_claims = None
     swept = state_on = False
     STATE_ROWS.clear()
     # #6477, 2026-10-29: RUN_BUDGET is checked between sessions, so a run blocked inside one call (pid 22262, 30 min
@@ -2349,6 +2664,16 @@ def main(argv=None):
             notes += [f"done marker skipped: {m}" for m in refused]
     except Exception as e:  # a marker that could not be written only delays a reclaim
         notes.append(f"done marker: {type(e).__name__}: {e}")
+    try:
+        if not live_run:  # like sessions.json: only the live policy acts on GitHub; a preview or test config never does
+            if cfg.get("DEAD_CLAIMS", "apply") != "off":
+                notes.append("dead claims: skipped, not the live policy run (--dead-claims-only previews it)")
+        elif not args.only and cfg.get("DEAD_CLAIMS", "apply") != "off":
+            live_now = {s["tmux"] for s in gathered} | {s["name"] for s in gathered if s.get("name")}
+            dead_claims = release_dead_claims(cfg, now, apply, (live_now, {s["sid"] for s in gathered if s.get("sid")}))
+            notes += dead_claims["notes"]
+    except Exception as e:  # a claim left held is the state before this pass: never fail the sweep over it
+        notes.append(f"dead claims: {type(e).__name__}: {e}")
     signal.alarm(0)
     faulthandler.cancel_dump_traceback_later()
     mode = "apply" if apply else "report-only"
@@ -2371,6 +2696,8 @@ def main(argv=None):
         report += ["", "## Session state (session_state.py, stima-api #7061)", "", *state_table()]
     if rounds:
         report += ["", "## Shadow rounds (" + ", ".join(SHADOW_SOURCES) + ")", *rounds]
+    if dead_claims and dead_claim_lines(dead_claims):
+        report += ["", "## Dead claims (stima-api#7527)", *[f"- {l}" for l in dead_claim_lines(dead_claims)]]
     if notes:
         report += ["", "## Shadow notes", *[f"- {n}" for n in notes]]
     if stale:

@@ -605,7 +605,8 @@ class Main(unittest.TestCase):
         self.live_file = self.tmp / "live" / "sessions.json"
         self.live = self.tmp / "session-reaper.conf"
         base = (f"REPORT={self.tmp / 'report.md'}\nCC_NEVER_KILL_PIDS=\nDONE_INBOX=\nSTALL_MARK_DIR=\n"
-                f"REAPED_DIR={self.tmp / 'reaped'}\nCLOSED_LOG={self.tmp / 'closed.md'}\n")
+                f"REAPED_DIR={self.tmp / 'reaped'}\nCLOSED_LOG={self.tmp / 'closed.md'}\n"
+                "DEAD_CLAIMS=off\n")  # this test's live config posts to GitHub if the dead-claim pass runs (stima-api#7527)
         self.live.write_text(base + "APPLY=1\n")
         self.copy = self.tmp / "copy.conf"
         self.copy.write_text(base + f"APPLY=0\nSTATE_DIR={self.tmp / 'preview'}\n")
