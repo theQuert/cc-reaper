@@ -899,6 +899,21 @@ done_keep_reason() {  # <dir> <sid> <live_ok> <live_set> <protected>
   rm -f "$ref"
 }
 
+# The repository's liveness authority, asked last about a directory the reaper is about to list
+# or remove (stima-api#7106). Status 0 = KEEP it: path-in-use.sh said IN USE or UNKNOWN, ran out
+# of time, crashed or is missing; PIU_RC and PIU_WHY then hold its exit status and first reason.
+# Status 1 only on a clean FREE. Its own default window is used, so it can only keep more.
+# $2 = seconds it may take (default 600).
+PIU_RC=0; PIU_WHY=""
+piu_keeps() {  # <dir> [<timeout seconds>]
+  local verdict
+  verdict="$(env -u PATH_IN_USE_WINDOW_HOURS PATH_IN_USE_TIMEOUT="${2:-600}" PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" bash "$PATH_IN_USE" "$1" 2>&1)"; PIU_RC=$?
+  [ "$PIU_RC" -ne 0 ] || return 1
+  PIU_WHY="$(printf '%s' "$verdict" | sed -n '2p' | sed 's/^ *//')"
+  [ -n "$PIU_WHY" ] || PIU_WHY="answered $PIU_RC"
+  return 0
+}
+
 # Judge and remove marked directory $1 (session $2, label $3). Status 0 when it was removed (or
 # would be, on a dry run), and DONE_KB holds its size; 1 when it was kept.
 DONE_KB=0
@@ -908,6 +923,9 @@ reap_done_marked() {  # <dir> <sid> <label> <live_ok> <live_set> <protected> [<s
   lsof_snapshot  # here, not inside the $(...) below, so the run keeps one snapshot
   why="$(done_keep_reason "$d" "$2" "$4" "$5" "$6")"
   if [ -n "$why" ]; then log "$3 kept: $d — marked done, but $why"; return 1; fi
+  if piu_keeps "$d" "$(piu_timeout "${PIU_PHASE_START:-$SECONDS}")"; then
+    log "$3 kept: $d — marked done, but path-in-use.sh: $PIU_WHY"; return 1
+  fi
   kb="$(kb_of "$d")"
   if [ "$DONE_MARKER_MODE" = spotcheck ]; then
     log "$3 spot-check: $d ($(as_gb "$kb")) is marked done and removable; logged only, not removed (CC_RB_DONE_MARKER=spotcheck)${7:+; $7}"
@@ -929,6 +947,7 @@ reap_done_jobs() {
   [ "$DONE_MARKER_MODE" != off ] || return 0
   [ -d "$JOBS_DIR" ] && [ ! -L "$JOBS_DIR" ] || return 0
   local d name sid live_ok=0 live_set="" prot n=0 kept=0 bytes=0
+  PIU_PHASE_START=$SECONDS
   # Its own snapshot: the scratchpad phase deleted its listing file when it ended.
   LSOF_STATE=untaken; LSOF_SNAP=""
   if live_set="$(live_session_ids)"; then live_ok=1; fi
@@ -1006,6 +1025,7 @@ reap_scratchpads() {
   # before anything about the directory is judged, so a directory is either judged whole or not
   # reached, and one not reached is left exactly as it was.
   local entries=() phase_start=$SECONDS judged=0 last="" stopped_after=""
+  PIU_PHASE_START=$phase_start  # reap_done_marked asks the gate within the same budget
   while IFS= read -r -d '' d; do entries+=("$d"); done < <(scratch_order)
   for d in ${entries[@]+"${entries[@]}"}; do
     # Inside the root, two levels down, and one line: anything else is never judged, never removed.
@@ -1143,6 +1163,18 @@ reap_scratchpads() {
         spotcheck_note keep "$d" - "${holders:--}" "$why; named by ${mention:-a transcript}"
         kept=$((kept + 1)); continue
       fi
+    fi
+
+    # The repository's liveness authority has the last word on the new rule's candidates too
+    # (stima-api#7106): the checks above are cheaper but narrower (a 6h pressure window, one
+    # session's alive/resumable state), and 2026-11-08 the spot check listed scratchpads that
+    # path-in-use.sh called IN USE ("session wrote its transcript within 24h"; "a session
+    # active within 24h names it"). Asked with its own default window, so it can only keep
+    # more. Anything but a clean FREE (in use, unknown, timeout, crash, no gate) keeps it.
+    if [ "$class" = new ] && piu_keeps "$d" "$(piu_timeout "$phase_start")"; then
+      log "scratchpad kept: $d — path-in-use.sh: $PIU_WHY"
+      spotcheck_note keep "$d" - "${holders:--}" "path-in-use.sh answered $PIU_RC; named by ${mention:-a transcript}"
+      kept=$((kept + 1)); continue
     fi
 
     # Measured before the removal, because afterwards there is nothing to measure. It is
