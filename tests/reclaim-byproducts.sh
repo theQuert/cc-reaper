@@ -1821,6 +1821,10 @@ SIDG=12121212-1212-1212-1212-121212121212
 SIDH=13131313-1313-1313-1313-131313131313
 SIDI=14141414-1414-1414-1414-141414141414
 SIDJ=15151515-1515-1515-1515-151515151515   # resumable (closed today); its own scratchpad does not exist
+# stima-api#7106: named, dead, idle, nothing alive names it - and path-in-use.sh, the repository's
+# authority, says IN USE (SIDK) or UNKNOWN (SIDL). The new rule must keep both; SID7/SIDE (gate: free) stay removable.
+SIDK=16161616-1616-1616-1616-161616161616
+SIDL=17171717-1717-1717-1717-171717171717
 live_fixture() {
   local root="$1" sid
   build_fixture "$root"
@@ -1831,12 +1835,15 @@ live_fixture() {
     printf 'it listed %s/proj/%s earlier\n' "$root/scratch" "$sid" >> "$root/home/.claude/projects/proj/00000000-0000-0000-0000-000000000000.jsonl"
   done
   touch "$root/scratch/proj/$SIDA/just-written"
-  for sid in $SIDH $SIDI; do
+  for sid in $SIDH $SIDI $SIDK $SIDL; do
     mkdir -p "$root/scratch/proj/$sid"; : > "$root/scratch/proj/$sid/out.txt"
     touch -t "$OLD_TS" "$root/scratch/proj/$sid/out.txt" "$root/scratch/proj/$sid"
   done
   printf 'cd %s/proj/%s\n' "$root/scratch" "$SIDH" > "$root/home/.claude/projects/proj/$SIDJ.jsonl"
   printf 'cd %s/proj/%s\n' "$root/scratch" "$SIDI" > "$root/home/.claude/projects/proj/$SID8.jsonl"
+  for sid in $SIDK $SIDL; do
+    printf 'it listed %s/proj/%s earlier\n' "$root/scratch" "$sid" >> "$root/home/.claude/projects/proj/00000000-0000-0000-0000-000000000000.jsonl"
+  done
   mkdir -p "$root/scratch/-dash-proj/$SIDF"; : > "$root/scratch/-dash-proj/$SIDF/out.txt"
   touch -t "$OLD_TS" "$root/scratch/-dash-proj/$SIDF/out.txt" "$root/scratch/-dash-proj/$SIDF"
   printf 'it listed %s/-dash-proj/%s earlier\n' "$root/scratch" "$SIDF" >> "$root/home/.claude/projects/proj/00000000-0000-0000-0000-000000000000.jsonl"
@@ -1858,7 +1865,9 @@ live_fixture() {
 printf '%s %s\n' "$1" "${PATH_IN_USE_WINDOW_HOURS:-unset}" >> "$(dirname "$0")/../piu-calls"
 case "$1" in
   *11111111-*) echo "free      $1"; exit 0 ;;
-  *-1313-*|*-1414-*|*-7777-*|*-8888-*|*-9999-*|*-aaaa-*|*-bbbb-*|*-cccc-*|*-dddd-*|*-eeee-*)
+  *-1616-*) echo "IN USE    $1"; echo "  session 16161616 wrote its transcript within 24h"; echo "  a session active within 24h names it: 5071c7db.jsonl"; exit 1 ;;
+  *-1717-*) echo "UNKNOWN   $1"; echo "  the transcript search did not finish"; exit 2 ;;
+  *-1313-*|*-1414-*|*-8888-*|*-9999-*|*-aaaa-*|*-bbbb-*|*-cccc-*|*-dddd-*)
     echo "IN USE    $1"; echo "  a session active within 24h names it: 00000000-0000-0000-0000-000000000000.jsonl"; exit 1 ;;
 esac
 echo "free      $1"; exit 0
@@ -1887,10 +1896,13 @@ check "a session that wrote a transcript inside the window is kept" "$OUT" "scra
 check "a scratchpad named only by a resumable session's transcript is kept (#7106)" "$OUT" "scratchpad kept: .*$SIDH — named by session $SIDJ, closed within 2d and resumable"
 check "a scratchpad named only by an alive session's transcript is kept (#7106)" "$OUT" "scratchpad kept: .*$SIDI — named by session $SID8, which is alive"
 check "one closed ten days ago is no longer protected (spotcheck: logged removable)" "$OUT" "spot-check: .*$SIDE"
+check "a named scratchpad the gate calls IN USE is kept, not listed removable (#7106)" "$OUT" "scratchpad kept: .*$SIDK — path-in-use.sh: session 16161616 wrote its transcript within 24h" "spot-check: .*$SIDK"
+check "a named scratchpad the gate cannot decide (UNKNOWN) is kept (#7106)" "$OUT" "scratchpad kept: .*$SIDL — path-in-use.sh: the transcript search did not finish" "spot-check: .*$SIDL"
 check "an unmentioned scratchpad whose session wrote a transcript is kept (the gate no longer searches transcripts)" "$OUT" \
   "scratchpad kept: .*$SIDG — its session wrote a transcript within 24h" "scratchpad reaped: .*$SIDG"
 grep -q '11111111-1111-1111-1111-111111111111 0$' "$WORK/l/piu-calls" && pass "with the index built the gate is asked with a window of 0, so it searches no transcript" || fail "the gate was asked with: $(cat "$WORK/l/piu-calls")"
-grep -q "$SID7" "$WORK/l/piu-calls" && fail "the gate was asked about a directory a transcript names" || pass "the gate is not asked about a directory the index names"
+grep -q "$SID7 unset$" "$WORK/l/piu-calls" && pass "a removable named directory is finally put to the gate with its own default window (#7106)" || fail "the gate was not asked about $SID7: $(cat "$WORK/l/piu-calls")"
+grep -q "$SID7 0$" "$WORK/l/piu-calls" && fail "the gate was asked about a named directory with the window of 0" || pass "never with a window of 0 for a named directory"
 n="$(wc -l < "$WORK/l/lsof-calls" | tr -d ' ')"; r="$(printf '%s\n' "$OUT" | grep -c '^scratchpad reaped:')"
 # One snapshot for the sweep, then one fresh check per removal - never one per scratchpad (10 here).
 [ "$n" = "$((r + 1))" ] && [ "$r" -ge 1 ] && pass "lsof runs once for the sweep plus once before each of the $r removals ($n calls, 10+ scratchpads)" || fail "lsof was called $n times for $r removals"
@@ -1898,7 +1910,7 @@ n="$(wc -l < "$WORK/l/lsof-calls" | tr -d ' ')"; r="$(printf '%s\n' "$OUT" | gre
 live_fixture "$WORK/l"
 OUT="$(CC_RB_NEW_RULES_MODE=auto run_real "$WORK/l" "$SCRIPT")"
 exists "$WORK/l" $SID7 && fail "auto: the named, dead, idle scratchpad was kept" || pass "auto: a named but dead scratchpad is removed"
-for sid in $SID8 $SID9 $SIDA $SIDB $SIDC $SIDD $SIDH $SIDI; do
+for sid in $SID8 $SID9 $SIDA $SIDB $SIDC $SIDD $SIDH $SIDI $SIDK $SIDL; do
   exists "$WORK/l" $sid && pass "auto: $sid stays" || fail "auto: $sid was removed"
 done
 [ -d "$WORK/l/scratch/-dash-proj/$SIDF" ] && fail "auto: a named scratchpad under a dash-led project directory was kept (grep read it as a flag?)" || pass "auto: a project directory that starts with a dash is matched, not parsed as an option"
@@ -1946,9 +1958,13 @@ exists "$WORK/l" $SID7 && pass "an unrecognised mode is read as spotcheck" || fa
 # the same new-rule class.
 live_fixture "$WORK/l"
 rm -rf "$WORK/l/home/.claude/projects"
+cat > "$WORK/l/bin/path-in-use.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "IN USE    $1"; echo "  a session active within 24h names it: 00000000-0000-0000-0000-000000000000.jsonl"; exit 1
+STUB
 OUT="$(run_real "$WORK/l" "$SCRIPT")"
-check "without a transcript index the gate's mention-only answer is the new rule's" "$OUT" "spot-check: .*$SID7"
-exists "$WORK/l" $SID7 && pass "and spotcheck still deletes nothing" || fail "deleted without an index"
+check "without a transcript index the gate's mention-only IN USE answer keeps the directory (#7106)" "$OUT" "scratchpad kept: .*$SID7 — " "spot-check: .*$SID7"
+exists "$WORK/l" $SID7 && pass "and nothing is deleted without an index" || fail "deleted without an index"
 
 # A gate answer that is IN USE for a real reason stays kept, whoever names it.
 live_fixture "$WORK/l"

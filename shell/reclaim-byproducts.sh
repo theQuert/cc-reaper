@@ -1145,6 +1145,21 @@ reap_scratchpads() {
       fi
     fi
 
+    # The repository's liveness authority has the last word on the new rule's candidates too
+    # (stima-api#7106): the checks above are cheaper but narrower (a 6h pressure window, one
+    # session's alive/resumable state), and 2026-11-08 the spot check listed scratchpads that
+    # path-in-use.sh called IN USE ("session wrote its transcript within 24h"; "a session
+    # active within 24h names it"). Asked with its own default window, so it can only keep
+    # more. Anything but a clean FREE (in use, unknown, timeout, crash, no gate) keeps it.
+    if [ "$class" = new ]; then
+      verdict="$(env -u PATH_IN_USE_WINDOW_HOURS PATH_IN_USE_TIMEOUT="$(piu_timeout "$phase_start")" PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
+      if [ "$rc" -ne 0 ]; then
+        log "scratchpad kept: $d — path-in-use.sh: $(printf '%s' "$verdict" | sed -n '2p' | sed 's/^ *//')"
+        spotcheck_note keep "$d" - "${holders:--}" "path-in-use.sh answered $rc; named by ${mention:-a transcript}"
+        kept=$((kept + 1)); continue
+      fi
+    fi
+
     # Measured before the removal, because afterwards there is nothing to measure. It is
     # a second walk of a tree the `rm -rf` below is about to walk anyway; on the dry-run
     # path it is the only walk, and it is still small beside the liveness gate that just
