@@ -195,6 +195,29 @@ class Judge(unittest.TestCase):
         fresh = self.judge(dict(loop, idle_min=20.0), brief, {"6837": {"pending_check_by": iso(21 * 60)}})
         self.assertEqual((fresh["state"], fresh["reasons"][0][:5]), ("WORKING", "idle:"))
 
+    def test_loop_whose_step_belongs_to_another_session_is_done(self):
+        """stima-api#7061 follow-up: `loop #6953` idle 274 min held a slot because the claimant (pr-drain) is not it."""
+        iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 12 * 3600))
+        loop = session(kind="bg", name="loop #6953 check-by", tmux="loop #6953 check-by", sid="1be6c43d-bg", idle_min=274.0)
+        claim = ("delivery #6953: reviewed (backend) -> agent claim  [0000000000000001]\n"
+                 "  claimant: claude session d51d6e58-1082-4130-8943-4a6dc14d588f (pr-drain); the step is that "
+                 "session's: hand it over while it lives")
+        js = {"6953": {"pending_check_by": iso}}
+        rec = self.judge(loop, {"6953": claim}, js)
+        self.assertEqual(rec["state"], "DONE")
+        self.assertEqual((rec["claims"][0]["mine"], rec["claims"][0]["oracle_step"]), (False, "agent claim"))
+        self.assertIn("#6953 agent claim (not its step)", rec["reasons"])
+        # claimant is this loop (8-hex prefix or full id): still its step
+        mine = claim.replace("d51d6e58-1082-4130-8943-4a6dc14d588f", "1be6c43d-bg")
+        self.assertEqual(self.judge(loop, {"6953": mine}, js)["state"], "WORKING")
+        # no claimant line: unchanged (unclaimed stays UNKNOWN)
+        self.assertEqual(self.judge(loop, {"6953": AGENT_UNCLAIMED}, js)["state"], "UNKNOWN")
+        # #6198 shape: a due `agent check-by` served by the loop stays UNKNOWN as before, claimant elsewhere or not
+        cb = AGENT_MINE.replace("sid-1 (full-audits, lead)", "fd576cac-1111-2222-3333-444455556666 (ci)")
+        self.assertEqual(self.judge(loop, {"6953": cb}, js)["state"], "UNKNOWN")
+        # an interactive named claim with a dead claimant is unchanged too
+        self.assertEqual(self.judge(session(claims=[(REPO, "6953")]), {"6953": claim})["state"], "UNKNOWN")
+
     def test_an_interactive_branch_claim_is_unchanged_by_a_far_check_by(self):
         iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 21 * 3600))
         s = session(claims=[(REPO, "6837")])
