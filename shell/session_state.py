@@ -81,7 +81,6 @@ def claim_step(r, brief, sid, mine_ids=(), other_sids=()):
     if not h:
         return "", None, False
     kind, step = h.group(1), " ".join(x for x in h.groups() if x)
-    last = brief.rstrip("\n").rsplit("\n", 1)[-1]
     if kind == "closed" or kind == "none":
         return step, False, False
     if kind == "stop":
@@ -90,9 +89,10 @@ def claim_step(r, brief, sid, mine_ids=(), other_sids=()):
             return step, False, True
         return step, True, False  # the stop comment (or its ask) is still the session's to post
     if kind == "wait":
-        if r.OWNER_END_RE.match(last) or r.CHECKBY_END_RE.match(last):
+        # the reaper's own reader: the oracle's trailer (judge, redundant check-by, board) follows the deciding line
+        if r._oracle_last(brief, r.OWNER_END_RE) or r._oracle_last(brief, r.CHECKBY_END_RE):
             return step, False, False
-        if RECORD_CHECKBY_RE.match(last):
+        if r._oracle_last(brief, RECORD_CHECKBY_RE):
             return step, True, False  # it owes the check-by comment that schedules its wake
         return step, None, False
     if kind == "agent":

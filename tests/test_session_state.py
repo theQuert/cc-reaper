@@ -238,6 +238,34 @@ class Judge(unittest.TestCase):
             self.assertEqual(reaper._decide(dict(s), CFG, NOW), ["issue-unknown:#6837"])
 
 
+class ClaimStepTrailer(unittest.TestCase):
+    """claim_step reads the deciding line before the oracle's trailer (stima-api#7061: `loop #3041 check-by` stayed UNKNOWN)."""
+    HEAD = ("delivery #9: serving-verified (none) -> wait check-by  [abc]\n  then acceptance: ...\n"
+            "  wake: 2026-11-09T01:00:00Z: ...\n")
+    OWNER = "  owner: tech.stima.stranded-step-dispatcher wakes it; no watcher needed, and the session may end"
+    JUDGE = "\n  judge: none (the session is woken)"
+    BOARD = "\nboard: \u672c\u5730\u63a8\u7b97 \u9032\u5ea6 5% (\u968e\u6bb5) \u968e\u6bb5 wait check-by \u958b\u59cb\u5be6\u4f5c \u7121 \u8017\u6642 \u7121"
+    RECORD = "  record `check-by 2026-11-09T01:00:00Z` on the issue: the wake is scheduled by that comment"
+
+    def step(self, brief):
+        return ss.claim_step(reaper, brief, "sid-x")
+
+    def test_owner_line_then_judge_and_board_ends_the_wait(self):
+        self.assertEqual(self.step(self.HEAD + self.OWNER + self.JUDGE + self.BOARD)[1], False)
+
+    def test_owner_line_then_board_only_ends_the_wait(self):
+        self.assertEqual(self.step(self.HEAD + self.OWNER + self.BOARD)[1], False)
+
+    def test_owner_line_alone_still_ends_the_wait(self):
+        self.assertEqual(self.step(self.HEAD + self.OWNER)[1], False)
+
+    def test_record_check_by_with_a_trailer_is_mine(self):
+        self.assertEqual(self.step(self.HEAD + self.RECORD + self.JUDGE + self.BOARD)[1], True)
+
+    def test_free_text_owner_line_mid_brief_ends_nothing(self):
+        self.assertIsNone(self.step(self.HEAD + self.OWNER + "\n  some other line" + self.BOARD)[1])
+
+
 class File(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
