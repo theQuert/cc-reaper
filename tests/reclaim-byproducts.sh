@@ -1866,6 +1866,7 @@ printf '%s %s\n' "$1" "${PATH_IN_USE_WINDOW_HOURS:-unset}" >> "$(dirname "$0")/.
 case "$1" in
   *11111111-*) echo "free      $1"; exit 0 ;;
   *-1616-*) echo "IN USE    $1"; echo "  session 16161616 wrote its transcript within 24h"; echo "  a session active within 24h names it: 5071c7db.jsonl"; exit 1 ;;
+  *b2b2b2b2*) echo "IN USE    $1"; echo "  session b2b2b2b2 wrote its transcript within 24h"; exit 1 ;;
   *-1717-*) echo "UNKNOWN   $1"; echo "  the transcript search did not finish"; exit 2 ;;
   *-1313-*|*-1414-*|*-8888-*|*-9999-*|*-aaaa-*|*-bbbb-*|*-cccc-*|*-dddd-*)
     echo "IN USE    $1"; echo "  a session active within 24h names it: 00000000-0000-0000-0000-000000000000.jsonl"; exit 1 ;;
@@ -1984,6 +1985,8 @@ exists "$WORK/l" $SID7 && pass "a gate answer with a non-mention reason keeps th
 # bbbb protected, dddd's transcript is written now. SIDM is new: dead, written just now, named
 # by a transcript, marked.
 SIDM=a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1
+# Marked done, dead, unheld, but path-in-use.sh says IN USE (scratchpad and job dir): kept (#7106).
+SIDN=b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2
 TWO_H_AGO="$(date -v-2H +%Y%m%d%H%M 2>/dev/null || date -d '2 hours ago' +%Y%m%d%H%M)"
 mark() {  # <dir> <sid> [touch -t stamp]: the stamp ages the marker and the directory it was written into
   printf 'session=%s\nat=2026-11-04T00:00:00Z\n' "$2" > "$1/claude-task-done"
@@ -2011,6 +2014,8 @@ marked_fixture() {
   mark "$root/home/.claude/jobs/${SIDM:0:8}" $SIDM
   mark "$root/home/.claude/jobs/${SID8:0:8}" $SID8
   mark "$root/home/.claude/jobs/${SID7:0:8}" $SIDM
+  mkdir -p "$root/scratch/proj/$SIDN" "$root/home/.claude/jobs/${SIDN:0:8}"
+  mark "$root/scratch/proj/$SIDN" $SIDN; mark "$root/home/.claude/jobs/${SIDN:0:8}" $SIDN
 }
 
 marked_fixture "$WORK/m"
@@ -2033,7 +2038,10 @@ check "  and the log says so" "$OUT" "job dir reaped: .*/${SIDM:0:8} (marked don
 [ -d "$WORK/m/home/.claude/jobs/${SID8:0:8}" ] && pass "done marker: a live session keeps its marked job directory" || fail "removed a live session's job directory"
 [ -d "$WORK/m/home/.claude/jobs/${SID7:0:8}" ] && pass "done marker: a job directory whose marker names another session is kept" || fail "removed a job directory marked for another session"
 check "  and says why" "$OUT" "job dir kept: .*/${SID7:0:8} — its done marker names session $SIDM"
-check "done marker: the ledger counts the job directories" "$OUT" "done jobs: 1 reaped, 2 kept"
+check "done marker: the ledger counts the job directories" "$OUT" "done jobs: 1 reaped, 3 kept"
+check "done marker: a marked scratchpad the gate calls IN USE is kept (auto, #7106)" "$OUT" "scratchpad kept: .*$SIDN — marked done, but path-in-use.sh: session b2b2b2b2 wrote its transcript within 24h"
+check "done marker: a marked job dir the gate calls IN USE is kept (auto, #7106)" "$OUT" "job dir kept: .*/${SIDN:0:8} — marked done, but path-in-use.sh: session b2b2b2b2 wrote its transcript within 24h"
+[ -d "$WORK/m/home/.claude/jobs/${SIDN:0:8}" ] && exists "$WORK/m" $SIDN && pass "  and both are still on disk" || fail "done marker: an IN USE marked directory was removed"
 
 # Review P3-1: later work anywhere in the tree keeps it, and so does a tree moved in whole with its
 # old mtimes, which only the marked directory's own mtime shows.
@@ -2065,6 +2073,7 @@ OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
 exists "$WORK/m" $SIDM && [ -d "$WORK/m/home/.claude/jobs/${SIDM:0:8}" ] && pass "done marker: unset, it is spotcheck and removes nothing" \
   || fail "done marker: the default removed a marked directory"
 check "  and logs what it would remove" "$OUT" "scratchpad spot-check: .*$SIDM .*marked done and removable"
+check "  but not what the gate calls IN USE (#7106)" "$OUT" "job dir kept: .*/${SIDN:0:8} — marked done, but path-in-use.sh:" "spot-check: .*$SIDN"
 
 marked_fixture "$WORK/m"
 OUT="$(run "$WORK/m" "$SCRIPT")"
