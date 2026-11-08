@@ -1144,7 +1144,7 @@ mutate "anonymous-only volume names" \
   "volume WOULD be reaped: stima-ci-work-1"
 
 mutate "a non-zero liveness verdict keeps the scratchpad" \
-  's|^      if \[ "$rc" -ne 0 \]; then|      if false; then|' \
+  's|^    if piu_keeps "$d" .*; then$|    if false; then|' \
   "scratchpad WOULD be reaped: .*22222222-"
 
 mutate "the idle window is checked before the gate" \
@@ -1723,10 +1723,10 @@ check "under pressure a scratchpad touched now is still kept" "$OUT" \
   "scratchpad kept: .*44444444-.*touched within 6h" "WOULD be reaped: .*44444444-"
 check "the pressure tier says so in the log" "$OUT" \
   "scratchpads: disk pressure (free 10GB < 100GB): idle window 6h"
-if grep -q "55555555-.* 6$" "$WORK/p/piu-calls" 2>/dev/null; then
-  pass "path-in-use is asked with the pressure window"
+if grep -q "55555555-.* unset$" "$WORK/p/piu-calls" 2>/dev/null; then
+  pass "path-in-use is asked with its own window, not the pressure window (#7106)"
 else
-  fail "path-in-use is asked with the pressure window: $(cat "$WORK/p/piu-calls" 2>/dev/null)"
+  fail "path-in-use is asked with its own window, not the pressure window: $(cat "$WORK/p/piu-calls" 2>/dev/null)"
 fi
 
 pressure_fixture "$WORK/p"
@@ -1868,6 +1868,7 @@ case "$1" in
   *-1616-*) echo "IN USE    $1"; echo "  session 16161616 wrote its transcript within 24h"; echo "  a session active within 24h names it: 5071c7db.jsonl"; exit 1 ;;
   *b2b2b2b2*) echo "IN USE    $1"; echo "  session b2b2b2b2 wrote its transcript within 24h"; exit 1 ;;
   *-1717-*) echo "UNKNOWN   $1"; echo "  the transcript search did not finish"; exit 2 ;;
+  *-1212-*) echo "IN USE    $1"; echo "  session 12121212 wrote its transcript within 24h"; exit 1 ;;
   *-1313-*|*-1414-*|*-8888-*|*-9999-*|*-aaaa-*|*-bbbb-*|*-cccc-*|*-dddd-*)
     echo "IN USE    $1"; echo "  a session active within 24h names it: 00000000-0000-0000-0000-000000000000.jsonl"; exit 1 ;;
 esac
@@ -1893,17 +1894,17 @@ check "a scratchpad a process holds is kept with the holder" "$OUT" "scratchpad 
 check "a scratchpad touched inside the window is kept" "$OUT" "scratchpad kept: .*$SIDA — touched within 24h"
 check "a protected session (by name) is kept" "$OUT" "scratchpad kept: .*$SIDB — belongs to a protected session"
 check "a session closed today is kept as resumable" "$OUT" "scratchpad kept: .*$SIDC — closed within 2d and resumable"
-check "a session that wrote a transcript inside the window is kept" "$OUT" "scratchpad kept: .*$SIDD — its session wrote a transcript"
+check "a session that wrote a transcript inside the window is kept" "$OUT" "scratchpad kept: .*$SIDD — path-in-use.sh: "
 check "a scratchpad named only by a resumable session's transcript is kept (#7106)" "$OUT" "scratchpad kept: .*$SIDH — named by session $SIDJ, closed within 2d and resumable"
 check "a scratchpad named only by an alive session's transcript is kept (#7106)" "$OUT" "scratchpad kept: .*$SIDI — named by session $SID8, which is alive"
 check "one closed ten days ago is no longer protected (spotcheck: logged removable)" "$OUT" "spot-check: .*$SIDE"
 check "a named scratchpad the gate calls IN USE is kept, not listed removable (#7106)" "$OUT" "scratchpad kept: .*$SIDK — path-in-use.sh: session 16161616 wrote its transcript within 24h" "spot-check: .*$SIDK"
 check "a named scratchpad the gate cannot decide (UNKNOWN) is kept (#7106)" "$OUT" "scratchpad kept: .*$SIDL — path-in-use.sh: the transcript search did not finish" "spot-check: .*$SIDL"
-check "an unmentioned scratchpad whose session wrote a transcript is kept (the gate no longer searches transcripts)" "$OUT" \
-  "scratchpad kept: .*$SIDG — its session wrote a transcript within 24h" "scratchpad reaped: .*$SIDG"
-grep -q '11111111-1111-1111-1111-111111111111 0$' "$WORK/l/piu-calls" && pass "with the index built the gate is asked with a window of 0, so it searches no transcript" || fail "the gate was asked with: $(cat "$WORK/l/piu-calls")"
+check "an unmentioned scratchpad whose session wrote a transcript is kept by the gate, not by a test of the reaper's own (#7106)" "$OUT" \
+  "scratchpad kept: .*$SIDG — path-in-use.sh: session 12121212 wrote its transcript within 24h" "scratchpad reaped: .*$SIDG"
+grep -q '11111111-1111-1111-1111-111111111111 unset$' "$WORK/l/piu-calls" && pass "every candidate is put to the gate with its own default window (#7106)" || fail "the gate was asked with: $(cat "$WORK/l/piu-calls")"
+grep -qE ' (0|[0-9]+)$' "$WORK/l/piu-calls" && fail "the gate was asked with a narrowed window: $(cat "$WORK/l/piu-calls")" || pass "never with a window of 0 or a pressure window"
 grep -q "$SID7 unset$" "$WORK/l/piu-calls" && pass "a removable named directory is finally put to the gate with its own default window (#7106)" || fail "the gate was not asked about $SID7: $(cat "$WORK/l/piu-calls")"
-grep -q "$SID7 0$" "$WORK/l/piu-calls" && fail "the gate was asked about a named directory with the window of 0" || pass "never with a window of 0 for a named directory"
 n="$(wc -l < "$WORK/l/lsof-calls" | tr -d ' ')"; r="$(printf '%s\n' "$OUT" | grep -c '^scratchpad reaped:')"
 # One snapshot for the sweep, then one fresh check per removal - never one per scratchpad (10 here).
 [ "$n" = "$((r + 1))" ] && [ "$r" -ge 1 ] && pass "lsof runs once for the sweep plus once before each of the $r removals ($n calls, 10+ scratchpads)" || fail "lsof was called $n times for $r removals"
@@ -1976,6 +1977,64 @@ STUB
 rm -rf "$WORK/l/home/.claude/projects"
 OUT="$(CC_RB_NEW_RULES_MODE=auto run_real "$WORK/l" "$SCRIPT")"
 exists "$WORK/l" $SID7 && pass "a gate answer with a non-mention reason keeps the directory" || fail "deleted despite a non-mention reason"
+
+# ------------------------------- path-in-use.sh alone decides liveness (stima-api#7106, 2026-11-08)
+#
+# The reaper once carried a second liveness test of its own: under disk pressure it asked the
+# authority with a 6h window (or 0, with the transcript index standing in), and judged "its
+# session wrote a transcript" by the same shorter window. 2026-11-08 the spot check found ten
+# decisions the authority called IN USE. The stub below answers as path-in-use.sh does: IN USE /
+# UNKNOWN / FREE for the 8h-idle $SIDP, but only when asked with its DEFAULT window - a shorter
+# window (6, or 0) makes it say FREE, exactly as the real session check does (it reads the
+# transcript's mtime against the window).
+SIDP=55555555-5555-5555-5555-555555555555
+authority_fixture() {  # <root> <IN_USE|UNKNOWN|FREE>
+  local root="$1" verdict="$2"
+  pressure_fixture "$root"
+  mkdir -p "$root/home/.claude/projects/proj"
+  : > "$root/home/.claude/projects/proj/$SIDP.jsonl"
+  touch -t "$(date -v-8H +%Y%m%d%H%M 2>/dev/null || date -d '8 hours ago' +%Y%m%d%H%M)" "$root/home/.claude/projects/proj/$SIDP.jsonl"
+  cat > "$root/bin/path-in-use.sh" <<STUB
+#!/usr/bin/env bash
+printf '%s %s\\n' "\$1" "\${PATH_IN_USE_WINDOW_HOURS:-unset}" >> "$root/piu-calls"
+case "\$1" in
+  *$SIDP*)
+    if [ -z "\${PATH_IN_USE_WINDOW_HOURS:-}" ]; then
+      case "$verdict" in
+        IN_USE)  echo "IN USE    \$1"; echo "  session $SIDP wrote its transcript within 24h"; exit 1 ;;
+        UNKNOWN) echo "UNKNOWN   \$1"; echo "  the transcript search did not finish"; exit 2 ;;
+      esac
+    fi ;;
+esac
+echo "free      \$1"; exit 0
+STUB
+  chmod +x "$root/bin/path-in-use.sh"
+}
+
+authority_fixture "$WORK/a" IN_USE
+OUT="$(FREE_GB_OVERRIDE=10 run "$WORK/a" "$SCRIPT")"
+check "under pressure an 8h-idle scratchpad the authority calls IN USE is kept (#7106)" "$OUT" \
+  "scratchpad kept: .*$SIDP — path-in-use.sh: session $SIDP wrote its transcript within 24h" "WOULD be reaped: .*$SIDP"
+OUT="$(FREE_GB_OVERRIDE=10 run_real "$WORK/a" "$SCRIPT")"
+exists "$WORK/a" $SIDP && pass "and a real run does not remove it" || fail "removed a scratchpad the authority called IN USE"
+
+authority_fixture "$WORK/a" UNKNOWN
+OUT="$(FREE_GB_OVERRIDE=10 run "$WORK/a" "$SCRIPT")"
+check "under pressure an 8h-idle scratchpad the authority cannot decide (UNKNOWN) is kept (#7106)" "$OUT" \
+  "scratchpad kept: .*$SIDP — path-in-use.sh: the transcript search did not finish" "WOULD be reaped: .*$SIDP"
+
+authority_fixture "$WORK/a" FREE
+OUT="$(FREE_GB_OVERRIDE=10 run "$WORK/a" "$SCRIPT")"
+check "under pressure an 8h-idle scratchpad the authority calls FREE is still reaped (#7106)" "$OUT" \
+  "scratchpad WOULD be reaped: .*$SIDP"
+OUT="$(FREE_GB_OVERRIDE=10 run_real "$WORK/a" "$SCRIPT")"
+exists "$WORK/a" $SIDP && fail "a FREE scratchpad idle past the pressure window was not removed" || pass "and a real run removes it"
+
+# The authority is asked with its own window, never the pressure window and never 0.
+authority_fixture "$WORK/a" FREE
+OUT="$(FREE_GB_OVERRIDE=10 run "$WORK/a" "$SCRIPT")"
+grep -q "$SIDP unset$" "$WORK/a/piu-calls" && pass "the authority is asked about $SIDP with its default window (#7106)" || fail "the authority was asked: $(cat "$WORK/a/piu-calls" 2>/dev/null)"
+grep -qE " (0|6)$" "$WORK/a/piu-calls" && fail "the authority was asked with a narrowed window: $(cat "$WORK/a/piu-calls")" || pass "never with the pressure window or a window of 0"
 
 # ---------------------------------------------------------------- the done marker (stima-api#7106)
 #

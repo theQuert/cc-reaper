@@ -18,8 +18,11 @@
 #                lsof per run), or it belongs to a protected session; a transcript that
 #                merely NAMES the path is not liveness (2026-10-24: 12 GB of scratchpads
 #                kept for days because the ci session printed their ids while taking an
-#                inventory, removed by hand). path-in-use.sh still judges every
-#                directory no transcript names. Directories the old mention rule kept are
+#                inventory, removed by hand). path-in-use.sh, asked once per directory
+#                that passed the checks above with its own 24h window, has the last word
+#                and no liveness test of this script's own stands beside it (#7106: a
+#                6h pressure window disagreed with it ten times). Directories the old
+#                mention rule kept are
 #                newly removable, and CC_RB_NEW_RULES_MODE=spotcheck (the default) only
 #                LOGS those to ~/.cc-reaper/logs/spotcheck-reclaim-byproducts.log;
 #                `auto` removes them. UNKNOWN is treated as in use. A scratchpad (and a
@@ -798,17 +801,6 @@ GREP1
   return 0
 }
 
-# A session transcript for $2 (in project $1) written inside $3 minutes. The session wrote
-# recently, whatever its processes look like.
-transcript_is_recent() {  # <project> <sid> <minutes>
-  local t
-  for t in "$PROJECTS_DIR/$1/$2.jsonl" "$PROJECTS_DIR"/*/"$2".jsonl; do
-    [ -f "$t" ] || continue
-    [ -n "$("$FIND" "$t" -mmin -"$3" -print -quit 2>/dev/null)" ] && return 0
-  done
-  return 1
-}
-
 # The spot-check log: what the new rule decided for a directory the mention rule used to
 # keep. Appended only by a run that can delete (a dry run prints, writes nothing).
 spotcheck_note() {  # <decision> <dir> <size-or-dash> <holders> <reason>
@@ -1090,9 +1082,10 @@ reap_scratchpads() {
       kept=$((kept + 1)); continue
     fi
 
-    # The old rule's view of this directory, from the one index. A directory no transcript
-    # names goes through path-in-use.sh exactly as before; one that is named is the new
-    # rule's, and path-in-use.sh (whose answer would be "in use, mentioned") is not asked.
+    # The old rule's view of this directory, from the one index: one that is named is the new
+    # rule's (logged only until CC_RB_NEW_RULES_MODE=auto), one that is not is removed as
+    # before. Which of the two it is says what happens on a FREE answer, never whether it is in
+    # use: that is path-in-use.sh's, below.
     class=old; mention=""
     if [ "$midx_ok" -eq 1 ]; then
       # The whole first field, never a substring of it: `grep -F proj/<sid>` also found
@@ -1102,43 +1095,6 @@ reap_scratchpads() {
       mention="$(printf '%s\n' "$mentioners" | sed -n '1p')"
       [ -n "$mention" ] && class=new
     fi
-    # Its session wrote a transcript inside the window: the session is active, whatever its
-    # processes look like. path-in-use.sh asks this too (check_session), and is told a window
-    # of 0 below when the index stands in for its transcript search, so it is asked here.
-    if [ "$midx_ok" -eq 1 ] && transcript_is_recent "$proj" "$sid" "$((window * 60))"; then
-      log "scratchpad kept: $d — its session wrote a transcript within ${window}h"
-      [ "$class" = new ] && spotcheck_note keep "$d" - "${holders:--}" "its session wrote a transcript within ${window}h; named by ${mention:-a transcript}"
-      kept=$((kept + 1)); continue
-    fi
-
-    if [ "$class" = old ]; then
-      # The user's rule: ask whether a live session is using it. Exit 0 free, 1 in use, 2
-      # unknown. UNKNOWN keeps it - on 2026-09-11 the mention rule correctly held a
-      # directory two sessions were still writing to while `lsof` reported no holder.
-      # With the index built, the transcript search is already done (once, for every
-      # directory) and the gate is asked with a window of 0: its own search then walks no
-      # file. That search was 4 x 17s per directory on 2 GB of transcripts, the slow half of
-      # a 2h13m sweep, and for a directory the index did not name it can only find nothing.
-      if [ "$midx_ok" -eq 1 ]; then
-        verdict="$(PATH_IN_USE_TIMEOUT="$(piu_timeout "$phase_start")" PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" PATH_IN_USE_WINDOW_HOURS=0 bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
-      elif [ "$window" -ne "$IDLE_HOURS" ]; then
-        verdict="$(PATH_IN_USE_TIMEOUT="$(piu_timeout "$phase_start")" PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" PATH_IN_USE_WINDOW_HOURS="$window" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
-      else
-        verdict="$(PATH_IN_USE_TIMEOUT="$(piu_timeout "$phase_start")" PATH_IN_USE_SELF="${CLAUDE_CODE_SESSION_ID:-}" bash "$PATH_IN_USE" "$d" 2>&1)"; rc=$?
-      fi
-      if [ "$rc" -ne 0 ]; then
-        # In use ONLY because a transcript names the path (a spelling the index missed): the
-        # same directory, the new rule's.
-        reasons="$(printf '%s\n' "$verdict" | sed '1d; s/^ *//; /^$/d')"
-        if [ "$rc" -eq 1 ] && [ -n "$reasons" ] && ! printf '%s\n' "$reasons" | grep -qv '^a session active within [0-9]*h names it: '; then
-          class=new; mention="$(printf '%s\n' "$reasons" | sed -n '1s/.*names it: //p')"
-        else
-          log "scratchpad kept: $d — $(printf '%s' "$verdict" | sed -n '2p' | sed 's/^ *//')"
-          kept=$((kept + 1)); continue
-        fi
-      fi
-    fi
-
     if [ "$class" = new ]; then
       # No process, no live session, not protected, not touched in the window; the only
       # thing that kept it was a transcript naming it. What else is liveness?
@@ -1165,15 +1121,17 @@ reap_scratchpads() {
       fi
     fi
 
-    # The repository's liveness authority has the last word on the new rule's candidates too
-    # (stima-api#7106): the checks above are cheaper but narrower (a 6h pressure window, one
-    # session's alive/resumable state), and 2026-11-08 the spot check listed scratchpads that
-    # path-in-use.sh called IN USE ("session wrote its transcript within 24h"; "a session
-    # active within 24h names it"). Asked with its own default window, so it can only keep
-    # more. Anything but a clean FREE (in use, unknown, timeout, crash, no gate) keeps it.
-    if [ "$class" = new ] && piu_keeps "$d" "$(piu_timeout "$phase_start")"; then
+    # The repository's liveness authority has the last word on every candidate that got this
+    # far (stima-api#7106), and this script holds no liveness test of its own beside it: the
+    # checks above are cheaper but only ever keep MORE (a live session, a holder, a protected or
+    # resumable session). 2026-11-08 the spot check listed ten scratchpads this script called
+    # idle (a 6h pressure window; "its session wrote a transcript" judged by the same window)
+    # that path-in-use.sh called IN USE ("session wrote its transcript within 24h"; "a session
+    # active within 24h names it"). It is asked once, with its own default window, so it can
+    # only keep more. Anything but a clean FREE (in use, unknown, timeout, crash, no gate) keeps.
+    if piu_keeps "$d" "$(piu_timeout "$phase_start")"; then
       log "scratchpad kept: $d — path-in-use.sh: $PIU_WHY"
-      spotcheck_note keep "$d" - "${holders:--}" "path-in-use.sh answered $PIU_RC; named by ${mention:-a transcript}"
+      [ "$class" = new ] && spotcheck_note keep "$d" - "${holders:--}" "path-in-use.sh answered $PIU_RC; named by ${mention:-a transcript}"
       kept=$((kept + 1)); continue
     fi
 
