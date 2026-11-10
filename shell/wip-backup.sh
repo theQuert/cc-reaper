@@ -150,7 +150,9 @@ snapshot_tree() {
   real="$(git -C "$wt" rev-parse --path-format=absolute --git-path index 2>/dev/null)"
   # read-tree -m with one tree is read-tree HEAD that keeps the stat data of entries whose
   # content matches, so only what changed is hashed below. Any trouble: a plain read-tree.
-  if ! { [ -f "$real" ] && cp "$real" "$idx" 2>/dev/null &&
+  # cp -p keeps the index's mtime: git trusts an entry's stat data only when the entry is
+  # older than the index file, so a copy dated now hid a same-second, same-size edit.
+  if ! { [ -f "$real" ] && cp -p "$real" "$idx" 2>/dev/null &&
          GIT_INDEX_FILE="$idx" git -C "$wt" read-tree -m "$head" 2>/dev/null; }; then
     rm -f "$idx"
     GIT_INDEX_FILE="$idx" git -C "$wt" read-tree "$head" || return 1
