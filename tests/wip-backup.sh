@@ -91,6 +91,8 @@ git "${F[@]}" -C "$WORK/wign" commit -qm "track managed/x"
 printf 'managed/\n' >> "$WORK/wign/.gitignore"
 git "${F[@]}" -C "$WORK/wign" commit -qam "ignore managed/"
 echo v2 > "$WORK/wign/managed/x"                 # tracked, modified, under an ignored dir
+# Same size as v1 and dated as the index: the racy case, whatever second the host is in.
+touch -r "$(git -C "$WORK/wign" rev-parse --path-format=absolute --git-path index)" "$WORK/wign/managed/x"
 echo secret > "$WORK/wign/managed/untracked"     # untracked, ignored: must stay out
 run
 SI="$(rref refs/wip/macmini/feat/2-tracked-under-ignored)"
