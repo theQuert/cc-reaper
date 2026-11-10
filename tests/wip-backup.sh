@@ -91,6 +91,8 @@ git "${F[@]}" -C "$WORK/wign" commit -qm "track managed/x"
 printf 'managed/\n' >> "$WORK/wign/.gitignore"
 git "${F[@]}" -C "$WORK/wign" commit -qam "ignore managed/"
 echo v2 > "$WORK/wign/managed/x"                 # tracked, modified, under an ignored dir
+# Same size as v1 and dated as the index: the racy case, whatever second the host is in.
+touch -r "$(git -C "$WORK/wign" rev-parse --path-format=absolute --git-path index)" "$WORK/wign/managed/x"
 echo secret > "$WORK/wign/managed/untracked"     # untracked, ignored: must stay out
 run
 SI="$(rref refs/wip/macmini/feat/2-tracked-under-ignored)"
@@ -252,6 +254,29 @@ echo 5 > "$WIP_STATE_DIR/run-count"; echo 0 > "$WIP_STATE_DIR/full-remaining"
 run --dry-run
 check "dry run: a gate-miss is reported but full-remaining is not armed" \
   'grep -q "gate-miss=1" "$WORK/out" && [ "$(cat "$WIP_STATE_DIR/full-remaining")" = 0 ] && [ "$(cat "$WIP_STATE_DIR/run-count")" = 5 ]'
+
+# ---------------------------------------------------------------- what a tick costs
+# The cleanup judges every WIP ref of the repository (2000+ on the Mac mini, 83 of a 161 s run), so
+# it is hourly: a tick with work but a fresh cleanup stamp must not run it.
+export WIP_STATE_DIR="$WORK/mstate"; unset WIP_GONE_GRACE_HOURS
+git -C "$MP" update-ref refs/tmp/zz "$(git -C "$MP" rev-parse HEAD)"
+git --git-dir="$MR" fetch -q "$MP" refs/tmp/zz:refs/wip/macmini/zz-gone
+echo tick > "$WORK/m1/c.txt"
+WIP_GONE_GRACE_HOURS=0 run
+check "cost: a tick with a fresh cleanup stamp leaves the cleanup for the hour" \
+  '[ -n "$(mref refs/wip/macmini/zz-gone)" ] && ! grep -q " deleted " "$WORK/out"'
+touch -t "$OLD" "$WIP_STATE_DIR"/*.cleanup; echo tick2 > "$WORK/m1/c.txt"
+WIP_GONE_GRACE_HOURS=0 run
+check "cost: once the stamp is an hour old the cleanup runs and restamps" \
+  '[ -z "$(mref refs/wip/macmini/zz-gone)" ] && grep -q "deleted mid refs/wip/macmini/zz-gone" "$WORK/out" && [ -n "$(find "$WIP_STATE_DIR"/*.cleanup -mmin -60)" ]'
+# The primary checkout is on a skipped branch (main): its tree, which holds every nested
+# worktree, is not walked to learn that. find is shimmed to log the directory it is given.
+mkdir -p "$WORK/findbin"
+printf '#!/bin/sh\necho "$1" >> "%s/find.log"\nexec /usr/bin/find "$@"\n' "$WORK" > "$WORK/findbin/find"
+chmod +x "$WORK/findbin/find"; : > "$WORK/find.log"; echo tick3 > "$WORK/m1/c.txt"
+PATH="$WORK/findbin:$PATH" run
+check "cost: the walk reaches a worktree (shim sees it) but never the primary checkout on main" \
+  'grep -qxF "$WORK/m1" "$WORK/find.log" && ! grep -qxF "$MP" "$WORK/find.log"'
 
 echo "wip-backup: $PASSED passed, $FAILURES failed"
 [ "$FAILURES" -eq 0 ]
