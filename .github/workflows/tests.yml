@@ -64,3 +64,5 @@ jobs:
         run: python3 tests/resource-watch-judge.py
       - name: resource-watch-watchdog
         run: bash tests/resource-watch-watchdog.sh
+      - name: wip-backup
+        run: bash tests/wip-backup.sh

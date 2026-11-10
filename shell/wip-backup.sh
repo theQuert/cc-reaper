@@ -244,7 +244,7 @@ cleanup_refs() {  # $1 = repo; $TMP/held lists every branch checked out in it, $
 }
 
 backup_repo() {  # $1 = a primary checkout
-  local repo="$1" line wt="" branch="" real why n=0 mode
+  local repo="$1" line wt="" branch="" real why n=0 mode skipped
   git -C "$repo" remote get-url "$REMOTE" >/dev/null 2>&1 || return 0
   : > "$TMP/held"; : > "$TMP/livebr"; : > "$TMP/todo"
   git -C "$repo" worktree list --porcelain > "$TMP/wts" 2>/dev/null || return 0
@@ -258,10 +258,13 @@ backup_repo() {  # $1 = a primary checkout
           echo "$branch" >> "$TMP/held"
           real="$(cd "$wt" && pwd -P)"
           why=""
+          skipped=0; case "$SKIP" in *" $branch "*) skipped=1 ;; esac
+          # A skipped branch (the primary checkout on main) is never backed up: do not walk its
+          # tree, which also holds every nested .claude/worktrees checkout, to learn that.
           if is_live "$real"; then why="live session"; echo "$branch" >> "$TMP/livebr"
-          elif is_recent "$wt"; then why="changed in ${RECENT}m"
+          elif [ "$skipped" = 0 ] && is_recent "$wt"; then why="changed in ${RECENT}m"
           fi
-          case "$SKIP" in *" $branch "*) why="" ;; esac
+          [ "$skipped" = 1 ] && why=""
           if [ -n "$why" ]; then
             mode=0
             if [ "$GATE" = 1 ] && gate_ok "$wt" "$branch"; then mode=$([ "$FULL" = 1 ] && echo 2 || echo 1); fi
@@ -273,8 +276,9 @@ backup_repo() {  # $1 = a primary checkout
   done < "$TMP/wts"
   # One listing per repository; none at all when nothing is active and the hourly cleanup
   # is not due, so an idle machine costs the remote nothing.
-  local stamp="$STATE/$(printf '%s' "$repo" | cksum | cut -d' ' -f1).cleanup"
-  if [ "$(awk -F'\t' '$4 != 1' "$TMP/todo" | wc -l)" -eq 0 ] && [ -n "$(find "$stamp" -mmin -60 2>/dev/null)" ]; then
+  local stamp="$STATE/$(printf '%s' "$repo" | cksum | cut -d' ' -f1).cleanup" due=1
+  [ -n "$(find "$stamp" -mmin -60 2>/dev/null)" ] && due=0
+  if [ "$(awk -F'\t' '$4 != 1' "$TMP/todo" | wc -l)" -eq 0 ] && [ "$due" = 0 ]; then
     n="$(wc -l < "$TMP/todo" | tr -d ' ')"; SAME=$((SAME + n)); GATED=$((GATED + n)); return 0  # all gated: no ls-remote
   fi
   # shellcheck disable=SC2086
@@ -289,6 +293,9 @@ backup_repo() {  # $1 = a primary checkout
       MISSES=$((MISSES + 1)); [ "$DRY" = 1 ] || echo "$FULL_EVERY" > "$STATE/full-remaining"
     fi
   done < "$TMP/todo"
+  # The cleanup judges every WIP ref of the repository (2000+ here: a few forks each, 80 s on a
+  # quiet host, minutes under load), so it runs hourly, not on every tick that has work.
+  [ "$due" = 1 ] || return 0
   rm -f "$TMP/del.failed"
   cleanup_refs "$repo"
   [ -f "$TMP/del.failed" ] && FAILED=1
