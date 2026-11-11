@@ -1320,19 +1320,37 @@ expect_no "a dead holder's lock is taken over" \
 expect_no "and released afterwards" \
   test -d "$S_LOCK"
 
-# A lock that cannot be taken at all is still a failure: a stale regular file where the
-# lock directory belongs has no holder to defer to, and mkdir cannot replace it.
+# A stale regular file where the lock directory belongs has no holder to defer to (stima-api#7895,
+# a heartbeat touch left a 0-byte one and every sweep of the repository then failed). It is
+# removed and the lock taken, so the sweep runs. A lock that truly cannot be taken is still a
+# failure: the case after this one, and the lock-ro / no-such-dir cases below.
 sgit worktree add -q "$S_ROOT/wt-locked" -b locked3 origin/main 2>/dev/null
 : > "$S_LOCK"
 touch -t "$(date -v-5M +%Y%m%d%H%M)" "$S_LOCK"
 OUT_LOCK3="$TMPDIR_ROOT/out-lock3.txt"
 LOCK3_RC=0
 PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$S_PRIMARY" --apply > "$OUT_LOCK3" 2>&1 || LOCK3_RC=$?
-expect_yes "a lock that cannot be taken still exits non-zero" test "$LOCK3_RC" -ne 0
+expect_yes "a stale file at the lock path is removed and the sweep runs, exiting 0" test "$LOCK3_RC" -eq 0
+expect_yes "and says so, without a could-not-be-taken line, and the lock is released" \
+  bash -c 'grep -qF "the sweep lock $3 was a file, not a lock directory; removed it and took the lock" "$1" && ! grep -q "could not be taken" "$1" && [ ! -e "$3" ] && [ ! -d "$2" ]' \
+    _ "$OUT_LOCK3" "$S_ROOT/wt-locked" "$S_LOCK"
+rm -f "$S_LOCK"
+_wj_idle --repo "$S_PRIMARY" --apply > /dev/null
+
+# A lock that truly cannot be taken is still a failure for the whole sweep: a stale directory
+# with no pid and something else inside is not a live holder, rmdir cannot clear it and mkdir
+# cannot replace it. The sweep exits non-zero and removes nothing.
+sgit worktree add -q "$S_ROOT/wt-locked4" -b locked4 origin/main 2>/dev/null
+mkdir "$S_LOCK"; : > "$S_LOCK/stray"
+touch -t "$(date -v-5M +%Y%m%d%H%M)" "$S_LOCK"
+OUT_LOCK4="$TMPDIR_ROOT/out-lock4.txt"
+LOCK4_RC=0
+PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$S_PRIMARY" --apply > "$OUT_LOCK4" 2>&1 || LOCK4_RC=$?
+expect_yes "a lock that cannot be taken still exits non-zero" test "$LOCK4_RC" -ne 0
 expect_yes "and removes nothing" \
   bash -c 'grep -q "could not be taken; removed nothing" "$1" && [ -d "$2" ]' \
-    _ "$OUT_LOCK3" "$S_ROOT/wt-locked"
-rm -f "$S_LOCK"
+    _ "$OUT_LOCK4" "$S_ROOT/wt-locked4"
+rm -f "$S_LOCK/stray"; rmdir "$S_LOCK"
 _wj_idle --repo "$S_PRIMARY" --apply > /dev/null
 
 # mkdir can also fail with nothing there to defer to: a missing or unwritable parent, as
@@ -2800,7 +2818,7 @@ BUDGET=0 run_budget --apply > "$OUT_B_ALL"
 expect_yes "budget: 0 is unbounded, and wraps from the cursor" test "$(examined "$OUT_B_ALL")" = "b c d a"
 expect_no "budget: an unbounded run never yields" file_has "$OUT_B_ALL" "budget exhausted"
 expect_yes "budget: the lock is refreshed at every worktree boundary" \
-  test "$(grep -cxF -- "$B_LOCK" "$TOUCH_LOG")" -ge 4
+  test "$(grep -cxF -- "-c $B_LOCK" "$TOUCH_LOG")" -ge 4
 expect_no "budget: a malformed budget fails the run" \
   env CC_WJ_SWEEP_BUDGET_SECONDS=x PATH="$STUBS_IDLE:$PATH" bash "$WJ" --repo "$B_ROOT/primary" --apply
 

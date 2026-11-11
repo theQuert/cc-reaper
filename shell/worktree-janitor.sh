@@ -1618,7 +1618,7 @@ _cc_wj_open_error() {
 
 _cc_wj_scan_claude_recent() { # <grace hours> [relisted]
   local grace="$1" relisted="${2:-}" projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
-  local now cutoff_minutes files f base sid activity cwd resolved why
+  local now cutoff_minutes files f base sid activity cwd resolved why find_rc find_err
   [ "$grace" -gt 0 ] || return 0
   [ -e "$projects" ] || return 0
   if [ ! -d "$projects" ] || [ ! -r "$projects" ] || [ ! -x "$projects" ]; then
@@ -1630,7 +1630,16 @@ _cc_wj_scan_claude_recent() { # <grace hours> [relisted]
     return 1
   }
   now="$(date +%s)"; cutoff_minutes=$((grace * 60))
-  files="$(find "$projects" -type f -name '*.jsonl' -mmin "-$cutoff_minutes" -print 2>/dev/null)" || {
+  # A non-zero exit with output is a partial listing only when every complaint is a file that
+  # vanished mid-walk (not a session). Permission denied or anything else skipped a directory,
+  # so its sessions are unknown: that, and no output at all, is a registry that could not be listed.
+  find_rc=0; find_err="$(mktemp "${TMPDIR:-/tmp}/cc-wj-find.XXXXXX")" || find_err=""
+  files="$(find "$projects" -type f -name '*.jsonl' -mmin "-$cutoff_minutes" -print 2>"${find_err:-/dev/null}")" || find_rc=$?
+  if [ "$find_rc" -ne 0 ]; then
+    { [ -n "$files" ] && [ -s "$find_err" ] && ! grep -qv 'No such file or directory$' "$find_err"; } || find_rc=fail
+  fi
+  [ -z "$find_err" ] || rm -f "$find_err"
+  [ "$find_rc" != fail ] || {
     _CC_WJ_ACTIVE_ERROR="the recent Claude transcript registry $projects could not be listed"
     return 1
   }
@@ -3988,7 +3997,7 @@ _cc_wj_trim_regenerable() {
     trimmed=$((trimmed + 1))
     printf '    → trimmed (%s bytes reclaimed)\n' "$before"
     # Every gate was asked again just now; say so to a sweep deciding whether this one died.
-    [ -n "${lock:-}" ] && touch "$lock" 2>/dev/null
+    [ -n "${lock:-}" ] && _cc_wj_lock_touch "$lock"
   done < "$list_file"
   rm -f "$list_file"
   printf 'TRIM_RESULT count=%s trimmed=%s reclaimed=%s\n' "$count" "$trimmed" "$reclaimed"
@@ -4839,10 +4848,21 @@ _cc_wj_lock_write() {
   ps -o command= -p "${_CC_WJ_RUN_PID:-$$}" > "$1/cmd" 2>/dev/null
 }
 
+# The heartbeat. `touch -c` never creates, so it only refreshes what exists: a bare `touch` on a lock that
+# was released or taken over made a 0-byte regular file at the lock path, which no sweep could
+# then take or remove (stima-api#7895, 2026-11-11).
+_cc_wj_lock_touch() { # <lock dir>
+  touch -c "$1" 2>/dev/null
+  return 0
+}
+
 # Whether $1 is held by a live sweep, read-only: sets _CC_WJ_LOCK_HOLDER. Status 0: held and
 # younger than 60 minutes; 2: held but past 60 minutes (to be taken over); 1: not held.
 _cc_wj_lock_live() { # <lock dir>
   local lock="$1" recorded live=0
+  _CC_WJ_LOCK_HOLDER=""
+  # A file or a symlink at the lock path is a wedge, never a holder; do not read through it.
+  if [ -L "$lock" ] || [ ! -d "$lock" ]; then return 1; fi
   _CC_WJ_LOCK_HOLDER="$(cat "$lock/pid" 2>/dev/null)"
   recorded="$(cat "$lock/cmd" 2>/dev/null)"
   # Alive and still running the command recorded when it took the lock. Matching on a name
@@ -4884,8 +4904,13 @@ _cc_wj_lock() { # <lock dir> [scope, default "in this repository"]
     _cc_wj_lock_deferred_line "$lock" "$_CC_WJ_LOCK_HOLDER" "$scope"
     return 2
   fi
-  rm -f "$lock/pid" "$lock/cmd" 2>/dev/null
-  rmdir "$lock" 2>/dev/null
+  if [ -L "$lock" ] || { [ -e "$lock" ] && [ ! -d "$lock" ]; }; then
+    echo "worktree-janitor: the sweep lock $lock was a file, not a lock directory; removed it and took the lock"
+    rm -f -- "$lock" 2>/dev/null
+  else
+    rm -f "$lock/pid" "$lock/cmd" 2>/dev/null
+    rmdir "$lock" 2>/dev/null
+  fi
   if ! mkdir "$lock" 2>/dev/null; then
     echo "worktree-janitor: the sweep lock $lock could not be taken; removed nothing $scope"
     return 1
@@ -5487,8 +5512,8 @@ KEEP
           fi
         fi
         # The heartbeat: a sweep that is still deciding is not a dead holder.
-        [ -n "$lock" ] && touch "$lock" 2>/dev/null
-        [ -z "${_CC_WJ_SWEEP_LOCK:-}" ] || touch "$_CC_WJ_SWEEP_LOCK" 2>/dev/null
+        [ -n "$lock" ] && _cc_wj_lock_touch "$lock"
+        [ -z "${_CC_WJ_SWEEP_LOCK:-}" ] || _cc_wj_lock_touch "$_CC_WJ_SWEEP_LOCK"
         if [ "$_CC_WJ_ORDER" = largest ]; then
           [ -z "$cursor_file" ] || printf '%s\n' "$wt_path" >> "$cursor_file" 2>/dev/null || :
         else
@@ -6181,7 +6206,7 @@ KEEP
               _cc_wj_tally "$rule_use" decides removal "$wt_path" "$bytes"
               _cc_wj_size_record "$wt_path" -
               printf "    → removed (%s bytes reclaimed)\n" "$bytes"
-              [ -n "$lock" ] && touch "$lock" 2>/dev/null
+              [ -n "$lock" ] && _cc_wj_lock_touch "$lock"
               # Queue prune for this repo
               prune_repos+=("$repo")
             else
