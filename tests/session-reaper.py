@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("session_reaper", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
 
-CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", STALL_MARK_DIR="")
+CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", STALL_MARK_DIR="", DISPATCH_FILE="")
 
 
 def session(**kw):
@@ -108,6 +108,69 @@ NOW0 = reaper.calendar.timegm((2026, 10, 27, 12, 0, 0, 0, 0, 0))
 ENDED = "delivery #9: pr-open -> wait check-by  [d]\n  owner: stranded-step dispatcher wakes it; no watcher needed, and the session may end"
 OTHER = "delivery #9: pr -> agent x\n  claimant: claude session other-sid (n); the step is that session's: hand it over while it lives"
 MINE = OTHER.replace("other-sid", "sid-1")
+
+
+class Routed(unittest.TestCase):
+    def keep(self, routes, session_name="work"):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "dispatcher-routes.json"
+            if routes is not None:
+                f.write_text(routes if isinstance(routes, str) else json.dumps(routes))
+            cfg = dict(CFG, DISPATCH_FILE=str(f))
+            return reaper.decide(session(tmux=session_name), cfg, NOW0)
+
+    def doc(self, **routes):
+        return {"version": 1, "routes": {n: {"session": "work", "at": NOW0 - age, "reason": "x", "previous": ""}
+                                         for n, age in routes.items()}}
+
+    def test_a_young_route_keeps_an_otherwise_closable_session(self):
+        self.assertEqual(self.keep(self.doc(**{"123": 600})), ["routed:#123"])
+
+    def test_an_old_route_keeps_nothing(self):
+        self.assertEqual(self.keep(self.doc(**{"123": 31 * 60})), [])
+
+    def test_a_route_naming_another_session_keeps_nothing(self):
+        self.assertEqual(self.keep(self.doc(**{"123": 60}), session_name="other"), [])
+
+    def test_a_malformed_file_keeps_nothing(self):
+        ok = {"session": "work", "at": NOW0 - 60}
+        for bad in (None, "", "not json", "[]", "null", '{"routes": 5}', '{"routes": []}', '{"routes": {"1": 5}}',
+                    json.dumps({"routes": {"1": {"session": "work", "at": "now"}}}),
+                    json.dumps({"routes": {"1": {"session": "work", "at": None}}}),
+                    json.dumps({"routes": {"1": {"session": 7, "at": NOW0 - 60}}}),
+                    json.dumps({"routes": {"1": {"at": NOW0 - 60}}}),
+                    json.dumps({"routes": {"1": {"session": "work", "at": True}}}),
+                    '{"routes": {"1": {"session": "work", "at": 1' + "0" * 400 + "}}}",
+                    '{"routes": {"1": {"session": "work", "at": NaN}}}',
+                    '{"routes": {"1": {"session": "work", "at": Infinity}}}',
+                    '{"routes": {"1": {"session": "work", "at": -Infinity}}}',
+                    "[" * 200000):  # nested past the recursion limit
+            with self.subTest(bad=bad):
+                self.assertEqual(self.keep(bad), [])
+        # one bad entry does not hide a good one beside it
+        self.assertEqual(self.keep({"routes": {"1": 5, "2": ok}}), ["routed:#2"])
+
+    def test_the_pass_start_read_does_not_raise_on_a_huge_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "r.json"
+            f.write_text('{"routes": {"1": {"session": "work", "at": 1' + "0" * 400 + "}, "
+                         '"2": {"session": "work", "at": %d}}}' % (NOW0 - 60))
+            self.assertEqual(reaper.read_routes(dict(CFG, DISPATCH_FILE=str(f))), {"2": ("work", float(NOW0 - 60))})
+
+    def test_a_route_written_after_the_pass_began_keeps_the_session_at_confirm_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "r.json"
+            cfg = dict(CFG, DISPATCH_FILE=str(f), _routes={})  # the pass-start read saw nothing
+            s = session()
+            self.assertEqual(reaper.decide(s, cfg, NOW0), [])
+            f.write_text(json.dumps({"routes": {"77": {"session": "work", "at": int(time.time()) - 5}}}))
+            self.assertEqual(reaper.confirm_close(s, cfg, []), ["routed:#77"])
+
+    def test_a_route_dated_in_the_future_is_ignored(self):
+        self.assertEqual(self.keep(self.doc(**{"123": -600})), [])
+
+    def test_the_newest_of_two_routes_is_reported(self):
+        self.assertEqual(self.keep(self.doc(**{"5": 900, "9": 120, "7": 600})), ["routed:#9"])
 
 
 class OracleClaims(unittest.TestCase):
@@ -558,7 +621,7 @@ class JudgeOrder(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=0\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+        cfgfile.write_text(f"APPLY=0\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\n")
         extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
                      fg=True, sub_active=0, screen_tail="")
         sessions = [session(tmux="busy", name="busy", status="busy", idle_min=1, sid="b" * 10, **extra),
@@ -1594,7 +1657,7 @@ class SkippedAndApply(unittest.TestCase):
         (self.tmp / "sessions").mkdir()
         self.cfgfile = self.tmp / "conf"
         self.cfgfile.write_text(f"APPLY=1\nREPORT={self.tmp / 'report.md'}\nREAPED_DIR={self.tmp / 'reaped'}\n"
-                                f"IDLE_LIST_HOURS=0\n")
+                                f"IDLE_LIST_HOURS=0\nDISPATCH_FILE=\n")
 
     def write(self, fname, **d):
         (self.tmp / "sessions" / f"{fname}.json").write_text(json.dumps(d))
@@ -1717,7 +1780,7 @@ class NoClaimDone(unittest.TestCase):
         cfgfile.write_text(f"APPLY=1\nDONE_INBOX={self.inbox}\nDONE_INBOX_SHADOW={self.inbox}\nNOCLAIM_DONE=apply\n"
                            f"NUDGE_EVENTS={events}\nNUDGE_STATE={tmp / 'nudged.json'}\nRELAY_DIR={tmp / 'relay'}\n"
                            f"IDLE_LIST_INBOX={tmp / 'idle-inbox.md'}\n"
-                           f"REPORT={tmp / 'report.md'}\nREAPED_DIR={tmp / 'reaped'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+                           f"REPORT={tmp / 'report.md'}\nREAPED_DIR={tmp / 'reaped'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\n")
         with mock.patch.object(reaper, "HOME", tmp), mock.patch.object(reaper, "gather", return_value=[dict(s)]), \
              mock.patch.object(reaper, "recover_exiting", return_value=[]), \
              mock.patch.object(reaper, "worktree_state", return_value=[]), \
@@ -2006,7 +2069,7 @@ class Unjudged(unittest.TestCase):
                          ("c", dict(kind="bg", pid=99, sessionId="dddddddd44", name="gone"))):
             (tmp / "sessions" / f"{fname}.json").write_text(json.dumps(d))
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\n")
         table = {11: (1, "B", "claude"), 12: (1, "C", "claude")}
         with mock.patch.object(reaper, "HOME", tmp), mock.patch.object(reaper, "SESSIONS_DIR", tmp / "sessions"), \
              mock.patch.object(reaper, "ps_table", return_value=table), \
@@ -2283,7 +2346,7 @@ class OracleReadsUnderLoad(FreshState):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=0\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+        cfgfile.write_text(f"APPLY=0\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\n")
         extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
                      fg=True, sub_active=0, screen_tail="")
         sessions = [session(tmux="idle", name="idle", idle_min=300, sid="i" * 10, **extra)]
@@ -2331,7 +2394,7 @@ class OracleReadsUnderLoad(FreshState):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDEAD_CLAIMS=off\n")
+        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\nDEAD_CLAIMS=off\n")
         extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
                      fg=True, sub_active=0, screen_tail="")
         sessions = [session(tmux="idle", name="idle", idle_min=300, sid="i" * 10, **extra)]
