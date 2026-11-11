@@ -875,6 +875,15 @@ class FinishAndReap(unittest.TestCase):
         self.assertFalse(ok)
         comment.assert_not_called()
 
+    def test_the_close_entry_says_when_why_and_after_how_long(self):
+        s = session(idle_min=75, last_text="all shipped\n\nSESSION-DONE: shipped", text_at=2, prompt_at=1)
+        info = reaper.close_info(s, self.cfg, 1794435756)
+        self.assertEqual((info["idle_min"], info["threshold"], info["said_done"], info["reason"]), (75, 60, True, "idle"))
+        self.assertTrue(reaper.finish_close("work", "sid-1", "/w", [], "done", "%9", "$3", True, self.cfg, 0, 4242, None, close=info))
+        line = [ln for ln in (self.d / "closed.md").read_text().splitlines() if ln.startswith("- work")][0]
+        self.assertTrue(line.endswith("<!-- pid:4242 --> <!-- close: at=2026-11-11T22:22:36Z idle=75 threshold=60 "
+                                      "said_done=true reason=idle -->"), line)
+
     def test_finish_close_writes_one_entry_per_close_of_the_same_session(self):
         close = lambda pid: reaper.finish_close("work", "sid-1", "/w", [], "done\n\n- next", "%9", "$3", True, self.cfg, 0, pid)
         self.assertTrue(close(4242))
