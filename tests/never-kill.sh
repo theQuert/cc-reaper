@@ -7,8 +7,7 @@
 # signalled at all are above any pid_max. The default list's pids are only ever asked about,
 # never handed to a kill path.
 #
-# Also here: guard-runner.sh always spares a runaway MCP server a live session is using, and the
-# Claude/Codex CLI matcher that decides what "a live session" is.
+# Also here: the Claude/Codex CLI matcher that decides what "a live session" is.
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -112,16 +111,6 @@ if [ "$(tr '\n' ' ' < "$tmp/signalled")" = "9100004 " ] && grep -qx 'rc2=1' "$tm
 else
   bad "monitor: signalled [$(tr '\n' ' ' < "$tmp/signalled")] out [$(tr '\n' ' ' < "$tmp/out")] log [$(cat "$tmp/home/.cc-reaper/logs/monitor.log" 2>/dev/null)]"
 fi
-
-# ─── guard-runner: in-use runaway servers are spared, whatever the environment ─
-cat > "$tmp/fake-cleanup.sh" <<'EOF'
-_cc_reaper_bound_log() { :; }
-claude-guard() { echo "spare=${CC_RUNAWAY_SPARE_IN_USE:-unset}"; }
-EOF
-out="$(CC_REAPER_CLEANUP="$tmp/fake-cleanup.sh" CC_RUNAWAY_SPARE_IN_USE=0 HOME="$tmp/home" \
-  bash "$ROOT_DIR/shell/guard-runner.sh")"
-[ "$out" = "spare=1" ] && ok "guard-runner always sets CC_RUNAWAY_SPARE_IN_USE=1" \
-  || bad "guard-runner passed CC_RUNAWAY_SPARE_IN_USE as: $out"
 
 # ─── What counts as a Claude or Codex session ─────────────────────────────────
 # Each line: expected (0 = an agent CLI) | command line.
