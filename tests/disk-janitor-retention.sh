@@ -298,7 +298,7 @@ t_evidence() {
   begin; H="$T/handoffs"; E="$T/helm"
   mkdir -p "$H/i100-old" "$H/i200-open" "$H/i300-fresh" "$H/i400" "$H/notes" "$E/2026-10-01-a" "$E/2026-10-02-b" "$E/2026-10-03-c" "$E/2026-10-04-d" "$T/outside/ev"
   echo x > "$H/i100-old/f"; echo x > "$H/i200-open/f"; echo x > "$H/i300-fresh/f"; echo x > "$H/i400/f"; echo x > "$H/notes/f"; : > "$H/i999.md"
-  echo x > "$E/2026-10-01-a/i100-x.md"; echo x > "$E/2026-10-02-b/i100-x.md"; echo x > "$E/2026-10-02-b/i200-y.md"
+  echo x > "$E/2026-10-01-a/100-x.md"; echo x > "$E/2026-10-02-b/100-x.md"; echo x > "$E/2026-10-02-b/200-y.md"
   echo x > "$E/2026-10-03-c/abc.txt"; echo '{"issue": 400}' > "$E/2026-10-04-d/manifest.json"
   echo keep > "$T/outside/ev/f"; ln -s "$T/outside/ev" "$H/i100-link"
   age "$H" 20; age "$E" 20; age "$T/outside" 20
@@ -662,7 +662,8 @@ codex_fixture() {  # sets C (the codex home), M (the main repo's git dir), C1 (o
   mkdir -p "$M/objects" "$M/refs/heads" "$M/refs/remotes/origin" "$C/worktrees" "$C/archived_sessions" "$C/helmway-evidence" \
     "$C/packages/p" "$C/plugins/q" "$C/sessions"
   printf 'ref: refs/heads/main\n' > "$M/HEAD"
-  printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n' > "$M/config"
+  # status.showUntrackedFiles = no: only an explicit -unormal makes `git status` see an untracked file.
+  printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n[status]\n\tshowUntrackedFiles = no\n' > "$M/config"
   tree="$(git --git-dir="$M" hash-object -t tree -w /dev/null)"
   C1="$(env $id git --git-dir="$M" commit-tree "$tree" -m base)"
   C2="$(env $id git --git-dir="$M" commit-tree "$tree" -p "$C1" -m local-only)"
@@ -684,7 +685,7 @@ t_codex() {
   local sd="$1" r=0 C M C1 C2 h x
   begin; codex_fixture; h="$C/helmway-evidence"; x="$C/archived_sessions"
   mkdir -p "$h/2026-11-01-a" "$h/2026-11-02-b" "$h/2026-11-03-c"
-  echo x > "$h/2026-11-01-a/i100-x.md"; echo x > "$h/2026-11-02-b/i200-y.md"; echo x > "$h/2026-11-03-c/n.txt"
+  echo x > "$h/2026-11-01-a/100-x.md"; echo x > "$h/2026-11-02-b/200-y.md"; echo x > "$h/2026-11-03-c/n.txt"
   cwt clean "$C1"; cwt ahead "ref: refs/heads/feat"; cwt dirty "$C1"; echo u > "$C/worktrees/dirty/repo/untracked"
   cwt held "$C1"; mkdir -p "$C/worktrees/nogit/repo"; echo x > "$C/worktrees/nogit/repo/f"
   echo a > "$x/a.jsonl"; echo h > "$x/held.jsonl"; echo s > "$x/state.sqlite"; echo w > "$x/state.sqlite-wal"
@@ -737,7 +738,8 @@ t_evidence_date_names() {
   local sd="$1" r=0 E
   begin; E="$T/helm"; mkdir -p "$E/2026-11-05-a" "$E/2026-11-06-b" "$E/2026-11-07-c" "$E/2026-11-08-d" "$E/2026-11-09-e"
   echo x > "$E/2026-11-05-a/2026-11-10T0930.log"; echo x > "$E/2026-11-05-a/2026-11-11.md"
-  echo x > "$E/2026-11-06-b/i2026-11-10.md"
+  echo x > "$E/2026-11-06-b/i2026-11-10.md"; echo x > "$E/2026-11-06-b/#2026-11.md"; echo x > "$E/2026-11-06-b/i2026_11_10.md"
+  echo x > "$E/2026-11-06-b/2026.11.10.md"
   echo x > "$E/2026-11-07-c/i2026.md"; echo x > "$E/2026-11-08-d/issue-2026.md"; echo x > "$E/2026-11-09-e/#2026.md"
   printf '2026\n' > "$T/gh.closed"
   run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HELMWAY_DIR="$E"
@@ -746,6 +748,21 @@ t_evidence_date_names() {
   [ ! -d "$E/2026-11-07-c" ] || { echo "  i<N> no longer names an issue"; r=1; }
   [ ! -d "$E/2026-11-08-d" ] || { echo "  issue-<N> no longer names an issue"; r=1; }
   [ ! -d "$E/2026-11-09-e" ] || { echo "  #<N> no longer names an issue"; r=1; }
+  return $r
+}
+
+# I-1: the real layout is <date>-<kind>/<N>-<slug>/; a bare <N>-slug entry names an issue.
+t_evidence_bare_names() {
+  local sd="$1" r=0 E
+  begin; E="$T/helm"; mkdir -p "$E/2026-10-31-quality/6125-pg-envelope" "$E/2026-10-31-mixed/6126-other" "$E/2026-10-31-both/6125-pg-envelope"
+  echo x > "$E/2026-10-31-quality/6125-pg-envelope/f"; echo x > "$E/2026-10-31-quality/2026-11-10T0930.log"
+  echo x > "$E/2026-10-31-mixed/6126-other/f"; echo '{"issue": 6125}' > "$E/2026-10-31-mixed/manifest.json"
+  echo x > "$E/2026-10-31-both/6125-pg-envelope/f"; echo x > "$E/2026-10-31-both/6126-other.md"
+  printf '6125\n' > "$T/gh.closed"            # #6125 closed, #6126 open; a year is not an issue
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HELMWAY_DIR="$E"
+  [ ! -d "$E/2026-10-31-quality" ] || { echo "  6125-pg-envelope plus a date-named log did not read as #6125 only"; r=1; }
+  [ -d "$E/2026-10-31-mixed" ] || { echo "  a manifest naming a closed issue plus a bare entry for an open one was removed"; r=1; }
+  [ -d "$E/2026-10-31-both" ] || { echo "  a bare <N>-slug entry for an open issue did not keep the directory"; r=1; }
   return $r
 }
 
@@ -791,6 +808,25 @@ t_codex_worktree_shapes() {
   return $r
 }
 
+# I-2: when the <id> directory is itself a worktree, a repository nested in a child is still judged.
+t_codex_nested_repo() {
+  local sd="$1" r=0 C M C1 C2 id sub
+  begin; codex_fixture; : > "$T/lsof.extra"; printf '100\n' > "$T/gh.closed"
+  mkdir -p "$M/info"; printf 'sub/\n' > "$M/info/exclude"          # the outer worktree ignores the nested repo
+  for id in nestahead nestok; do
+    mkdir -p "$M/worktrees/$id" "$C/worktrees/$id"
+    printf '%s\n' "$C1" > "$M/worktrees/$id/HEAD"; printf '../..\n' > "$M/worktrees/$id/commondir"
+    printf '%s\n' "$C/worktrees/$id/.git" > "$M/worktrees/$id/gitdir"; printf 'gitdir: %s\n' "$M/worktrees/$id" > "$C/worktrees/$id/.git"
+    sub="$C/worktrees/$id/sub/.git"; mkdir -p "$sub"; cp -R "$M/objects" "$M/refs" "$M/config" "$sub/"
+    rm -f "$sub/refs/heads/feat"; printf 'ref: refs/heads/main\n' > "$sub/HEAD"
+  done
+  printf '%s\n' "$C2" > "$C/worktrees/nestahead/sub/.git/refs/heads/feat"       # a commit on no remote, inside the nested repo
+  codexrun "$sd" apply
+  [ -d "$C/worktrees/nestahead" ] || { echo "  a worktree with an unpushed commit in a nested repository was removed"; r=1; }
+  [ ! -d "$C/worktrees/nestok" ] || { echo "  control: a worktree whose nested repository is on a remote survived"; r=1; }
+  return $r
+}
+
 t_wired_into_check() {
   local sd="$1"
   awk '/^_cc_dj_check\(\)/{f=1} f && /^  _cc_dj_retention$/{found=1} f && /^}/{exit} END{exit !found}' "$sd/disk-janitor.sh"
@@ -809,7 +845,7 @@ t_scratch_lsof_unknown_keeps t_scratch_default_shadow t_projects t_projects_defa
 t_evidence t_evidence_gh_failure t_dev t_dev_sigkill t_dev_young_keeps t_dev_active_worktree_keeps
 t_dev_merged_worktree_stops t_dev_primary_keeps t_dev_live_session_keeps t_dev_claude_ancestor_keeps
 t_dev_never_kill_keeps t_dev_unknown_keeps t_dev_match_default t_report_forces_shadow t_bad_mode_is_shadow t_defaults t_remove_guards
-t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing t_codex t_codex_lsof_unknown_keeps t_evidence_date_names t_codex_days t_codex_worktree_shapes"
+t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing t_codex t_codex_lsof_unknown_keeps t_evidence_date_names t_codex_days t_codex_worktree_shapes t_evidence_bare_names t_codex_nested_repo"
 
 for c in $CASES; do
   if "$c" "$SRC"; then ok "$c"; else nok "$c"; fi
@@ -882,9 +918,11 @@ mutant "evidence: recent files do not keep" $H '                if days_of(kind)
 mutant "evidence: unknown issue state counts as closed" $H 'closed = closed_issues(a.repo, a.gh, a.limit)' 'closed = closed_issues(a.repo, a.gh, a.limit) or set(range(10**6))' t_evidence_gh_failure
 mutant "evidence: default mode is shadow" $J 'CC_DJ_RET_EVIDENCE_MODE:-apply' 'CC_DJ_RET_EVIDENCE_MODE:-shadow' t_codex t_defaults
 # F1 issue names
-mutant "evidence: the old entry regex reads a date as an issue" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)?(\d{3,6})(?:[-_.]|$)")' t_evidence_date_names
-mutant "evidence: i<N> followed by a date counts" $H '_NUM = r"(\d{3,6})(?![0-9A-Za-z])(?!-\d{2}-\d{2})"' '_NUM = r"(\d{3,6})(?![0-9A-Za-z])"' t_evidence_date_names
-mutant "evidence: #<N> and issue-<N> are not names" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)" + _NUM)' t_evidence_date_names
+mutant "evidence: the old entry regex reads a date as an issue" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)?" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)?(\d{3,6})(?:[-_.]|$)")' t_evidence_date_names
+mutant "evidence: a date counts as a number" $H '_NOT_DATE = r"(?!(?:19|20)\d{2}[-_.](?:0[1-9]|1[0-2])(?!\d))"' '_NOT_DATE = r""' t_evidence_date_names t_evidence_bare_names
+mutant "evidence: #<N> and issue-<N> are not names" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)?" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)?" + _NUM)' t_evidence_date_names
+mutant "evidence: a bare <N>-slug is not a name" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)?" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)' t_evidence_bare_names t_evidence
+mutant "codex: a nested repository is not judged" $H '        for n in sorted(os.listdir(top)):       # a repository nested in a child, ignored by the outer one' '        for n in []:       # a repository nested in a child, ignored by the outer one' t_codex_nested_repo
 # F2 codex age
 mutant "codex: CODEX_DAYS does not reach worktrees and archived sessions" $H 'return a.codex_days if kind in ("helmway", "worktrees", "archived") else a.days' 'return a.codex_days if kind == "helmway" else a.days' t_codex_days
 mutant "codex: the age test is skipped for worktrees and archived sessions" $H '        if ds > 0 and newest_within(p, ds * 86400):
@@ -894,7 +932,7 @@ mutant "codex: the age test is skipped for worktrees and archived sessions" $H '
 mutant "codex: a non-git sibling does not keep the <id> directory" $H '                return False, "%s is not a git worktree" % d' '                continue' t_codex_worktree_shapes
 mutant "codex: a full clone is judged by HEAD only" $H '"rev-list", "--count", "--all", "--not", "--remotes"' '"rev-list", "--count", "HEAD", "--not", "--remotes"' t_codex_worktree_shapes
 mutant "codex: a stash does not keep a full clone" $H '            if rc2 != 0 or stash:' '            if False:' t_codex_worktree_shapes
-mutant "codex: untracked files are not looked at" $H '"status", "--porcelain", "-unormal"' '"status", "--porcelain", "-uno"' t_codex
+mutant "codex: untracked files are not looked at" $H '"status", "--porcelain", "-unormal"' '"status", "--porcelain"' t_codex
 # ~/.codex leftovers
 mutant "codex: helmway-evidence is aged like handoffs" $H 'return a.codex_days if kind in ("helmway", "worktrees", "archived") else a.days' 'return a.days' t_codex
 mutant "codex: a dirty worktree goes" $H 'return False, "uncommitted changes in %s" % d' 'pass' t_codex

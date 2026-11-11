@@ -261,9 +261,12 @@ def cmd_projects(a):
 
 # ------------------------------------------------------------------ evidence
 
-# An issue is named `i<N>`, `issue-<N>` or `#<N>`; a number that begins a date (`i2026-11-10`) is not one.
-_NUM = r"(\d{3,6})(?![0-9A-Za-z])(?!-\d{2}-\d{2})"
-ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)
+# An issue is named `i<N>`, `issue-<N>`, `#<N>` or, for an entry inside an evidence directory, a bare
+# `<N>-slug` (the real layout is `<date>-<kind>/<N>-<slug>/`). A number that begins a date, a year
+# followed by a separator and a month (`2026-11`, `2026_11`, `2026.11`, also after i/issue-/#), is not one.
+_NOT_DATE = r"(?!(?:19|20)\d{2}[-_.](?:0[1-9]|1[0-2])(?!\d))"
+_NUM = _NOT_DATE + r"(\d{3,6})(?![0-9A-Za-z])"
+ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)?" + _NUM)
 NAME_ISSUE = re.compile(r"(?:^|[-_.])(?:i|issue-?|#)" + _NUM)
 MANIFEST_ISSUE = re.compile(r'stima-api#(\d{3,6})|"issue(?:_number)?"\s*:\s*(\d{3,6})')
 SQLITE_NAME = re.compile(r"\.sqlite3?(?:-wal|-shm|-journal)?$", re.I)
@@ -272,7 +275,7 @@ ROOT_KINDS = ("helmway", "handoffs", "worktrees", "archived")
 
 def issues_of(kind, path):
     """Issue numbers a directory names: handoffs by `i<N>` in the name; helmway-evidence by
-    `i<N>`/`issue-<N>`/`#<N>` in the name, by top-level entries named that way, or by a top-level
+    `i<N>`/`issue-<N>`/`#<N>` in the name, by top-level entries named `<N>-slug` or that way, or by a top-level
     manifest file naming `stima-api#N`. An empty set means the directory names no issue."""
     base = os.path.basename(path)
     found = set()
@@ -344,6 +347,10 @@ def codex_worktree_verdict(top):
     <id>/<repo>) is clean and has no commit outside the remotes; (False, why) otherwise."""
     if os.path.lexists(os.path.join(top, ".git")):
         found = [top]
+        for n in sorted(os.listdir(top)):       # a repository nested in a child, ignored by the outer one
+            d = os.path.join(top, n)
+            if not os.path.islink(d) and os.path.isdir(d) and os.path.lexists(os.path.join(d, ".git")):
+                found.append(d)
     else:
         found = []
         for n in sorted(os.listdir(top)):
