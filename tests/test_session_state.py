@@ -27,7 +27,7 @@ reaper = load("session_reaper", ROOT / "shell" / "session-reaper.py")
 ss = load("session_state", ROOT / "shell" / "session_state.py")
 REAL = json.loads((ROOT / "tests" / "fixtures" / "delivery-state-briefs.json").read_text())
 REPO = "theQuert/stima-api"
-CFG = dict(reaper.DEFAULTS, IDLE_MINUTES="60", DONE_GRACE_MINUTES="5", STALL_MARK_DIR="",
+CFG = dict(reaper.DEFAULTS, IDLE_MINUTES="60", DONE_GRACE_MINUTES="5",
            CHECKBY_REPO=REPO, PROTECT="keep-*", NEVER_CLOSE="")
 NOW = 1_800_000_000.0
 
@@ -791,7 +791,7 @@ class Main(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp)
         self.live_file = self.tmp / "live" / "sessions.json"
         self.live = self.tmp / "session-reaper.conf"
-        base = (f"REPORT={self.tmp / 'report.md'}\nCC_NEVER_KILL_PIDS=\nDONE_INBOX=\nSTALL_MARK_DIR=\n"
+        base = (f"REPORT={self.tmp / 'report.md'}\nCC_NEVER_KILL_PIDS=\nDONE_INBOX=\n"
                 f"REAPED_DIR={self.tmp / 'reaped'}\nCLOSED_LOG={self.tmp / 'closed.md'}\n"
                 "DEAD_CLAIMS=off\n")  # this test's live config posts to GitHub if the dead-claim pass runs (stima-api#7527)
         self.live.write_text(base + "APPLY=1\n")

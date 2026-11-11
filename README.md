@@ -846,8 +846,8 @@ rm -f ~/Library/LaunchAgents/com.cc-reaper.session-reaper.plist ~/.cc-reaper/ses
 ### Stall watch (retired)
 
 `stall-watch.py` and its LaunchAgent were retired 2026-11-12 (stima-api #7904): 9044 runs wrote no mark, report or alert.
-`install.sh` boots out `com.cc-reaper.stall-watch` and removes its plist and script. `session-reaper.py` still honours a
-`STALL_MARK_DIR/<session id>.json` mark if one is put there.
+`install.sh` boots out `com.cc-reaper.stall-watch` and removes its plist and script. `session-reaper.py` no longer reads
+marks.
 
 ## GCE disk watch (shadow until enabled)
 

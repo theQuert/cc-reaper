@@ -363,7 +363,7 @@ class OnlyTheLivePolicyActs(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d)
         conf = d / "r.conf"
         conf.write_text(f"APPLY=1\nSTATE_DIR={d}\nREPORT={d / 'report.md'}\nREAPED_DIR={d / 'reaped'}\n"
-                        f"CLOSED_LOG={d / 'closed.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+                        f"CLOSED_LOG={d / 'closed.md'}\nIDLE_LIST_HOURS=0\n")
         with mock.patch.object(reaper, "release_dead_claims", side_effect=AssertionError("ran")) as ran, \
              mock.patch.object(reaper, "gather", return_value=[]):
             reaper.main(["--config", str(conf), "--apply"])
@@ -374,7 +374,7 @@ class OnlyTheLivePolicyActs(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d)
         conf = d / "r.conf"
         conf.write_text(f"APPLY=1\nSTATE_DIR={d}\nREPORT={d / 'report.md'}\nREAPED_DIR={d / 'reaped'}\n"
-                        f"CLOSED_LOG={d / 'closed.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+                        f"CLOSED_LOG={d / 'closed.md'}\nIDLE_LIST_HOURS=0\n")
         res = {"released": [], "would": [], "young": [], "alive": 0, "deferred": [], "unreadable": "", "notes": []}
         with mock.patch.object(reaper, "CONFIG", conf), \
              mock.patch.object(reaper, "release_dead_claims", return_value=res) as ran, \

@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("session_reaper", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
 
-CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", STALL_MARK_DIR="", DISPATCH_FILE="")
+CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", DISPATCH_FILE="")
 
 
 def session(**kw):
@@ -621,7 +621,7 @@ class JudgeOrder(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=0\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\n")
+        cfgfile.write_text(f"APPLY=0\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nDISPATCH_FILE=\n")
         extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
                      fg=True, sub_active=0, screen_tail="")
         sessions = [session(tmux="busy", name="busy", status="busy", idle_min=1, sid="b" * 10, **extra),
@@ -1780,7 +1780,7 @@ class NoClaimDone(unittest.TestCase):
         cfgfile.write_text(f"APPLY=1\nDONE_INBOX={self.inbox}\nDONE_INBOX_SHADOW={self.inbox}\nNOCLAIM_DONE=apply\n"
                            f"NUDGE_EVENTS={events}\nNUDGE_STATE={tmp / 'nudged.json'}\nRELAY_DIR={tmp / 'relay'}\n"
                            f"IDLE_LIST_INBOX={tmp / 'idle-inbox.md'}\n"
-                           f"REPORT={tmp / 'report.md'}\nREAPED_DIR={tmp / 'reaped'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\n")
+                           f"REPORT={tmp / 'report.md'}\nREAPED_DIR={tmp / 'reaped'}\nIDLE_LIST_HOURS=0\nDISPATCH_FILE=\n")
         with mock.patch.object(reaper, "HOME", tmp), mock.patch.object(reaper, "gather", return_value=[dict(s)]), \
              mock.patch.object(reaper, "recover_exiting", return_value=[]), \
              mock.patch.object(reaper, "worktree_state", return_value=[]), \
@@ -2069,7 +2069,7 @@ class Unjudged(unittest.TestCase):
                          ("c", dict(kind="bg", pid=99, sessionId="dddddddd44", name="gone"))):
             (tmp / "sessions" / f"{fname}.json").write_text(json.dumps(d))
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\n")
+        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nDISPATCH_FILE=\n")
         table = {11: (1, "B", "claude"), 12: (1, "C", "claude")}
         with mock.patch.object(reaper, "HOME", tmp), mock.patch.object(reaper, "SESSIONS_DIR", tmp / "sessions"), \
              mock.patch.object(reaper, "ps_table", return_value=table), \
@@ -2346,7 +2346,7 @@ class OracleReadsUnderLoad(FreshState):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=0\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\n")
+        cfgfile.write_text(f"APPLY=0\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nDISPATCH_FILE=\n")
         extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
                      fg=True, sub_active=0, screen_tail="")
         sessions = [session(tmux="idle", name="idle", idle_min=300, sid="i" * 10, **extra)]
@@ -2394,7 +2394,7 @@ class OracleReadsUnderLoad(FreshState):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\nDEAD_CLAIMS=off\n")
+        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nDISPATCH_FILE=\nDEAD_CLAIMS=off\n")
         extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
                      fg=True, sub_active=0, screen_tail="")
         sessions = [session(tmux="idle", name="idle", idle_min=300, sid="i" * 10, **extra)]
@@ -2423,6 +2423,23 @@ class OracleReadsUnderLoad(FreshState):
         with mock.patch.object(reaper, "run", side_effect=AssertionError("ran")):
             self.assertEqual(reaper.confirm_close(session(claims=[(REPO, "9")]), self.cfg, ["idle:5<60min"]),
                              ["idle:5<60min"])
+
+
+class RetiredStallMark(unittest.TestCase):
+    """stall-watch.py is retired and nothing writes a mark: a file in the old mark directory keeps nothing."""
+
+    def test_a_stall_mark_file_keeps_nothing(self):
+        import json
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            (Path(d) / "sid-1.json").write_text(json.dumps(
+                {"sid": "sid-1", "fingerprints": ["rate-limit"], "since": now, "updated": now}))
+            cfg = dict(CFG, STALL_MARK_DIR=d)
+            keep = reaper.decide(session(), cfg)
+        self.assertFalse([k for k in keep if str(k).startswith("stalled:")], keep)
+        self.assertNotIn("STALL_MARK_DIR", reaper.DEFAULTS)
 
 
 if __name__ == "__main__":

@@ -77,9 +77,6 @@ DEFAULTS = {
     "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
     "DISPATCH_FILE": "~/.claude/state/dispatcher-routes.json",  # dispatcher routes a card to a live session; empty: off
     "DISPATCH_KEEP_MINUTES": "30",  # a route younger than this keeps the session it names (`routed:#N`)
-    "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # stall-watch.py writes <session id>.json here; empty: off
-    "STALL_MARK_HOURS": "12",  # a mark not refreshed for this long is stale and ignored
-    "STALL_MARK_MAX_HOURS": "48",  # a mark whose event was first seen longer ago is ignored however fresh it is
     "IDLE_LIST_EXCLUDE": "",
     # EL-T2512: a session whose newest assistant text, written after its last prompt, says SESSION-DONE or
     # `SESSION-STATE: IDLE_NO_WORK` waits DONE_GRACE_MINUTES instead of IDLE_MINUTES; every other gate still holds.
@@ -1530,29 +1527,6 @@ def routed(cfg, tmux, now):
     return f"routed:#{max(ages)[1]}" if ages else ""
 
 
-def stall_mark(cfg, sid, now=None):
-    """Fingerprints stall-watch.py currently sees on this session ("" when none, stale, over its cap, or unreadable).
-
-    The mark must be refreshed within STALL_MARK_HOURS and must not be older than STALL_MARK_MAX_HOURS from the
-    event's first sighting (`since`); both ages are absolute values, so a timestamp in the future expires too."""
-    if not cfg.get("STALL_MARK_DIR") or not re.fullmatch(r"[\w-]+", sid or ""):
-        return ""
-    f = Path(os.path.expanduser(cfg["STALL_MARK_DIR"])) / f"{sid}.json"
-    at = now if now is not None else time.time()
-    try:
-        d = json.loads(f.read_text())
-        fps = d.get("fingerprints")
-        if not isinstance(fps, list) or not fps or not all(isinstance(x, str) for x in fps) or d.get("sid") != sid:
-            return ""  # not a mark (for example a session file in a misconfigured directory)
-        refreshed = max(abs(at - f.stat().st_mtime), abs(at - float(d.get("updated", 0))))
-        if refreshed > float(cfg["STALL_MARK_HOURS"]) * 3600 \
-                or abs(at - float(d.get("since", 0))) > float(cfg["STALL_MARK_MAX_HOURS"]) * 3600:
-            return ""
-        return ",".join(fps)
-    except (OSError, ValueError, AttributeError, TypeError):
-        return ""
-
-
 def _ends_on(s, rx, window=1):
     """The reply that ends the transcript, written after the last prompt, has a bare `rx` line among its last `window`
     non-blank lines (1: the last one), outside a code fence (``` or ~~~) and not in an indented (4 spaces or a tab)
@@ -1668,9 +1642,6 @@ def idle_threshold(s, cfg):
 def _decide(s, cfg, now=None):
     # /exit on an attachment does not prove the detached job has stopped. Classification is the whole bg path.
     keep = ["kind:bg"] if s.get("kind") == "bg" else []
-    stalled = stall_mark(cfg, s.get("sid"), now)
-    if stalled:  # an account switch or rate limit stalled it: not idle, not finished
-        keep.append("stalled:" + stalled)
     if s.get("never_kill"):  # its process tree holds a pid on the never-kill list
         keep.append("never-kill:" + ",".join(str(p) for p in s["never_kill"]))
     if protected(cfg, s["tmux"], s["name"]):
