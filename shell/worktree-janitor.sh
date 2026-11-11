@@ -69,6 +69,11 @@ Environment:
   CC_WJ_SCHEDULE_APPLY    Set to 1 to let --scheduled remove (default: report only)
   CC_WJ_PRESSURE_FREE_GB  Below this many GB free, the disk pressure tier applies
                           (default: 100; off or 0 disables it)
+  CC_WJ_LOW_DISK_FREE_GB   Below this many GiB free on the volume holding $HOME, an applying or
+                          scheduled run logs LOW-DISK and writes one line to
+                          <state>/low-disk-warning for a SessionStart hook to print; a run above
+                          it removes the file. An alert only: nothing is deleted
+                          (default: 25; off or 0 disables it)
   CC_WJ_PRESSURE_IDLE_HOURS, CC_WJ_PRESSURE_SESSION_GRACE_HOURS
                           The idle window and session lease under pressure (default: 2)
   CC_WJ_TRIM_DIRTY_IDLE_HOURS
@@ -2210,9 +2215,66 @@ _cc_wj_scan_active_sessions() { # <recent-session grace hours>
 # Return 0 when a structured tool call in the current two human user turns names the
 # target, 1 when none does, and 2 when the transcript cannot be parsed. Live claims and
 # recent leases intentionally share this parser.
+#
+# A Claude session that enters a worktree has its transcript moved to that worktree's project
+# directory, so a path the scan listed minutes ago can be gone by the time a candidate asks
+# (stima-api#7881: a sweep spends 15 minutes on 147 trees, and every session that starts in the
+# primary checkout and moves into a task worktree moves its transcript). Read as an unparsable
+# record, one ordinary move kept every tree of the pass: 4 of the 35 removal passes that examined trees on 2026-11-11,
+# each holding back 3-4 clean, landed, idle worktrees. The same session id's transcript is looked
+# up where it went and read there; only when none can be found, or one cannot be read, is the
+# answer still 2 (kept, as before). Anything that cannot be decided stays 2.
+#
+# Prints the readable transcripts that replace the missing transcript $1, one per line; status 1
+# when $1 exists, is not a Claude `<session id>.jsonl`, or nothing readable replaces it.
+_cc_wj_transcript_moved() { # <transcript>
+  local t="$1" projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}" base sid found f n=0
+  [ ! -e "$t" ] || return 1
+  base="${t##*/}"; sid="${base%.jsonl}"
+  [ "$sid" != "$base" ] || return 1
+  printf '%s\n' "$sid" | grep -Eqx "$_CC_WJ_UUID_RE" || return 1
+  [ -d "$projects" ] || return 1
+  found="$(_cc_wj_with_timeout 15 find "$projects" -maxdepth 2 -type f -name "$base" -print 2>/dev/null)" || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '%s\n' "$f"; n=$((n + 1))
+  done <<MOVED
+$found
+MOVED
+  [ "$n" -gt 0 ]
+}
+
+# 0 when the cwd the moved transcript $2 last recorded is $1 or inside it, 1 when it is not, 2
+# when it cannot be told: the session moved into this tree after the scan, so the cwd claim the
+# scan could not make is made here.
+_cc_wj_moved_cwd_in() { # <resolved target> <moved transcript>
+  local wt="$1" cwd resolved
+  cwd="$(_cc_wj_transcript_tail_query claude-cwd "$2")" || return 2
+  case "$cwd" in /*) ;; *) return 2 ;; esac
+  case "${cwd%/}/" in "${wt%/}/"*) return 0 ;; esac
+  [ -e "$cwd" ] || return 1
+  resolved="$(_cc_wj_claim_cwd "$cwd")" || return 2
+  case "${resolved%/}/" in "${wt%/}/"*) return 0 ;; esac
+  return 1
+}
+
 _cc_wj_transcript_claims_path() { # <harness> <transcript> <resolved target>
-  local harness="$1" transcript="$2" wt="$3" alt mode rc
+  local harness="$1" transcript="$2" wt="$3" alt mode rc moved m result=1
   case "$wt" in /private/*) alt="${wt#/private}" ;; *) alt="/private$wt" ;; esac
+  if [ "$harness" = Claude ] && [ ! -e "$transcript" ] && moved="$(_cc_wj_transcript_moved "$transcript")"; then
+    while IFS= read -r m; do
+      [ -n "$m" ] || continue
+      _cc_wj_moved_cwd_in "$wt" "$m"; rc=$?
+      [ "$rc" -eq 0 ] && return 0
+      [ "$rc" -eq 1 ] || result=2
+      _cc_wj_transcript_claims_path "$harness" "$m" "$wt"; rc=$?
+      [ "$rc" -eq 0 ] && return 0
+      [ "$rc" -eq 1 ] || result=2
+    done <<MOVED_ROWS
+$moved
+MOVED_ROWS
+    return "$result"
+  fi
   [ -r "$transcript" ] || return 2
   case "$harness" in
     Claude) mode=claude-claim ;;
@@ -5900,6 +5962,9 @@ _cc_wj_run() {
   [ "$scheduled" -eq 1 ] && [ "${CC_WJ_SCHEDULE_APPLY-}" = 1 ] && applying=1
   # One id for both phases of a sweep, so spot-check records of one run can be read together.
   _CC_WJ_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  # Before any lock or scan, so a run that defers still says the disk is low. Only a run that may
+  # remove, or the schedule, speaks: a report run is read-only.
+  if [ "$applying" -eq 1 ] || [ "$scheduled" -eq 1 ]; then _cc_wj_low_disk_check; fi
   if [ "$scheduled" -eq 1 ]; then
     _cc_wj_bound_log "$HOME/.cc-reaper/logs/launchd-worktree-janitor-stdout.log"
     _cc_wj_bound_log "$HOME/.cc-reaper/logs/launchd-worktree-janitor-stderr.log"
@@ -5995,6 +6060,43 @@ _cc_wj_gib() {
     ''|*[!0-9]*) printf '?' ;;
     *) awk -v k="$1" 'BEGIN { printf "%.1fGiB", k / 1048576 }' ;;
   esac
+}
+
+# The low-disk floor (stima-api#7881): the Mac mini sat at 9.4 GiB free of 460 with nobody told,
+# because the pressure tier above only shortens windows and says nothing outside the janitor log.
+# Under CC_WJ_LOW_DISK_FREE_GB (default 25) free on the volume holding $HOME, an applying or
+# scheduled run logs the figure and writes one line to <state>/low-disk-warning, the file a
+# SessionStart hook prints (`cat ~/.cc-reaper/state/low-disk-warning 2>/dev/null`); a run that
+# finds the volume above the floor removes it. It deletes nothing and never changes a decision.
+# `off` or 0 disables it; a garbled value is the default, not off, because an alert that a typo
+# silences is no alert; an unreadable free figure leaves the file as it is.
+_cc_wj_low_disk_floor() {
+  local v="${CC_WJ_LOW_DISK_FREE_GB:-25}"
+  case "$v" in off) echo 0; return 0 ;; esac
+  case "$v" in ''|*[!0-9]*|??????*) v=25 ;; esac
+  echo $((10#$v))
+}
+_cc_wj_low_disk_check() {
+  local floor free file tmp
+  floor="$(_cc_wj_low_disk_floor)"
+  file="$(_cc_wj_state_dir)/low-disk-warning"
+  if [ "$floor" -le 0 ]; then
+    rm -f "$file" 2>/dev/null
+    return 0
+  fi
+  free="$(_cc_wj_free_kb)"
+  case "$free" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$free" -ge $((floor * 1048576)) ]; then
+    rm -f "$file" 2>/dev/null
+    return 0
+  fi
+  _cc_wj_log_write "LOW-DISK: free $(_cc_wj_gib "$free") < ${floor}GiB floor; warning written to $file"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  tmp="$file.tmp.$$"
+  printf 'cc-reaper LOW DISK: %s free (floor %sGiB) at %s; worktree-janitor log: %s\n' \
+    "$(_cc_wj_gib "$free")" "$floor" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$(_cc_wj_log)" > "$tmp" 2>/dev/null &&
+    mv -f "$tmp" "$file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
 }
 
 # `--session`: the inventory for the repository a Claude Code or Codex session stood in,
