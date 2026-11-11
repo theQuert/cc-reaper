@@ -60,6 +60,8 @@ jobs:
         run: bash tests/worktree-janitor-evidence-expiry.sh
       - name: worktree-janitor-sweep-lock-first
         run: bash tests/worktree-janitor-sweep-lock-first.sh
+      - name: worktree-janitor-log-changed
+        run: bash tests/worktree-janitor-log-changed.sh
       - name: worktree-active-sessions
         run: bash tests/worktree-active-sessions.sh
       - name: resource-watch
