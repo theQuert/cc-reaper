@@ -444,10 +444,10 @@ class Review(Base):
         self.assertEqual(len(self.alerts()), 1)
         self.assertIn("disk-high", self.alerts()[0])
 
-    def test_the_shipped_policy_lists_the_two_refused_hosts_and_the_default_lists_none(self):
+    def test_the_shipped_policy_lists_the_four_refused_hosts_and_the_default_lists_none(self):
         self.assertEqual(self.cfg()["GDW_KNOWN_UNREADABLE"], "")
         conf = gdw.load_config(Path(__file__).resolve().parent.parent / "config" / "gce-disk-watch.conf", env={})
-        self.assertEqual(conf["GDW_KNOWN_UNREADABLE"].split(), ["stima-ci-1", "stima-ci-deploy-1"])
+        self.assertEqual(conf["GDW_KNOWN_UNREADABLE"].split(), ["stima-ci-1", "stima-ci-2", "stima-ci-3", "stima-ci-deploy-1"])
 
     def test_a_damaged_entry_never_crashes_the_round_and_the_host_alerts_again(self):
         damaged = [{"kind": "disk-high", "sent": "yesterday", "todo": [], "notice": "alert", "told": True},
