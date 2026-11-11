@@ -143,7 +143,8 @@ class Routed(unittest.TestCase):
                     '{"routes": {"1": {"session": "work", "at": 1' + "0" * 400 + "}}}",
                     '{"routes": {"1": {"session": "work", "at": NaN}}}',
                     '{"routes": {"1": {"session": "work", "at": Infinity}}}',
-                    '{"routes": {"1": {"session": "work", "at": -Infinity}}}'):
+                    '{"routes": {"1": {"session": "work", "at": -Infinity}}}',
+                    "[" * 200000):  # nested past the recursion limit
             with self.subTest(bad=bad):
                 self.assertEqual(self.keep(bad), [])
         # one bad entry does not hide a good one beside it

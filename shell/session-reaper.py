@@ -1509,14 +1509,14 @@ def read_routes(cfg):
     """The dispatcher's routes as {issue: (session, at)}; nothing readable gives {}. Read once per pass."""
     try:
         entries = list(json.loads(Path(os.path.expanduser(cfg["DISPATCH_FILE"])).read_text())["routes"].items())
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except Exception:  # any unreadable shape (a deeply nested file raises RecursionError): this rule keeps nothing
         return {}
     out = {}
     for n, r in entries:
         try:
             if isinstance(r["session"], str) and isinstance(r["at"], (int, float)) and math.isfinite(r["at"]):
                 out[str(n)] = (r["session"], float(r["at"]))
-        except (KeyError, TypeError, ValueError, OverflowError):
+        except Exception:  # one bad entry (a huge time raises OverflowError) does not hide the others
             pass
     return out
 
