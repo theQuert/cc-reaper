@@ -74,6 +74,8 @@ DEFAULTS = {
     "ORACLE_CACHE_MINUTES": "45",
     "ORACLE_TIMEOUT_SECONDS": "60",  # one --brief read; 30 s timed out under load with 8 parallel reads (stima-api #7061)
     "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
+    "DISPATCH_FILE": "~/.claude/state/dispatcher-routes.json",  # dispatcher routes a card to a live session; empty: off
+    "DISPATCH_KEEP_MINUTES": "30",  # a route younger than this keeps the session it names (`routed:#N`)
     "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # stall-watch.py writes <session id>.json here; empty: off
     "STALL_MARK_HOURS": "12",  # a mark not refreshed for this long is stale and ignored
     "STALL_MARK_MAX_HOURS": "48",  # a mark whose event was first seen longer ago is ignored however fresh it is
@@ -1502,6 +1504,31 @@ def shadow_rounds(cfg, config_path, seen, sdir, now, idle_override=False):
     return lines
 
 
+def read_routes(cfg):
+    """The dispatcher's routes as {issue: (session, at)}; nothing readable gives {}. Read once per pass."""
+    try:
+        entries = list(json.loads(Path(os.path.expanduser(cfg["DISPATCH_FILE"])).read_text())["routes"].items())
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+    out = {}
+    for n, r in entries:
+        try:
+            if isinstance(r["session"], str) and isinstance(r["at"], (int, float)):
+                out[str(n)] = (r["session"], float(r["at"]))
+        except (KeyError, TypeError):
+            pass
+    return out
+
+
+def routed(cfg, tmux, now):
+    """`routed:#N` for the newest route to this tmux session younger than DISPATCH_KEEP_MINUTES (one dated more than
+    5 minutes ahead is a bad clock and is ignored)."""
+    routes = cfg["_routes"] if "_routes" in cfg else read_routes(cfg)
+    ages = [(at, n) for n, (name, at) in routes.items()
+            if name == tmux and -300 <= now - at < float(cfg["DISPATCH_KEEP_MINUTES"]) * 60]
+    return f"routed:#{max(ages)[1]}" if ages else ""
+
+
 def stall_mark(cfg, sid, now=None):
     """Fingerprints stall-watch.py currently sees on this session ("" when none, stale, over its cap, or unreadable).
 
@@ -1647,6 +1674,8 @@ def _decide(s, cfg, now=None):
         keep.append("never-kill:" + ",".join(str(p) for p in s["never_kill"]))
     if protected(cfg, s["tmux"], s["name"]):
         keep.append("protected")
+    if cfg.get("DISPATCH_FILE") and (route := routed(cfg, s["tmux"], now if now is not None else time.time())):
+        keep.append(route)
     if not s.get("fg", True):
         keep.append("not-foreground")
     if s.get("vim"):
@@ -2645,6 +2674,7 @@ def main(argv=None):
                          "only with --apply (the config's APPLY is ignored here)")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
+    cfg["_routes"] = read_routes(cfg) if cfg.get("DISPATCH_FILE") else {}
     if args.idle_minutes is not None:
         cfg["IDLE_MINUTES"] = args.idle_minutes
     apply = args.apply or cfg["APPLY"] == "1"
