@@ -703,7 +703,11 @@ for AGENT in $CC_RETIRED_AGENTS; do
     launchctl bootout "$AGENT_UI/$RETIRED_LABEL" >/dev/null 2>&1 ||
       { [ ! -e "$RETIRED_PLIST" ] || launchctl unload "$RETIRED_PLIST" >/dev/null 2>&1; } || true
     rm -f "${PLIST_DIR:?}/$RETIRED_LABEL.plist"
-    echo "  retired agent $RETIRED_LABEL (booted out, plist removed)"
+    if launchctl print "$AGENT_UI/$RETIRED_LABEL" >/dev/null 2>&1; then
+      echo "  retired agent $RETIRED_LABEL (still loaded: bootout and unload refused; plist removed)"
+    else
+      echo "  retired agent $RETIRED_LABEL (booted out, plist removed)"
+    fi
   fi
 done
 for f in $CC_RETIRED_SCRIPTS; do rm -f "${REAPER_DIR:?}/$f"; done
