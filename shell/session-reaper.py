@@ -36,6 +36,7 @@ import glob
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shlex
@@ -1513,9 +1514,9 @@ def read_routes(cfg):
     out = {}
     for n, r in entries:
         try:
-            if isinstance(r["session"], str) and isinstance(r["at"], (int, float)):
+            if isinstance(r["session"], str) and isinstance(r["at"], (int, float)) and math.isfinite(r["at"]):
                 out[str(n)] = (r["session"], float(r["at"]))
-        except (KeyError, TypeError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             pass
     return out
 
@@ -1839,6 +1840,9 @@ def confirm_close(s, cfg, keep):
     a check-by, so it closes as it did before this function. Only a session about to close pays the reads."""
     if keep:
         return keep
+    # a route written since the pass began (a pass can take minutes) still keeps the session
+    if cfg.get("DISPATCH_FILE") and (route := routed(dict(cfg, _routes=read_routes(cfg)), s["tmux"], time.time())):
+        return [route]
     changed = refresh_briefs(s, cfg, time.time())
     if not changed:
         return keep

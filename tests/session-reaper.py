@@ -139,11 +139,31 @@ class Routed(unittest.TestCase):
                     json.dumps({"routes": {"1": {"session": "work", "at": None}}}),
                     json.dumps({"routes": {"1": {"session": 7, "at": NOW0 - 60}}}),
                     json.dumps({"routes": {"1": {"at": NOW0 - 60}}}),
-                    json.dumps({"routes": {"1": {"session": "work", "at": True}}})):
+                    json.dumps({"routes": {"1": {"session": "work", "at": True}}}),
+                    '{"routes": {"1": {"session": "work", "at": 1' + "0" * 400 + "}}}",
+                    '{"routes": {"1": {"session": "work", "at": NaN}}}',
+                    '{"routes": {"1": {"session": "work", "at": Infinity}}}',
+                    '{"routes": {"1": {"session": "work", "at": -Infinity}}}'):
             with self.subTest(bad=bad):
                 self.assertEqual(self.keep(bad), [])
         # one bad entry does not hide a good one beside it
         self.assertEqual(self.keep({"routes": {"1": 5, "2": ok}}), ["routed:#2"])
+
+    def test_the_pass_start_read_does_not_raise_on_a_huge_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "r.json"
+            f.write_text('{"routes": {"1": {"session": "work", "at": 1' + "0" * 400 + "}, "
+                         '"2": {"session": "work", "at": %d}}}' % (NOW0 - 60))
+            self.assertEqual(reaper.read_routes(dict(CFG, DISPATCH_FILE=str(f))), {"2": ("work", float(NOW0 - 60))})
+
+    def test_a_route_written_after_the_pass_began_keeps_the_session_at_confirm_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "r.json"
+            cfg = dict(CFG, DISPATCH_FILE=str(f), _routes={})  # the pass-start read saw nothing
+            s = session()
+            self.assertEqual(reaper.decide(s, cfg, NOW0), [])
+            f.write_text(json.dumps({"routes": {"77": {"session": "work", "at": int(time.time()) - 5}}}))
+            self.assertEqual(reaper.confirm_close(s, cfg, []), ["routed:#77"])
 
     def test_a_route_dated_in_the_future_is_ignored(self):
         self.assertEqual(self.keep(self.doc(**{"123": -600})), [])
@@ -1636,7 +1656,7 @@ class SkippedAndApply(unittest.TestCase):
         (self.tmp / "sessions").mkdir()
         self.cfgfile = self.tmp / "conf"
         self.cfgfile.write_text(f"APPLY=1\nREPORT={self.tmp / 'report.md'}\nREAPED_DIR={self.tmp / 'reaped'}\n"
-                                f"IDLE_LIST_HOURS=0\n")
+                                f"IDLE_LIST_HOURS=0\nDISPATCH_FILE=\n")
 
     def write(self, fname, **d):
         (self.tmp / "sessions" / f"{fname}.json").write_text(json.dumps(d))
@@ -2373,7 +2393,7 @@ class OracleReadsUnderLoad(FreshState):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         cfgfile = tmp / "conf"
-        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDEAD_CLAIMS=off\n")
+        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDISPATCH_FILE=\nDEAD_CLAIMS=off\n")
         extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
                      fg=True, sub_active=0, screen_tail="")
         sessions = [session(tmux="idle", name="idle", idle_min=300, sid="i" * 10, **extra)]
