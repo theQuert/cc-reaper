@@ -537,20 +537,27 @@ def fresh_brief(repo, num, cfg, now):
     return _read_brief(repo, num, cfg, now)
 
 
-def refresh_briefs(s, cfg, now, extra=()):
-    """Numbers whose brief, read fresh now, differs from the one the verdict was built on. Looks at every issue a
+def refresh_briefs(s, cfg, now, extra=(), used=None):
+    """Numbers whose brief, once read in this run, differs from the one a verdict was built on. Looks at every issue a
     verdict on `s` rests on: its claims, `extra` refs (a loop's own #N), and, for a session with no claim, the issues
-    its text names (what oracle_claims() looked at). A key already read in this run costs nothing and counts unchanged.
-    The cache outlives a run (45 minutes), so a verdict that releases a session may not rest on it (stima-api#7904)."""
+    its text names (what oracle_claims() looked at). The cache outlives a run (45 minutes), so a verdict that releases
+    a session may not rest on it (stima-api#7904).
+
+    `used` maps (repo, number) to the brief that verdict used (session_state.judge()): the key is read here when no one
+    read it in this run, then the brief now in memory is compared with the one used. Another session's judgement may have
+    read the key between this verdict's use and now, so that a key is in `_fresh_this_run` proves nothing about `used`.
+    A key whose read in this run failed (None) is changed under `used`: it supports no DONE. Without `used`
+    (confirm_close(), which runs after the judging threads), a key already read in this run counts unchanged."""
     refs = list(dict.fromkeys([*(s.get("claims") or ()), *((r, str(n)) for r, n in extra),
                                *(() if s.get("claims") else ((cfg["CHECKBY_REPO"], n) for n in named_issues(s, cfg)))]))
     changed = []
     for r, n in refs:
         key = (r, str(n))
-        if key in _fresh_this_run:
+        if used is None and key in _fresh_this_run:
             continue
-        old = _brief_cache.get(key)
-        if fresh_brief(r, n, cfg, now) != old:  # fresh_brief() replaces the cached brief either way
+        old = _brief_cache.get(key) if used is None else used.get(key)
+        cur = fresh_brief(r, n, cfg, now)  # a key already read in this run is taken as is
+        if r == cfg["CHECKBY_REPO"] and (cur != old or (used is not None and cur is None)):
             changed.append(str(n))
     return changed
 

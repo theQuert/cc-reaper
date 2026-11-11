@@ -113,7 +113,7 @@ def claim_step(r, brief, sid, mine_ids=(), other_sids=(), loop=False):
     return step, None, False
 
 
-def _claims(s, r, cfg, now, thr):
+def _claims(s, r, cfg, now, thr, used=None):
     """[(repo, number, source)]: branch claims, a background loop's #N, else issues the session names whose claimant
     is this session (only for an idle session past its threshold: the lookup costs an oracle call per issue)."""
     out = [(rp, str(n), "branch") for rp, n in s.get("claims") or ()]
@@ -122,6 +122,9 @@ def _claims(s, r, cfg, now, thr):
     if s.get("kind") == "bg" and m and repo and not any(n == m.group(1) for _, n, _ in out):
         out.append((repo, m.group(1), "name"))
     if not out and s.get("status") == "idle" and s.get("idle_min", 0) >= thr:
+        if used is not None and hasattr(r, "named_issues"):  # the briefs the named-issue lookup is about to rest on
+            for n in r.named_issues(s, cfg):
+                used[(repo, str(n))] = r.oracle_brief(repo, n, cfg, now)
         out += [(rp, str(n), "named") for rp, n in r.oracle_claims(s, cfg, now)]
     return out
 
@@ -133,20 +136,29 @@ def judge(s, r, cfg, now):
     and the reaper's brief cache outlives a run, so a DONE stands only on briefs read in this run: before it is returned,
     r.refresh_briefs() reads every issue the verdict rests on fresh (one read per key per run), and the session is judged
     again when a brief changed (stima-api#7904)."""
-    rec = _judge(s, r, cfg, now)
+    rec, used = _judge(s, r, cfg, now)
     refresh = getattr(r, "refresh_briefs", None)
     if rec["state"] == "DONE" and refresh:
         try:
-            changed = refresh(s, cfg, now, [(c["repo"], c["issue"]) for c in rec["claims"]])
+            refs = lambda: [(c["repo"], c["issue"]) for c in rec["claims"]]  # noqa: E731
+            # Whether another session's judgement read a key in this run says nothing about the brief THIS verdict
+            # used (it may have read an older one before that): refresh_briefs() compares `used` with what is in
+            # memory once every key is read in this run. A difference: judge once more, on this-run values only.
+            changed = refresh(s, cfg, now, refs(), used)
             if changed:
-                rec = _judge(s, r, cfg, now)
-                rec["reasons"] = rec["reasons"] + ["fresh-brief-changed:" + ",".join(f"#{n}" for n in changed)]
+                rec, used = _judge(s, r, cfg, now)
+                note = "fresh-brief-changed:" + ",".join(f"#{n}" for n in changed)
+                if rec["state"] == "DONE" and refresh(s, cfg, now, refs(), used):  # a failed read supports no DONE
+                    rec["state"], rec["reasons"] = "UNKNOWN", ["brief-unread-in-this-run"]
+                rec["reasons"] = rec["reasons"] + [note]
         except Exception as e:  # a DONE not confirmed on fresh briefs is not DONE
             rec["state"], rec["reasons"] = "UNKNOWN", [f"error:{type(e).__name__}: {e}"[:200]]
     return rec
 
 
 def _judge(s, r, cfg, now):
+    """(record, used): `used` maps (repo, issue) to the brief text this judgement rested on, kept out of the record."""
+    used = {}
     sid = s.get("sid") or ""
     rec = {"name": s.get("name") or s.get("tmux") or sid[:8], "tmux": s.get("tmux") or "", "sid": sid,
            "pid": s.get("pid"), "kind": s.get("kind") or "interactive", "status": s.get("status"),
@@ -161,13 +173,13 @@ def _judge(s, r, cfg, now):
         # the oracle says, so its claims are listed unread: an oracle run costs several `gh` calls, and a fleet's busy
         # sessions spent the whole run budget on them (stima-api#7904). Its state is then the cheap facts' alone.
         closable = s.get("status") == "idle" and rec["idle_min"] >= thr
-        for repo, n, src in _claims(s, r, cfg, now, thr):
+        for repo, n, src in _claims(s, r, cfg, now, thr, used):
             if not closable:
                 rec["claims"].append({"issue": int(n), "repo": repo, "source": src, "oracle_step": "", "mine": None,
                                       "read": False})
                 continue
-            step, mine, pers = claim_step(r, r.oracle_brief(repo, n, cfg, now), sid, mine_ids, s.get("other_sids", ()),
-                                         loop=src == "name")
+            used[(repo, str(n))] = brief = r.oracle_brief(repo, n, cfg, now)
+            step, mine, pers = claim_step(r, brief, sid, mine_ids, s.get("other_sids", ()), loop=src == "name")
             c = {"issue": int(n), "repo": repo, "source": src, "oracle_step": step, "mine": mine}
             if src == "name":  # a background loop: when its check-by falls due (None: the oracle could not say)
                 d = r.oracle_json(repo, n, cfg) if repo == cfg.get("CHECKBY_REPO") else None
@@ -201,7 +213,7 @@ def _judge(s, r, cfg, now):
         rec["state"], rec["reasons"] = st, why
     except Exception as e:  # a session this cannot judge is UNKNOWN, never DONE
         rec["state"], rec["reasons"] = "UNKNOWN", [f"error:{type(e).__name__}: {e}"[:200]]
-    return rec
+    return rec, used
 
 
 def _state(s, rec, thr, own, person, unknown, stalled, ahead, dirty):

@@ -263,8 +263,19 @@ class OracleBriefContract(unittest.TestCase):
         self.assertEqual(r.call_args.args[0][-2:], ["--repo", "theQuert/stima-api"])
 
 
-class OracleBrief(unittest.TestCase):
+class FreshState(unittest.TestCase):
+    """Every test that touches the brief caches starts and ends with both empty, whatever ran before."""
+
     def setUp(self):
+        reaper._brief_cache.clear()
+        reaper._fresh_this_run.clear()
+        self.addCleanup(reaper._brief_cache.clear)
+        self.addCleanup(reaper._fresh_this_run.clear)
+
+
+class OracleBrief(FreshState):
+    def setUp(self):
+        super().setUp()
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         self.cfg = dict(CFG, ORACLE_CACHE_DIR=d, ORACLE_ROOT=d)
@@ -2174,18 +2185,15 @@ class DoneMarker(unittest.TestCase):
         self.assertIn(str(m), reaper.write_done_markers(self.cfg, [self.s()], self.now))
 
 
-class OracleReadsUnderLoad(unittest.TestCase):
+class OracleReadsUnderLoad(FreshState):
     """stima-api#7904: an oracle run is spent only on a session a run can close, the cache outlives a run, and a
     session about to close is read fresh."""
 
     def setUp(self):
+        super().setUp()
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         self.cfg = dict(CFG, ORACLE_CACHE_DIR=d, ORACLE_ROOT=d, PREFETCH_WORKERS="1")
-        reaper._brief_cache.clear()
-        reaper._fresh_this_run.clear()
-        self.addCleanup(reaper._brief_cache.clear)
-        self.addCleanup(reaper._fresh_this_run.clear)
 
     def prefetch(self, sessions, brief, cfg=None):
         with mock.patch.object(reaper, "batch_issue_states"), mock.patch.object(reaper, "claim_time", return_value=None), \
