@@ -876,7 +876,7 @@ model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper
   and its `.pub` exist, so it never generates a key or writes metadata. One bad host, or one damaged
   state entry (read back as `ok`, so the host is told again), never stops the others.
 - **Tell:** once per host per state change; while the state stays, again at most every
-  `GDW_REALERT_MINUTES` (120); one `recovered` line when it clears (only for a state that was told).
+  `GDW_REALERT_MINUTES` (120), for `disk-high` only (a host that stays `unreadable` is told once); one `recovered` line when it clears (only for a state that was told).
   Shadow (`GDW_APPLY=0`): a `would alert <host> <kind> used=..% avail=..GB inodes=..%` line in
   `~/.cc-reaper/logs/gce-disk-watch.log`, nothing else. Apply: one
   `GCE-DISK ALERT|STILL|RECOVERED host=<host> kind=<kind> used=.. avail=.. inodes=..` log line and a
@@ -884,10 +884,11 @@ model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper
   is logged `ERROR` and stays pending in `~/.cc-reaper/state/gce-disk-watch.json`, so the next run
   retries that channel alone. Shadow and apply keep separate state, so turning apply on tells a
   standing state afresh.
-- **Record:** each run logs one line per host and one summary line
-  (`<n> hosts, <n> read, <n> high, <n> unreadable, <n> would-alert, <n> alerted, <n> recovered,
-  <n> failures; unreadable: <host>(<reason>[ known]) ...`), the spot-check record. With the shipped
-  policy the summary counts the two known-unreadable hosts every round; `known` marks them.
+- **Record:** a host's line is logged when its state changes (read kind, told kind, known-unreadable: not the
+  reason, the numbers or the `fails` counter) and the summary line when a host line was, a tell was made or
+  a failure happened; a run that changes nothing logs nothing (stima-api #7904).
+  The summary (`<n> hosts, <n> read, <n> high, <n> unreadable, <n> would-alert, <n> alerted, <n> recovered,
+  <n> failures; unreadable: <host>(<reason>[ known]) ...`) counts the known-unreadable hosts too; `known` marks them.
 
 ```bash
 ./install.sh   # deploys the script and the shadow policy; never starts the agent unasked
