@@ -345,6 +345,42 @@ and each tree the per-tree rule would free is appended to `CC_WJ_SPOTCHECK_LOG` 
 but `tree`) is the old behaviour: the first record that cannot be read keeps every worktree,
 whatever `CC_WJ_NEW_RULES_MODE` says.
 
+### Promoting one rule: `CC_WJ_PROMOTED_RULES`
+
+`CC_WJ_NEW_RULES_MODE=auto` turns every rule on probation on at once. `CC_WJ_PROMOTED_RULES`
+(whitespace-separated rule names: `dirty-pressure`, `primary-skills-link`, `build-output`,
+`pushed-idle`, `session-unknown-per-tree`) lets the named rules decide while the others stay in
+spot-check. A rule is promoted when its record is clean: no `would-remove` or `would-trim` line for it
+named a tree that, when audited, held commits origin did not contain, had a live holder or session,
+or lost a file a person wrote. A rule with no records stays on probation. The reason for each rule
+is written in `config/worktree-janitor.conf` beside the knob.
+
+### Evidence that has expired: `evidence-expired`
+
+A landed, idle tree can be kept only by what a command cannot rebuild and the `archive:` line cannot
+copy: a file under `.codex/evidence/` bigger than `CC_WJ_ARCHIVE_MAX_BYTES`, or one that is not a
+regular file. The founder's rule (2026-11-11): evidence goes after 7 days, and only when its issue
+is closed. So when **every** unrebuildable entry of the tree is an ignored one under
+`CC_WJ_EVIDENCE_EXPIRY_ROOT` (default `.codex/evidence`) and all of these hold, the tree is
+removable, after every other gate (holders, sessions, landed, idle, locks) has said yes:
+
+- every top-level entry under the root starts with an issue number (`2303`, `2924-final-tmp`; a
+  name with no number, more than six digits, a leading zero, a letter straight after the digits or a
+  date such as `2026-11-11-notes` keeps the tree);
+- `origin` is a GitHub URL, and `gh api repos/OWNER/REPO/issues/N --jq .state` answers exactly
+  `closed` for each number (asked once per run and issue; an error, a timeout, no `gh` or a rate
+  limit keeps the tree);
+- the newest file under the root is at least `CC_WJ_EVIDENCE_EXPIRY_DAYS` (default 7) old;
+- no file under the root, package trees included, is credential-shaped.
+
+Files the `archive:` line can copy are copied and verified first, as for any removal; only what it
+cannot copy goes with the tree. `CC_WJ_EVIDENCE_EXPIRY_MODE` is `shadow` by default: nothing
+changes, and `rule=evidence-expired action=would-remove` with the tree's bytes goes to the
+spot-check log. `apply` lets the rule decide; `off` does not ask. The report says why a tree's
+evidence kept it (`evidence-expired: kept: <reason>`), and a run ends with one
+`rule-effect: <rule> ... trees=N GiB=X` line for the rule and for each rule that freed, or in
+spot-check would free, something.
+
 ## Where to run it
 
 - **From cc-reaper's six-hour LaunchAgent** for repositories under the installed `~/GitHub`

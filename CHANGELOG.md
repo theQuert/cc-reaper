@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+- **worktree-janitor: evidence that has expired no longer keeps a landed idle tree (stima-api #7895).** After #7881 the
+  installed janitor still kept 67 of 137 trees as unrebuildable, most for files under `.codex/evidence/` that the
+  `archive:` line cannot copy (bigger than 1 MiB, or not a regular file). A landed, idle tree whose only unrebuildable
+  entries are under `CC_WJ_EVIDENCE_EXPIRY_ROOT` is now removable when every issue its top-level entries name (the leading
+  digits, in the GitHub repository of `origin`) is closed and the newest file is at least `CC_WJ_EVIDENCE_EXPIRY_DAYS`
+  (default 7) old: the founder's rule of 2026-11-11, evidence goes after 7 days and only when its issue is closed.
+  Anything unknown keeps the tree (a name with no number, a date-like name, a non-GitHub remote, a failed or
+  timed-out `gh api` lookup, a credential-shaped file anywhere under the root, another unrebuildable entry). Issue states
+  are asked once per run and issue. `CC_WJ_EVIDENCE_EXPIRY_MODE` ships `shadow`: nothing changes and
+  `rule=evidence-expired action=would-remove` goes to the spot-check log; `apply` lets it decide, `off` disables it.
+  The files the `archive:` line can copy are still copied and verified first.
+- **worktree-janitor: a rule on probation can be promoted on its own (stima-api #7895).** `CC_WJ_PROMOTED_RULES`
+  (whitespace-separated rule names) makes the named rules decide as under `CC_WJ_NEW_RULES_MODE=auto` while every other
+  rule stays in spot-check. The shipped config promotes `primary-skills-link` and `session-unknown-per-tree`, whose
+  spot-check records are clean, and keeps `dirty-pressure` (5 named trees hold commits origin does not contain),
+  `pushed-idle` and `build-output` (no records) on probation. A run's report ends with one `rule-effect:` line per rule
+  that freed, or in spot-check would free, something: trees and GiB.
+
 ### Fixed
 - **worktree-janitor: a transcript a session moved no longer keeps every tree of the pass (stima-api #7881).** A Claude
   session that enters a worktree has its transcript moved to that worktree's project directory. The sweep lists

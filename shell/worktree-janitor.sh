@@ -122,6 +122,19 @@ Environment:
                          remove logged to CC_WJ_SPOTCHECK_LOG (spotcheck). A gitignored *.log
                          file is no longer on probation: it never keeps a worktree
   CC_WJ_SPOTCHECK_LOG    (default: ~/.cc-reaper/logs/spotcheck-worktree-janitor.log)
+  CC_WJ_PROMOTED_RULES   Whitespace-separated rules on probation that decide as under auto while
+                         CC_WJ_NEW_RULES_MODE stays spotcheck for the rest: dirty-pressure,
+                         primary-skills-link, build-output, pushed-idle, session-unknown-per-tree
+                         (default: none; the installed config names the ones with a clean record)
+  CC_WJ_EVIDENCE_EXPIRY_MODE  shadow (default; any value but apply or off), apply or off. A landed, idle
+                         tree whose only unrebuildable entries are under the evidence root is removable
+                         when every issue its top-level entries name (leading digits, GitHub repository of
+                         origin, gh api .state == closed) is closed and the newest file under the root is
+                         old enough; anything unknown keeps it. shadow decides nothing and logs
+                         rule=evidence-expired action=would-remove to CC_WJ_SPOTCHECK_LOG
+  CC_WJ_EVIDENCE_EXPIRY_DAYS  Age of the newest evidence file, in days (default: 7)
+  CC_WJ_EVIDENCE_EXPIRY_ROOT  Evidence root inside a worktree (default: .codex/evidence)
+  CC_WJ_EVIDENCE_GH_TIMEOUT_SECONDS  Bound on one issue lookup (default: 30)
   CC_WJ_UNKNOWN_SESSION_SCOPE  tree (default) or global (any other value too). With tree, a
                          session record that cannot be read keeps only the worktrees it could be
                          about (KEEP(session-unknown:<record>)), under CC_WJ_NEW_RULES_MODE: in
@@ -1759,7 +1772,7 @@ _CC_WJ_UNKNOWN_BY=""      # attr: a record names the tree; recent / any: every r
 
 _cc_wj_unknown_scope() {
   case "${CC_WJ_UNKNOWN_SESSION_SCOPE:-tree}" in
-    tree) if [ "$(_cc_wj_new_rules_mode)" = auto ]; then echo tree; else echo spotcheck; fi ;;
+    tree) if _cc_wj_rule_auto session-unknown-per-tree; then echo tree; else echo spotcheck; fi ;;
     *) echo global ;;
   esac
 }
@@ -2955,7 +2968,7 @@ _cc_wj_sensitive_name() {
 # levels down). A `find` that FAILS answers like one that found something: an unreadable
 # directory is not evidence that nothing is there.
 _cc_wj_find_credential() {
-  local dir="$1" depth="${2:-}" hit
+  local dir="$1" depth="${2:-}" all="${3:-}" hit
   set -- \( -type f -o -type l \) \
          ! -name '.env.example' ! -name '.env.sample' \
          ! -name '.env.template' ! -name '.env.dist' \( \
@@ -2965,6 +2978,9 @@ _cc_wj_find_credential() {
          \) -print -quit
   if [ -n "$depth" ]; then
     hit="$(find "$dir" -maxdepth "$depth" "$@" 2>/dev/null)" || return 0
+  elif [ "$all" = all ]; then
+    # Package trees included: evidence the janitor may discard is searched to the bottom.
+    hit="$(find "$dir" "$@" 2>/dev/null)" || return 0
   else
     hit="$(find "$dir" -type d \( -name node_modules -o -name site-packages \) -prune \
              -o "$@" 2>/dev/null)" || return 0
@@ -3190,10 +3206,14 @@ PRUNED
           _cc_wj_pin '!!' "$rel (declared archive:, but it could not be listed for the copy)"
           return 0; }
         continue ;;
-      2) _cc_wj_pin '!!' "$rel (declared archive:, but $_CC_WJ_ARCHIVE_WHY)"; return 0 ;;
+      2) _cc_wj_pin '!!' "$rel (declared archive:, but $_CC_WJ_ARCHIVE_WHY)"
+         [ "${_CC_WJ_WALK_ALL:-}" = 1 ] && continue
+         return 0 ;;
     esac
     _cc_wj_declared "$rel" && ! _cc_wj_sensitive_name "${rel##*/}" && continue
     _cc_wj_pin '!!' "$rel"
+    # The evidence rule (_cc_wj_pins) walks on, to list every file the copy can take.
+    [ "${_CC_WJ_WALK_ALL:-}" = 1 ] && continue
     return 0
   done <<LIST
 $list
@@ -3265,6 +3285,57 @@ _cc_wj_new_rules_mode() {
     auto) echo auto ;;
     *) echo spotcheck ;;
   esac
+}
+
+# A rule on probation can be promoted on its own: CC_WJ_PROMOTED_RULES, whitespace-separated rule
+# names (stima-api#7895), decides as under `auto` while CC_WJ_NEW_RULES_MODE stays `spotcheck` for
+# every rule not named. Rules: dirty-pressure, primary-skills-link, build-output, pushed-idle,
+# session-unknown-per-tree. evidence-expired has its own mode, CC_WJ_EVIDENCE_EXPIRY_MODE.
+_cc_wj_rule_promoted() { # <rule>
+  local list
+  list=" $(printf '%s' "${CC_WJ_PROMOTED_RULES:-}" | tr -s '[:space:]' ' ') "
+  case "$list" in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+# Whether rule $1 decides: CC_WJ_NEW_RULES_MODE=auto, or the rule is promoted.
+_cc_wj_rule_auto() { # <rule>
+  [ "$(_cc_wj_new_rules_mode)" = auto ] || _cc_wj_rule_promoted "$1"
+}
+
+# A rule that decided (auto or promoted) discounted entry $3 of worktree $1: what the dry run's
+# per-rule report counts. Written like `_cc_wj_newrule_note`, into the file the sweep names.
+_CC_WJ_RULEUSE_LOG=""
+_cc_wj_ruleuse_note() { # <worktree> <rule> <entry>
+  [ -z "${_CC_WJ_RULEUSE_LOG:-}" ] ||
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$_CC_WJ_RULEUSE_LOG" 2>/dev/null || true
+}
+
+# What each rule frees, for the report at the end of a run: one line per rule and mode, in
+# $_CC_WJ_TALLY (set by the sweep): rule, mode (shadow: logged only; decides), phase, worktree, bytes.
+_CC_WJ_TALLY=""
+_cc_wj_tally() { # <comma-separated rules> <mode> <phase> <worktree> <bytes>
+  local r rules="$1"
+  [ -n "${_CC_WJ_TALLY:-}" ] && [ -n "$rules" ] || return 0
+  case "$5" in ''|*[!0-9]*) set -- "$1" "$2" "$3" "$4" 0 ;; esac
+  while [ -n "$rules" ]; do
+    r="${rules%%,*}"
+    if [ "$rules" = "$r" ]; then rules=""; else rules="${rules#*,}"; fi
+    [ -z "$r" ] || printf '%s\t%s\t%s\t%s\t%s\n' "$r" "$2" "$3" "$4" "$5" >> "$_CC_WJ_TALLY" 2>/dev/null || true
+  done
+}
+
+# The report: trees and GiB per rule and mode. Trees are distinct worktrees; bytes add up (a trim
+# counts the directories it would remove).
+_cc_wj_tally_report() { # <tally file> <applying 0|1>
+  [ -s "$1" ] || return 0
+  LC_ALL=C awk -F'\t' -v applying="$2" '
+    { k = $1 SUBSEP $2; if (!(($1 SUBSEP $2 SUBSEP $4) in seen)) { seen[$1 SUBSEP $2 SUBSEP $4] = 1; trees[k]++ }
+      bytes[k] += $5; if (!(k in order)) { order[k] = ++n; name[n] = $1; mode[n] = $2; key[n] = k } }
+    END { for (i = 1; i <= n; i++)
+            printf "rule-effect: %s %s trees=%d GiB=%.2f\n", name[i],
+              (mode[i] == "shadow" ? "(shadow: logged only, decides nothing)" : (applying ? "(decided: freed)" : "(decides: would free)")),
+              trees[key[i]], bytes[key[i]] / 1073741824 }' "$1" | LC_ALL=C sort
 }
 
 # A spot-checked new rule's line for the inventory: worktree $1, rule $2, entry $3.
@@ -3346,6 +3417,168 @@ _cc_wj_spotcheck() { # <phase> <action> <rules> <path> <bytes> <holder> <worktre
   printf '[%s] run=%s phase=%s action=%s rule=%s path=%s bytes=%s holder=%s worktree=%s\n' \
     "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${_CC_WJ_RUN_ID:-?}" "$1" "$2" "$3" "$4" "$5" "$6" "$7" \
     >> "$log" 2>/dev/null || true
+  _cc_wj_tally "$3" shadow "$1" "$7" "$5"
+}
+
+# ─── evidence-expired (stima-api#7895) ────────────────────────────────────────
+
+# A landed, idle tree kept only by records under the evidence root (`.codex/evidence`) is
+# removable once every issue those records name is closed and the newest file is old enough.
+# The founder's rule (2026-11-11, stima-api#7881): evidence is deleted after 7 days, and only
+# when its issue is closed. It is asked of the unrebuildable entries (`_cc_wj_pins`), after
+# every discount has declined them, and only when ALL of them are under the root; every other
+# gate - holders, sessions, landed, idle, locks - still decides afterwards, as for any tree.
+#
+# CC_WJ_EVIDENCE_EXPIRY_MODE   shadow (default; any value but apply or off): decides nothing,
+#                              logs rule=evidence-expired action=would-remove with the tree's bytes
+#                              to the spot-check log; apply: the rule decides; off: not asked
+# CC_WJ_EVIDENCE_EXPIRY_DAYS   the newest file under the root must be at least this old (default 7)
+# CC_WJ_EVIDENCE_EXPIRY_ROOT   the root, relative to the worktree (default .codex/evidence)
+# CC_WJ_EVIDENCE_GH_TIMEOUT_SECONDS  bound on one issue lookup (default 30)
+#
+# Every failure to learn something keeps the tree. The first reason is kept in
+# _CC_WJ_EVIDENCE_WHY and shown in the report as `evidence-expired: kept: <reason>`.
+_cc_wj_evidence_mode() {
+  case "${CC_WJ_EVIDENCE_EXPIRY_MODE:-shadow}" in
+    off) echo off ;;
+    apply) echo apply ;;
+    *) echo shadow ;;
+  esac
+}
+
+# The root, printed: a plain relative path with no wildcard, `..` or control character.
+_cc_wj_evidence_root() {
+  local r="${CC_WJ_EVIDENCE_EXPIRY_ROOT:-.codex/evidence}"
+  r="${r%/}"
+  case "$r" in
+    ''|.|./*|/*|*..*|*[*?[]*|*$'\n'*|*$'\t'*) return 1 ;;
+  esac
+  printf '%s\n' "$r"
+}
+
+# Whole days of the knob, 1-4 digits and above 0; anything else turns the rule off.
+_cc_wj_evidence_days() {
+  local v="${CC_WJ_EVIDENCE_EXPIRY_DAYS:-7}"
+  case "$v" in ''|*[!0-9]*|?????*) return 1 ;; esac
+  v=$((10#$v))
+  [ "$v" -gt 0 ] || return 1
+  printf '%s\n' "$v"
+}
+
+# `owner/repo` of worktree $1's origin when that is a GitHub URL (https, ssh or scp form);
+# status 1 for any other remote, or a name that is not a plain owner and repository.
+_cc_wj_evidence_slug() { # <worktree>
+  local url rest host slug
+  url="$(git -C "$1" config --get remote.origin.url 2>/dev/null)" || return 1
+  url="${url%/}"; url="${url%.git}"
+  case "$url" in
+    *://*) rest="${url#*://}"; rest="${rest#*@}"; host="${rest%%/*}"; host="${host%%:*}"; slug="${rest#*/}" ;;
+    *:*) host="${url%%:*}"; host="${host##*@}"; slug="${url#*:}" ;;
+    *) return 1 ;;
+  esac
+  [ "$host" = github.com ] || return 1
+  case "$slug" in
+    ''|/*|*/|*/*/*) return 1 ;;
+    */*) ;;
+    *) return 1 ;;
+  esac
+  case "${slug%%/*}${slug#*/}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  printf '%s\n' "$slug"
+}
+
+# The issue number an entry name leads with, printed; status 1 when there is none that can be
+# trusted: no leading digits, more than six, a leading zero, a letter right after them
+# (`3rdparty`), or a date (`2026-11-11-notes`, `2026_11_04-run`, `2026.11.04`, `2026-11`: digits, one of
+# `-_.`, two more digits) - a wrong number would ask about another issue.
+_cc_wj_evidence_issue() { # <top-level entry name>
+  local n="$1" d rest
+  d="${n%%[!0-9]*}"
+  [ -n "$d" ] && [ "${#d}" -le 6 ] || return 1
+  case "$d" in 0*) return 1 ;; esac
+  rest="${n#"$d"}"
+  case "$rest" in ''|[-_.\ ]*) ;; *) return 1 ;; esac
+  case "$rest" in [-_.][0-9][0-9]*) return 1 ;; esac
+  printf '%s\n' "$d"
+}
+
+# State of issue $2 of repository $1 (`owner/repo`): closed, open or unknown, printed.
+# `gh api repos/OWNER/REPO/issues/N --jq .state` under a timeout; only exactly `closed` frees
+# anything. Asked once per run and issue when the sweep set $_CC_WJ_EVIDENCE_CACHE_DIR, failures
+# included, so a slow or rate-limited API costs one wait, not one per tree; after the first timeout
+# of a run every later lookup answers unknown at once (the `timed-out` marker in the cache dir).
+_cc_wj_evidence_issue_state() { # <owner/repo> <number>
+  local key="$1#$2" f="" out secs rc=0
+  if [ -n "${_CC_WJ_EVIDENCE_CACHE_DIR:-}" ] && [ -d "$_CC_WJ_EVIDENCE_CACHE_DIR" ]; then
+    f="$_CC_WJ_EVIDENCE_CACHE_DIR/$(printf '%s' "$key" | cksum | tr ' ' '-')"
+    if [ -f "$f" ] && [ "$(sed -n 1p "$f")" = "$key" ]; then sed -n 2p "$f"; return 0; fi
+    if [ -e "$_CC_WJ_EVIDENCE_CACHE_DIR/timed-out" ]; then printf 'unknown\n'; return 0; fi
+  fi
+  secs="$(_cc_wj_seconds "${CC_WJ_EVIDENCE_GH_TIMEOUT_SECONDS:-30}")" || secs=30
+  if command -v gh >/dev/null 2>&1; then
+    out="$(_cc_wj_with_timeout "$secs" gh api --hostname github.com "repos/$1/issues/$2" --jq .state 2>/dev/null)" || rc=$?
+    [ "$rc" -eq 0 ] || out=""
+    if [ "$rc" -eq 124 ] && [ -n "$f" ]; then : > "$_CC_WJ_EVIDENCE_CACHE_DIR/timed-out" 2>/dev/null || true; fi
+  else
+    out=""
+  fi
+  case "$out" in closed|open) ;; *) out=unknown ;; esac
+  [ -z "$f" ] || printf '%s\n%s\n' "$key" "$out" > "$f" 2>/dev/null || true
+  printf '%s\n' "$out"
+}
+
+# Status 0 when the records under the evidence root of worktree $1 have expired: every top-level
+# entry names an issue, every issue is closed on origin's repository (GitHub only), no file under
+# the root is credential-shaped or younger than CC_WJ_EVIDENCE_EXPIRY_DAYS. Status 1 otherwise,
+# the reason in _CC_WJ_EVIDENCE_WHY. Cheap local questions first; the network last.
+_CC_WJ_EVIDENCE_WHY=""
+_cc_wj_evidence_expired() { # <worktree>
+  local wt="$1" root days entries nl f name num nums="" slug st
+  # Called from inside `IFS=<tab> read ... <<EOF $(...) EOF`, where the word splitting is the tab's.
+  local IFS=$' \t\n'
+  _CC_WJ_EVIDENCE_WHY=""
+  root="$(_cc_wj_evidence_root)" || { _CC_WJ_EVIDENCE_WHY="the evidence root is not a plain relative path"; return 1; }
+  days="$(_cc_wj_evidence_days)" || { _CC_WJ_EVIDENCE_WHY="CC_WJ_EVIDENCE_EXPIRY_DAYS is not a whole number of days"; return 1; }
+  if [ ! -d "$wt/$root" ] || [ "$(_cc_wj_realpath "$wt/$root")" != "$(_cc_wj_realpath "$wt")/$root" ]; then
+    _CC_WJ_EVIDENCE_WHY="$root is not a directory inside the worktree"; return 1
+  fi
+  nl="$(find "$wt/$root" -name "*"$'\n'"*" -print -quit 2>/dev/null)" ||
+    { _CC_WJ_EVIDENCE_WHY="$root could not be walked"; return 1; }
+  [ -z "$nl" ] || { _CC_WJ_EVIDENCE_WHY="a name under $root holds a newline"; return 1; }
+  entries="$(find "$wt/$root" -mindepth 1 -maxdepth 1 -print 2>/dev/null)" ||
+    { _CC_WJ_EVIDENCE_WHY="$root could not be listed"; return 1; }
+  [ -n "$entries" ] || { _CC_WJ_EVIDENCE_WHY="$root is empty"; return 1; }
+  while IFS= read -r f; do
+    name="${f##*/}"
+    num="$(_cc_wj_evidence_issue "$name")" ||
+      { _CC_WJ_EVIDENCE_WHY="no issue number in the name $root/$name"; return 1; }
+    case " $nums " in *" $num "*) ;; *) nums="$nums $num" ;; esac
+  done <<EVENTRIES
+$entries
+EVENTRIES
+  nums="${nums# }"
+  # At least `days` old: `-mtime -N` is a file younger than N whole days, so any hit keeps the tree.
+  f="$(find "$wt/$root" ! -type d -mtime "-$days" -print -quit 2>/dev/null)" ||
+    { _CC_WJ_EVIDENCE_WHY="the file times under $root could not be read"; return 1; }
+  [ -z "$f" ] || { _CC_WJ_EVIDENCE_WHY="${f#"$wt/"} is younger than $days days"; return 1; }
+  if _cc_wj_find_credential "$wt/$root" "" all; then
+    _CC_WJ_EVIDENCE_WHY="a credential-shaped file under $root"; return 1
+  fi
+  slug="$(_cc_wj_evidence_slug "$wt")" ||
+    { _CC_WJ_EVIDENCE_WHY="origin is not a GitHub repository"; return 1; }
+  while [ -n "$nums" ]; do
+    num="${nums%% *}"
+    if [ "$nums" = "$num" ]; then nums=""; else nums="${nums#* }"; fi
+    st="$(_cc_wj_evidence_issue_state "$slug" "$num")"
+    [ "$st" = closed ] ||
+      { _CC_WJ_EVIDENCE_WHY="issue $slug#$num is $st"; return 1; }
+  done
+  return 0
+}
+
+# The reason a tree's evidence kept it, for the report: worktree $1, reason $2.
+_cc_wj_evidence_why_note() {
+  [ -z "${_CC_WJ_EVIDENCE_WHY_LOG:-}" ] ||
+    printf '%s\t%s\n' "$1" "$2" >> "$_CC_WJ_EVIDENCE_WHY_LOG" 2>/dev/null || true
 }
 
 # Status 0, with _CC_WJ_DENY_REASON set, when CC_WJ_DENY_NAMES forbids touching worktree $1 on
@@ -3386,7 +3619,7 @@ DENY_SESSIONS
 #
 # With $2, each archivable file this read discounts is appended to that file, one path per
 # line, so a removal copies out exactly what the read that cleared it saw.
-_cc_wj_pins() {
+_cc_wj_pins_scan() {
   local wt="$1" archive_to="${2:-}" sf rec code rest base skip_next=0 drc reach arc status_timeout status_rc=0 nr
   status_timeout="$(_cc_wj_git_status_timeout_seconds)" || {
     _cc_wj_pin '??' "(invalid git status timeout)"; return 1; }
@@ -3443,10 +3676,12 @@ _cc_wj_pins() {
             if _cc_wj_build_output "$wt" "$rest" dir; then
               if _cc_wj_find_credential "$wt/$rest" 2; then
                 _cc_wj_pin '!!' "$rest/ (build output, but holds a credential-shaped file)"
-              elif [ "$(_cc_wj_new_rules_mode)" != auto ]; then
+              elif ! _cc_wj_rule_auto build-output; then
                 # A new rule (stima-api#7106): spot-checked like the others until auto.
                 _cc_wj_newrule_note "$wt" build-output "$rest/"
                 _cc_wj_pin '!!' "$rest/"
+              else
+                _cc_wj_ruleuse_note "$wt" build-output "$rest/"
               fi
             else
               _cc_wj_pin '!!' "$rest/"
@@ -3500,7 +3735,10 @@ _cc_wj_pins() {
         else nr="$(_cc_wj_new_rule "$wt" "$rest")" || nr=""
         fi
         if [ -n "$nr" ]; then
-          [ "$(_cc_wj_new_rules_mode)" = auto ] && continue
+          if _cc_wj_rule_auto "$nr"; then
+            _cc_wj_ruleuse_note "$wt" "$nr" "$rest"
+            continue
+          fi
           # Spot check: still kept, and the inventory is told which rule would discount it.
           _cc_wj_newrule_note "$wt" "$nr" "$rest"
         fi
@@ -3509,6 +3747,75 @@ _cc_wj_pins() {
     esac
   done < "$sf"
   rm -f "$sf"
+  return 0
+}
+
+# `_cc_wj_pins_scan`'s answer, less what the evidence rule frees (stima-api#7895): when every
+# entry it prints is an ignored one under the evidence root and `_cc_wj_evidence_expired` says
+# the records have expired. In `apply` mode the answer is then empty, after a second walk that
+# lists every file the archive: line can copy (appended to $2 beside what the first read listed)
+# and refuses a walk that could not list them all; in `shadow` mode the answer is unchanged and
+# each entry is noted for the spot-check log, as for any rule on probation.
+_cc_wj_pins() {
+  local wt="$1" archive_to="${2:-}" out out2 rc=0 mode root line ok=1 tmp f
+  out="$(_cc_wj_pins_scan "$wt" "$archive_to")" || rc=$?
+  mode="$(_cc_wj_evidence_mode)"
+  if [ "$mode" = off ] || [ "$rc" -ne 0 ] || [ -z "$out" ] || ! root="$(_cc_wj_evidence_root)"; then
+    [ -z "$out" ] || printf '%s\n' "$out"
+    return "$rc"
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      "!! $root"|"!! $root/"*|"!! $root ("*) ;;
+      *) ok=0; break ;;
+    esac
+  done <<EVPINS
+$out
+EVPINS
+  if [ "$ok" -eq 0 ]; then printf '%s\n' "$out"; return "$rc"; fi
+  if ! _cc_wj_evidence_expired "$wt"; then
+    _cc_wj_evidence_why_note "$wt" "$_CC_WJ_EVIDENCE_WHY"
+    printf '%s\n' "$out"
+    return "$rc"
+  fi
+  if [ "$mode" = shadow ]; then
+    while IFS= read -r line; do _cc_wj_newrule_note "$wt" evidence-expired "${line#'!! '}"; done <<EVSHADOW
+$out
+EVSHADOW
+    printf '%s\n' "$out"
+    return "$rc"
+  fi
+  # apply: the copy list must be whole before anything is discarded.
+  tmp="$(mktemp "${TMPDIR:-/tmp}/cc-wj-evidence.XXXXXX")" || {
+    _cc_wj_evidence_why_note "$wt" "no temporary file for the archive list"; printf '%s\n' "$out"; return "$rc"; }
+  out2="$(_CC_WJ_WALK_ALL=1 _cc_wj_pins_scan "$wt" "$tmp")" || {
+    rm -f "$tmp"; _cc_wj_evidence_why_note "$wt" "the archive list could not be read"; printf '%s\n' "$out"; return "$rc"; }
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      "!! $root"|"!! $root/"*|"!! $root ("*) ;;
+      *) ok=0 ;;
+    esac
+    case "$line" in
+      *"holds more than 1000 files"*|*"could not be walked"*|*"holds a newline"*|*"could not be listed for the copy"*|*"credential-shaped"*|*"an archive: pattern may name a path inside it"*) ok=0 ;;
+    esac
+  done <<EVPINS2
+$out2
+EVPINS2
+  if [ "$ok" -eq 0 ]; then
+    rm -f "$tmp"; _cc_wj_evidence_why_note "$wt" "the files the archive: line can copy could not all be listed"
+    printf '%s\n' "$out"; return "$rc"
+  fi
+  if [ -n "$archive_to" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      grep -qxF -- "$f" "$archive_to" 2>/dev/null || { printf '%s\n' "$f" >> "$archive_to"; } 2>/dev/null || {
+        rm -f "$tmp"; _cc_wj_evidence_why_note "$wt" "the archive list could not be written"
+        printf '%s\n' "$out"; return "$rc"; }
+    done < "$tmp"
+  fi
+  rm -f "$tmp"
+  _cc_wj_ruleuse_note "$wt" evidence-expired "$root"
   return 0
 }
 
@@ -4930,6 +5237,12 @@ _cc_wj_run_inner() {
   _CC_WJ_TRANSCRIPT_CACHE_GENERATION=0
   _CC_WJ_PINS_CACHE_DIR="$work/pins-cache"
   mkdir -p "$_CC_WJ_PINS_CACHE_DIR" 2>/dev/null || _CC_WJ_PINS_CACHE_DIR=""
+  # evidence-expired (stima-api#7895): issue states asked once per run, what each rule that decided
+  # discounted, why a tree's evidence kept it, and what every rule frees (the report at the end).
+  _CC_WJ_EVIDENCE_CACHE_DIR="$work/evidence-cache"
+  mkdir -p "$_CC_WJ_EVIDENCE_CACHE_DIR" 2>/dev/null || _CC_WJ_EVIDENCE_CACHE_DIR=""
+  : > "$work/ruleuse"; : > "$work/evidence-why"; : > "$work/tally"
+  _CC_WJ_TALLY="$work/tally"
   # Unreadable session records, per phase (stima-api#5886).
   local uk_scope uk_note="" uk_bytes uk_holder uk_would=0
   uk_scope="$(_cc_wj_unknown_scope)"
@@ -5004,7 +5317,7 @@ KEEP
   local trim_known active lease landed idle referenced classification wt_phys git_keep head0 bytes kp active_detail active_rc lease_detail recent_rc linked_count abandoned idle_long trim_result trim_count trim_count_done trim_bytes task_done wt_idle_hours
   local nr_rules="" nr_dirty="" nr_count nr_line nr_note="" nr_holder nr_active_ok nr_blind
   local pi_rule="" pi_hours="" pi_idle="" pi_note="" pi_ok pi_rc pi_cls pi_bytes pi_would=0
-  local dp_rule="" dp_hours="" dp_normal="" dp_ok sv_active_ok sv_blind
+  local dp_rule="" dp_hours="" dp_normal="" dp_ok sv_active_ok sv_blind dp_used="" rule_use="" uk_freed="" ev_why="" tally_text="" line
   local st_path st_branch st_dirty st_ahead st_push st_pins
   # Said once, because the absence is otherwise silent: every squash-merged worktree just
   # reads KEEP(unlanded). That is how the scheduled sweep went without landed=pr for weeks.
@@ -5155,7 +5468,7 @@ KEEP
       if [ "$dirty" = DEFERRED ]; then
         dirty="?"; ahead="?"; push_state="no_remote"; pins="-"
         IFS=$'\t' read -r st_path st_branch st_dirty st_ahead st_push st_pins <<DEFERRED_LINE
-$(_CC_WJ_NEWRULE_LOG="$work/newrule" _cc_wj_emit_wt_block "$wt_path" "$branch" 1 < /dev/null)
+$(_CC_WJ_NEWRULE_LOG="$work/newrule" _CC_WJ_RULEUSE_LOG="$work/ruleuse" _CC_WJ_EVIDENCE_WHY_LOG="$work/evidence-why" _cc_wj_emit_wt_block "$wt_path" "$branch" 1 < /dev/null)
 DEFERRED_LINE
         # Anything but this worktree's own line is an unread status, and `?` keeps the tree.
         if [ "$st_path" = "$wt_path" ] && [ "$st_branch" = "$branch" ] && [ -n "$st_dirty" ] &&
@@ -5196,7 +5509,7 @@ DEFERRED_LINE
       # Spot check: a worktree kept only by entries a rule on probation would discount is
       # judged as the rule would judge it, and every decision that would act is logged instead
       # and reverts to what the existing rules decide (KEEP(unrebuildable=<n>)).
-      nr_rules=""; nr_dirty=""; pi_rule=""; pi_note=""; pi_idle=""; dp_rule=""
+      nr_rules=""; nr_dirty=""; pi_rule=""; pi_note=""; pi_idle=""; dp_rule=""; dp_used=""; rule_use=""; uk_freed=""
       case "$dirty" in
         ''|0|*[!0-9]*) ;;
         *)
@@ -5328,7 +5641,7 @@ DEFERRED_LINE
              dp_hours="$(_cc_wj_rule_hours "$CC_WJ_TRIM_DIRTY_IDLE_HOURS_PRESSURE")" &&
              [ "$dp_hours" -lt "$CC_WJ_TRIM_DIRTY_IDLE_HOURS" ] &&
              [ "$(_cc_wj_idle "$wt_path" "$dp_hours")" = yes ]; then
-            if [ "$(_cc_wj_new_rules_mode)" = auto ]; then dp_ok=yes; else dp_ok=spotcheck; fi
+            if _cc_wj_rule_auto dirty-pressure; then dp_ok=yes; dp_used=1; else dp_ok=spotcheck; fi
           fi
           if [ "$dp_ok" = no ]; then
             printf "    classification: KEEP(unrebuildable=%s)\n" "$dirty"
@@ -5404,6 +5717,10 @@ NR_TRIM
         case "$trim_count_done" in ''|*[!0-9]*) trim_count_done=0 ;; esac
         case "$trim_bytes" in ''|*[!0-9]*) trim_bytes=0 ;; esac
         total_trim_candidates=$((total_trim_candidates + trim_count))
+        if [ -n "$dp_used" ] && [ "$trim_count" -gt 0 ]; then
+          _cc_wj_tally dirty-pressure decides trim "$wt_path" \
+            "$(printf '%s\n' "$trim_result" | awk '/^  TRIM_CANDIDATE  / { sub(/.*bytes=/, ""); s += $0 } END { print s + 0 }')"
+        fi
         if [ "$apply" -eq 1 ]; then
           total_trimmed=$((total_trimmed + trim_count_done))
           total_trim_reclaimed=$((total_trim_reclaimed + trim_bytes))
@@ -5441,7 +5758,7 @@ NR_TRIM
             # idle past its own, longer window. From here it is judged as pushed work, with
             # every gate below and every recheck before the removal.
             if [ "$pushed" != yes ] && [ "$wip" != yes ] && [ "$reclaim" = 1 ] &&
-               [ "$(_cc_wj_new_rules_mode)" = auto ] &&
+               _cc_wj_rule_auto pushed-idle &&
                pi_hours="$(_cc_wj_pushed_idle_window "$wt_idle_hours")" &&
                [ "$(_cc_wj_pushed_fetched "$wt_path")" = yes ]; then
               pi_idle="$(_cc_wj_idle "$wt_path" "$pi_hours")"
@@ -5542,6 +5859,8 @@ KEEP
                { [ "$wip" = yes ] && _cc_wj_unknown_gate "$wt_path" "$session_grace_hours" yes; }; then
               classification="KEEP($_CC_WJ_UNKNOWN_REASON)"
               _cc_wj_unknown_note_kept "$_CC_WJ_UNKNOWN_REASON" "$wt_path"
+            elif [ "$uk_scope" = tree ]; then
+              uk_freed=session-unknown-per-tree
             elif [ "$uk_scope" = spotcheck ]; then
               uk_holder="none(sweep-snapshot)"
               { [ "$LSOF_OK" != yes ] || _cc_wj_held "$work" "$wt_path"; } && uk_holder="held"
@@ -5571,7 +5890,7 @@ KEEP
       # with edits to snapshot, nor while a session record could not be read.
       if [ "$trim" -eq 0 ] && [ "$classification" = "KEEP(unlanded)" ] && [ "$wip" != yes ] &&
          [ "$dirty" = "0" ] && [ "$reclaim" = 1 ] && [ -z "$_CC_WJ_UNKNOWN" ] &&
-         [ "$(_cc_wj_new_rules_mode)" = spotcheck ] &&
+         ! _cc_wj_rule_auto pushed-idle &&
          pi_hours="$(_cc_wj_pushed_idle_window "$wt_idle_hours")" &&
          [ "$(_cc_wj_pushed_fetched "$wt_path")" = yes ] &&
          [ "$(_cc_wj_idle "$wt_path" "$pi_hours")" = yes ]; then
@@ -5621,6 +5940,11 @@ KEEP
         ACTIVE_OK="$nr_active_ok"; activity_blind="$nr_blind"
       fi
 
+      # What decided, for the per-rule report: rules that discounted an entry of this tree
+      # (auto or promoted), the pushed-idle window, an unreadable session record the per-tree rule let go.
+      rule_use="$(W="$wt_path" LC_ALL=C awk -F'\t' '$1 == ENVIRON["W"] && !seen[$2]++ { printf "%s%s", (n++ ? "," : ""), $2 }' "$work/ruleuse")"
+      [ -z "$pi_rule" ] || rule_use="${rule_use:+$rule_use,}$pi_rule"
+      [ -z "$uk_freed" ] || rule_use="${rule_use:+$rule_use,}$uk_freed"
       printf "  WORKTREE  %s\n" "$wt_path"
       printf "    branch=%s  dirty=%s  ahead=%s  push=%s  active=%s  recent=%s  landed=%s  idle=%s\n" \
         "$branch" "${wip_dirty:-$dirty}" "$ahead" "$push_state" "$active" "$lease" "$landed" "$idle"
@@ -5649,6 +5973,8 @@ KEEP
       fi
       if [ "$dirty" != "0" ] && [ "${pins:--}" != "-" ]; then
         printf "    kept by: %s\n" "$pins"
+        ev_why="$(W="$wt_path" LC_ALL=C awk -F'\t' '$1 == ENVIRON["W"] { r = $2 } END { print r }' "$work/evidence-why")"
+        [ -z "$ev_why" ] || printf "    evidence-expired: kept: %s\n" "$ev_why"
         case "$pins" in
           *'!! '*)
             printf "    if a command rebuilds an ignored entry, list it in .worktree-regenerable on origin/%s\n" \
@@ -5673,6 +5999,7 @@ KEEP
             bytes=$(du -sk "$wt_path" 2>/dev/null | awk '{print $1 * 1024}') || bytes=0
             _cc_wj_size_record "$wt_path" "$bytes"
             total_estimate=$((total_estimate + ${bytes:-0}))
+            _cc_wj_tally "$rule_use" decides removal "$wt_path" "${bytes:-0}"
           fi
           if [ "$apply" -eq 1 ]; then
             # A task can start after the inventory snapshot without yet opening any file
@@ -5816,6 +6143,7 @@ KEEP
             if _cc_wj_remove_worktree "$repo" "$wt_path" "$([ "$wip" = yes ] && echo --force)"; then
               total_removed=$((total_removed + 1))
               total_reclaimed=$((total_reclaimed + bytes))
+              _cc_wj_tally "$rule_use" decides removal "$wt_path" "$bytes"
               _cc_wj_size_record "$wt_path" -
               printf "    → removed (%s bytes reclaimed)\n" "$bytes"
               [ -n "$lock" ] && touch "$lock" 2>/dev/null
@@ -5890,6 +6218,8 @@ KEEP
     _cc_wj_log_write "spotcheck: pushed-idle would free $pi_would worktree(s)"
   fi
   [ -z "$_CC_WJ_UNKNOWN_ERRORS" ] || activity_blind=1
+  tally_text="$(_cc_wj_tally_report "$work/tally" "$apply")"
+  _CC_WJ_TALLY=""
   _cc_wj_remove_private_temp "$work"
   if [ -n "${BASH_VERSION:-}" ]; then
     trap - INT TERM HUP
@@ -5945,6 +6275,14 @@ KEEP
     printf "Summary: removable=%d  kept=%d  (dry-run; use --apply to remove)  pushed=%d  wip=%d  estimated-reclaimable=%s GB\n" \
       "$total_removable" "$total_kept" "$total_pushed" "$total_wip" \
       "$(awk -v b="$total_estimate" 'BEGIN { printf "%.2f", b / 1073741824 }')"
+  fi
+
+  # What each rule frees: evidence-expired and every rule on probation or promoted (stima-api#7895).
+  if [ -n "$tally_text" ]; then
+    printf '%s\n' "$tally_text"
+    while IFS= read -r line; do _cc_wj_log_write "$line"; done <<TALLY_LOG
+$tally_text
+TALLY_LOG
   fi
 
   # Notification fires only on --apply pass (report-only runs don't measure bytes)
