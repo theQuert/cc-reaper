@@ -22,6 +22,9 @@ starts the branch or follows a `/`, `claude/7023-x` names #7023; WORD_ISSUE_RE o
 whose oracle claimant (`delivery_state.py N --brief`, from the newest `Claimed by ... session` comment) is this
 session; for a `loop #N ...` background session, #N.
 
+A session that cannot close in this run (status not idle, or idle under its threshold) has its claims listed with
+`"read": false` and no oracle call: it is kept whatever the oracle says (stima-api#7904).
+
 The facts come from the reaper's own gather (tmux panes, session files, transcripts, worktrees) and its oracle
 readers, loaded from `session-reaper.py` beside this file: there is one gatherer, and this module only judges.
 session-reaper.py runs it in every sweep and writes the file; `session_state.py` alone writes it too (read-only
@@ -135,7 +138,15 @@ def judge(s, r, cfg, now):
         rec["idle_threshold"] = thr
         mine_ids = [w["marker"] for w in s.get("owned") or () if w.get("marker")]
         own, person, unknown = [], [], []
+        # A session that cannot close in this run (busy, shell, waiting, or idle under its threshold) is kept whatever
+        # the oracle says, so its claims are listed unread: an oracle run costs several `gh` calls, and a fleet's busy
+        # sessions spent the whole run budget on them (stima-api#7904). Its state is then the cheap facts' alone.
+        closable = s.get("status") == "idle" and rec["idle_min"] >= thr
         for repo, n, src in _claims(s, r, cfg, now, thr):
+            if not closable:
+                rec["claims"].append({"issue": int(n), "repo": repo, "source": src, "oracle_step": "", "mine": None,
+                                      "read": False})
+                continue
             step, mine, pers = claim_step(r, r.oracle_brief(repo, n, cfg, now), sid, mine_ids, s.get("other_sids", ()),
                                          loop=src == "name")
             c = {"issue": int(n), "repo": repo, "source": src, "oracle_step": step, "mine": mine}
@@ -201,9 +212,22 @@ def _state(s, rec, thr, own, person, unknown, stalled, ahead, dirty):
 
 
 def judge_all(r, sessions, cfg, now, workers=8):
-    """Judge every session, `workers` at a time (each claim may cost an oracle call; the reaper's caches are shared)."""
+    """Judge every session, `workers` at a time (each claim may cost an oracle call; the reaper's caches are shared).
+    The sessions that can close go first, longest idle first, so a run cut short has read the ones that matter; the
+    records come back in the order of `sessions`."""
+    def key(i):
+        s = sessions[i]
+        try:
+            closable = s.get("status") == "idle" and float(s.get("idle_min") or 0) >= r.idle_threshold(s, cfg)
+        except Exception:  # judge() turns the same failure into an UNKNOWN record
+            closable = True
+        return (0 if closable else 1, -float(s.get("idle_min") or 0))
+    order = sorted(range(len(sessions)), key=key)
+    out = [None] * len(sessions)
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        return list(pool.map(lambda s: judge(s, r, cfg, now), sessions))
+        for i, rec in zip(order, pool.map(lambda i: judge(sessions[i], r, cfg, now), order)):
+            out[i] = rec
+    return out
 
 
 def document(records, now, unjudged=()):

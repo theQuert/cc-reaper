@@ -278,7 +278,7 @@ class OracleBrief(unittest.TestCase):
             self.assertEqual(r.call_count, 1)
             self.assertEqual(r.call_args.args[0][1:], ["scripts/ci/delivery_state.py", "9", "--brief", "--repo", "theQuert/stima-api"])
             reaper._brief_cache.clear()
-            reaper.oracle_brief("theQuert/stima-api", "9", self.cfg, 1000 + 601)
+            reaper.oracle_brief("theQuert/stima-api", "9", self.cfg, 1000 + 45 * 60 + 1)
             self.assertEqual(r.call_count, 2)
 
     def test_failure_is_none_and_not_cached(self):
@@ -543,7 +543,7 @@ class JudgeOrder(unittest.TestCase):
         got = [s["tmux"] for s in sorted(sessions, key=lambda x: reaper.judge_order(x, CFG))]
         self.assertEqual(got, ["oldest", "old", "one", "issues", "young", "busy", "keep-me"])
 
-    def test_a_budget_cut_leaves_the_busy_sessions_unjudged(self):
+    def test_a_budget_cut_leaves_candidates_unjudged_and_the_busy_ones_working(self):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         cfgfile = tmp / "conf"
@@ -551,7 +551,9 @@ class JudgeOrder(unittest.TestCase):
         extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
                      fg=True, sub_active=0, screen_tail="")
         sessions = [session(tmux="busy", name="busy", status="busy", idle_min=1, sid="b" * 10, **extra),
-                    session(tmux="done", name="done", idle_min=300, sid="d" * 10, **extra)]
+                    session(tmux="done", name="done", idle_min=300, sid="d" * 10, **extra),
+                    session(tmux="late", name="late", idle_min=200, sid="l" * 10, **extra),
+                    session(tmux="young", name="young", idle_min=20, sid="y" * 10, **extra)]
         judged = []
 
         def decide(s, cfg, now=None):
@@ -566,7 +568,12 @@ class JudgeOrder(unittest.TestCase):
             reaper.RUN_BUDGET = 1200.0
         self.assertEqual(judged, ["done"])
         report = (tmp / "report.md").read_text()
-        self.assertIn("unjudged:run-budget", [l for l in report.splitlines() if l.startswith("| busy")][0])
+        row = lambda name: [l for l in report.splitlines() if l.startswith(f"| {name} ")][0]  # noqa: E731
+        # a candidate the budget cut off wanted a read; a busy or young session could not close, whatever the oracle says
+        self.assertIn("unjudged:run-budget", row("late"))
+        self.assertIn("working:status:busy", row("busy"))
+        self.assertIn("working:idle:20<60min", row("young"))
+        self.assertNotIn("unjudged", row("busy") + row("young"))
 
 
 class Transcript(unittest.TestCase):
@@ -2165,6 +2172,122 @@ class DoneMarker(unittest.TestCase):
         # The session said done again, later: the marker moves with it.
         os.utime(m, (self.now - 3600, self.now - 3600))
         self.assertIn(str(m), reaper.write_done_markers(self.cfg, [self.s()], self.now))
+
+
+class OracleReadsUnderLoad(unittest.TestCase):
+    """stima-api#7904: an oracle run is spent only on a session a run can close, the cache outlives a run, and a
+    session about to close is read fresh."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        self.cfg = dict(CFG, ORACLE_CACHE_DIR=d, ORACLE_ROOT=d, PREFETCH_WORKERS="1")
+        reaper._brief_cache.clear()
+        self.addCleanup(reaper._brief_cache.clear)
+
+    def prefetch(self, sessions, brief, cfg=None):
+        with mock.patch.object(reaper, "batch_issue_states"), mock.patch.object(reaper, "claim_time", return_value=None), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "checkby_state", return_value="CLEAR"), \
+             mock.patch.object(reaper, "oracle_brief", side_effect=brief):
+            reaper.prefetch(sessions, cfg or self.cfg, time.time())
+
+    def test_prefetch_reads_no_brief_for_a_session_that_cannot_close(self):
+        calls = []
+        sessions = [session(sid="b", tmux="b", name="b", status="busy", idle_min=500, last_text="", claims=[(REPO, "1")]),
+                    session(sid="s", tmux="s", name="s", status="shell", idle_min=500, last_text="", claims=[(REPO, "2")]),
+                    session(sid="w", tmux="w", name="w", status="waiting", idle_min=500, last_text="", claims=[(REPO, "3")]),
+                    session(sid="y", tmux="y", name="y", idle_min=20, last_text="", claims=[(REPO, "4")]),
+                    session(sid="i", tmux="i", name="i", idle_min=90, last_text="", claims=[(REPO, "5")])]
+        self.prefetch(sessions, lambda r, n, c, now: calls.append(n))
+        self.assertEqual(calls, ["5"])
+
+    def test_prefetch_keeps_the_read_the_waiting_keyword_label_needs(self):
+        # decide() asks person_step() for a claim of a session whose text says "approval": prefetch still feeds it
+        calls = []
+        s = session(sid="b", tmux="b", name="b", status="busy", last_text="needs approval", claims=[(REPO, "1")])
+        self.prefetch([s], lambda r, n, c, now: calls.append(n))
+        self.assertEqual(calls, ["1"])
+
+    def test_a_budget_that_allows_k_reads_reads_the_longest_idle_candidates(self):
+        calls = []
+
+        def brief(r, n, c, now):
+            calls.append(n)
+            if len(calls) == 2:
+                reaper.RUN_START -= 100000  # PREFETCH_BUDGET is spent after the second read
+        sessions = [session(sid=f"s{i}", tmux=f"t{i}", name=f"t{i}", idle_min=m, last_text="", claims=[(REPO, str(i))])
+                    for i, m in enumerate([70, 400, 90, 250, 65])]
+        sessions.append(session(sid="b", tmux="b", name="b", status="busy", idle_min=999, last_text="",
+                                claims=[(REPO, "99")]))
+        start = reaper.RUN_START
+        self.addCleanup(setattr, reaper, "RUN_START", start)
+        self.prefetch(sessions, brief)
+        self.assertEqual(calls, ["1", "3"])  # 400 and 250 minutes idle; the busy session is never read
+
+    def test_the_cache_serves_the_next_run_inside_the_ttl_and_not_past_it(self):
+        self.assertEqual(reaper.DEFAULTS["ORACLE_CACHE_MINUTES"], "45")
+        cfg = dict(self.cfg, ORACLE_CACHE_MINUTES=reaper.DEFAULTS["ORACLE_CACHE_MINUTES"])
+        with mock.patch.object(reaper, "run", return_value=(0, ENDED)) as r:
+            self.assertEqual(reaper.oracle_brief(REPO, "9", cfg, 1000), ENDED)
+            reaper._brief_cache.clear()  # the next launchd run, 30 minutes on: a new process
+            self.assertEqual(reaper.oracle_brief(REPO, "9", cfg, 1000 + 30 * 60), ENDED)
+            self.assertEqual(r.call_count, 1)
+            reaper._brief_cache.clear()
+            reaper.oracle_brief(REPO, "9", cfg, 1000 + 45 * 60 + 1)
+            self.assertEqual(r.call_count, 2)
+
+    def closing(self, fresh):
+        """An idle session whose one claim the cached brief says may end, and what the oracle answers now."""
+        s = session(claims=[(REPO, "9")], last_text="all good", state={"state": "DONE", "claims": []})
+        with mock.patch.object(reaper, "run", return_value=(0, ENDED)):
+            reaper.oracle_brief(REPO, "9", self.cfg, time.time())  # a brief a run ago, still inside the TTL
+        with mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "checkby_state", return_value="CLEAR"), \
+             mock.patch.object(reaper, "run", return_value=fresh) as run:
+            keep = reaper.decide(s, self.cfg)
+            self.assertEqual(keep, [])  # on the cached brief alone it closes
+            return s, reaper.confirm_close(s, self.cfg, keep), run.call_count
+
+    def test_a_session_about_to_close_is_read_fresh_and_closes_when_the_issue_is_unchanged(self):
+        s, keep, reads = self.closing((0, ENDED))
+        self.assertEqual((keep, reads), ([], 1))
+        self.assertNotIn("brief_changed", s)
+
+    def test_a_session_about_to_close_is_kept_when_the_issue_changed_since_the_cached_brief(self):
+        s, keep, reads = self.closing((0, MINE))
+        self.assertEqual(reads, 1)
+        self.assertEqual(keep, ["owed-step:#9"])
+        self.assertEqual(s["brief_changed"], ["9"])
+        self.assertIsNone(s["state"])  # the state was judged on the old brief and releases nothing
+
+    def test_an_oracle_that_cannot_answer_at_the_confirming_read_keeps_the_session(self):
+        s, keep, reads = self.closing((1, ""))
+        self.assertTrue(keep)
+        self.assertEqual(s["brief_changed"], ["9"])
+
+    def test_main_confirms_before_it_reaps_and_obeys_the_answer(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        cfgfile = tmp / "conf"
+        cfgfile.write_text(f"APPLY=0\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\n")
+        extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
+                     fg=True, sub_active=0, screen_tail="")
+        sessions = [session(tmux="idle", name="idle", idle_min=300, sid="i" * 10, **extra)]
+        with mock.patch.object(reaper, "HOME", tmp), mock.patch.object(reaper, "gather", return_value=sessions), \
+             mock.patch.object(reaper, "prefetch"), mock.patch.object(reaper, "decide", return_value=[]), \
+             mock.patch.object(reaper, "confirm_close", return_value=["owed-step:#9"]) as confirm, \
+             mock.patch.object(reaper, "recover_exiting", return_value=[]), mock.patch.object(reaper, "alert"):
+            reaper.main(["--config", str(cfgfile)])
+        confirm.assert_called_once()
+        row = [l for l in (tmp / "report.md").read_text().splitlines() if l.startswith("| idle ")][0]
+        self.assertIn("| keep | owed-step:#9 |", row)
+
+    def test_a_kept_session_costs_no_confirming_read(self):
+        with mock.patch.object(reaper, "run", side_effect=AssertionError("ran")):
+            self.assertEqual(reaper.confirm_close(session(claims=[(REPO, "9")]), self.cfg, ["idle:5<60min"]),
+                             ["idle:5<60min"])
 
 
 if __name__ == "__main__":

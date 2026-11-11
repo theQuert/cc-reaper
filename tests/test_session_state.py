@@ -280,6 +280,74 @@ class Judge(unittest.TestCase):
             self.assertEqual(reaper._decide(dict(s), CFG, NOW), ["issue-unknown:#6837"])
 
 
+class OracleReads(unittest.TestCase):
+    """stima-api#7904: only a session a run can close pays for the oracle."""
+
+    def run_judge(self, s, briefs=None, **cfg):
+        calls = []
+
+        def brief(r, n, c, now):
+            calls.append(("brief", str(n)))
+            return (briefs or {}).get(str(n))
+
+        def js(r, n, c):
+            calls.append(("json", str(n)))
+        with mock.patch.object(reaper, "oracle_brief", side_effect=brief), \
+             mock.patch.object(reaper, "worktree_state", side_effect=lambda w, c: list(w.get("problems", []))), \
+             mock.patch.object(reaper, "oracle_json", side_effect=js), \
+             mock.patch.object(reaper, "oracle_claims", side_effect=lambda *a: calls.append(("named",)) or []):
+            return ss.judge(s, reaper, dict(CFG, **cfg), NOW), calls
+
+    def test_a_busy_session_with_claims_makes_no_oracle_call_and_is_working(self):
+        for status in ("busy", "shell", "waiting"):
+            rec, calls = self.run_judge(session(status=status, idle_min=500, claims=[(REPO, "7026"), (REPO, "6945")]),
+                                        {"7026": AGENT_MINE})
+            self.assertEqual((calls, rec["state"], rec["reasons"]), ([], "WORKING", [f"status:{status}"]))
+            self.assertEqual([(c["issue"], c["read"]) for c in rec["claims"]], [(7026, False), (6945, False)])
+
+    def test_a_session_idle_under_the_threshold_makes_no_oracle_call(self):
+        rec, calls = self.run_judge(session(idle_min=59, claims=[(REPO, "7026")], owned=[wt("a")]), {"7026": AGENT_MINE})
+        self.assertEqual((calls, rec["state"], rec["reasons"]), ([], "WORKING", ["idle:59<60min"]))
+        rec, calls = self.run_judge(session(kind="bg", name="loop #7026 x", idle_min=10))
+        self.assertEqual((calls, rec["state"]), ([], "WORKING"))
+        self.assertEqual(rec["claims"][0]["source"], "name")  # the loop's #N is listed, unread
+
+    def test_the_done_grace_threshold_decides_when_the_oracle_is_read(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        facts = transcript(tmp)  # a session that said SESSION-DONE
+        for grace in ("shadow", "off"):  # the grace is not live: IDLE_MINUTES holds
+            rec, calls = self.run_judge(session(idle_min=10, claims=[(REPO, "6000")], **facts), {"6000": CLOSED},
+                                        DONE_GRACE=grace)
+            self.assertEqual(calls, [])
+        rec, calls = self.run_judge(session(idle_min=10, claims=[(REPO, "6000")], **facts), {"6000": CLOSED},
+                                    DONE_GRACE="apply")
+        self.assertEqual((calls, rec["state"]), ([("brief", "6000")], "DONE"))  # past the 5 minute grace
+
+    def test_a_session_idle_long_enough_is_read_and_judged_as_before(self):
+        rec, calls = self.run_judge(session(claims=[(REPO, "7026")]), {"7026": AGENT_MINE})
+        self.assertEqual((calls, rec["state"], rec["claims"][0]["mine"]), ([("brief", "7026")], "WORKING", True))
+        self.assertNotIn("read", rec["claims"][0])
+        rec, calls = self.run_judge(session(claims=[(REPO, "6000")]), {"6000": CLOSED})
+        self.assertEqual((calls, rec["state"]), ([("brief", "6000")], "DONE"))
+        rec, calls = self.run_judge(session(), named=None)  # no branch claim: the named-issue lookup is asked
+        self.assertEqual(calls, [("named",)])
+
+    def test_judge_all_judges_the_candidates_first_longest_idle_first_and_returns_input_order(self):
+        order = []
+        sessions = [session(sid="b", name="b", status="busy", idle_min=900, claims=[(REPO, "1")]),
+                    session(sid="y", name="y", idle_min=30, claims=[(REPO, "2")]),
+                    session(sid="m", name="m", idle_min=100, claims=[(REPO, "3")]),
+                    session(sid="o", name="o", idle_min=300, claims=[(REPO, "4")])]
+        with mock.patch.object(reaper, "oracle_brief", side_effect=lambda r, n, c, now: order.append(str(n))), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "oracle_json", return_value=None), \
+             mock.patch.object(reaper, "oracle_claims", return_value=[]):
+            recs = ss.judge_all(reaper, sessions, CFG, NOW, workers=1)
+        self.assertEqual(order, ["4", "3"])  # only the two candidates, 300 minutes idle before 100
+        self.assertEqual([x["sid"] for x in recs], ["b", "y", "m", "o"])
+
+
 class ClaimStepTrailer(unittest.TestCase):
     """claim_step reads the deciding line before the oracle's trailer (stima-api#7061: `loop #3041 check-by` stayed UNKNOWN)."""
     HEAD = ("delivery #9: serving-verified (none) -> wait check-by  [abc]\n  then acceptance: ...\n"
