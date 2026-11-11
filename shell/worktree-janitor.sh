@@ -1328,7 +1328,9 @@ _cc_wj_scan_claude_sessions() {
     row="$(_cc_wj_claude_record_row "$f" "$base")" || rr=$?
     # A record a session is still rewriting stays torn longer than the reads above wait: one more
     # read a second later, at most five per sweep so broken records cannot slow it (stima-api#7904).
-    if [ "$rr" -eq 1 ] && [ "${_CC_WJ_RECORD_SETTLES:-0}" -lt 5 ]; then
+    # Not inside a command substitution (the per-tree trim runs there): its count would be lost,
+    # and every tree would pay the wait.
+    if [ "$rr" -eq 1 ] && [ "${BASH_SUBSHELL:-0}" -eq 0 ] && [ "${_CC_WJ_RECORD_SETTLES:-0}" -lt 5 ]; then
       _CC_WJ_RECORD_SETTLES=$(( ${_CC_WJ_RECORD_SETTLES:-0} + 1 ))
       sleep 1
       rr=0

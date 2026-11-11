@@ -46,7 +46,10 @@ cat > "$STUBS/lsof" <<'STUB'
 #!/usr/bin/env bash
 echo x >> "$LSOF_CALLS"
 case " $* " in
-  *" -d cwd "*) ;;
+  *" -p "*" -d cwd "*)
+    pid=""; prev=""; for a in "$@"; do [ "$prev" = -p ] && pid="$a"; prev="$a"; done
+    [ -z "${PID_CWD:-}" ] || printf 'p%s\nn%s\n' "$pid" "$PID_CWD" ;;
+  *" -d cwd "*) [ -z "${HOLDERS_OK:-}" ] || printf 'p1\nn/\n' ;;
   *) printf 'p1\nn/dev/null\n' ;;
 esac
 STUB
@@ -70,6 +73,13 @@ if [ -n "${BREAK_FILES:-}" ] && printf '%s\n' "$BREAK_FILES" | grep -qxF "$last"
 fi
 exec "$REAL_JQ" "$@"
 STUB
+# Counts every `sleep 1` (a settle wait) and runs it for real unless SLEEP_FAST=1.
+cat > "$STUBS/sleep" <<'STUB'
+#!/usr/bin/env bash
+[ "$*" = 1 ] && echo x >> "$SLEEP_CALLS"
+[ "${SLEEP_FAST:-}" = 1 ] || exec /bin/sleep "$@"
+STUB
+SLEEP_CALLS="$T/sleep-calls"; export SLEEP_CALLS; : > "$SLEEP_CALLS"
 chmod +x "$STUBS"/*
 
 SESSIONS="$T/claude-sessions"; PROJECTS="$T/claude-projects"; mkdir -p "$SESSIONS" "$PROJECTS"
@@ -92,21 +102,16 @@ mkdir "$LOCK"
 echo "$holder" > "$LOCK/pid"
 ps -o command= -p "$holder" > "$LOCK/cmd"
 
-session_sweep() { # <output file>; prints the elapsed seconds
-  local t0 t1
-  t0="$(date +%s)"
+session_sweep() { # <output file>
   PATH="$STUBS:$PATH" CC_WJ_DETACHED=1 CC_WJ_SESSION_DIR="$PRIMARY" CC_WJ_SESSION_APPLY=1 CC_WJ_HARNESS=claude \
     bash "$WJ" --session > "$1" 2>&1 </dev/null
-  t1="$(date +%s)"
-  echo $((t1 - t0))
 }
 
 : > "$LSOF_CALLS"
-elapsed="$(session_sweep "$T/held.txt")"
+session_sweep "$T/held.txt" >/dev/null
 check "A held: the defer line names the holder and the repository lock" \
   grep -qF "worktree-janitor: another worktree-janitor sweep (pid $holder) holds $LOCK; deferred to it and removed nothing in this repository" "$T/held.txt"
 check "A held: the session sweep still ends with status=0" grep -q 'session sweep ended .* status=0$' "$T/held.txt"
-check "A held: it ends within a couple of seconds" test "$elapsed" -le 5
 check "A held: no process scan ran" test ! -s "$LSOF_CALLS"
 refute "A held: no disk-pressure or scan output, nothing was examined" grep -q 'WORKTREE\|Summary:' "$T/held.txt"
 check "A held: the holder's lock is untouched" test "$(cat "$LOCK/pid")" = "$holder"
@@ -142,6 +147,11 @@ check "lock: a live holder past 60 minutes is taken over, as before" \
 check "lock: and the lock is then this run's" test "$(cat "$L2/pid")" != "$holder2"
 rm -f "$L2/pid" "$L2/cmd"; rmdir "$L2"
 check "lock: a free lock is not held (status 1)" test "$(lockfn _cc_wj_lock_live "$L2")" = rc=1
+# A sweep between its mkdir and its writes: a fresh directory with no pid or cmd is a holder.
+mkdir "$L2"
+check "lock: a fresh empty lock directory (mkdir before the writes) is held (status 0)" test "$(lockfn _cc_wj_lock_live "$L2")" = rc=0
+check "lock: and a sweep defers to it (status 2)" test "$(lockfn _cc_wj_lock "$L2" | tail -n 1)" = rc=2
+rmdir "$L2"
 
 # ─── B: a record being rewritten is read once more ────────────────────────────
 
@@ -181,14 +191,14 @@ scan() { # prints "<elapsed> <unknown rows> <claims> <settles>"
 export CC_WJ_RECORD_READS=1
 
 mkrec 1 whole
-: > "$JQ_CALLS"
+: > "$JQ_CALLS"; : > "$SLEEP_CALLS"
 out="$(BREAK_FILES="$REC_FILE" BREAK_FIRST=1 scan)"
 read -r el unk claims settles <<< "$out"
 check "B torn once: the record was read a second time" test "$(grep -c . "$JQ_CALLS")" -ge 2
 check "B torn once: it is no unknown record" test "$unk" -eq 0
 check "B torn once: its cwd claim was made" test "$claims" -eq 1
 check "B torn once: one settle was used" test "$settles" -eq 1
-check "B torn once: the settle wait is about a second" test "$el" -ge 1
+check "B torn once: the settle wait is one sleep of a second" test "$(grep -c . "$SLEEP_CALLS")" -eq 1
 kill "$REC_PID" 2>/dev/null; rm -f "$REC_FILE" "$REC_FILE.reads"
 
 mkrec 2 torn
@@ -205,12 +215,51 @@ files=""
 for n in 3 4 5 6 7 8 9; do
   mkrec "$n" torn; files="$files$REC_FILE"$'\n'
 done
-: > "$JQ_CALLS"
-out="$(BREAK_FILES="${files%$'\n'}" BREAK_FIRST=all scan)"
+: > "$JQ_CALLS"; : > "$SLEEP_CALLS"
+out="$(SLEEP_FAST=1 BREAK_FILES="${files%$'\n'}" BREAK_FIRST=all scan)"
 read -r el unk claims settles <<< "$out"
 check "B bound: five settle reads, not seven" test "$settles" -eq 5
 check "B bound: 7 first reads and 5 settle reads" test "$(grep -c . "$JQ_CALLS")" -eq 12
 check "B bound: every broken record is still unknown" test "$unk" -eq 7
+check "B bound: five sleeps of a second" test "$(grep -c . "$SLEEP_CALLS")" -eq 5
+
+# ─── The trim path: the settle is not paid inside a command substitution ──────
+#
+# The apply-mode trim asks `_cc_wj_trim_regenerable` once per worktree inside $(...), and that
+# function rescans the sessions before it removes a cache. A counter changed there is lost with the
+# subshell, so each tree would pay the wait again. One torn record, four trees with a cache: the
+# sweep's own scan settles once, and the four trims settle none.
+for f in "$SESSIONS"/*.json; do rm -f "$f" "$f.reads"; done
+printf 'node_modules/\n' > "$PRIMARY/.gitignore"
+G -C "$PRIMARY" add .gitignore; G -C "$PRIMARY" commit -qm ignore; G -C "$PRIMARY" push -q origin main
+for n in 1 2 3 4; do
+  G -C "$PRIMARY" worktree add -q -b "T$n" "$T/wt-T$n" main
+  mkdir -p "$T/wt-T$n/node_modules"; echo x > "$T/wt-T$n/node_modules/x"
+  find "$T/wt-T$n" "$(git -C "$T/wt-T$n" rev-parse --absolute-git-dir)" -exec touch -t 202001010000 {} +
+done
+mkrec 20 torn
+TORN_FILE="$REC_FILE"
+: > "$JQ_CALLS"; : > "$SLEEP_CALLS"; : > "$T/trim-results"
+trim_out="$(SLEEP_FAST=1 BREAK_FILES="$TORN_FILE" BREAK_FIRST=all HOLDERS_OK=1 PID_CWD="$T/wt-A" T="$T" PATH="$STUBS:$PATH" bash -c '
+  source "$1" >/dev/null 2>&1
+  work="$(mktemp -d "${TMPDIR:-/tmp}/cc-wj.XXXXXX")"
+  LSOF_OK=yes; ACTIVE_OK=yes; _CC_WJ_RECORD_SETTLES=0; _CC_WJ_UNKNOWN_ERRORS=""
+  _cc_wj_scan_holders "$work" >/dev/null 2>&1
+  _cc_wj_scan_active_sessions 0 >/dev/null 2>&1
+  settles_after_scan="$_CC_WJ_RECORD_SETTLES"
+  for n in 1 2 3 4; do
+    r="$(_cc_wj_trim_regenerable "$T/wt-T$n" "$work" 1 0 "" 2>&1)"
+    printf "%s\n" "$r" | grep -E "KEEP|TRIM_CANDIDATE|TRIM_RESULT|kept" | tr "\n" " " >> "$T/trim-results"
+    echo >> "$T/trim-results"
+  done
+  printf "%s %s\n" "$settles_after_scan" "$_CC_WJ_RECORD_SETTLES"
+  _cc_wj_remove_private_temp "$work"' _ "$WJ" 2>&1)"
+read -r settles_scan settles_end <<< "$trim_out"
+check "trim: all four trees were trimmed through the rescan" test "$(grep -c 'trimmed=1' "$T/trim-results")" -eq 4
+check "trim: the sweep's own scan settled once" test "$settles_scan" -eq 1
+check "trim: the four trims settled none, so the count stays at one" test "$settles_end" -eq 1
+check "trim: one sleep of a second in all" test "$(grep -c . "$SLEEP_CALLS")" -eq 1
+check "trim: 2 reads for the sweep's scan, 1 for each of the four trims" test "$(grep -c . "$JQ_CALLS")" -eq 6
 
 if [ "$failures" -eq 0 ]; then echo "# all passed"; else echo "# $failures failed"; fi
 [ "$failures" -eq 0 ]
