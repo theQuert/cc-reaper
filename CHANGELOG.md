@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Removed
+- **`session-reaper.py` and `session_state.py` no longer read stall marks (stima-api #7904).** `stall-watch.py` was retired
+  and nothing writes `STALL_MARK_DIR/<session id>.json`, so the `stalled:<fingerprint>` keep reason, `stall_mark()` and
+  the `STALL_MARK_*` keys are gone; a leftover key in an installed conf is ignored.
+
 ### Added
 - **worktree-janitor: evidence that has expired no longer keeps a landed idle tree (stima-api #7895).** After #7881 the
   installed janitor still kept 67 of 137 trees as unrebuildable, most for files under `.codex/evidence/` that the
@@ -131,7 +136,7 @@
   With `STALL_APPLY=1` it appends one `## EL-T801-CI-HARDEN STALL <session>` block per (pane,
   fingerprint, session id) event to the inbox with the `claude --resume <id> --remote-control <name>`
   recovery command; with apply on it writes a mark (bounded from the event's first sighting) that
-  `session-reaper.py` shows as `stalled:<fingerprint>` and keeps. Fingerprints match only Claude Code's own
+  `session-reaper.py` showed as `stalled:<fingerprint>` and kept (retired 2026-11-12, see Removed). Fingerprints match only Claude Code's own
   line shapes, and a failed tmux read keeps the earlier state. It never types into a pane (#5212): only `display` and `capture-pane` are reachable.
 
 ### Fixed

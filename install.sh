@@ -704,7 +704,7 @@ for AGENT in $CC_RETIRED_AGENTS; do
       { [ ! -e "$RETIRED_PLIST" ] || launchctl unload "$RETIRED_PLIST" >/dev/null 2>&1; } || true
     rm -f "${PLIST_DIR:?}/$RETIRED_LABEL.plist"
     if launchctl print "$AGENT_UI/$RETIRED_LABEL" >/dev/null 2>&1; then
-      echo "  retired agent $RETIRED_LABEL (still loaded: bootout and unload refused; plist removed)"
+      echo "  retired agent $RETIRED_LABEL (still loaded after bootout; plist removed)"
     else
       echo "  retired agent $RETIRED_LABEL (booted out, plist removed)"
     fi

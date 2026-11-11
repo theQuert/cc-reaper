@@ -870,7 +870,7 @@ model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper
   `no-df-output`, `no-ssh-key`, ...), never the command's output, told only after
   `GDW_UNREADABLE_ROUNDS` (2) such reads in a row; until then the host keeps its previous kind and the
   log shows `fails=<n>/<rounds>`. A host in `GDW_KNOWN_UNREADABLE` (shipped: stima-ci-1,
-  stima-ci-2, stima-ci-3 and stima-ci-deploy-1, whose reads are refused) is read every round but never told
+  stima-ci-2, stima-ci-3, stopped runner instances, and stima-ci-deploy-1, refused by OS Login) is read every round but never told
   `unreadable` (logged `known-unreadable`); its last confirmed `disk-high` stays, and re-alerts, until a
   read shows it clear. gcloud runs only when `GDW_SSH_KEY` (`~/.ssh/google_compute_engine`)
   and its `.pub` exist, so it never generates a key or writes metadata. One bad host, or one damaged
