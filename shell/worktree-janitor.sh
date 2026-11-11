@@ -1326,6 +1326,14 @@ _cc_wj_scan_claude_sessions() {
     # neither, every tree.
     rr=0
     row="$(_cc_wj_claude_record_row "$f" "$base")" || rr=$?
+    # A record a session is still rewriting stays torn longer than the reads above wait: one more
+    # read a second later, at most five per sweep so broken records cannot slow it (stima-api#7904).
+    if [ "$rr" -eq 1 ] && [ "${_CC_WJ_RECORD_SETTLES:-0}" -lt 5 ]; then
+      _CC_WJ_RECORD_SETTLES=$(( ${_CC_WJ_RECORD_SETTLES:-0} + 1 ))
+      sleep 1
+      rr=0
+      row="$(_cc_wj_claude_record_row "$f" "$base")" || rr=$?
+    fi
     if [ "$rr" -eq 3 ]; then continue; fi
     if [ "$rr" -ne 0 ]; then
       _cc_wj_unparsed_claim "$f" "$base" "$projects" && continue
@@ -4817,36 +4825,49 @@ _cc_wj_lock_write() {
   ps -o command= -p "${_CC_WJ_RUN_PID:-$$}" > "$1/cmd" 2>/dev/null
 }
 
-_cc_wj_lock() { # <lock dir> [scope, default "in this repository"]
-  local lock="$1" scope="${2:-in this repository}" holder recorded live=0
-  if mkdir "$lock" 2>/dev/null; then
-    _cc_wj_lock_write "$lock"
-    return 0
-  fi
-  holder="$(cat "$lock/pid" 2>/dev/null)"
+# Whether $1 is held by a live sweep, read-only: sets _CC_WJ_LOCK_HOLDER. Status 0: held and
+# younger than 60 minutes; 2: held but past 60 minutes (to be taken over); 1: not held.
+_cc_wj_lock_live() { # <lock dir>
+  local lock="$1" recorded live=0
+  _CC_WJ_LOCK_HOLDER="$(cat "$lock/pid" 2>/dev/null)"
   recorded="$(cat "$lock/cmd" 2>/dev/null)"
   # Alive and still running the command recorded when it took the lock. Matching on a name
   # instead took over a sweep started through a symlink, and kept a pid the kernel had
   # handed to anything whose command line happened to contain it.
-  if [ -n "$holder" ] && [ -n "$recorded" ] &&
-     [ "$(ps -o command= -p "$holder" 2>/dev/null)" = "$recorded" ]; then
+  if [ -n "$_CC_WJ_LOCK_HOLDER" ] && [ -n "$recorded" ] &&
+     [ "$(ps -o command= -p "$_CC_WJ_LOCK_HOLDER" 2>/dev/null)" = "$recorded" ]; then
     live=1
-  elif [ -d "$lock" ] && { [ -z "$holder" ] || [ -z "$recorded" ]; } &&
+  elif [ -d "$lock" ] && { [ -z "$_CC_WJ_LOCK_HOLDER" ] || [ -z "$recorded" ]; } &&
        [ -z "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
     # A sweep between its mkdir and its writes. Only a directory can be that: when mkdir
     # failed and nothing is there - an unwritable or missing parent - `find` prints nothing
     # either, and this branch used to read that as a holder and defer.
     live=1
   fi
-  if [ "$live" -eq 1 ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
-    echo "worktree-janitor: pid ${holder:-?} has held $lock for over 60 minutes; taking it over"
-    live=0
+  [ "$live" -eq 1 ] || return 1
+  [ -z "$(find "$lock" -maxdepth 0 -mmin +60 2>/dev/null)" ] || return 2
+  return 0
+}
+
+_cc_wj_lock_deferred_line() { # <lock dir> <holder> <scope>
+  echo "worktree-janitor: another worktree-janitor sweep${2:+ (pid $2)} holds $1; deferred to it and removed nothing $3"
+}
+
+_cc_wj_lock() { # <lock dir> [scope, default "in this repository"]
+  local lock="$1" scope="${2:-in this repository}" live_rc=0
+  if mkdir "$lock" 2>/dev/null; then
+    _cc_wj_lock_write "$lock"
+    return 0
+  fi
+  _cc_wj_lock_live "$lock" || live_rc=$?
+  if [ "$live_rc" -eq 2 ]; then
+    echo "worktree-janitor: pid ${_CC_WJ_LOCK_HOLDER:-?} has held $lock for over 60 minutes; taking it over"
   fi
   # 2, not 1: a live holder is another removal or trim sweep of this repository, so this run
   # leaves the repository to it and to the next sweep rather than failing. Counting the
   # deferral as a failure put 14 false `status=1` lines in one day's session log (2026-09-23).
-  if [ "$live" -eq 1 ]; then
-    echo "worktree-janitor: another worktree-janitor sweep${holder:+ (pid $holder)} holds $lock; deferred to it and removed nothing $scope"
+  if [ "$live_rc" -eq 0 ]; then
+    _cc_wj_lock_deferred_line "$lock" "$_CC_WJ_LOCK_HOLDER" "$scope"
     return 2
   fi
   rm -f "$lock/pid" "$lock/cmd" 2>/dev/null
@@ -6313,6 +6334,7 @@ _cc_wj_run() {
   [ "$scheduled" -eq 1 ] && [ "${CC_WJ_SCHEDULE_APPLY-}" = 1 ] && applying=1
   # One id for both phases of a sweep, so spot-check records of one run can be read together.
   _CC_WJ_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  _CC_WJ_RECORD_SETTLES=0
   if [ "$scheduled" -eq 1 ]; then
     _cc_wj_bound_log "$HOME/.cc-reaper/logs/launchd-worktree-janitor-stdout.log"
     _cc_wj_bound_log "$HOME/.cc-reaper/logs/launchd-worktree-janitor-stderr.log"
@@ -6517,11 +6539,21 @@ _cc_wj_session() {
       echo "worktree-janitor: the hook input's cwd ${CC_WJ_SESSION_CWD} does not resolve, so this session's worktree is unknown; reporting only"
       apply_flag=""
     fi
-    # Out of every worktree, so this sweep's own working directory holds none of them.
-    cd / || true
-    CC_WJ_KEEP_PATH="$dir${cwd:+
+    # The repository lock is probed before any scan, as the scheduled sweep's host lock is: 142 of
+    # 164 session sweeps in 32 hours ran the process, transcript and session scans (64 s on
+    # average) and then deferred to a sweep that held this lock, removing nothing
+    # (stima-api#7904). A holder that is gone a moment later only costs the next sweep the tree.
+    local lock_live=0
+    [ -z "$apply_flag" ] || _cc_wj_lock_live "$common/cc-reaper-worktree-janitor.lock" || lock_live=$?
+    if [ -n "$apply_flag" ] && [ "$lock_live" -eq 0 ]; then
+      _cc_wj_lock_deferred_line "$common/cc-reaper-worktree-janitor.lock" "$_CC_WJ_LOCK_HOLDER" "in this repository"
+    else
+      # Out of every worktree, so this sweep's own working directory holds none of them.
+      cd / || true
+      CC_WJ_KEEP_PATH="$dir${cwd:+
 $cwd}${CC_WJ_SESSION_DIR:+
 $CC_WJ_SESSION_DIR}" _cc_wj_run --repo "$main" $apply_flag || rc=$?
+    fi
   fi
   echo "== worktree-janitor session sweep ended $(date '+%Y-%m-%dT%H:%M:%S%z') elapsed=$(( $(date +%s) - t0 ))s free_before=$(_cc_wj_gib "$free0") free_after=$(_cc_wj_gib "$(_cc_wj_free_kb)") status=$rc"
   return 0
