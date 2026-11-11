@@ -11,7 +11,9 @@ jobs:
     # The scripts target macOS (BSD stat, launchd), so the suites run there. The repository is public:
     # GitHub-hosted minutes are free. Add a suite here when a PR changes the script it covers.
     runs-on: macos-latest
-    timeout-minutes: 30
+    # The suites took 29 to 30 minutes on 2026-11-11 (disk-janitor alone 637 s), so 30 cancelled every other
+    # run at the last steps; 45 leaves room, and a suite that hangs is still cut.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: git identity for fixture repositories
@@ -58,6 +60,8 @@ jobs:
         run: bash tests/worktree-janitor-unknown-session.sh
       - name: worktree-janitor-evidence-expiry
         run: bash tests/worktree-janitor-evidence-expiry.sh
+      - name: worktree-janitor-sweep-lock-first
+        run: bash tests/worktree-janitor-sweep-lock-first.sh
       - name: worktree-active-sessions
         run: bash tests/worktree-active-sessions.sh
       - name: resource-watch
