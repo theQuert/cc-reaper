@@ -3488,7 +3488,8 @@ _cc_wj_evidence_slug() { # <worktree>
 
 # The issue number an entry name leads with, printed; status 1 when there is none that can be
 # trusted: no leading digits, more than six, a leading zero, a letter right after them
-# (`3rdparty`), or a date (`2026-11-11-notes`) - a wrong number would ask about another issue.
+# (`3rdparty`), or a date (`2026-11-11-notes`, `2026_11_04-run`, `2026.11.04`, `2026-11`: digits, one of
+# `-_.`, two more digits) - a wrong number would ask about another issue.
 _cc_wj_evidence_issue() { # <top-level entry name>
   local n="$1" d rest
   d="${n%%[!0-9]*}"
@@ -3496,23 +3497,27 @@ _cc_wj_evidence_issue() { # <top-level entry name>
   case "$d" in 0*) return 1 ;; esac
   rest="${n#"$d"}"
   case "$rest" in ''|[-_.\ ]*) ;; *) return 1 ;; esac
-  case "$n" in [0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]*) return 1 ;; esac
+  case "$rest" in [-_.][0-9][0-9]*) return 1 ;; esac
   printf '%s\n' "$d"
 }
 
 # State of issue $2 of repository $1 (`owner/repo`): closed, open or unknown, printed.
 # `gh api repos/OWNER/REPO/issues/N --jq .state` under a timeout; only exactly `closed` frees
 # anything. Asked once per run and issue when the sweep set $_CC_WJ_EVIDENCE_CACHE_DIR, failures
-# included, so a slow or rate-limited API costs one wait, not one per tree.
+# included, so a slow or rate-limited API costs one wait, not one per tree; after the first timeout
+# of a run every later lookup answers unknown at once (the `timed-out` marker in the cache dir).
 _cc_wj_evidence_issue_state() { # <owner/repo> <number>
-  local key="$1#$2" f="" out secs
+  local key="$1#$2" f="" out secs rc=0
   if [ -n "${_CC_WJ_EVIDENCE_CACHE_DIR:-}" ] && [ -d "$_CC_WJ_EVIDENCE_CACHE_DIR" ]; then
     f="$_CC_WJ_EVIDENCE_CACHE_DIR/$(printf '%s' "$key" | cksum | tr ' ' '-')"
     if [ -f "$f" ] && [ "$(sed -n 1p "$f")" = "$key" ]; then sed -n 2p "$f"; return 0; fi
+    if [ -e "$_CC_WJ_EVIDENCE_CACHE_DIR/timed-out" ]; then printf 'unknown\n'; return 0; fi
   fi
   secs="$(_cc_wj_seconds "${CC_WJ_EVIDENCE_GH_TIMEOUT_SECONDS:-30}")" || secs=30
   if command -v gh >/dev/null 2>&1; then
-    out="$(_cc_wj_with_timeout "$secs" gh api --hostname github.com "repos/$1/issues/$2" --jq .state 2>/dev/null)" || out=""
+    out="$(_cc_wj_with_timeout "$secs" gh api --hostname github.com "repos/$1/issues/$2" --jq .state 2>/dev/null)" || rc=$?
+    [ "$rc" -eq 0 ] || out=""
+    if [ "$rc" -eq 124 ] && [ -n "$f" ]; then : > "$_CC_WJ_EVIDENCE_CACHE_DIR/timed-out" 2>/dev/null || true; fi
   else
     out=""
   fi

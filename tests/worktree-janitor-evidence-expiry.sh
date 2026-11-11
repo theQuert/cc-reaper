@@ -79,10 +79,17 @@ mkwt "$PRIMARY" ev-open;     evid ev-open 103 "$LONG"; evid ev-open 104 "$LONG"
 mkwt "$PRIMARY" ev-young;    evid ev-young 105 "$LONG"; put ev-young .codex/evidence/105/late.txt "$YOUNG"
 mkwt "$PRIMARY" ev-nonum;    evid ev-nonum 107 "$LONG"; evid ev-nonum scratch "$LONG"
 mkwt "$PRIMARY" ev-date;     evid ev-date 2026-11-11-notes "$LONG"
+mkwt "$PRIMARY" ev-date-us;  evid ev-date-us 2026_11_04-run "$LONG"
+mkwt "$PRIMARY" ev-date-dot; evid ev-date-dot 2026.11.04 "$LONG"
+mkwt "$PRIMARY" ev-date-ym;  evid ev-date-ym 2026-11 "$LONG"
 mkwt "$PRIMARY" ev-letter;   evid ev-letter 3rdparty "$LONG"
 mkwt "$PRIMARY" ev-cred;     evid ev-cred 108 "$LONG"; put ev-cred .codex/evidence/108/.env "$LONG"
 mkwt "$PRIMARY" ev-ghfail;   evid ev-ghfail 109 "$LONG"
 mkwt "$PRIMARY" ev-timeout;  evid ev-timeout 110 "$LONG"
+mkwt "$PRIMARY" ev-timeout2; evid ev-timeout2 111 "$LONG"
+# Expired evidence, but the branch holds a commit main does not: not landed, so nothing may reach it.
+mkwt "$PRIMARY" ev-unlanded; evid ev-unlanded 101 "$LONG"
+echo more > "$T/wt-ev-unlanded/unlanded.txt"; G -C "$T/wt-ev-unlanded" add unlanded.txt; G -C "$T/wt-ev-unlanded" commit -qm unlanded
 mkwt "$PRIMARY" ev-mixed;    evid ev-mixed 101 "$LONG"; put ev-mixed stray.db "$LONG"
 mkwt "$PRIMARY" ev-live;     evid ev-live 101 "$LONG"
 mkwt "$PRIMARY" ev-skills;   evid ev-skills 101 "$LONG"
@@ -194,6 +201,13 @@ keeps() { # <report file> <label> <how a live session shows: shadow reverts to t
   check "$l: a name with no issue number keeps it" judged "$r" ev-nonum "KEEP(unrebuildable=1)"
   check "  and the report names the entry" says "$r" ev-nonum "no issue number in the name .codex/evidence/scratch"
   check "$l: a date-like name is no issue number" says "$r" ev-date "no issue number in the name .codex/evidence/2026-11-11-notes"
+  for d in us dot ym; do
+    check "$l: a date written with underscores, dots or only a month (ev-date-$d) is no issue number" \
+      judged "$r" "ev-date-$d" "KEEP(unrebuildable=1)"
+  done
+  check "  and the report names the entry" says "$r" ev-date-us "no issue number in the name .codex/evidence/2026_11_04-run"
+  check "$l: a tree not landed on main stays kept with its evidence expired" \
+    bash -c 'grep -A3 -F "wt-ev-unlanded" "$1" | grep -qE "^    classification: KEEP\("' _ "$r"
   check "$l: a name whose digits run into a letter is no issue number" says "$r" ev-letter "no issue number in the name .codex/evidence/3rdparty"
   check "$l: a credential-shaped file keeps it" judged "$r" ev-cred "KEEP(unrebuildable=1)"
   check "  and the report says so" says "$r" ev-cred "a credential-shaped file under .codex/evidence"
@@ -204,16 +218,20 @@ keeps() { # <report file> <label> <how a live session shows: shadow reverts to t
   check "$l: a live session in it keeps it" judged "$r" ev-live "$live"
 }
 keeps "$T/report-shadow.txt" shadow "KEEP(unrebuildable=1)"
-for n in open young nonum date letter cred ghfail timeout nongh mixed live; do
+for n in open young nonum date date-us date-dot date-ym letter cred ghfail timeout timeout2 nongh mixed live unlanded; do
   refute "shadow: ev-$n is not logged" logged "ev-$n"
 done
 
 # A lookup that outlasts its bound keeps the tree: one run with 110 hanging and a 2 s bound.
-issue 110 hang
+# Two distinct issues hang (110, 111): the first costs the bound, the second is answered unknown at once.
+issue 110 hang; issue 111 hang; : > "$GH_LOG"
 CC_WJ_EVIDENCE_GH_TIMEOUT_SECONDS=2 CC_WJ_EVIDENCE_EXPIRY_MODE=apply wj > "$T/report-timeout.txt"
 check "a timed-out issue lookup keeps the tree" says "$T/report-timeout.txt" ev-timeout "issue acme/widgets#110 is unknown"
+check "  and so does the tree of the second hanging issue" says "$T/report-timeout.txt" ev-timeout2 "issue acme/widgets#111 is unknown"
+check "after the first timeout the run asks no further issue (one hanging call in all)" \
+  test "$(( $(issue_calls 110) + $(issue_calls 111) ))" -eq 1
 check "  and does not hold up the tree whose issue answered" judged "$T/report-timeout.txt" ev-closed REMOVABLE
-rm -f "$GH_STATE/acme_widgets_issues_110"
+rm -f "$GH_STATE/acme_widgets_issues_110" "$GH_STATE/acme_widgets_issues_111"
 
 # ─── off ─────────────────────────────────────────────────────────────────────
 
@@ -239,6 +257,7 @@ refute "apply: nothing is logged to the spot-check log" logged ev-closed
 check "apply: a newest file 7 days old (ev-edge) is old enough" judged "$T/report-apply.txt" ev-edge REMOVABLE
 check "apply: and 6 days (ev-young) is not" judged "$T/report-apply.txt" ev-young "KEEP(unrebuildable=1)"
 keeps "$T/report-apply.txt" apply "KEEP(active-session)"
+check "apply: that tree is kept as not landed" judged "$T/report-apply.txt" ev-unlanded "KEEP(unlanded)"
 check "apply: an issue is asked once per run" test "$(issue_calls 101)" -eq 1
 
 # ─── per-rule promotion ──────────────────────────────────────────────────────
@@ -295,7 +314,12 @@ mutant age ev-young apply \
 mutant no-number ev-nonum apply \
   '      { _CC_WJ_EVIDENCE_WHY="no issue number in the name $root/$name"; return 1; }' '      num=1'
 mutant date-name ev-date apply \
-  'case "$n" in [0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]*) return 1 ;; esac' ':'
+  'case "$rest" in [-_.][0-9][0-9]*) return 1 ;; esac' ':'
+for sep in us dot ym; do
+  mutant "date-sep-$sep" "ev-date-$sep" apply \
+    'case "$rest" in [-_.][0-9][0-9]*) return 1 ;; esac' \
+    'case "$n" in [0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]*) return 1 ;; esac'
+done
 mutant credential ev-cred apply \
   'if _cc_wj_find_credential "$wt/$root" "" all; then' 'if false; then' \
   '*"holds a newline"*|*"could not be listed for the copy"*|*"credential-shaped"*|' '*"holds a newline"*|*"could not be listed for the copy"*|'
@@ -315,6 +339,23 @@ mutant mode-off ev-closed off \
 mutant promotion skills-only spotcheck \
   $'  case "$list" in *" $1 "*) return 0 ;; esac\n  return 1\n}' $'  return 0\n}'
 
+# The timeout marker is what spares the second hanging issue its wait: without it both issues are asked.
+python3 - "$WJ" "$T/mutant-marker.sh" <<'PY'
+import sys
+s = open(sys.argv[1]).read()
+old = """    if [ -e "$_CC_WJ_EVIDENCE_CACHE_DIR/timed-out" ]; then printf 'unknown\\n'; return 0; fi\n"""
+if s.count(old) != 1: sys.exit("marker line not found exactly once")
+open(sys.argv[2], "w").write(s.replace(old, ""))
+PY
+rc=$?
+if [ "$rc" -ne 0 ]; then nok "mutant timeout-marker could not be built"; else
+  issue 110 hang; issue 111 hang; : > "$GH_LOG"
+  WJS="$T/mutant-marker.sh" CC_WJ_EVIDENCE_GH_TIMEOUT_SECONDS=2 CC_WJ_EVIDENCE_EXPIRY_MODE=apply wj > "$T/mutant-marker.txt"
+  if [ "$(( $(issue_calls 110) + $(issue_calls 111) ))" -eq 2 ]; then ok "mutant timeout-marker is killed: both hanging issues are asked without the marker"
+  else nok "mutant timeout-marker survives: the second hanging issue was not asked"; fi
+  issue 110 fail; issue 111 fail
+fi
+
 # ─── apply --apply: removal, copy first, the rest untouched ──────────────────
 
 : > "$SPOT"
@@ -327,7 +368,7 @@ check "  and the record the archive: line can copy was copied first" \
   bash -c 'find "$1" -name result.json -path "*ev-closed*" | grep -q result.json && find "$1" -name n.txt | grep -q n.txt' _ "$T/archive"
 refute "  and the file it cannot copy was not" bash -c 'find "$1" -name big.bin | grep -q .' _ "$T/archive"
 check "  and the other trees stay" \
-  bash -c 'for n in open young nonum date letter cred ghfail timeout mixed live skills; do [ -d "$1/wt-ev-$n" ] || exit 1; done' _ "$T"
+  bash -c 'for n in open young nonum date date-us date-dot date-ym letter cred ghfail timeout timeout2 mixed live skills unlanded; do [ -d "$1/wt-ev-$n" ] || exit 1; done' _ "$T"
 check "  and a tree on another remote stays" test -d "$T/wt-ev-nongh"
 check "--apply: the janitor says what it freed" grep -qF "rule-effect: evidence-expired (decided: freed) trees=3 " "$T/apply-apply.txt"
 refute "  and the rule logged nothing in apply mode" grep -qF "rule=evidence-expired" "$SPOT"
