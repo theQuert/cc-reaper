@@ -298,7 +298,7 @@ t_evidence() {
   begin; H="$T/handoffs"; E="$T/helm"
   mkdir -p "$H/i100-old" "$H/i200-open" "$H/i300-fresh" "$H/i400" "$H/notes" "$E/2026-10-01-a" "$E/2026-10-02-b" "$E/2026-10-03-c" "$E/2026-10-04-d" "$T/outside/ev"
   echo x > "$H/i100-old/f"; echo x > "$H/i200-open/f"; echo x > "$H/i300-fresh/f"; echo x > "$H/i400/f"; echo x > "$H/notes/f"; : > "$H/i999.md"
-  echo x > "$E/2026-10-01-a/100-x.md"; echo x > "$E/2026-10-02-b/100-x.md"; echo x > "$E/2026-10-02-b/200-y.md"
+  mkdir -p "$E/2026-10-01-a/100-x" "$E/2026-10-02-b/100-x"; echo x > "$E/2026-10-01-a/100-x/f"; echo x > "$E/2026-10-02-b/100-x/f"; echo x > "$E/2026-10-02-b/200-y.md"
   echo x > "$E/2026-10-03-c/abc.txt"; echo '{"issue": 400}' > "$E/2026-10-04-d/manifest.json"
   echo keep > "$T/outside/ev/f"; ln -s "$T/outside/ev" "$H/i100-link"
   age "$H" 20; age "$E" 20; age "$T/outside" 20
@@ -685,7 +685,7 @@ t_codex() {
   local sd="$1" r=0 C M C1 C2 h x
   begin; codex_fixture; h="$C/helmway-evidence"; x="$C/archived_sessions"
   mkdir -p "$h/2026-11-01-a" "$h/2026-11-02-b" "$h/2026-11-03-c"
-  echo x > "$h/2026-11-01-a/100-x.md"; echo x > "$h/2026-11-02-b/200-y.md"; echo x > "$h/2026-11-03-c/n.txt"
+  mkdir -p "$h/2026-11-01-a/100-x"; echo x > "$h/2026-11-01-a/100-x/f"; echo x > "$h/2026-11-02-b/200-y.md"; echo x > "$h/2026-11-03-c/n.txt"
   cwt clean "$C1"; cwt ahead "ref: refs/heads/feat"; cwt dirty "$C1"; echo u > "$C/worktrees/dirty/repo/untracked"
   cwt held "$C1"; mkdir -p "$C/worktrees/nogit/repo"; echo x > "$C/worktrees/nogit/repo/f"
   echo a > "$x/a.jsonl"; echo h > "$x/held.jsonl"; echo s > "$x/state.sqlite"; echo w > "$x/state.sqlite-wal"
@@ -748,6 +748,32 @@ t_evidence_date_names() {
   [ ! -d "$E/2026-11-07-c" ] || { echo "  i<N> no longer names an issue"; r=1; }
   [ ! -d "$E/2026-11-08-d" ] || { echo "  issue-<N> no longer names an issue"; r=1; }
   [ ! -d "$E/2026-11-09-e" ] || { echo "  #<N> no longer names an issue"; r=1; }
+  return $r
+}
+
+# I-3: a bare number counts only as <N>-<letter> (no leading zero), and in a file name it can keep a
+# directory but never make one removable.
+t_evidence_bare_numbers_keep() {
+  local sd="$1" r=0 E d
+  begin; E="$T/helm"
+  for d in n1 n2 n3 n4 n5 n6; do mkdir -p "$E/2026-11-01-$d"; done
+  echo x > "$E/2026-11-01-n1/notes.md"; echo x > "$E/2026-11-01-n1/0930.log"
+  echo x > "$E/2026-11-01-n2/notes.md"; echo x > "$E/2026-11-01-n2/001.png"
+  echo x > "$E/2026-11-01-n3/2026.md"; echo x > "$E/2026-11-01-n3/2026-Q4.md"
+  echo x > "$E/2026-11-01-n4/404.html"
+  mkdir -p "$E/2026-11-01-n5/0930-run" "$E/2026-11-01-n5/001-x"; echo x > "$E/2026-11-01-n5/0930-run/f"; echo x > "$E/2026-11-01-n5/001-x/f"
+  mkdir -p "$E/2026-11-01-n6/404" "$E/2026-11-01-n6/500-1"; echo x > "$E/2026-11-01-n6/404/f"; echo x > "$E/2026-11-01-n6/500-1/f"
+  mkdir -p "$E/2026-11-01-okdir/930-run" "$E/2026-11-01-okpre"; echo x > "$E/2026-11-01-okdir/930-run/f"; echo x > "$E/2026-11-01-okpre/i930-x.md"
+  printf '930\n1\n2026\n404\n500\n' > "$T/gh.closed"
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HELMWAY_DIR="$E"
+  [ -d "$E/2026-11-01-n1" ] || { echo "  notes.md + 0930.log was read as issue #930 and removed"; r=1; }
+  [ -d "$E/2026-11-01-n2" ] || { echo "  001.png was read as issue #1 and removed"; r=1; }
+  [ -d "$E/2026-11-01-n3" ] || { echo "  2026.md / 2026-Q4.md made a directory removable"; r=1; }
+  [ -d "$E/2026-11-01-n4" ] || { echo "  404.html was read as issue #404 and removed"; r=1; }
+  [ -d "$E/2026-11-01-n5" ] || { echo "  a leading-zero bare number was read as an issue"; r=1; }
+  [ -d "$E/2026-11-01-n6" ] || { echo "  a bare number with no letter after it (404/, 500-1/) was read as an issue"; r=1; }
+  [ ! -d "$E/2026-11-01-okdir" ] || { echo "  control: a bare <N>-slug directory of a closed issue did not remove"; r=1; }
+  [ ! -d "$E/2026-11-01-okpre" ] || { echo "  control: i<N> of a closed issue did not remove"; r=1; }
   return $r
 }
 
@@ -845,7 +871,7 @@ t_scratch_lsof_unknown_keeps t_scratch_default_shadow t_projects t_projects_defa
 t_evidence t_evidence_gh_failure t_dev t_dev_sigkill t_dev_young_keeps t_dev_active_worktree_keeps
 t_dev_merged_worktree_stops t_dev_primary_keeps t_dev_live_session_keeps t_dev_claude_ancestor_keeps
 t_dev_never_kill_keeps t_dev_unknown_keeps t_dev_match_default t_report_forces_shadow t_bad_mode_is_shadow t_defaults t_remove_guards
-t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing t_codex t_codex_lsof_unknown_keeps t_evidence_date_names t_codex_days t_codex_worktree_shapes t_evidence_bare_names t_codex_nested_repo"
+t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing t_codex t_codex_lsof_unknown_keeps t_evidence_date_names t_codex_days t_codex_worktree_shapes t_evidence_bare_names t_evidence_bare_numbers_keep t_codex_nested_repo"
 
 for c in $CASES; do
   if "$c" "$SRC"; then ok "$c"; else nok "$c"; fi
@@ -913,15 +939,18 @@ mutant "go-cache: ignores a running build" $J '1) _cc_dj_ret_report go-cache "$m
 mutant "go-cache: threshold ignores CC_RW_DISK_ACT_GB" $J 'CC_DJ_RET_GOCACHE_ACT_GB:-${CC_RW_DISK_ACT_GB:-40}' 'CC_DJ_RET_GOCACHE_ACT_GB:-40' t_gocache t_defaults
 # 6 evidence
 mutant "evidence: open issue does not keep" $H '        if still:' '        if False:' t_evidence
-mutant "evidence: a directory naming no issue goes" $H '        if not nums:' '        if False:' t_evidence
+mutant "evidence: a directory naming no issue goes" $H '        if not strong:' '        if False:' t_evidence t_evidence_bare_numbers_keep
 mutant "evidence: recent files do not keep" $H '                if days_of(kind) > 0 and newest_within(p, days_of(kind) * 86400):' '                if False:' t_evidence
 mutant "evidence: unknown issue state counts as closed" $H 'closed = closed_issues(a.repo, a.gh, a.limit)' 'closed = closed_issues(a.repo, a.gh, a.limit) or set(range(10**6))' t_evidence_gh_failure
 mutant "evidence: default mode is shadow" $J 'CC_DJ_RET_EVIDENCE_MODE:-apply' 'CC_DJ_RET_EVIDENCE_MODE:-shadow' t_codex t_defaults
 # F1 issue names
-mutant "evidence: the old entry regex reads a date as an issue" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)?" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)?(\d{3,6})(?:[-_.]|$)")' t_evidence_date_names
-mutant "evidence: a date counts as a number" $H '_NOT_DATE = r"(?!(?:19|20)\d{2}[-_.](?:0[1-9]|1[0-2])(?!\d))"' '_NOT_DATE = r""' t_evidence_date_names t_evidence_bare_names
-mutant "evidence: #<N> and issue-<N> are not names" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)?" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)?" + _NUM)' t_evidence_date_names
-mutant "evidence: a bare <N>-slug is not a name" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)?" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)' t_evidence_bare_names t_evidence
+mutant "evidence: the old entry regex reads a date as an issue" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)?(\d{3,6})(?:[-_.]|$)")' t_evidence_date_names
+mutant "evidence: a date counts as a number" $H '_NOT_DATE = r"(?!(?:19|20)\d{2}[-_.](?:0[1-9]|1[0-2])(?!\d))"' '_NOT_DATE = r""' t_evidence_date_names
+mutant "evidence: #<N> and issue-<N> are not names" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)" + _NUM)' t_evidence_date_names
+mutant "evidence: a bare <N>-slug is not a name" $H 'BARE_ISSUE = re.compile(r"^([1-9]\d{2,5})-[A-Za-z]")' 'BARE_ISSUE = re.compile(r"^(?!)(\d)")' t_evidence_bare_names t_evidence
+mutant "evidence: a bare number may start with a zero" $H 'BARE_ISSUE = re.compile(r"^([1-9]\d{2,5})-[A-Za-z]")' 'BARE_ISSUE = re.compile(r"^(\d{3,6})-[A-Za-z]")' t_evidence_bare_numbers_keep
+mutant "evidence: a bare number needs no letter after it" $H 'BARE_ISSUE = re.compile(r"^([1-9]\d{2,5})-[A-Za-z]")' 'BARE_ISSUE = re.compile(r"^([1-9]\d{2,5})(?!\d)")' t_evidence_bare_numbers_keep
+mutant "evidence: a bare number in a file name can remove" $H '(found if os.path.isdir(full) and not os.path.islink(full) else weak).add(int(m.group(1)))' 'found.add(int(m.group(1)))' t_evidence_bare_numbers_keep
 mutant "codex: a nested repository is not judged" $H '        for n in sorted(os.listdir(top)):       # a repository nested in a child, ignored by the outer one' '        for n in []:       # a repository nested in a child, ignored by the outer one' t_codex_nested_repo
 # F2 codex age
 mutant "codex: CODEX_DAYS does not reach worktrees and archived sessions" $H 'return a.codex_days if kind in ("helmway", "worktrees", "archived") else a.days' 'return a.codex_days if kind == "helmway" else a.days' t_codex_days

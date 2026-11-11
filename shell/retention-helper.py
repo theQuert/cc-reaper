@@ -261,12 +261,16 @@ def cmd_projects(a):
 
 # ------------------------------------------------------------------ evidence
 
-# An issue is named `i<N>`, `issue-<N>`, `#<N>` or, for an entry inside an evidence directory, a bare
-# `<N>-slug` (the real layout is `<date>-<kind>/<N>-<slug>/`). A number that begins a date, a year
-# followed by a separator and a month (`2026-11`, `2026_11`, `2026.11`, also after i/issue-/#), is not one.
+# An issue is named `i<N>`, `issue-<N>` or `#<N>`; inside an evidence directory also by a bare
+# `<N>-<letter>...` entry (the real layout is `<date>-<kind>/<N>-<slug>/`): no leading zero, a hyphen
+# and a letter, so `0930.log`, `001.png`, `404.html` and `2026.md` name nothing. A bare number in a FILE
+# name can only keep a directory (it may name an open issue); it never makes one removable. A number
+# that begins a date, a year followed by a separator and a month (`2026-11`, `2026_11`, `2026.11`,
+# also after i/issue-/#), is not one.
 _NOT_DATE = r"(?!(?:19|20)\d{2}[-_.](?:0[1-9]|1[0-2])(?!\d))"
 _NUM = _NOT_DATE + r"(\d{3,6})(?![0-9A-Za-z])"
-ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)?" + _NUM)
+ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)
+BARE_ISSUE = re.compile(r"^([1-9]\d{2,5})-[A-Za-z]")
 NAME_ISSUE = re.compile(r"(?:^|[-_.])(?:i|issue-?|#)" + _NUM)
 MANIFEST_ISSUE = re.compile(r'stima-api#(\d{3,6})|"issue(?:_number)?"\s*:\s*(\d{3,6})')
 SQLITE_NAME = re.compile(r"\.sqlite3?(?:-wal|-shm|-journal)?$", re.I)
@@ -274,11 +278,14 @@ ROOT_KINDS = ("helmway", "handoffs", "worktrees", "archived")
 
 
 def issues_of(kind, path):
-    """Issue numbers a directory names: handoffs by `i<N>` in the name; helmway-evidence by
-    `i<N>`/`issue-<N>`/`#<N>` in the name, by top-level entries named `<N>-slug` or that way, or by a top-level
-    manifest file naming `stima-api#N`. An empty set means the directory names no issue."""
+    """(found, weak): the issue numbers a directory names. `found` is evidence that may remove it:
+    handoffs by `i<N>` in the name; helmway-evidence by `i<N>`/`issue-<N>`/`#<N>` in the name, by a
+    top-level entry named that way or a bare `<N>-<letter>` DIRECTORY, or by a top-level manifest file
+    naming `stima-api#N`. `weak` are bare numbers in file names: they can keep the directory (an open
+    issue) but never supply the evidence that removes it."""
     base = os.path.basename(path)
     found = set()
+    weak = set()
     m = re.match(r"^i(\d+)(?![0-9])", base) if kind == "handoffs" else None
     if m:
         found.add(int(m.group(1)))
@@ -288,13 +295,18 @@ def issues_of(kind, path):
             m = ENTRY_ISSUE.match(entry)
             if m:
                 found.add(int(m.group(1)))
+            else:
+                m = BARE_ISSUE.match(entry)
+                if m:
+                    full = os.path.join(path, entry)
+                    (found if os.path.isdir(full) and not os.path.islink(full) else weak).add(int(m.group(1)))
             if entry.lower().startswith("manifest") and os.path.isfile(os.path.join(path, entry)) \
                     and not os.path.islink(os.path.join(path, entry)):
                 with open(os.path.join(path, entry), "rb") as f:
                     text = f.read(65536).decode("utf-8", "replace")
                 for g in MANIFEST_ISSUE.findall(text):
                     found.add(int(g[0] or g[1]))
-    return found
+    return found, weak
 
 
 def closed_issues(repo, gh, limit):
@@ -470,20 +482,21 @@ def cmd_evidence(a):
             try:
                 if days_of(kind) > 0 and newest_within(p, days_of(kind) * 86400):
                     continue
-                nums = issues_of(kind, p)
+                strong, weak = issues_of(kind, p)
+                nums = strong | weak
             except OSError as e:
                 print("KEEP\t%s\t0\tcannot read it (%s)" % (p, e))
                 continue
-            old.append((kind, root, p, nums))
+            old.append((kind, root, p, nums, strong))
     closed = None
-    if any(nums for _, _, _, nums in old):
+    if any(nums for _, _, _, nums, _ in old):
         closed = closed_issues(a.repo, a.gh, a.limit)
         if closed is None:
             print("ERR\tgh issue list failed; no directory is judged closed this run")
     cands = []      # (kind, root, p, label)
-    for kind, root, p, nums in old:
-        if not nums:
-            print("KEEP\t%s\t0\tnames no issue" % p)
+    for kind, root, p, nums, strong in old:
+        if not strong:
+            print("KEEP\t%s\t0\tnames no issue%s" % (p, " that proves it closed" if nums else ""))
             continue
         if closed is None:
             print("KEEP\t%s\t0\tissue state unknown (%s)" % (p, ",".join("#%d" % n for n in sorted(nums))))
