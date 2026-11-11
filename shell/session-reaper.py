@@ -520,8 +520,9 @@ def oracle_brief(repo, num, cfg, now):
     try:
         d = json.loads(cache.read_text())
         if 0 <= now - d["at"] < ttl and isinstance(d["brief"], str):
-            _brief_cache[key] = d["brief"]
-            return d["brief"]
+            # setdefault: a fresh read that landed in memory while this thread read the disk must not be overwritten by the older
+            # disk value, or a DONE could rest on it as if it were read in this run
+            return _brief_cache.setdefault(key, d["brief"])
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return _read_brief(repo, num, cfg, now)
