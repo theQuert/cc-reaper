@@ -30,7 +30,8 @@ to local files (and a local notification).
           numbers or the fails counter), and the summary line (hosts, read, high, unreadable, would-alert, alerted,
           recovered, failures) when a host line was, a tell was made or a failure happened. A run that changes
           nothing logs nothing (stima-api #7904: 1778 identical runs, 515 timeouts for two hosts that cannot be read).
-          A host that stays unreadable is told once, not again every GDW_REALERT_MINUTES; only disk-high is.
+          A host that stays unreadable is told once and then once a day (UNREADABLE_REALERT_S), not every
+          GDW_REALERT_MINUTES; disk-high is told again every GDW_REALERT_MINUTES.
 
 Config: defaults, then GDW_CONFIG (~/.cc-reaper/gce-disk-watch.conf, KEY=VALUE), then GDW_* environment variables.
 """
@@ -262,6 +263,9 @@ def osascript_notify(title, text):
         raise OSError(f"osascript exit {p.returncode}")
 
 
+UNREADABLE_REALERT_S = 24 * 3600  # a host that stays unreadable is told again once a day
+
+
 class Watch:
     def __init__(self, cfg, runner=gcloud_runner, notifier=osascript_notify, clock=time.time):
         self.cfg, self.runner, self.notifier, self.clock = cfg, runner, notifier, clock
@@ -345,7 +349,10 @@ class Watch:
                      "sent": None, "told": False}
         else:
             entry = prev
-            if kind == HIGH and not entry["todo"] and entry["sent"] is not None and now - entry["sent"] >= every:
+            # disk-high is told again every GDW_REALERT_MINUTES; a host that stays unreadable once a day, because a
+            # full root disk can also make the host unreadable and one missed ALERT would be the last word on it.
+            wait = every if kind == HIGH else max(every, UNREADABLE_REALERT_S) if kind == UNREADABLE else None
+            if wait is not None and not entry["todo"] and entry["sent"] is not None and now - entry["sent"] >= wait:
                 entry.update(notice="realert", todo=self.channels("realert"))
         entry["fails"] = fails
         entry["read_at"] = now

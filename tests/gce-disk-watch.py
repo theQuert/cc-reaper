@@ -213,8 +213,13 @@ class Runs(Base):
             self.clock.t += 600
         log = (self.tmp / "logs" / "gce-disk-watch.log").read_text()
         self.assertEqual(len([l for l in log.splitlines() if " host stima-ci-2 " in l]), 2)  # fails=1/2, then told
-        self.assertEqual(len(self.alerts()), 1)  # one ALERT, never a STILL for an unreadable host
+        self.assertEqual(len(self.alerts()), 1)  # one ALERT, no STILL inside a day for an unreadable host
         self.assertEqual(len(self.notes), 1)
+        for i in range(90):  # 15 more hours: past one day since the ALERT, short of two
+            self.run_once(flip[i % 2], GDW_APPLY="1")
+            self.clock.t += 600
+        self.assertEqual(len(self.alerts()), 2)  # told again once a day: a full root disk also reads as unreadable
+        self.assertEqual(len(self.notes), 2)
 
     def test_a_changed_number_is_not_a_changed_state_and_a_changed_state_is_logged(self):
         self.run_once({})
@@ -548,8 +553,9 @@ class Cadence(Base):
         self.assertEqual(reads[6], sorted(HOSTS))  # 60 min: all, known ones included
         total = sum(len(r) for r in reads)
         self.assertEqual(total, 5 + 3 + 5 + 0)  # versus 35 reads at every run
-        _, lines, _ = self.cad(refused)
-        self.assertEqual(lines, [])  # not due and unchanged: nothing read, nothing logged
+        _, lines, runner = self.cad(refused)
+        self.assertEqual(runner.calls, [])  # not due: nothing read
+        self.assertEqual(lines, [])  # and nothing logged
 
     def test_slack_lets_a_slightly_early_start_read(self):
         self.cad({})
