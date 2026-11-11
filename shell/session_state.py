@@ -203,28 +203,25 @@ def _judge(s, r, cfg, now):
         # a never-kill pid or a child process: B (the dispatcher) stops a DONE session, so these are never DONE
         bg += ["never-kill:" + ",".join(str(p) for p in s["never_kill"])] if s.get("never_kill") else []
         bg += [f"child-process:{s['descendants']}"] if (s.get("descendants") or 0) > 0 else []
-        stalled = r.stall_mark(cfg, sid, now)
         # a loop's check-by keeps it only when it falls due within the idle threshold: further out it holds a live slot
         # for nothing (the prompt cache lives 60 min, so a later resume costs what a fresh wake does; stima-api#7061)
         ahead = [c for c in rec["claims"]
                  if c.get("check_by") and now < (r._iso_epoch(c["check_by"]) or 0) <= now + thr * 60]
         dirty = [w for w in rec["worktrees"] if w["dirty"] or w["unpushed"]]
-        st, why = _state(s, rec, thr, own, person, unknown, stalled, ahead, dirty)
+        st, why = _state(s, rec, thr, own, person, unknown, ahead, dirty)
         rec["state"], rec["reasons"] = st, why
     except Exception as e:  # a session this cannot judge is UNKNOWN, never DONE
         rec["state"], rec["reasons"] = "UNKNOWN", [f"error:{type(e).__name__}: {e}"[:200]]
     return rec, used
 
 
-def _state(s, rec, thr, own, person, unknown, stalled, ahead, dirty):
+def _state(s, rec, thr, own, person, unknown, ahead, dirty):
     if s.get("status") != "idle":
         return "WORKING", [f"status:{s.get('status')}"]
     if rec["bg_work"]:
         return "WORKING", list(rec["bg_work"])
     if own:
         return "WORKING", ["own-step:" + "; ".join(own)]
-    if stalled:
-        return "UNKNOWN", ["stalled:" + stalled]
     asks = (["asking"] if s.get("asking") else []) + (["dialog"] if DIALOG_RE.search(s.get("screen_tail") or "") else [])
     if person or asks:
         return "WAITING_PERSON", asks + (["person-step:" + "; ".join(person)] if person else [])

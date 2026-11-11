@@ -24,7 +24,8 @@ cat > "$S/launchctl" <<'STUB'
 printf '%s\n' "$*" >> "$(dirname "$0")/calls"
 case "$1" in
   bootstrap) label=${3##*/}; : > "$(dirname "$0")/${label%.plist}.loaded" ;;
-  bootout) rm -f "$(dirname "$0")/${2##*/}.loaded" ;;
+  bootout) [ -e "$(dirname "$0")/refuse" ] && exit 1; rm -f "$(dirname "$0")/${2##*/}.loaded" ;;
+  unload) [ -e "$(dirname "$0")/refuse" ] && exit 1 ;;
   print) test -e "$(dirname "$0")/${2##*/}.loaded"; exit $? ;;
 esac
 exit 0
@@ -203,5 +204,13 @@ out="$(run 2>&1)"; rc=$?
   && ok "a host with none of them sees no bootout and no line" || bad "second run: rc=$rc calls: $(grep -E '^(bootout|unload|bootstrap)' "$S/calls" | tr '\n' ';')"
 out="$(run --check 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && ok "and checks clean again" || bad "after retirement: rc=$rc: $(printf '%s\n' "$out" | grep -v current)"
+
+# A retired agent launchd will not boot out is reported as still loaded, never as booted out.
+: > "$S/com.cc-reaper.stall-watch.loaded"; : > "$L/com.cc-reaper.stall-watch.plist"; : > "$S/refuse"
+out="$(run 2>&1)"
+rm -f "$S/refuse"
+printf '%s\n' "$out" | grep -q 'retired agent com.cc-reaper.stall-watch .*still loaded' && ! printf '%s\n' "$out" | grep -q 'stall-watch.*booted out' \
+  && ok "a retired agent that will not boot out is reported still loaded" || bad "refused bootout: $(printf '%s\n' "$out" | grep 'retired agent')"
+rm -f "$S/com.cc-reaper.stall-watch.loaded"
 
 [ "$failures" -eq 0 ] && echo "install-check: all passed" || { echo "install-check: $failures failed"; exit 1; }

@@ -846,8 +846,8 @@ rm -f ~/Library/LaunchAgents/com.cc-reaper.session-reaper.plist ~/.cc-reaper/ses
 ### Stall watch (retired)
 
 `stall-watch.py` and its LaunchAgent were retired 2026-11-12 (stima-api #7904): 9044 runs wrote no mark, report or alert.
-`install.sh` boots out `com.cc-reaper.stall-watch` and removes its plist and script. `session-reaper.py` still honours a
-`STALL_MARK_DIR/<session id>.json` mark if one is put there.
+`install.sh` boots out `com.cc-reaper.stall-watch` and removes its plist and script. `session-reaper.py` no longer reads
+marks.
 
 ## GCE disk watch (shadow until enabled)
 
@@ -869,8 +869,8 @@ model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper
   prints no `/` line is `unreadable`, with a fixed reason word (`exit-255`, `timeout`,
   `no-df-output`, `no-ssh-key`, ...), never the command's output, told only after
   `GDW_UNREADABLE_ROUNDS` (2) such reads in a row; until then the host keeps its previous kind and the
-  log shows `fails=<n>/<rounds>`. A host in `GDW_KNOWN_UNREADABLE` (shipped: stima-ci-1 and
-  stima-ci-deploy-1, whose OS Login refuses the Mac's key by design) is read every round but never told
+  log shows `fails=<n>/<rounds>`. A host in `GDW_KNOWN_UNREADABLE` (shipped: stima-ci-1,
+  stima-ci-2, stima-ci-3, stopped runner instances, and stima-ci-deploy-1, refused by OS Login) is read every round but never told
   `unreadable` (logged `known-unreadable`); its last confirmed `disk-high` stays, and re-alerts, until a
   read shows it clear. gcloud runs only when `GDW_SSH_KEY` (`~/.ssh/google_compute_engine`)
   and its `.pub` exist, so it never generates a key or writes metadata. One bad host, or one damaged
