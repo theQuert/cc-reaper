@@ -190,6 +190,21 @@ check "live directory lock: nothing was examined" test ! -s "$LSOF_CALLS"
 kill "$holder3" 2>/dev/null; wait "$holder3" 2>/dev/null
 rm -f "${LOCK:?}/pid" "${LOCK:?}/cmd"; rmdir "$LOCK"
 
+# A symlink to a directory with a live holder is not a holder: the link goes, the target stays.
+sleep 600 </dev/null >/dev/null 2>&1 &
+holder4=$!; pids="$pids $holder4"
+exec_settled "$holder4"
+mkdir "$T/target.lock"; echo "$holder4" > "$T/target.lock/pid"; ps -o command= -p "$holder4" > "$T/target.lock/cmd"
+ln -s "$T/target.lock" "$LOCK"
+check "link to a live lock directory: the probe says not held (status 1)" test "$(lockfn _cc_wj_lock_live "$LOCK")" = rc=1
+: > "$LSOF_CALLS"
+session_sweep "$T/livelink.txt" >/dev/null
+refute "link to a live lock directory: the sweep does not defer" grep -qF 'deferred to it' "$T/livelink.txt"
+check "link to a live lock directory: the repository was examined" test -s "$LSOF_CALLS"
+check "link to a live lock directory: the target is untouched" test "$(cat "$T/target.lock/pid")" = "$holder4"
+kill "$holder4" 2>/dev/null; wait "$holder4" 2>/dev/null
+rm -f "${T:?}/target.lock/pid" "${T:?}/target.lock/cmd"; rmdir "$T/target.lock"
+
 # ─── B: a record being rewritten is read once more ────────────────────────────
 
 # A live process whose command line carries the session id, so a readable record binds to it, and
@@ -305,19 +320,25 @@ REAL_FIND="$(command -v find)"; export REAL_FIND
 cat > "$FSTUBS/find" <<'STUB'
 #!/usr/bin/env bash
 "$REAL_FIND" "$@"
+[ -z "${FIND_ERR:-}" ] || echo "$FIND_ERR" >&2
 [ -z "${FIND_FAIL:-}" ] || exit 1
 STUB
 chmod +x "$FSTUBS/find"
 FP="$T/find-projects"; mkdir -p "$FP/d"
 printf '{"type":"user"}\n' > "$FP/d/0000bbbb-0000-4000-8000-000000000001.jsonl"
 recent() { # <FIND_FAIL value> -> "<rc> [<error>]"
-  FIND_FAIL="$1" CC_WJ_CLAUDE_PROJECTS="$FP" PATH="$FSTUBS:$STUBS:$PATH" bash -c '
+  FIND_FAIL="$1" FIND_ERR="${2:-}" CC_WJ_CLAUDE_PROJECTS="$FP" PATH="$FSTUBS:$STUBS:$PATH" bash -c '
     source "$1" >/dev/null 2>&1
     _CC_WJ_ACTIVE_ERROR=""; _CC_WJ_RECENT_CLAIMS=""; _CC_WJ_RECENT_TRANSCRIPTS=""
     _cc_wj_scan_claude_recent 1 >/dev/null 2>&1; rc=$?
     printf "%s [%s]\n" "$rc" "$_CC_WJ_ACTIVE_ERROR"' _ "$WJ"
 }
-check "find partial: exit 1 with output is no listing failure" test "$(recent 1)" = "0 []"
+check "find partial: exit 1 with output and only vanished-file errors is used" \
+  test "$(recent 1 'find: /x/y.jsonl: No such file or directory')" = "0 []"
+check "find partial: Permission denied is the listing failure" \
+  bash -c 'case "$1" in "1 [the recent Claude transcript registry"*"could not be listed]") exit 0;; *) exit 1;; esac' _ "$(recent 1 'find: /x/sub: Permission denied')"
+check "find partial: exit 1 with output and no stderr line is the listing failure" \
+  bash -c 'case "$1" in "1 [the recent Claude transcript registry"*"could not be listed]") exit 0;; *) exit 1;; esac' _ "$(recent 1)"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$FSTUBS/find"
 check "find failed with no output: the registry could not be listed, as before" \
   bash -c 'case "$1" in "1 [the recent Claude transcript registry"*"could not be listed]") exit 0;; *) exit 1;; esac' _ "$(recent 1)"

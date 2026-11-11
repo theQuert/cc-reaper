@@ -1618,7 +1618,7 @@ _cc_wj_open_error() {
 
 _cc_wj_scan_claude_recent() { # <grace hours> [relisted]
   local grace="$1" relisted="${2:-}" projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
-  local now cutoff_minutes files f base sid activity cwd resolved why find_rc
+  local now cutoff_minutes files f base sid activity cwd resolved why find_rc find_err
   [ "$grace" -gt 0 ] || return 0
   [ -e "$projects" ] || return 0
   if [ ! -d "$projects" ] || [ ! -r "$projects" ] || [ ! -x "$projects" ]; then
@@ -1630,11 +1630,16 @@ _cc_wj_scan_claude_recent() { # <grace hours> [relisted]
     return 1
   }
   now="$(date +%s)"; cutoff_minutes=$((grace * 60))
-  # A non-zero exit with output is a partial listing (a file that vanished mid-walk is not a
-  # session); only a failure with no output at all is a registry that could not be listed.
-  find_rc=0
-  files="$(find "$projects" -type f -name '*.jsonl' -mmin "-$cutoff_minutes" -print 2>/dev/null)" || find_rc=$?
-  { [ "$find_rc" -eq 0 ] || [ -n "$files" ]; } || {
+  # A non-zero exit with output is a partial listing only when every complaint is a file that
+  # vanished mid-walk (not a session). Permission denied or anything else skipped a directory,
+  # so its sessions are unknown: that, and no output at all, is a registry that could not be listed.
+  find_rc=0; find_err="$(mktemp "${TMPDIR:-/tmp}/cc-wj-find.XXXXXX")" || find_err=""
+  files="$(find "$projects" -type f -name '*.jsonl' -mmin "-$cutoff_minutes" -print 2>"${find_err:-/dev/null}")" || find_rc=$?
+  if [ "$find_rc" -ne 0 ]; then
+    { [ -n "$files" ] && [ -s "$find_err" ] && ! grep -qv 'No such file or directory$' "$find_err"; } || find_rc=fail
+  fi
+  [ -z "$find_err" ] || rm -f "$find_err"
+  [ "$find_rc" != fail ] || {
     _CC_WJ_ACTIVE_ERROR="the recent Claude transcript registry $projects could not be listed"
     return 1
   }
@@ -4843,11 +4848,11 @@ _cc_wj_lock_write() {
   ps -o command= -p "${_CC_WJ_RUN_PID:-$$}" > "$1/cmd" 2>/dev/null
 }
 
-# The heartbeat. Only an existing lock directory is refreshed: a bare `touch` on a lock that
+# The heartbeat. `touch -c` never creates, so it only refreshes what exists: a bare `touch` on a lock that
 # was released or taken over made a 0-byte regular file at the lock path, which no sweep could
 # then take or remove (stima-api#7895, 2026-11-11).
 _cc_wj_lock_touch() { # <lock dir>
-  [ -d "$1" ] && touch "$1" 2>/dev/null
+  touch -c "$1" 2>/dev/null
   return 0
 }
 
