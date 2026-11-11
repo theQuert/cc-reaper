@@ -298,7 +298,7 @@ t_evidence() {
   begin; H="$T/handoffs"; E="$T/helm"
   mkdir -p "$H/i100-old" "$H/i200-open" "$H/i300-fresh" "$H/i400" "$H/notes" "$E/2026-10-01-a" "$E/2026-10-02-b" "$E/2026-10-03-c" "$E/2026-10-04-d" "$T/outside/ev"
   echo x > "$H/i100-old/f"; echo x > "$H/i200-open/f"; echo x > "$H/i300-fresh/f"; echo x > "$H/i400/f"; echo x > "$H/notes/f"; : > "$H/i999.md"
-  echo x > "$E/2026-10-01-a/100-x.md"; echo x > "$E/2026-10-02-b/100-x.md"; echo x > "$E/2026-10-02-b/200-y.md"
+  echo x > "$E/2026-10-01-a/i100-x.md"; echo x > "$E/2026-10-02-b/i100-x.md"; echo x > "$E/2026-10-02-b/i200-y.md"
   echo x > "$E/2026-10-03-c/abc.txt"; echo '{"issue": 400}' > "$E/2026-10-04-d/manifest.json"
   echo keep > "$T/outside/ev/f"; ln -s "$T/outside/ev" "$H/i100-link"
   age "$H" 20; age "$E" 20; age "$T/outside" 20
@@ -542,6 +542,7 @@ t_remove_guards() {
   [ -L "$root/linkfile" ] || { echo "  removed a symlink"; r=1; }
   [ -f "$T/outside/d/f" ] || { echo "  removed through a symlinked directory"; r=1; }
   [ -L "$root/linkdir" ] || { echo "  removed a symlinked directory"; r=1; }
+  has 'not inside the root' || { echo "  the outside path was not refused for being outside the root"; r=1; }
   return $r
 }
 
@@ -683,7 +684,7 @@ t_codex() {
   local sd="$1" r=0 C M C1 C2 h x
   begin; codex_fixture; h="$C/helmway-evidence"; x="$C/archived_sessions"
   mkdir -p "$h/2026-11-01-a" "$h/2026-11-02-b" "$h/2026-11-03-c"
-  echo x > "$h/2026-11-01-a/100-x.md"; echo x > "$h/2026-11-02-b/200-y.md"; echo x > "$h/2026-11-03-c/n.txt"
+  echo x > "$h/2026-11-01-a/i100-x.md"; echo x > "$h/2026-11-02-b/i200-y.md"; echo x > "$h/2026-11-03-c/n.txt"
   cwt clean "$C1"; cwt ahead "ref: refs/heads/feat"; cwt dirty "$C1"; echo u > "$C/worktrees/dirty/repo/untracked"
   cwt held "$C1"; mkdir -p "$C/worktrees/nogit/repo"; echo x > "$C/worktrees/nogit/repo/f"
   echo a > "$x/a.jsonl"; echo h > "$x/held.jsonl"; echo s > "$x/state.sqlite"; echo w > "$x/state.sqlite-wal"
@@ -731,6 +732,65 @@ t_codex_lsof_unknown_keeps() {
   return $r
 }
 
+# F1: a date-shaped name is not an issue number; i<N>, issue-<N> and #<N> are.
+t_evidence_date_names() {
+  local sd="$1" r=0 E
+  begin; E="$T/helm"; mkdir -p "$E/2026-11-05-a" "$E/2026-11-06-b" "$E/2026-11-07-c" "$E/2026-11-08-d" "$E/2026-11-09-e"
+  echo x > "$E/2026-11-05-a/2026-11-10T0930.log"; echo x > "$E/2026-11-05-a/2026-11-11.md"
+  echo x > "$E/2026-11-06-b/i2026-11-10.md"
+  echo x > "$E/2026-11-07-c/i2026.md"; echo x > "$E/2026-11-08-d/issue-2026.md"; echo x > "$E/2026-11-09-e/#2026.md"
+  printf '2026\n' > "$T/gh.closed"
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HELMWAY_DIR="$E"
+  [ -d "$E/2026-11-05-a" ] || { echo "  a directory holding only date-named files was removed (#2026 is closed)"; r=1; }
+  [ -d "$E/2026-11-06-b" ] || { echo "  i2026-11-10 was read as issue #2026"; r=1; }
+  [ ! -d "$E/2026-11-07-c" ] || { echo "  i<N> no longer names an issue"; r=1; }
+  [ ! -d "$E/2026-11-08-d" ] || { echo "  issue-<N> no longer names an issue"; r=1; }
+  [ ! -d "$E/2026-11-09-e" ] || { echo "  #<N> no longer names an issue"; r=1; }
+  return $r
+}
+
+# F2: CC_DJ_RET_CODEX_DAYS applies to every ~/.codex root, by the entry's newest mtime.
+t_codex_days() {
+  local sd="$1" r=0 C M C1 C2 h x
+  begin; codex_fixture; h="$C/helmway-evidence"; x="$C/archived_sessions"
+  mkdir -p "$h/2026-11-01-old" "$h/2026-11-02-new"; echo x > "$h/2026-11-01-old/i100-x.md"; echo x > "$h/2026-11-02-new/i100-x.md"
+  cwt oldwt "$C1"; cwt newwt "$C1"; echo a > "$x/old.jsonl"; echo b > "$x/new.jsonl"
+  age "$h/2026-11-01-old" 40; age "$C/worktrees/oldwt" 40; age "$x/old.jsonl" 40
+  printf '100\n' > "$T/gh.closed"; : > "$T/lsof.extra"
+  # EVIDENCE_DAYS is larger than the age of the old entries: only CODEX_DAYS can let them go.
+  codexrun "$sd" apply CC_DJ_RET_CODEX_DAYS=30 CC_DJ_RET_EVIDENCE_DAYS=100
+  [ ! -d "$h/2026-11-01-old" ] && [ ! -d "$C/worktrees/oldwt" ] && [ ! -e "$x/old.jsonl" ] || { echo "  an entry older than CODEX_DAYS survived"; r=1; }
+  [ -d "$h/2026-11-02-new" ] || { echo "  a fresh helmway-evidence dir was removed"; r=1; }
+  [ -d "$C/worktrees/newwt" ] || { echo "  a fresh worktree was removed"; r=1; }
+  [ -f "$x/new.jsonl" ] || { echo "  a fresh archived session was removed"; r=1; }
+  grep -q 'KEEP .*newwt 0 newest file inside is younger than 30 days' "$T/spot.log" || { echo "  no KEEP line with the age reason"; r=1; }
+  return $r
+}
+
+# F3: the shapes a codex <id> directory can take.
+cwt_full() {  # <id> <HEAD content>: a full clone $C/worktrees/<id>/repo: .git is a directory with the main repo's objects and refs
+  local w="$C/worktrees/$1/repo"
+  mkdir -p "$w/.git"; cp -R "$M/objects" "$M/refs" "$M/config" "$w/.git/"
+  rm -f "$w/.git/refs/heads/feat"; printf '%s\n' "$2" > "$w/.git/HEAD"
+}
+t_codex_worktree_shapes() {
+  local sd="$1" r=0 C M C1 C2 w
+  begin; codex_fixture; : > "$T/lsof.extra"; printf '100\n' > "$T/gh.closed"
+  cwt_full fullok "ref: refs/heads/main"
+  cwt_full fullahead "ref: refs/heads/main"; printf '%s\n' "$C2" > "$C/worktrees/fullahead/repo/.git/refs/heads/feat"
+  cwt_full fullstash "ref: refs/heads/main"; w="$C/worktrees/fullstash/repo/.git"
+  printf '%s\n' "$C1" > "$w/refs/stash"; mkdir -p "$w/logs/refs"
+  printf '%s %s t <t@t> 1700000000 +0000\tWIP\n' 0000000000000000000000000000000000000000 "$C1" > "$w/logs/refs/stash"
+  cwt sib "$C1"; echo x > "$C/worktrees/sib/notes.txt"
+  codexrun "$sd" apply
+  [ ! -d "$C/worktrees/fullok" ] || { echo "  a clean full clone with every ref on a remote survived"; r=1; }
+  [ -d "$C/worktrees/fullahead" ] || { echo "  a full clone with a local-only branch was removed"; r=1; }
+  [ -d "$C/worktrees/fullstash" ] || { echo "  a full clone with a stash was removed"; r=1; }
+  [ -d "$C/worktrees/sib" ] || { echo "  an <id> directory with a non-git sibling was removed"; r=1; }
+  grep -q 'KEEP .*worktrees/sib 0 .*notes.txt is not a git worktree' "$T/spot.log" || { echo "  no KEEP line naming the sibling"; r=1; }
+  return $r
+}
+
 t_wired_into_check() {
   local sd="$1"
   awk '/^_cc_dj_check\(\)/{f=1} f && /^  _cc_dj_retention$/{found=1} f && /^}/{exit} END{exit !found}' "$sd/disk-janitor.sh"
@@ -749,7 +809,7 @@ t_scratch_lsof_unknown_keeps t_scratch_default_shadow t_projects t_projects_defa
 t_evidence t_evidence_gh_failure t_dev t_dev_sigkill t_dev_young_keeps t_dev_active_worktree_keeps
 t_dev_merged_worktree_stops t_dev_primary_keeps t_dev_live_session_keeps t_dev_claude_ancestor_keeps
 t_dev_never_kill_keeps t_dev_unknown_keeps t_dev_match_default t_report_forces_shadow t_bad_mode_is_shadow t_defaults t_remove_guards
-t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing t_codex t_codex_lsof_unknown_keeps"
+t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing t_codex t_codex_lsof_unknown_keeps t_evidence_date_names t_codex_days t_codex_worktree_shapes"
 
 for c in $CASES; do
   if "$c" "$SRC"; then ok "$c"; else nok "$c"; fi
@@ -821,15 +881,29 @@ mutant "evidence: a directory naming no issue goes" $H '        if not nums:' ' 
 mutant "evidence: recent files do not keep" $H '                if days_of(kind) > 0 and newest_within(p, days_of(kind) * 86400):' '                if False:' t_evidence
 mutant "evidence: unknown issue state counts as closed" $H 'closed = closed_issues(a.repo, a.gh, a.limit)' 'closed = closed_issues(a.repo, a.gh, a.limit) or set(range(10**6))' t_evidence_gh_failure
 mutant "evidence: default mode is shadow" $J 'CC_DJ_RET_EVIDENCE_MODE:-apply' 'CC_DJ_RET_EVIDENCE_MODE:-shadow' t_codex t_defaults
+# F1 issue names
+mutant "evidence: the old entry regex reads a date as an issue" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)?(\d{3,6})(?:[-_.]|$)")' t_evidence_date_names
+mutant "evidence: i<N> followed by a date counts" $H '_NUM = r"(\d{3,6})(?![0-9A-Za-z])(?!-\d{2}-\d{2})"' '_NUM = r"(\d{3,6})(?![0-9A-Za-z])"' t_evidence_date_names
+mutant "evidence: #<N> and issue-<N> are not names" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)" + _NUM)' t_evidence_date_names
+# F2 codex age
+mutant "codex: CODEX_DAYS does not reach worktrees and archived sessions" $H 'return a.codex_days if kind in ("helmway", "worktrees", "archived") else a.days' 'return a.codex_days if kind == "helmway" else a.days' t_codex_days
+mutant "codex: the age test is skipped for worktrees and archived sessions" $H '        if ds > 0 and newest_within(p, ds * 86400):
+            return "newest' '        if False:
+            return "newest' t_codex_days
+# F3 worktree shapes
+mutant "codex: a non-git sibling does not keep the <id> directory" $H '                return False, "%s is not a git worktree" % d' '                continue' t_codex_worktree_shapes
+mutant "codex: a full clone is judged by HEAD only" $H '"rev-list", "--count", "--all", "--not", "--remotes"' '"rev-list", "--count", "HEAD", "--not", "--remotes"' t_codex_worktree_shapes
+mutant "codex: a stash does not keep a full clone" $H '            if rc2 != 0 or stash:' '            if False:' t_codex_worktree_shapes
+mutant "codex: untracked files are not looked at" $H '"status", "--porcelain", "-unormal"' '"status", "--porcelain", "-uno"' t_codex
 # ~/.codex leftovers
-mutant "codex: helmway-evidence is aged like handoffs" $H 'return a.codex_days if kind == "helmway" else a.days' 'return a.days' t_codex
+mutant "codex: helmway-evidence is aged like handoffs" $H 'return a.codex_days if kind in ("helmway", "worktrees", "archived") else a.days' 'return a.days' t_codex
 mutant "codex: a dirty worktree goes" $H 'return False, "uncommitted changes in %s" % d' 'pass' t_codex
 mutant "codex: a commit on no remote does not keep" $H '        if int(out) != 0:' '        if False:' t_codex
 mutant "codex: a held entry goes" $H '            elif is_held(p, held):' '            elif False:' t_codex
 mutant "codex: unknown lsof counts as nothing held" $H 'held = held_paths([r for _, r, _, _ in units])' 'held = held_paths([r for _, r, _, _ in units]) or []' t_codex_lsof_unknown_keeps
 mutant "codex: an sqlite file goes" $H '    if SQLITE_NAME.search(os.path.basename(p)):' '    if False:' t_codex
 mutant "codex: a directory holding an sqlite file goes" $H '            if any(SQLITE_NAME.search(n) for n in dn + fn):' '            if False:' t_codex
-mutant "codex: unlink accepts a symlink" $H '        if not stat.S_ISREG(os.stat(leaf, dir_fd=fd, follow_symlinks=False).st_mode):' '        if False:' t_safe_rmtree
+mutant "codex: unlink accepts a symlink" $H '        if not stat.S_ISREG(os.stat(leaf, dir_fd=fd, follow_symlinks=False).st_mode):' '        if False:' t_safe_rmtree t_remove_guards
 # 7 dev processes
 mutant "dev: claude ancestor ignored" $H '        if is_agent(p["cmd"]):' '        if False:' t_dev_claude_ancestor_keeps
 mutant "dev: live session cwd ignored" $H '        if c == real or c.startswith(real + "/"):' '        if False:' t_dev_live_session_keeps
@@ -847,17 +921,15 @@ mutant "dev: default pattern drifts in the script" $J '\S*proxy\.mjs|vite(?: |$)
 # shared safety
 mutant "report mode deletes" $J 'if [ "${_CC_DJ_RET_REPORT:-0}" = 1 ]; then echo shadow; else echo apply; fi' 'echo apply' t_report_forces_shadow
 mutant "unknown mode deletes" $J '    *) echo shadow ;;' '    *) echo apply ;;' t_bad_mode_is_shadow
-mutant "removal guard: variables unchecked" $J 'local root="${1:?}" list="${2:?}" kind="${3:?}" p par' 'local root="${1:-}" list="${2:-}" kind="${3:-d}" p par' t_remove_guards
-M2_OLD='case "$par/" in "$root"/*) ;; *) _cc_dj_log "retention: refused $p: parent resolves outside $root"; continue ;; esac' M2_NEW=':' \
-  mutant "removal guard: outside the root" $J 'case "$p" in "$root"/?*) ;; *) _cc_dj_log "retention: refused $p: not inside $root"; continue ;; esac' ':' t_remove_guards
-mutant "removal guard: symlink target" $J 'if [ -L "$p" ]; then _cc_dj_log "retention: refused $p: is a symlink"; continue; fi' ':' t_remove_guards
-mutant "removal guard: symlinked parent" $J 'case "$par/" in "$root"/*) ;; *) _cc_dj_log "retention: refused $p: parent resolves outside $root"; continue ;; esac' ':' t_remove_guards
+mutant "removal guard: variables unchecked" $J 'local root="${1:?}" list="${2:?}" kind="${3:?}" helper out line left' 'local root="${1:-}" list="${2:-}" kind="${3:-d}" helper out line left' t_remove_guards
+mutant "removal guard: outside the root" $H '    if not path.startswith(root + "/"):' '    if False:' t_remove_guards
+mutant "removal guard: file removal falls back to rm" $H '(safe_unlink if a.kind == "f" else safe_rmtree)(root, p)' 'safe_rmtree(root, p) if a.kind == "d" else os.unlink(p)' t_remove_guards
 mutant "root trust: owner and mode unchecked (bash)" $J 'if [ "$own" != "${CC_DJ_RET_UID:-$(id -u)}" ] || [ $(( 8#$mode & 8#022 )) -ne 0 ]; then' 'if false; then' t_root_mode t_root_uid
 mutant "root trust: owner unchecked (bash)" $J 'if [ "$own" != "${CC_DJ_RET_UID:-$(id -u)}" ] || [ $(( 8#$mode & 8#022 )) -ne 0 ]; then' 'if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then' t_root_uid
 mutant "root trust: mode unchecked (bash)" $J 'if [ "$own" != "${CC_DJ_RET_UID:-$(id -u)}" ] || [ $(( 8#$mode & 8#022 )) -ne 0 ]; then' 'if [ "$own" != "${CC_DJ_RET_UID:-$(id -u)}" ]; then' t_root_mode
 mutant "root trust: owner and mode unchecked (helper)" $H 'return st.st_uid == want_uid() and (st.st_mode & 0o022) == 0' 'return True' t_root_mode t_root_uid
 mutant "removal: root descriptor not re-checked" $H '        if not trusted_stat(os.fstat(fd)):' '        if False:' t_safe_rmtree
-mutant "removal: components followed through symlinks" $H 'flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW' 'flags = os.O_RDONLY | os.O_DIRECTORY' t_safe_rmtree t_swap_after_listing
+mutant "removal: components followed through symlinks" $H 'flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW' 'flags = os.O_RDONLY | os.O_DIRECTORY' t_safe_rmtree t_swap_after_listing t_remove_guards
 mutant "removal: unsafe rmtree allowed" $H 'if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):' 'if False:' t_safe_rmtree
 mutant "removal: .. components allowed" $H 'if any(p in ("", ".", "..") for p in parts):' 'if False:' t_safe_rmtree
 mutant "not wired into --check" $J '  _cc_dj_retention

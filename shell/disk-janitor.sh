@@ -1087,41 +1087,28 @@ _cc_dj_ret_bytes_of() {  # <path>: allocated bytes, 0 when unreadable
   du -sk "$1" 2>/dev/null | awk 'NR==1 && $1 ~ /^[0-9]+$/ { printf "%d", $1 * 1024; found=1 } END { if (!found) printf "0" }'
 }
 
-# Removes the paths in NUL-separated $2 under canonical root $1, one explicit path at a time.
-# kind d removes a directory tree, f a single regular file. Sets _CC_DJ_RET_REMOVED. A file is
-# checked again right before (inside the root, not a symlink, parent still inside the root). A
-# directory tree is removed by retention-helper.py with an fd-relative walk (O_NOFOLLOW on every
-# component, shutil.rmtree(dir_fd=...)), so a parent swapped for a symlink after the listing cannot
-# redirect the delete; bash only hands it the list.
+# Removes the paths in NUL-separated $2 under canonical root $1, one explicit path at a time, by
+# retention-helper.py: kind d removes a directory tree, f a single regular file. Both walk fd-relative
+# (O_NOFOLLOW on every component, root ownership and mode re-checked on the descriptor), so a parent
+# swapped for a symlink after the listing cannot redirect the delete; bash only hands over the list.
+# Sets _CC_DJ_RET_REMOVED.
 _cc_dj_ret_remove_list() {  # <root> <list> <kind>
-  local root="${1:?}" list="${2:?}" kind="${3:?}" p par helper out line left
+  local root="${1:?}" list="${2:?}" kind="${3:?}" helper out line left
   _CC_DJ_RET_REMOVED=0
-  if [ "$kind" = d ]; then
-    helper="${CC_DJ_RET_HELPER:-$(dirname "${BASH_SOURCE[0]}")/retention-helper.py}"
-    if [ ! -r "$helper" ] || ! command -v python3 >/dev/null 2>&1; then
-      _cc_dj_log "retention: $helper or python3 not found; nothing removed"; return 0
-    fi
-    left=$(( ${_CC_DJ_RET_DEADLINE:-0} - SECONDS )); [ "$left" -ge 1 ] || left=1
-    out="$(python3 -I "$helper" remove --root "$root" --list "$list" --seconds "$left" 2>&1)" || {
-      _cc_dj_log "retention: directory removal failed: $(printf '%s' "$out" | tail -1)"; return 0; }
-    while IFS= read -r line; do
-      case "$line" in
-        REMOVED*) _CC_DJ_RET_REMOVED=$((_CC_DJ_RET_REMOVED + 1)) ;;
-        REFUSED*|ERR*) _cc_dj_log "retention: $(printf '%s' "$line" | tr '\t' ' ')" ;;
-      esac
-    done <<< "$out"
-    return 0
+  case "$kind" in d|f) ;; *) return 0 ;; esac
+  helper="${CC_DJ_RET_HELPER:-$(dirname "${BASH_SOURCE[0]}")/retention-helper.py}"
+  if [ ! -r "$helper" ] || ! command -v python3 >/dev/null 2>&1; then
+    _cc_dj_log "retention: $helper or python3 not found; nothing removed"; return 0
   fi
-  while IFS= read -r -d '' p; do
-    [ -n "$p" ] || continue
-    case "$p" in "$root"/?*) ;; *) _cc_dj_log "retention: refused $p: not inside $root"; continue ;; esac
-    if [ -L "$p" ]; then _cc_dj_log "retention: refused $p: is a symlink"; continue; fi
-    # The parent, physically resolved, is still inside the root: no symlinked directory on the way.
-    par="$(cd -P -- "${p%/*}" 2>/dev/null && pwd -P)" || { _cc_dj_log "retention: refused $p: parent unreadable"; continue; }
-    case "$par/" in "$root"/*) ;; *) _cc_dj_log "retention: refused $p: parent resolves outside $root"; continue ;; esac
-    if _cc_dj_ret_over_budget; then _cc_dj_log "retention: time budget spent; the rest waits for the next run"; break; fi
-    if [ -f "$p" ] && rm -f -- "$p"; then _CC_DJ_RET_REMOVED=$((_CC_DJ_RET_REMOVED + 1)); fi
-  done < "$list"
+  left=$(( ${_CC_DJ_RET_DEADLINE:-0} - SECONDS )); [ "$left" -ge 1 ] || left=1
+  out="$(python3 -I "$helper" remove --root "$root" --list "$list" --seconds "$left" --kind "$kind" 2>&1)" || {
+    _cc_dj_log "retention: removal failed: $(printf '%s' "$out" | tail -1)"; return 0; }
+  while IFS= read -r line; do
+    case "$line" in
+      REMOVED*) _CC_DJ_RET_REMOVED=$((_CC_DJ_RET_REMOVED + 1)) ;;
+      REFUSED*|ERR*) _cc_dj_log "retention: $(printf '%s' "$line" | tr '\t' ' ')" ;;
+    esac
+  done <<< "$out"
   return 0
 }
 

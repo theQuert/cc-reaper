@@ -44,8 +44,11 @@ def newest_within(path, seconds, now=None):
     Walks without following symlinks; stops at the first recent file. A read error raises."""
     now = time.time() if now is None else now
     cutoff = now - seconds
-    if os.lstat(path).st_mtime >= cutoff:
+    st = os.lstat(path)
+    if st.st_mtime >= cutoff:
         return True
+    if not stat.S_ISDIR(st.st_mode):
+        return False        # a file or a symlink: only its own mtime counts
     errors = []
     for dirpath, dirnames, filenames in os.walk(path, followlinks=False, onerror=errors.append):
         if errors:
@@ -151,8 +154,8 @@ def safe_unlink(root, path):
 
 
 def cmd_remove(a):
-    """Remove each directory in the NUL-separated list under the verified root, by explicit path,
-    within the time budget. One line per path: REMOVED or REFUSED with the reason."""
+    """Remove each directory tree (--kind d) or regular file (--kind f) in the NUL-separated list under
+    the verified root, by explicit path, within the time budget. One line per path: REMOVED or REFUSED with the reason."""
     root = real_root(a.root)
     if root is None:
         print("ERR\troot %s is missing, a symlink, or not owned by us / writable by others" % a.root)
@@ -165,7 +168,7 @@ def cmd_remove(a):
             print("ERR\ttime budget spent; the rest waits for the next run")
             break
         try:
-            safe_rmtree(root, p)
+            (safe_unlink if a.kind == "f" else safe_rmtree)(root, p)
             print("REMOVED\t%s" % p)
         except OSError as e:
             print("REFUSED\t%s\t%s" % (p, e))
@@ -258,8 +261,10 @@ def cmd_projects(a):
 
 # ------------------------------------------------------------------ evidence
 
-ENTRY_ISSUE = re.compile(r"^(?:i)?(\d{3,6})(?:[-_.]|$)")
-NAME_ISSUE = re.compile(r"(?:^|[-_.])(?:i|issue-?)(\d{3,6})(?![0-9A-Za-z])")
+# An issue is named `i<N>`, `issue-<N>` or `#<N>`; a number that begins a date (`i2026-11-10`) is not one.
+_NUM = r"(\d{3,6})(?![0-9A-Za-z])(?!-\d{2}-\d{2})"
+ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)
+NAME_ISSUE = re.compile(r"(?:^|[-_.])(?:i|issue-?|#)" + _NUM)
 MANIFEST_ISSUE = re.compile(r'stima-api#(\d{3,6})|"issue(?:_number)?"\s*:\s*(\d{3,6})')
 SQLITE_NAME = re.compile(r"\.sqlite3?(?:-wal|-shm|-journal)?$", re.I)
 ROOT_KINDS = ("helmway", "handoffs", "worktrees", "archived")
@@ -267,7 +272,7 @@ ROOT_KINDS = ("helmway", "handoffs", "worktrees", "archived")
 
 def issues_of(kind, path):
     """Issue numbers a directory names: handoffs by `i<N>` in the name; helmway-evidence by
-    `i<N>`/`issue-<N>` in the name, by top-level entries named `<N>-...`, or by a top-level
+    `i<N>`/`issue-<N>`/`#<N>` in the name, by top-level entries named that way, or by a top-level
     manifest file naming `stima-api#N`. An empty set means the directory names no issue."""
     base = os.path.basename(path)
     found = set()
@@ -337,24 +342,34 @@ def git_ro(cwd, *args):
 def codex_worktree_verdict(top):
     """(True, reason) when every git worktree under `top` (itself, or one level down: codex keeps
     <id>/<repo>) is clean and has no commit outside the remotes; (False, why) otherwise."""
-    found = []
-    for d in [top] + [os.path.join(top, n) for n in sorted(os.listdir(top))]:
-        if os.path.islink(d) or not os.path.isdir(d):
-            continue
-        g = os.path.join(d, ".git")
-        if os.path.lexists(g):
-            if os.path.islink(g):
-                return False, ".git in %s is a symlink" % d
+    if os.path.lexists(os.path.join(top, ".git")):
+        found = [top]
+    else:
+        found = []
+        for n in sorted(os.listdir(top)):
+            d = os.path.join(top, n)
+            if os.path.islink(d) or not os.path.isdir(d) or not os.path.lexists(os.path.join(d, ".git")):
+                return False, "%s is not a git worktree" % d
             found.append(d)
     if not found:
         return False, "holds no git worktree"
     for d in found:
-        rc, out = git_ro(d, "status", "--porcelain")
+        g = os.path.join(d, ".git")
+        if os.path.islink(g):
+            return False, ".git in %s is a symlink" % d
+        rc, out = git_ro(d, "status", "--porcelain", "-unormal")
         if rc != 0:
             return False, "git status failed in %s" % d
         if out:
             return False, "uncommitted changes in %s" % d
-        rc, out = git_ro(d, "rev-list", "--count", "HEAD", "--not", "--remotes")
+        if os.path.isdir(g):
+            # A full clone owns its branches and its stash: every ref must be on a remote.
+            rc, out = git_ro(d, "rev-list", "--count", "--all", "--not", "--remotes")
+            rc2, stash = git_ro(d, "stash", "list")
+            if rc2 != 0 or stash:
+                return False, "%s has a stash or it cannot be read" % d
+        else:
+            rc, out = git_ro(d, "rev-list", "--count", "HEAD", "--not", "--remotes")
         if rc != 0 or not out.isdigit():
             return False, "cannot count the commits outside the remotes in %s" % d
         if int(out) != 0:
@@ -395,7 +410,18 @@ def cmd_evidence(a):
         roots.append((kind, r))
 
     def days_of(kind):
-        return a.codex_days if kind == "helmway" else a.days
+        return a.codex_days if kind in ("helmway", "worktrees", "archived") else a.days
+
+    def young(kind, p):
+        """Why an entry is too recent to go (its newest mtime inside is within the age), or None."""
+        ds = days_of(kind)
+        if ds > 0 and newest_within(p, ds * 86400):
+            return "newest file inside is younger than %s days" % ds
+        return None
+
+    def aged(kind, why):
+        ds = days_of(kind)
+        return why + (", quiet for %s+ days" % ds if ds > 0 else "")
 
     # First pass: what could matter, so gh and lsof are asked only when needed.
     old = []        # (kind, root, p, issue numbers)
@@ -413,17 +439,24 @@ def cmd_evidence(a):
             if kind == "archived":
                 if not (os.path.isdir(p) or os.path.isfile(p)):
                     continue
-                ok, why = codex_archived_verdict(p)
-                (units.append((kind, root, p, why)) if ok else print("KEEP\t%s\t0\t%s" % (p, why)))
+                try:
+                    ok, why = codex_archived_verdict(p)
+                    young_why = young(kind, p) if ok else None
+                except OSError as e:
+                    ok, why, young_why = False, "cannot judge it (%s)" % e, None
+                if young_why:
+                    ok, why = False, young_why
+                (units.append((kind, root, p, aged(kind, why))) if ok else print("KEEP\t%s\t0\t%s" % (p, why)))
                 continue
             if not os.path.isdir(p):
                 continue
             if kind == "worktrees":
                 try:
-                    ok, why = codex_worktree_verdict(p)
+                    young_why = young(kind, p)
+                    ok, why = (False, young_why) if young_why else codex_worktree_verdict(p)
                 except (OSError, subprocess.SubprocessError) as e:
                     ok, why = False, "cannot judge it (%s)" % e
-                (units.append((kind, root, p, why)) if ok else print("KEEP\t%s\t0\t%s" % (p, why)))
+                (units.append((kind, root, p, aged(kind, why))) if ok else print("KEEP\t%s\t0\t%s" % (p, why)))
                 continue
             if kind == "handoffs" and not re.match(r"^i\d+", n):
                 continue
@@ -475,12 +508,12 @@ def cmd_evidence(a):
         # A fresh look right before removing: the entry may have changed since it was listed.
         try:
             ds = days_of(kind)
+            changed = False
             if kind == "worktrees":
                 changed = not codex_worktree_verdict(p)[0]
             elif kind == "archived":
                 changed = not codex_archived_verdict(p)[0]
-            else:
-                changed = ds > 0 and newest_within(p, ds * 86400)
+            changed = changed or (ds > 0 and newest_within(p, ds * 86400))
             if changed or not inside(root, p) or os.path.islink(p):
                 print("KEEP\t%s\t0\tchanged since it was listed" % p)
                 continue
@@ -762,6 +795,7 @@ def main(argv=None):
     r.add_argument("--root", required=True)
     r.add_argument("--list", required=True)
     r.add_argument("--seconds", type=float, default=900)
+    r.add_argument("--kind", choices=["d", "f"], default="d", help="d: directory trees, f: regular files")
     r.set_defaults(fn=cmd_remove)
     e = sub.add_parser("evidence")
     e.add_argument("--mode", choices=["shadow", "apply"], default="shadow")
