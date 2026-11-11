@@ -2021,6 +2021,17 @@ def verify(s, snapshot):
     return fails
 
 
+def close_info(s, cfg, now):
+    """Why and after how long a session is closed, for the closed-sessions entry (stima-api #7904): UTC time, idle
+    minutes, the threshold that applied (IDLE_MINUTES, or DONE_GRACE_MINUTES), whether the transcript ends on a done
+    line, and the rule that released it."""
+    thr = idle_threshold(s, cfg)
+    reason = ("state-done" if s.get("state_close") else "not-mine" if s.get("oracle_not_mine")
+              else "done-grace" if thr < float(cfg["IDLE_MINUTES"]) else "idle")
+    return {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "idle_min": round(float(s.get("idle_min") or 0)),
+            "threshold": round(thr), "said_done": bool(said_done(s)), "reason": reason}
+
+
 def write_record(s, cfg, now, status):
     """The context a person or `--resume` needs once the session is gone, written before /exit."""
     d = Path(os.path.expanduser(cfg["REAPED_DIR"]))
@@ -2034,6 +2045,7 @@ def write_record(s, cfg, now, status):
            "pane": s.get("pane", ""), "session_id": s.get("session_id", ""),
            # #7001: the claims closed as not this session's step; finish_close() releases none of them
            "oracle_not_mine": dict(s.get("oracle_not_mine") or {}),
+           "close": close_info(s, cfg, now),
            "resume": f"tmux new-session -d -s {s['tmux']} -c {s['cwd']} 'claude --resume {s['sid']}'"}
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=1) + "\n")
@@ -2121,7 +2133,7 @@ def notmine_posted(ref, sid, pid):
     return any(notmine_mark(sid, pid) in (c.get("body") or "") for c in comments if isinstance(c, dict))
 
 
-def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg, now, pid=None, not_mine=None):
+def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg, now, pid=None, not_mine=None, close=None):
     """The steps after claude has exited, safe to repeat: each checks for its own earlier effect.
     Returns False when a step could not be confirmed (the record then stays "exiting").
     `not_mine` ({issue number: why}, #7001): those claims get notmine_comment(), never a release."""
@@ -2131,6 +2143,9 @@ def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg,
     # One entry per close, not per session id: a resumed session that is closed again needs its own entry (#6477:
     # apertis-ops's second close left none, because its id was already in the log). Its pid is new on every resume.
     mark, summ = f"<!-- pid:{pid} -->", " ".join(summ.split())  # one line, so the id and the mark share it
+    # A second comment after the pid mark, so every reader of the line (the sid, the pid mark, the header) is unchanged.
+    tail = (" <!-- close: at={at} idle={idle_min} threshold={threshold} said_done={sd} reason={reason} -->".format(
+        sd=str(close["said_done"]).lower(), **close) if close else "")
     try:
         done = any(sid in ln and mark in ln for ln in log.read_text().splitlines())
     except OSError:
@@ -2140,7 +2155,7 @@ def finish_close(rec_tmux, sid, cwd, claims, summ, pane, session_id, alone, cfg,
         issues = " ".join(f"{r}#{n}" for r, n in claims) or "-"
         with log.open("a") as fh:
             fh.write(f"\n## {stamp} session-reaper (resume: claude --resume <sid>)\n"
-                     f"- {rec_tmux} {sid} cwd={cwd} issues={issues} — {summ} {mark}\n")
+                     f"- {rec_tmux} {sid} cwd={cwd} issues={issues} — {summ} {mark}{tail}\n")
     ok = True
     for ref in [r for r in claims if str(r[1]) in not_mine]:  # #7001: never a release, so the claim stays
         seen = notmine_posted(ref, sid, pid)
@@ -2201,7 +2216,7 @@ def recover_exiting(cfg, now):
                 continue
         claims = [tuple(c.rsplit("#", 1)) for c in rec.get("claims", []) if "#" in c]
         if not finish_close(rec["tmux"], rec["sid"], rec["cwd"], claims, (rec.get("last_text") or "").strip()[:120],
-                            pane, rec.get("session_id"), True, cfg, now, pid, rec.get("oracle_not_mine")):
+                            pane, rec.get("session_id"), True, cfg, now, pid, rec.get("oracle_not_mine"), close=rec.get("close")):
             try:
                 if now - path.stat().st_mtime > STALE_EXITING_SECONDS:
                     notes.append(f"{rec['tmux']} ({rec['sid']}): record exiting over 24h, issue comment unconfirmed")
@@ -2279,7 +2294,7 @@ def reap(s, cfg, now):
         mark_record(s["record"], "exception")
         raise
     if not finish_close(s["tmux"], s["sid"], s["cwd"], s["claims"], summary(s), s["pane"],
-                        s["session_id"], alone, cfg, now, s["pid"], s.get("oracle_not_mine")):
+                        s["session_id"], alone, cfg, now, s["pid"], s.get("oracle_not_mine"), close=close_info(s, cfg, now)):
         return "skipped:close-unconfirmed", [f"{s['tmux']}: log or issue comment not confirmed; record stays exiting"]
     # Kill only what this session owned: the whole tmux session if it was its only pane.
     # Recount just before the kill: a window opened during the exit wait must survive. A pane
