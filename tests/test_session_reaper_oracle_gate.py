@@ -334,5 +334,20 @@ class IssueRe(unittest.TestCase):
             self.assertIsNone(reaper.ISSUE_RE.search(branch), branch)
 
 
+class OracleTimeoutTest(unittest.TestCase):
+    def test_brief_read_uses_the_configured_timeout(self):
+        # stima-api #7061: a hard 30 s timed out under load with 8 parallel reads and judged live claims UNKNOWN.
+        cfg = dict(reaper.DEFAULTS) if hasattr(reaper, "DEFAULTS") else {}
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        cfg.update({"CHECKBY_REPO": "o/r", "ORACLE_CACHE_DIR": tmp, "ORACLE_CACHE_MINUTES": "10", "ORACLE_ROOT": tmp})
+        cfg.setdefault("ORACLE_TIMEOUT_SECONDS", "60")
+        seen = []
+        reaper._brief_cache.clear()
+        with mock.patch.object(reaper, "run", side_effect=lambda argv, t, **kw: seen.append(t) or (0, "delivery #9: x -> agent y")):
+            self.assertEqual(reaper.oracle_brief("o/r", 9, cfg, 1000.0), "delivery #9: x -> agent y")
+        self.assertEqual(seen, [60.0])
+
+
 if __name__ == "__main__":
     unittest.main()
