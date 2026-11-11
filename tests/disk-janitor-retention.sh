@@ -71,7 +71,8 @@ begin() {  # sets T, FH and the env every case runs under
     CC_DJ_RET_GCLOUD_DIR="$T/none/gcloud" CC_DJ_RET_RELEASE_DIR="$T/none/release"
     CC_DJ_RET_SCRATCH_ROOT="$T/none/scratch" CC_DJ_RET_PROJECTS_DIR="$T/none/projects"
     CC_DJ_RET_GOCACHE_DIR="$T/none/gocache" CC_DJ_RET_HELMWAY_DIR="$T/none/helmway"
-    CC_DJ_RET_HANDOFFS_DIR="$T/none/handoffs")
+    CC_DJ_RET_HANDOFFS_DIR="$T/none/handoffs" CC_DJ_RET_CODEX_WORKTREES_DIR="$T/none/cwt"
+    CC_DJ_RET_CODEX_ARCHIVED_DIR="$T/none/carch")
 }
 
 jr() { env "${BASE_ENV[@]}" "$@"; }       # jr K=V ... bash script args
@@ -303,9 +304,9 @@ t_evidence() {
   age "$H" 20; age "$E" 20; age "$T/outside" 20
   touch "$H/i300-fresh/new"
   printf '100\n300\n400\n' > "$T/gh.closed"
-  # Default (shadow): everything stays, bytes are reported per directory.
-  run "$sd" CC_DJ_RET_EVIDENCE_MODE= CC_DJ_RET_HELMWAY_DIR="$E" CC_DJ_RET_HANDOFFS_DIR="$H"
-  [ -d "$H/i100-old" ] && [ -d "$E/2026-10-01-a" ] || { echo "  default mode removed"; r=1; }
+  # Shadow: everything stays, bytes are reported per directory.
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE=shadow CC_DJ_RET_HELMWAY_DIR="$E" CC_DJ_RET_HANDOFFS_DIR="$H"
+  [ -d "$H/i100-old" ] && [ -d "$E/2026-10-01-a" ] || { echo "  shadow removed"; r=1; }
   has 'rule=evidence mode=shadow candidates=4 bytes=[1-9]' || { echo "  shadow should list i100-old, i400, 2026-10-01-a, 2026-10-04-d"; r=1; }
   grep -q 'rule=evidence WOULD-REMOVE .*i100-old' "$T/spot.log" || { echo "  no per-directory line with the reason"; r=1; }
   run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HELMWAY_DIR="$E" CC_DJ_RET_HANDOFFS_DIR="$H"
@@ -511,8 +512,8 @@ t_bad_mode_is_shadow() {
 t_defaults() {
   local sd="$1" r=0 out
   begin
-  out="$(env HOME="$FH" CC_DJ_CONFIG=/dev/null bash -c 'unset CC_RW_DISK_ACT_GB; . "$1"; echo "$CC_DJ_RET_GCLOUD_MODE $CC_DJ_RET_RELEASE_MODE $CC_DJ_RET_GOCACHE_MODE $CC_DJ_RET_SCRATCH_MODE $CC_DJ_RET_PROJECTS_MODE $CC_DJ_RET_EVIDENCE_MODE $CC_DJ_RET_DEV_MODE $CC_DJ_RET_GOCACHE_ACT_GB $CC_DJ_RET_GCLOUD_DAYS $CC_DJ_RET_RELEASE_KEEP $CC_DJ_RET_SCRATCH_DAYS $CC_DJ_RET_PROJECTS_DAYS $CC_DJ_RET_EVIDENCE_DAYS $CC_DJ_RET_DEV_MIN_AGE_HOURS"' _ "$sd/disk-janitor.sh" 2>&1)"
-  [ "$out" = "apply apply apply shadow shadow shadow shadow 40 14 5 3 7 7 168" ] || { echo "  defaults are: $out"; r=1; }
+  out="$(env HOME="$FH" CC_DJ_CONFIG=/dev/null bash -c 'unset CC_RW_DISK_ACT_GB; . "$1"; echo "$CC_DJ_RET_GCLOUD_MODE $CC_DJ_RET_RELEASE_MODE $CC_DJ_RET_GOCACHE_MODE $CC_DJ_RET_SCRATCH_MODE $CC_DJ_RET_PROJECTS_MODE $CC_DJ_RET_EVIDENCE_MODE $CC_DJ_RET_DEV_MODE $CC_DJ_RET_GOCACHE_ACT_GB $CC_DJ_RET_GCLOUD_DAYS $CC_DJ_RET_RELEASE_KEEP $CC_DJ_RET_SCRATCH_DAYS $CC_DJ_RET_PROJECTS_DAYS $CC_DJ_RET_EVIDENCE_DAYS $CC_DJ_RET_DEV_MIN_AGE_HOURS $CC_DJ_RET_CODEX_DAYS"' _ "$sd/disk-janitor.sh" 2>&1)"
+  [ "$out" = "apply apply apply shadow shadow apply shadow 40 14 5 3 7 7 168 0" ] || { echo "  defaults are: $out"; r=1; }
   out="$(env HOME="$FH" CC_DJ_CONFIG=/dev/null CC_RW_DISK_ACT_GB=33 bash -c '. "$1"; echo "$CC_DJ_RET_GOCACHE_ACT_GB"' _ "$sd/disk-janitor.sh" 2>&1)"
   [ "$out" = 33 ] || { echo "  go-cache threshold does not follow CC_RW_DISK_ACT_GB ($out)"; r=1; }
   return $r
@@ -587,6 +588,7 @@ t_safe_rmtree() {
   begin; R="$T/r"
   mkdir -p "$R/a/b/leaf" "$T/out/leaf" "$T/r2"; echo f > "$R/a/b/leaf/f"; echo keep > "$T/out/leaf/f"
   ln -s "$T/out" "$R/lnk"; ln -s "$T/out/leaf" "$R/linkleaf"; chmod 755 "$R"
+  echo keep > "$T/out/loose"; ln -s "$T/out/loose" "$R/linkfile"; echo p > "$R/plain"
   cat > "$T/unit.py" <<'PY'
 import importlib.util, os, shutil, sys
 spec = importlib.util.spec_from_file_location("rh", sys.argv[1])
@@ -596,7 +598,7 @@ mode, root, path = sys.argv[2:5]
 if mode == "nofdsafe":
     shutil.rmtree.avoids_symlink_attacks = False
 try:
-    m.safe_rmtree(root, path)
+    (m.safe_unlink if mode == "unlink" else m.safe_rmtree)(root, path)
     print("REMOVED")
 except OSError as e:
     print("REFUSED", e)
@@ -621,6 +623,16 @@ PY
   out="$(u normal "$T/r2" "$T/r2/x")"
   case "$out" in REFUSED*) ;; *) echo "  removed under a mode-777 root: $out"; r=1 ;; esac
   [ -d "$T/r2/x" ] || { echo "  the mode-777 root's entry is gone"; r=1; }
+  out="$(u unlink "$R" "$R/linkfile")"
+  case "$out" in REFUSED*) ;; *) echo "  unlinked a symlink: $out"; r=1 ;; esac
+  [ -L "$R/linkfile" ] && [ -f "$T/out/loose" ] || { echo "  the symlink or the file behind it is gone"; r=1; }
+  out="$(u unlink "$R" "$R/a")"
+  case "$out" in REFUSED*) ;; *) echo "  unlinked a directory: $out"; r=1 ;; esac
+  out="$(u unlink "$R" "$R/lnk/loose")"
+  case "$out" in REFUSED*) ;; *) echo "  unlinked through a symlinked parent: $out"; r=1 ;; esac
+  [ -f "$T/out/loose" ] || { echo "  the file behind the symlinked parent is gone"; r=1; }
+  out="$(u unlink "$R" "$R/plain")"
+  [ "$out" = REMOVED ] && [ ! -e "$R/plain" ] || { echo "  control: a plain unlink failed: $out"; r=1; }
   out="$(u normal "$R" "$R/a/b/leaf")"
   [ "$out" = REMOVED ] && [ ! -d "$R/a/b/leaf" ] || { echo "  control: a plain removal failed: $out"; r=1; }
   return $r
@@ -637,6 +649,85 @@ t_swap_after_listing() {
   [ -f "$T/outside/$UUID_A/f" ] || { echo "  a parent swapped for a symlink redirected the delete outside the root"; r=1; }
   [ ! -d "$root/proj2/$UUID_B" ] || { echo "  control: an untouched listed path was not removed"; r=1; }
   has 'REFUSED' || { echo "  the refusal was not logged"; r=1; }
+  return $r
+}
+
+# ~/.codex leftovers (the founder: 「codex相關的都去刪光」): no age; a worktree goes only when clean with
+# every commit on a remote and no process in it; an archived session goes unless held or sqlite;
+# nothing else under ~/.codex is a root. The repo is built from plumbing (see dev_fixture).
+codex_fixture() {  # sets C (the codex home), M (the main repo's git dir), C1 (on origin/main), C2 (local only)
+  C="$T/codex"; M="$T/mainrepo/.git"
+  local tree id="GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t"
+  mkdir -p "$M/objects" "$M/refs/heads" "$M/refs/remotes/origin" "$C/worktrees" "$C/archived_sessions" "$C/helmway-evidence" \
+    "$C/packages/p" "$C/plugins/q" "$C/sessions"
+  printf 'ref: refs/heads/main\n' > "$M/HEAD"
+  printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n' > "$M/config"
+  tree="$(git --git-dir="$M" hash-object -t tree -w /dev/null)"
+  C1="$(env $id git --git-dir="$M" commit-tree "$tree" -m base)"
+  C2="$(env $id git --git-dir="$M" commit-tree "$tree" -p "$C1" -m local-only)"
+  printf '%s\n' "$C1" > "$M/refs/heads/main"; printf '%s\n' "$C1" > "$M/refs/remotes/origin/main"
+  printf '%s\n' "$C2" > "$M/refs/heads/feat"
+  echo '{}' > "$C/auth.json"; echo 'x = 1' > "$C/config.toml"; echo p > "$C/packages/p/f"; echo q > "$C/plugins/q/f"
+  echo s > "$C/state.sqlite"; echo r > "$C/sessions/rollout.jsonl"
+}
+cwt() {  # <id> <HEAD file content>: a linked worktree $C/worktrees/<id>/repo
+  local w="$C/worktrees/$1/repo" gd="$M/worktrees/$1"
+  mkdir -p "$w" "$gd"
+  printf '%s\n' "$2" > "$gd/HEAD"; printf '../..\n' > "$gd/commondir"; printf '%s\n' "$w/.git" > "$gd/gitdir"
+  printf 'gitdir: %s\n' "$gd" > "$w/.git"
+}
+codexrun() { run "$1" CC_DJ_RET_EVIDENCE_MODE="$2" CC_DJ_RET_HELMWAY_DIR="$C/helmway-evidence" \
+  CC_DJ_RET_CODEX_WORKTREES_DIR="$C/worktrees" CC_DJ_RET_CODEX_ARCHIVED_DIR="$C/archived_sessions" LSOF_EXTRA="$T/lsof.extra" "${@:3}"; }
+
+t_codex() {
+  local sd="$1" r=0 C M C1 C2 h x
+  begin; codex_fixture; h="$C/helmway-evidence"; x="$C/archived_sessions"
+  mkdir -p "$h/2026-11-01-a" "$h/2026-11-02-b" "$h/2026-11-03-c"
+  echo x > "$h/2026-11-01-a/100-x.md"; echo x > "$h/2026-11-02-b/200-y.md"; echo x > "$h/2026-11-03-c/n.txt"
+  cwt clean "$C1"; cwt ahead "ref: refs/heads/feat"; cwt dirty "$C1"; echo u > "$C/worktrees/dirty/repo/untracked"
+  cwt held "$C1"; mkdir -p "$C/worktrees/nogit/repo"; echo x > "$C/worktrees/nogit/repo/f"
+  echo a > "$x/a.jsonl"; echo h > "$x/held.jsonl"; echo s > "$x/state.sqlite"; echo w > "$x/state.sqlite-wal"
+  mkdir -p "$x/dir1" "$x/dir2"; echo x > "$x/dir1/x.jsonl"; echo y > "$x/dir2/hist.sqlite"
+  echo keep > "$T/outside/f"; ln -s "$T/outside" "$x/lnk"
+  printf 'n%s\n' "$C/worktrees/held/repo" "$x/held.jsonl" > "$T/lsof.extra"
+  printf '100\n' > "$T/gh.closed"
+  # Shadow lists the four, with bytes and the reason, and removes nothing.
+  codexrun "$sd" shadow
+  [ -d "$C/worktrees/clean" ] && [ -f "$x/a.jsonl" ] && [ -d "$h/2026-11-01-a" ] || { echo "  shadow removed"; r=1; }
+  has 'rule=evidence mode=shadow candidates=4 bytes=[1-9]' || { echo "  shadow should list helmway a, worktree clean, a.jsonl, dir1"; r=1; }
+  grep -q 'rule=evidence WOULD-REMOVE .*/worktrees/clean [0-9]* clean, every commit is on a remote' "$T/spot.log" || { echo "  no per-worktree line with the reason"; r=1; }
+  # The default mode is apply, and nothing is aged: the files above were written a moment ago.
+  codexrun "$sd" ""
+  [ ! -d "$h/2026-11-01-a" ] || { echo "  helmway-evidence of a closed issue survived (no age applies)"; r=1; }
+  [ ! -d "$C/worktrees/clean" ] || { echo "  a clean worktree with every commit on a remote survived"; r=1; }
+  [ ! -e "$x/a.jsonl" ] && [ ! -d "$x/dir1" ] || { echo "  archived sessions survived"; r=1; }
+  [ -d "$h/2026-11-02-b" ] || { echo "  helmway-evidence of an open issue was removed"; r=1; }
+  [ -d "$h/2026-11-03-c" ] || { echo "  helmway-evidence naming no issue was removed"; r=1; }
+  [ -d "$C/worktrees/ahead" ] || { echo "  a worktree with a commit on no remote was removed"; r=1; }
+  [ -f "$C/worktrees/dirty/repo/untracked" ] || { echo "  a dirty worktree was removed"; r=1; }
+  [ -d "$C/worktrees/held" ] || { echo "  a worktree a process holds was removed"; r=1; }
+  [ -d "$C/worktrees/nogit" ] || { echo "  an entry holding no git worktree was removed"; r=1; }
+  [ -f "$x/held.jsonl" ] || { echo "  an archived session a process holds was removed"; r=1; }
+  [ -f "$x/state.sqlite" ] && [ -f "$x/state.sqlite-wal" ] || { echo "  an sqlite file in archived_sessions was removed"; r=1; }
+  [ -f "$x/dir2/hist.sqlite" ] || { echo "  a directory holding an sqlite file was removed"; r=1; }
+  [ -L "$x/lnk" ] && [ -f "$T/outside/f" ] || { echo "  a symlink in archived_sessions was followed or removed"; r=1; }
+  [ -f "$C/auth.json" ] && [ -f "$C/config.toml" ] && [ -f "$C/packages/p/f" ] && [ -f "$C/plugins/q/f" ] \
+    && [ -f "$C/state.sqlite" ] && [ -f "$C/sessions/rollout.jsonl" ] || { echo "  something outside the three roots was touched"; r=1; }
+  has 'rule=evidence mode=apply candidates=4 .* removed=4' || { echo "  apply report wrong"; r=1; }
+  : > "$T/dj.log"; codexrun "$sd" ""
+  has 'candidates=0 .* removed=0' || { echo "  second run is not a no-op"; r=1; }
+  return $r
+}
+
+# lsof that cannot report means nothing in a worktree or an archived session can be called unheld.
+t_codex_lsof_unknown_keeps() {
+  local sd="$1" r=0 C M C1 C2
+  begin; codex_fixture; cwt clean "$C1"; echo a > "$C/archived_sessions/a.jsonl"; : > "$T/lsof.extra"
+  codexrun "$sd" apply CC_DJ_RET_LSOF=/usr/bin/true
+  [ -d "$C/worktrees/clean" ] && [ -f "$C/archived_sessions/a.jsonl" ] || { echo "  removed with lsof unable to report"; r=1; }
+  grep -q 'lsof cannot report open files; kept' "$T/spot.log" || { echo "  no KEEP line"; r=1; }
+  codexrun "$sd" apply
+  [ ! -d "$C/worktrees/clean" ] && [ ! -e "$C/archived_sessions/a.jsonl" ] || { echo "  control: not removed with a working lsof"; r=1; }
   return $r
 }
 
@@ -658,7 +749,7 @@ t_scratch_lsof_unknown_keeps t_scratch_default_shadow t_projects t_projects_defa
 t_evidence t_evidence_gh_failure t_dev t_dev_sigkill t_dev_young_keeps t_dev_active_worktree_keeps
 t_dev_merged_worktree_stops t_dev_primary_keeps t_dev_live_session_keeps t_dev_claude_ancestor_keeps
 t_dev_never_kill_keeps t_dev_unknown_keeps t_dev_match_default t_report_forces_shadow t_bad_mode_is_shadow t_defaults t_remove_guards
-t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing"
+t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing t_codex t_codex_lsof_unknown_keeps"
 
 for c in $CASES; do
   if "$c" "$SRC"; then ok "$c"; else nok "$c"; fi
@@ -727,11 +818,18 @@ mutant "go-cache: threshold ignores CC_RW_DISK_ACT_GB" $J 'CC_DJ_RET_GOCACHE_ACT
 # 6 evidence
 mutant "evidence: open issue does not keep" $H '        if still:' '        if False:' t_evidence
 mutant "evidence: a directory naming no issue goes" $H '        if not nums:' '        if False:' t_evidence
-mutant "evidence: recent files do not keep" $H '                if newest_within(p, a.days * 86400):
-                    continue' '                if False:
-                    continue' t_evidence
+mutant "evidence: recent files do not keep" $H '                if days_of(kind) > 0 and newest_within(p, days_of(kind) * 86400):' '                if False:' t_evidence
 mutant "evidence: unknown issue state counts as closed" $H 'closed = closed_issues(a.repo, a.gh, a.limit)' 'closed = closed_issues(a.repo, a.gh, a.limit) or set(range(10**6))' t_evidence_gh_failure
-mutant "evidence: default mode is apply" $J 'CC_DJ_RET_EVIDENCE_MODE:-shadow' 'CC_DJ_RET_EVIDENCE_MODE:-apply' t_evidence t_defaults
+mutant "evidence: default mode is shadow" $J 'CC_DJ_RET_EVIDENCE_MODE:-apply' 'CC_DJ_RET_EVIDENCE_MODE:-shadow' t_codex t_defaults
+# ~/.codex leftovers
+mutant "codex: helmway-evidence is aged like handoffs" $H 'return a.codex_days if kind == "helmway" else a.days' 'return a.days' t_codex
+mutant "codex: a dirty worktree goes" $H 'return False, "uncommitted changes in %s" % d' 'pass' t_codex
+mutant "codex: a commit on no remote does not keep" $H '        if int(out) != 0:' '        if False:' t_codex
+mutant "codex: a held entry goes" $H '            elif is_held(p, held):' '            elif False:' t_codex
+mutant "codex: unknown lsof counts as nothing held" $H 'held = held_paths([r for _, r, _, _ in units])' 'held = held_paths([r for _, r, _, _ in units]) or []' t_codex_lsof_unknown_keeps
+mutant "codex: an sqlite file goes" $H '    if SQLITE_NAME.search(os.path.basename(p)):' '    if False:' t_codex
+mutant "codex: a directory holding an sqlite file goes" $H '            if any(SQLITE_NAME.search(n) for n in dn + fn):' '            if False:' t_codex
+mutant "codex: unlink accepts a symlink" $H '        if not stat.S_ISREG(os.stat(leaf, dir_fd=fd, follow_symlinks=False).st_mode):' '        if False:' t_safe_rmtree
 # 7 dev processes
 mutant "dev: claude ancestor ignored" $H '        if is_agent(p["cmd"]):' '        if False:' t_dev_claude_ancestor_keeps
 mutant "dev: live session cwd ignored" $H '        if c == real or c.startswith(real + "/"):' '        if False:' t_dev_live_session_keeps

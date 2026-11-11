@@ -95,8 +95,10 @@ Environment:
                         scratchpads quiet _DAYS, 3, with no live session), PROJECTS (shadow; transcripts
                         of worktrees that no longer exist, quiet _DAYS, 7), GOCACHE (apply; `go clean
                         -cache` under _ACT_GB free, default CC_RW_DISK_ACT_GB, at most once per
-                        _INTERVAL_SECONDS), EVIDENCE (shadow; helmway-evidence and handoffs i<N> dirs
-                        of closed issues quiet _DAYS, 7), DEV (shadow; dev servers 168 h old in a merged
+                        _INTERVAL_SECONDS), EVIDENCE (apply; helmway-evidence dirs of closed issues, handoffs i<N> dirs of closed
+                        issues quiet _DAYS, 7; ~/.codex/worktrees entries that are clean with every commit
+                        on a remote and ~/.codex/archived_sessions entries, none held by a process; _CODEX_DAYS, 0,
+                        is the age for ~/.codex paths), DEV (shadow; dev servers 168 h old in a merged
                         or idle worktree with no live Claude owner). CC_DJ_RET_BUDGET_SECONDS bounds a run.
   CC_DJ_GROWTH_TARGETS  Growth targets for --check (default: ~/.cc-reaper/growth-targets.tsv)
   CC_DJ_GROWTH_INTERVAL_HOURS / _BUDGET_SECONDS / _WINDOW_HOURS / _ALERT_GB / _KEY_TIMEOUT
@@ -172,10 +174,13 @@ CC_DJ_RET_PROJECTS_MATCH="${CC_DJ_RET_PROJECTS_MATCH:--worktrees-}"
 CC_DJ_RET_GOCACHE_MODE="${CC_DJ_RET_GOCACHE_MODE:-apply}"
 CC_DJ_RET_GOCACHE_ACT_GB="${CC_DJ_RET_GOCACHE_ACT_GB:-${CC_RW_DISK_ACT_GB:-40}}"
 CC_DJ_RET_GOCACHE_INTERVAL_SECONDS="${CC_DJ_RET_GOCACHE_INTERVAL_SECONDS:-86400}"
-CC_DJ_RET_EVIDENCE_MODE="${CC_DJ_RET_EVIDENCE_MODE:-shadow}"
+CC_DJ_RET_EVIDENCE_MODE="${CC_DJ_RET_EVIDENCE_MODE:-apply}"
 CC_DJ_RET_EVIDENCE_DAYS="${CC_DJ_RET_EVIDENCE_DAYS:-7}"
 CC_DJ_RET_EVIDENCE_REPO="${CC_DJ_RET_EVIDENCE_REPO:-theQuert/stima-api}"
+CC_DJ_RET_CODEX_DAYS="${CC_DJ_RET_CODEX_DAYS:-0}"
 CC_DJ_RET_HELMWAY_DIR="${CC_DJ_RET_HELMWAY_DIR:-$HOME/.codex/helmway-evidence}"
+CC_DJ_RET_CODEX_WORKTREES_DIR="${CC_DJ_RET_CODEX_WORKTREES_DIR:-$HOME/.codex/worktrees}"
+CC_DJ_RET_CODEX_ARCHIVED_DIR="${CC_DJ_RET_CODEX_ARCHIVED_DIR:-$HOME/.codex/archived_sessions}"
 CC_DJ_RET_HANDOFFS_DIR="${CC_DJ_RET_HANDOFFS_DIR:-$HOME/handoffs}"
 CC_DJ_RET_DEV_MODE="${CC_DJ_RET_DEV_MODE:-shadow}"
 CC_DJ_RET_DEV_MIN_AGE_HOURS="${CC_DJ_RET_DEV_MIN_AGE_HOURS:-168}"
@@ -1013,8 +1018,11 @@ _cc_dj_alert() {
 #                    that nothing under has changed for CC_DJ_RET_PROJECTS_DAYS (7)
 #   go-cache         `go clean -cache` when free space is under CC_DJ_RET_GOCACHE_ACT_GB (default
 #                    CC_RW_DISK_ACT_GB, 40) and no run in CC_DJ_RET_GOCACHE_INTERVAL_SECONDS (86400)
-#   evidence         ~/.codex/helmway-evidence/* and ~/handoffs/i<N>* quiet for CC_DJ_RET_EVIDENCE_DAYS
-#                    (7) whose every named issue is CLOSED (one gh read per run)
+#   evidence         ~/handoffs/i<N>* quiet for CC_DJ_RET_EVIDENCE_DAYS (7) and ~/.codex/helmway-evidence/*
+#                    (no age: CC_DJ_RET_CODEX_DAYS, 0), whose every named issue is CLOSED (one gh read per
+#                    run); ~/.codex/worktrees/* clean with every commit on a remote; ~/.codex/archived_sessions/*
+#                    (never an sqlite file); the last two only when no process holds anything in them.
+#                    Nothing else under ~/.codex is a root: auth.json, config.toml, packages, plugins, sessions.
 #   dev-processes    next dev / proxy.mjs / ... running CC_DJ_RET_DEV_MIN_AGE_HOURS (168)+ in a merged
 #                    or idle worktree whose Claude session is gone; SIGTERM, then SIGKILL
 #
@@ -1392,12 +1400,14 @@ _cc_dj_ret_helper_rule() {  # <rule> <mode> <helper args...>
 }
 
 _cc_dj_ret_evidence() {
-  local mode days
+  local mode days cdays
   mode="$(_cc_dj_ret_mode "$CC_DJ_RET_EVIDENCE_MODE")"; [ "$mode" = off ] && return 0
   days="$(_cc_dj_ret_num CC_DJ_RET_EVIDENCE_DAYS "$CC_DJ_RET_EVIDENCE_DAYS" 1)" || return 0
+  cdays="$(_cc_dj_ret_num CC_DJ_RET_CODEX_DAYS "$CC_DJ_RET_CODEX_DAYS" 0)" || return 0
   _cc_dj_ret_helper_rule evidence "$mode" evidence --mode "$([ "$mode" = apply ] && echo apply || echo shadow)" \
-    --days "$days" --repo "$CC_DJ_RET_EVIDENCE_REPO" --gh "${CC_DJ_RET_GH:-gh}" \
-    --root "helmway:$CC_DJ_RET_HELMWAY_DIR" --root "handoffs:$CC_DJ_RET_HANDOFFS_DIR"
+    --days "$days" --codex-days "$cdays" --repo "$CC_DJ_RET_EVIDENCE_REPO" --gh "${CC_DJ_RET_GH:-gh}" \
+    --root "helmway:$CC_DJ_RET_HELMWAY_DIR" --root "handoffs:$CC_DJ_RET_HANDOFFS_DIR" \
+    --root "worktrees:$CC_DJ_RET_CODEX_WORKTREES_DIR" --root "archived:$CC_DJ_RET_CODEX_ARCHIVED_DIR"
 }
 
 _cc_dj_ret_dev_processes() {

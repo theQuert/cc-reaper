@@ -6,7 +6,9 @@ three rules whose predicate is too long for shell and needs an exact answer:
 
   projects   ~/.claude/projects/<encoded cwd> directories whose worktree no longer exists
   evidence   ~/.codex/helmway-evidence/<dated dir> and ~/handoffs/i<N>* directories whose
-             issue is CLOSED and that nothing has written to for N days
+             issue is CLOSED (handoffs also quiet for N days), plus ~/.codex/worktrees entries
+             that are clean with every commit on a remote and ~/.codex/archived_sessions entries,
+             both only when no process holds anything in them
   devprocs   long-running dev servers (next dev, proxy.mjs, ...) in a merged or idle worktree
              whose Claude session is gone
 
@@ -93,12 +95,9 @@ def real_root(root):
     return os.path.realpath(root)
 
 
-def safe_rmtree(root, path):
-    """Remove the directory tree `path` under `root` without ever following a symlink: the root is
-    opened O_NOFOLLOW and its ownership and mode are checked on the descriptor, every component
-    down to the parent is opened O_NOFOLLOW|O_DIRECTORY relative to the one before, and the leaf
-    is removed with shutil.rmtree(dir_fd=...). A path swapped for a symlink after it was listed
-    fails the open. Raises OSError (with the reason) when it refuses."""
+def _open_parent(root, path):
+    """(fd, leaf): a descriptor on the parent directory of `path` and the leaf's name, reached
+    without following a symlink. The caller closes the descriptor. Raises OSError when it refuses."""
     if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
         raise OSError("shutil.rmtree is not symlink-attack safe on this platform; refusing to remove")
     root = root.rstrip("/")
@@ -116,13 +115,37 @@ def safe_rmtree(root, path):
             nfd = os.open(comp, flags, dir_fd=fd)
             os.close(fd)
             fd = nfd
-        leaf = parts[-1]
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, parts[-1]
+
+
+def safe_rmtree(root, path):
+    """Remove the directory tree `path` under `root` without ever following a symlink: the root is
+    opened O_NOFOLLOW and its ownership and mode are checked on the descriptor, every component
+    down to the parent is opened O_NOFOLLOW|O_DIRECTORY relative to the one before, and the leaf
+    is removed with shutil.rmtree(dir_fd=...). A path swapped for a symlink after it was listed
+    fails the open. Raises OSError (with the reason) when it refuses."""
+    fd, leaf = _open_parent(root, path)
+    try:
         st = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
         if stat.S_ISLNK(st.st_mode):
             raise OSError("is a symlink")
         if not stat.S_ISDIR(st.st_mode):
             raise OSError("is not a directory")
         shutil.rmtree(leaf, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def safe_unlink(root, path):
+    """The same walk for one regular file: never a symlink, never a directory."""
+    fd, leaf = _open_parent(root, path)
+    try:
+        if not stat.S_ISREG(os.stat(leaf, dir_fd=fd, follow_symlinks=False).st_mode):
+            raise OSError("is not a regular file")
+        os.unlink(leaf, dir_fd=fd)
     finally:
         os.close(fd)
 
@@ -238,6 +261,8 @@ def cmd_projects(a):
 ENTRY_ISSUE = re.compile(r"^(?:i)?(\d{3,6})(?:[-_.]|$)")
 NAME_ISSUE = re.compile(r"(?:^|[-_.])(?:i|issue-?)(\d{3,6})(?![0-9A-Za-z])")
 MANIFEST_ISSUE = re.compile(r'stima-api#(\d{3,6})|"issue(?:_number)?"\s*:\s*(\d{3,6})')
+SQLITE_NAME = re.compile(r"\.sqlite3?(?:-wal|-shm|-journal)?$", re.I)
+ROOT_KINDS = ("helmway", "handoffs", "worktrees", "archived")
 
 
 def issues_of(kind, path):
@@ -282,21 +307,99 @@ def closed_issues(repo, gh, limit):
     return nums
 
 
+def held_paths(prefixes):
+    """Every open file and working directory of every process that lies under one of `prefixes`,
+    from ONE system-wide lsof; None when lsof cannot report (then nothing is judged unheld)."""
+    exe = os.environ.get("CC_DJ_RET_LSOF", "lsof")
+    try:
+        out = subprocess.run([exe, "-nP", "-b", "-w", "-Fn"], capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    names = [ln[1:] for ln in out.stdout.splitlines() if ln.startswith("n/")]
+    if not names:
+        return None
+    pre = [p.rstrip("/") + "/" for p in prefixes]
+    return [n for n in names if any((n + "/").startswith(p) for p in pre)]
+
+
+def is_held(path, held):
+    return any(h == path or h.startswith(path + "/") for h in held)
+
+
+def git_ro(cwd, *args):
+    """git that cannot run a repository's configured commands or write its index."""
+    cmd = ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", cwd] + list(args)
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                         env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
+    return out.returncode, out.stdout.strip()
+
+
+def codex_worktree_verdict(top):
+    """(True, reason) when every git worktree under `top` (itself, or one level down: codex keeps
+    <id>/<repo>) is clean and has no commit outside the remotes; (False, why) otherwise."""
+    found = []
+    for d in [top] + [os.path.join(top, n) for n in sorted(os.listdir(top))]:
+        if os.path.islink(d) or not os.path.isdir(d):
+            continue
+        g = os.path.join(d, ".git")
+        if os.path.lexists(g):
+            if os.path.islink(g):
+                return False, ".git in %s is a symlink" % d
+            found.append(d)
+    if not found:
+        return False, "holds no git worktree"
+    for d in found:
+        rc, out = git_ro(d, "status", "--porcelain")
+        if rc != 0:
+            return False, "git status failed in %s" % d
+        if out:
+            return False, "uncommitted changes in %s" % d
+        rc, out = git_ro(d, "rev-list", "--count", "HEAD", "--not", "--remotes")
+        if rc != 0 or not out.isdigit():
+            return False, "cannot count the commits outside the remotes in %s" % d
+        if int(out) != 0:
+            return False, "%s commits in %s are on no remote" % (out, d)
+    return True, "clean, every commit is on a remote"
+
+
+def codex_archived_verdict(p):
+    """An archived session goes unless it is, or holds, an sqlite database."""
+    if SQLITE_NAME.search(os.path.basename(p)):
+        return False, "is an sqlite database"
+    if os.path.isdir(p):
+        for _, dn, fn in os.walk(p, followlinks=False):
+            if any(SQLITE_NAME.search(n) for n in dn + fn):
+                return False, "holds an sqlite database"
+    return True, "archived session"
+
+
 def cmd_evidence(a):
+    """Evidence and codex leftovers, one rule: handoffs `i<N>` and helmway-evidence directories whose
+    issue is closed (handoffs also quiet for --days, helmway-evidence for --codex-days, 0 = no age),
+    plus ~/.codex/worktrees entries that are clean with every commit on a remote, and
+    ~/.codex/archived_sessions entries (never an sqlite file); the last two only when no process
+    holds anything in them. Prints one line per directory and a SUMMARY."""
     apply = a.mode == "apply"
     roots = []
     for spec in a.root:
         kind, _, path = spec.partition(":")
-        if kind not in ("helmway", "handoffs"):
+        if kind not in ROOT_KINDS:
             print("ERR\tunknown root kind %s" % kind)
             continue
+        if not os.path.lexists(path):
+            continue                      # nothing there, nothing to clean
         r = real_root(path)
         if r is None:
-            print("ERR\tevidence root %s is missing, not a directory, or a symlink; skipped" % path)
+            print("ERR\tevidence root %s is not a directory, a symlink, or not owned by us / writable by others; skipped" % path)
             continue
         roots.append((kind, r))
-    # First pass: the directories old enough to matter, so gh is asked only when needed.
-    old = []
+
+    def days_of(kind):
+        return a.codex_days if kind == "helmway" else a.days
+
+    # First pass: what could matter, so gh and lsof are asked only when needed.
+    old = []        # (kind, root, p, issue numbers)
+    units = []      # (kind, root, p, reason) codex worktrees / archived sessions that pass their own test
     for kind, root in roots:
         try:
             names = sorted(os.listdir(root))
@@ -305,17 +408,28 @@ def cmd_evidence(a):
             continue
         for n in names:
             p = os.path.join(root, n)
-            if os.path.islink(p) or not os.path.isdir(p):
+            if os.path.islink(p):
+                continue
+            if kind == "archived":
+                if not (os.path.isdir(p) or os.path.isfile(p)):
+                    continue
+                ok, why = codex_archived_verdict(p)
+                (units.append((kind, root, p, why)) if ok else print("KEEP\t%s\t0\t%s" % (p, why)))
+                continue
+            if not os.path.isdir(p):
+                continue
+            if kind == "worktrees":
+                try:
+                    ok, why = codex_worktree_verdict(p)
+                except (OSError, subprocess.SubprocessError) as e:
+                    ok, why = False, "cannot judge it (%s)" % e
+                (units.append((kind, root, p, why)) if ok else print("KEEP\t%s\t0\t%s" % (p, why)))
                 continue
             if kind == "handoffs" and not re.match(r"^i\d+", n):
                 continue
             try:
-                if newest_within(p, a.days * 86400):
+                if days_of(kind) > 0 and newest_within(p, days_of(kind) * 86400):
                     continue
-            except OSError as e:
-                print("KEEP\t%s\t0\tcannot read it (%s)" % (p, e))
-                continue
-            try:
                 nums = issues_of(kind, p)
             except OSError as e:
                 print("KEEP\t%s\t0\tcannot read it (%s)" % (p, e))
@@ -326,7 +440,7 @@ def cmd_evidence(a):
         closed = closed_issues(a.repo, a.gh, a.limit)
         if closed is None:
             print("ERR\tgh issue list failed; no directory is judged closed this run")
-    cand = total = removed = 0
+    cands = []      # (kind, root, p, label)
     for kind, root, p, nums in old:
         if not nums:
             print("KEEP\t%s\t0\tnames no issue" % p)
@@ -338,22 +452,45 @@ def cmd_evidence(a):
         if still:
             print("KEEP\t%s\t0\tissue not closed (%s)" % (p, ",".join("#%d" % n for n in still)))
             continue
+        ds = days_of(kind)
+        cands.append((kind, root, p, "closed %s%s" % (",".join("#%d" % n for n in sorted(nums)),
+                                                   ", quiet for %s+ days" % ds if ds > 0 else "")))
+    if units:
+        held = held_paths([r for _, r, _, _ in units])      # taken after the slow git work
+        for kind, root, p, why in units:
+            if held is None:
+                print("KEEP\t%s\t0\tlsof cannot report open files; kept" % p)
+            elif is_held(p, held):
+                print("KEEP\t%s\t0\theld open by a process" % p)
+            else:
+                cands.append((kind, root, p, why))
+    cand = total = removed = 0
+    for kind, root, p, label in cands:
         b = disk_bytes(p)
         cand += 1
         total += b
-        label = ",".join("#%d" % n for n in sorted(nums))
         if not apply:
-            print("WOULD-REMOVE\t%s\t%d\tclosed %s, quiet for %s+ days" % (p, b, label, a.days))
+            print("WOULD-REMOVE\t%s\t%d\t%s" % (p, b, label))
             continue
-        # A fresh look right before removing: the directory may have been written to since.
+        # A fresh look right before removing: the entry may have changed since it was listed.
         try:
-            if newest_within(p, a.days * 86400) or not inside(root, p) or os.path.islink(p):
+            ds = days_of(kind)
+            if kind == "worktrees":
+                changed = not codex_worktree_verdict(p)[0]
+            elif kind == "archived":
+                changed = not codex_archived_verdict(p)[0]
+            else:
+                changed = ds > 0 and newest_within(p, ds * 86400)
+            if changed or not inside(root, p) or os.path.islink(p):
                 print("KEEP\t%s\t0\tchanged since it was listed" % p)
                 continue
-            safe_rmtree(root, p)
+            if os.path.isdir(p):
+                safe_rmtree(root, p)
+            else:
+                safe_unlink(root, p)
             removed += 1
-            print("REMOVED\t%s\t%d\tclosed %s, quiet for %s+ days" % (p, b, label, a.days))
-        except OSError as e:
+            print("REMOVED\t%s\t%d\t%s" % (p, b, label))
+        except (OSError, subprocess.SubprocessError) as e:
             print("ERR\tremoving %s failed (%s)" % (p, e))
     print("SUMMARY\tcandidates=%d bytes=%d removed=%d" % (cand, total, removed))
     return 0
@@ -628,8 +765,9 @@ def main(argv=None):
     r.set_defaults(fn=cmd_remove)
     e = sub.add_parser("evidence")
     e.add_argument("--mode", choices=["shadow", "apply"], default="shadow")
-    e.add_argument("--root", action="append", default=[], help="helmway:<dir> or handoffs:<dir>")
+    e.add_argument("--root", action="append", default=[], help="helmway|handoffs|worktrees|archived:<dir>")
     e.add_argument("--days", type=int, default=7)
+    e.add_argument("--codex-days", type=int, default=0)
     e.add_argument("--repo", default="theQuert/stima-api")
     e.add_argument("--gh", default="gh")
     e.add_argument("--limit", type=int, default=20000)
