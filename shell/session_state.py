@@ -127,7 +127,26 @@ def _claims(s, r, cfg, now, thr):
 
 
 def judge(s, r, cfg, now):
-    """The state record of one gathered session (`s` as the reaper's gather() returns it)."""
+    """The state record of one gathered session (`s` as the reaper's gather() returns it).
+
+    DONE is the one state a reader acts on by stopping a session (the dispatcher reads this file for up to 45 minutes),
+    and the reaper's brief cache outlives a run, so a DONE stands only on briefs read in this run: before it is returned,
+    r.refresh_briefs() reads every issue the verdict rests on fresh (one read per key per run), and the session is judged
+    again when a brief changed (stima-api#7904)."""
+    rec = _judge(s, r, cfg, now)
+    refresh = getattr(r, "refresh_briefs", None)
+    if rec["state"] == "DONE" and refresh:
+        try:
+            changed = refresh(s, cfg, now, [(c["repo"], c["issue"]) for c in rec["claims"]])
+            if changed:
+                rec = _judge(s, r, cfg, now)
+                rec["reasons"] = rec["reasons"] + ["fresh-brief-changed:" + ",".join(f"#{n}" for n in changed)]
+        except Exception as e:  # a DONE not confirmed on fresh briefs is not DONE
+            rec["state"], rec["reasons"] = "UNKNOWN", [f"error:{type(e).__name__}: {e}"[:200]]
+    return rec
+
+
+def _judge(s, r, cfg, now):
     sid = s.get("sid") or ""
     rec = {"name": s.get("name") or s.get("tmux") or sid[:8], "tmux": s.get("tmux") or "", "sid": sid,
            "pid": s.get("pid"), "kind": s.get("kind") or "interactive", "status": s.get("status"),

@@ -2183,7 +2183,9 @@ class OracleReadsUnderLoad(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d)
         self.cfg = dict(CFG, ORACLE_CACHE_DIR=d, ORACLE_ROOT=d, PREFETCH_WORKERS="1")
         reaper._brief_cache.clear()
+        reaper._fresh_this_run.clear()
         self.addCleanup(reaper._brief_cache.clear)
+        self.addCleanup(reaper._fresh_this_run.clear)
 
     def prefetch(self, sessions, brief, cfg=None):
         with mock.patch.object(reaper, "batch_issue_states"), mock.patch.object(reaper, "claim_time", return_value=None), \
@@ -2242,6 +2244,7 @@ class OracleReadsUnderLoad(unittest.TestCase):
         s = session(claims=[(REPO, "9")], last_text="all good", state={"state": "DONE", "claims": []})
         with mock.patch.object(reaper, "run", return_value=(0, ENDED)):
             reaper.oracle_brief(REPO, "9", self.cfg, time.time())  # a brief a run ago, still inside the TTL
+        reaper._fresh_this_run.clear()  # ... so it was not read in this run
         with mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
              mock.patch.object(reaper, "worktree_state", return_value=[]), \
              mock.patch.object(reaper, "checkby_state", return_value="CLEAR"), \
@@ -2260,6 +2263,7 @@ class OracleReadsUnderLoad(unittest.TestCase):
         self.assertEqual(reads, 1)
         self.assertEqual(keep, ["owed-step:#9"])
         self.assertEqual(s["brief_changed"], ["9"])
+        self.assertIn("fresh brief changed: #9", reaper.report_line(dict(s, pid=1, descendants=0, owned=[]), keep, "keep"))
         self.assertIsNone(s["state"])  # the state was judged on the old brief and releases nothing
 
     def test_an_oracle_that_cannot_answer_at_the_confirming_read_keeps_the_session(self):
@@ -2283,6 +2287,66 @@ class OracleReadsUnderLoad(unittest.TestCase):
         confirm.assert_called_once()
         row = [l for l in (tmp / "report.md").read_text().splitlines() if l.startswith("| idle ")][0]
         self.assertIn("| keep | owed-step:#9 |", row)
+
+    def test_a_claimless_alarm_session_is_kept_when_a_named_issue_was_claimed_since_the_cached_brief(self):
+        # DONE_GRACE=apply: a session ending on WAITING_UNTIL closes through the alarm branch, whose named-claim gate
+        # reads the brief of an issue its text names (F2)
+        cfg = dict(self.cfg, DONE_GRACE="apply", DONE_GRACE_MINUTES="5")
+        s = session(claims=[], descendants=0, text_at=2, prompt_at=1, last_text="parked on #7050\nSESSION-STATE: WAITING_UNTIL=2999-01-01T00:00Z")
+        with mock.patch.object(reaper, "run", return_value=(0, OTHER.replace("#9", "#7050"))):
+            reaper.oracle_brief(REPO, "7050", cfg, time.time())  # a run ago: another session holds #7050
+        reaper._fresh_this_run.clear()
+        mine = MINE.replace("#9", "#7050")
+        with mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "named_open_prs", return_value=[]), \
+             mock.patch.object(reaper, "run", return_value=(0, mine)) as run:
+            keep = reaper.decide(s, cfg)
+            self.assertEqual(keep, [])  # on the cached brief alone the alarm closes
+            keep = reaper.confirm_close(s, cfg, keep)
+            self.assertEqual((keep, run.call_count), (["named-claim:#7050"], 1))
+            self.assertEqual(s["brief_changed"], ["7050"])
+            self.assertEqual(reaper.confirm_close(s, cfg, []), [])  # nothing changed the second time: taken as is
+            self.assertEqual(run.call_count, 1)  # ... and no key is read twice in a run
+
+    def test_a_key_read_in_this_run_is_not_read_again(self):
+        s = session(claims=[(REPO, "9")])
+        reaper._brief_cache[(REPO, "9")] = ENDED
+        reaper._fresh_this_run.add((REPO, "9"))
+        with mock.patch.object(reaper, "run", side_effect=AssertionError("a second read")):
+            self.assertEqual(reaper.refresh_briefs(s, self.cfg, time.time()), [])
+
+    def test_a_claimless_session_that_names_nothing_costs_no_read(self):
+        with mock.patch.object(reaper, "run", side_effect=AssertionError("ran")):
+            self.assertEqual(reaper.confirm_close(session(claims=[], last_text="done"), self.cfg, []), [])
+
+    def run_main(self, confirm):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        cfgfile = tmp / "conf"
+        cfgfile.write_text(f"APPLY=1\nREPORT={tmp / 'report.md'}\nIDLE_LIST_HOURS=0\nSTALL_MARK_DIR=\nDEAD_CLAIMS=off\n")
+        extra = dict(pid=5, start="S", file="f", status_at=1, cwd="/w", pane="%1", session_id="$1", descendants=0,
+                     fg=True, sub_active=0, screen_tail="")
+        sessions = [session(tmux="idle", name="idle", idle_min=300, sid="i" * 10, **extra)]
+        with mock.patch.object(reaper, "HOME", tmp), mock.patch.object(reaper, "gather", return_value=sessions), \
+             mock.patch.object(reaper, "prefetch"), mock.patch.object(reaper, "decide", return_value=[]), \
+             mock.patch.object(reaper, "confirm_close", **confirm), \
+             mock.patch.object(reaper, "reap", return_value=("reaped", [])) as reap, \
+             mock.patch.object(reaper, "write_done_markers", return_value=[]), \
+             mock.patch.object(reaper, "recover_exiting", return_value=[]), mock.patch.object(reaper, "alert"):
+            reaper.main(["--config", str(cfgfile), "--apply"])
+        return reap, [l for l in (tmp / "report.md").read_text().splitlines() if l.startswith("| idle ")][0]
+
+    def test_under_apply_a_confirmed_keep_is_never_reaped(self):
+        reap, row = self.run_main({"return_value": ["owed-step:#9"]})
+        reap.assert_not_called()
+        self.assertIn("| keep | owed-step:#9 |", row)
+        reap, row = self.run_main({"return_value": []})  # the control: an unchanged close does reap
+        reap.assert_called_once()
+
+    def test_under_apply_a_failing_confirmation_keeps_the_session_as_an_error(self):
+        reap, row = self.run_main({"side_effect": OSError("boom")})
+        reap.assert_not_called()
+        self.assertIn("| error |", row)
 
     def test_a_kept_session_costs_no_confirming_read(self):
         with mock.patch.object(reaper, "run", side_effect=AssertionError("ran")):

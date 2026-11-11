@@ -487,6 +487,7 @@ def checkby_state(repo, num, cfg):
 
 
 _brief_cache = {}
+_fresh_this_run = set()  # (repo, num) keys whose brief was read from the oracle in this run: taken as is, never read twice
 
 
 def _read_brief(repo, num, cfg, now):
@@ -503,6 +504,7 @@ def _read_brief(repo, num, cfg, now):
         except OSError:
             pass
     _brief_cache[key] = brief
+    _fresh_this_run.add(key)
     return brief
 
 
@@ -526,10 +528,31 @@ def oracle_brief(repo, num, cfg, now):
 
 
 def fresh_brief(repo, num, cfg, now):
-    """The brief read from the oracle now, whatever the disk or memory cache holds; it replaces both."""
+    """The brief read from the oracle in this run: a key already read in this run is taken as is (no second read);
+    otherwise it is read now, whatever the disk or memory cache holds, and replaces both."""
     if repo != cfg["CHECKBY_REPO"]:
         return None
+    if (repo, str(num)) in _fresh_this_run:
+        return _brief_cache.get((repo, str(num)))
     return _read_brief(repo, num, cfg, now)
+
+
+def refresh_briefs(s, cfg, now, extra=()):
+    """Numbers whose brief, read fresh now, differs from the one the verdict was built on. Looks at every issue a
+    verdict on `s` rests on: its claims, `extra` refs (a loop's own #N), and, for a session with no claim, the issues
+    its text names (what oracle_claims() looked at). A key already read in this run costs nothing and counts unchanged.
+    The cache outlives a run (45 minutes), so a verdict that releases a session may not rest on it (stima-api#7904)."""
+    refs = list(dict.fromkeys([*(s.get("claims") or ()), *((r, str(n)) for r, n in extra),
+                               *(() if s.get("claims") else ((cfg["CHECKBY_REPO"], n) for n in named_issues(s, cfg)))]))
+    changed = []
+    for r, n in refs:
+        key = (r, str(n))
+        if key in _fresh_this_run:
+            continue
+        old = _brief_cache.get(key)
+        if fresh_brief(r, n, cfg, now) != old:  # fresh_brief() replaces the cached brief either way
+            changed.append(str(n))
+    return changed
 
 
 BRIEF_STATE_RE = re.compile(r"\Adelivery #\d+: (\w+)")
@@ -1765,22 +1788,21 @@ DECIDE_RESULTS = ("oracle_not_mine", "state_close", "state_shadow", "state_held"
 
 
 def confirm_close(s, cfg, keep):
-    """`keep` after a fresh look at the claims of a session that decide() would close (empty `keep`).
+    """`keep` after a fresh look at what a close rests on, for a session decide() would close (empty `keep`).
 
     The brief cache outlives a run (ORACLE_CACHE_MINUTES 45 > the 30-minute interval, stima-api#7904), so a close is the
     one verdict that may not rest on it: closing a session that still has a step is the costly direction, and the
-    cache is keyed on the issue, not on what the issue said a moment ago. Each claim's brief is read from the oracle
-    now. Unchanged, `keep` stands. Changed (or unreadable), the session is decided again on the fresh briefs, with the
-    state record dropped (it was judged on the old briefs, so it releases nothing) and every earlier result cleared.
-    Only a session about to close pays the reads, which is at most a few a run."""
-    if keep or not s.get("claims"):
+    cache is keyed on the issue, not on what the issue said a moment ago. refresh_briefs() reads each claim's brief from
+    the oracle now, and for a session with no claim the issues its text names (the alarm path's `named-claim:` gate).
+    A key already read in this run (by session_state.judge()'s own confirmation, or a cache miss) is not read again.
+    Nothing changed: `keep` stands. A brief changed, or came back unreadable: the session is decided again on the fresh
+    briefs, the state record is dropped (it was judged on the old ones, so it releases nothing) and every earlier result
+    is cleared. What that second decide does with an unreadable brief is what decide() always does: a claim path keeps
+    the session (`issue-unknown:`), but a session ending in SESSION-DONE never read the claim's brief for anything but
+    a check-by, so it closes as it did before this function. Only a session about to close pays the reads."""
+    if keep:
         return keep
-    at = time.time()
-    changed = []
-    for r, n in s["claims"]:
-        old = _brief_cache.get((r, str(n)))
-        if fresh_brief(r, n, cfg, at) != old:  # fresh_brief() replaces the cached brief either way
-            changed.append(n)
+    changed = refresh_briefs(s, cfg, time.time())
     if not changed:
         return keep
     for k in DECIDE_RESULTS:
@@ -1796,17 +1818,22 @@ def person_step(s, cfg, now=None):
     return any(_brief_kind(b) == "stop" for _, b in claim_briefs(s["claims"], cfg, at))
 
 
+def named_issues(s, cfg, limit=8):
+    """The issue numbers (`#N` in the session's name or last text, not already a claim) oracle_claims() looks at."""
+    named = []
+    for n in NAMED_RE.findall(f"{s.get('name', '')}\n{s['last_text']}"):
+        if n not in named and (cfg["CHECKBY_REPO"], n) not in s["claims"]:
+            named.append(n)
+    return named[:limit]
+
+
 def oracle_claims(s, cfg, now, limit=8):
     """Issues the session names (`#N` in its last text or name) whose oracle brief says THIS session is the
     claimant (its id or a worktree marker it owns); the claim a worktree-less session has no branch for."""
     repo = cfg["CHECKBY_REPO"]
-    named = []
-    for n in NAMED_RE.findall(f"{s.get('name', '')}\n{s['last_text']}"):
-        if n not in named and (repo, n) not in s["claims"]:
-            named.append(n)
     mine = [w["marker"] for w in s["owned"] if w.get("marker")]
     out = []
-    for n in named[:limit]:
+    for n in named_issues(s, cfg, limit):
         c = CLAIMANT_RE.search(oracle_brief(repo, n, cfg, now) or "")
         if c and (_same_session(c.group(1), s["sid"]) or any(_same_session(c.group(1), m) for m in mine)):
             out.append((repo, n))
@@ -2583,6 +2610,7 @@ def report_line(s, keep, outcome):
     why += [f"state DONE ({s['state_close']} apply)"] if s.get("state_close") else []
     why += [f"state DONE held: {_cell(s['state_held'], 120)}"] if s.get("state_held") else []
     why += [f"state error: {_cell(s['state_error'], 120)}"] if s.get("state_error") else []
+    why += ["fresh brief changed: " + ",".join(f"#{n}" for n in s["brief_changed"])] if s.get("brief_changed") else []
     if s.get("claim_why"):  # name why no claim was found
         keep = [f"claim-unknown({s['claim_why']})" if k == "claim-unknown" else k for k in keep]
     blocked = [", ".join(f"blocked: #{n}" for n in s["blocked"])] if s.get("blocked") else []

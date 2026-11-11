@@ -59,6 +59,20 @@ WAIT_AHEAD = WAIT_SCHEDULED.replace("6633", "6634").replace("2026-11-03T07:23:00
 FALSE_CLAIM_BRANCHES = ("canary-main-1031", "chore/uiux-sync-1026", "uiux-accept-1029", "claude/prompt-size-403-4389")
 
 
+REAL_REFRESH = reaper.refresh_briefs
+_refresh_patch = mock.patch.object(reaper, "refresh_briefs", return_value=[])
+
+
+def setUpModule():
+    # judge() confirms a DONE on briefs read fresh (stima-api#7904); these tests mock the oracle, so that read is off
+    # unless a test turns the real one on (Confirmed)
+    _refresh_patch.start()
+
+
+def tearDownModule():
+    _refresh_patch.stop()
+
+
 def transcript(tmp, text="Merged.\n\nSESSION-DONE: nothing left, #7026 merged"):
     """transcript_facts() of a recorded transcript: a prompt 20 min ago, the reply 10 min ago."""
     path = tmp / "t.jsonl"
@@ -346,6 +360,66 @@ class OracleReads(unittest.TestCase):
             recs = ss.judge_all(reaper, sessions, CFG, NOW, workers=1)
         self.assertEqual(order, ["4", "3"])  # only the two candidates, 300 minutes idle before 100
         self.assertEqual([x["sid"] for x in recs], ["b", "y", "m", "o"])
+
+
+class Confirmed(unittest.TestCase):
+    """stima-api#7904: DONE is what the dispatcher stops a session on, and the brief cache outlives a run: a DONE stands
+    only on briefs read in this run."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        self.cfg = dict(CFG, ORACLE_CACHE_DIR=d, ORACLE_ROOT=d)
+        reaper._brief_cache.clear()
+        reaper._fresh_this_run.clear()
+        self.addCleanup(reaper._brief_cache.clear)
+        self.addCleanup(reaper._fresh_this_run.clear)
+        p = mock.patch.object(reaper, "refresh_briefs", REAL_REFRESH)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def judge(self, s, cached, fresh, js=None):
+        """judge() of `s` when run A cached `cached` for #6945 and the oracle answers `fresh` now; (record, reads)."""
+        with mock.patch.object(reaper, "run", return_value=(0, cached)):
+            reaper.oracle_brief(REPO, "6945", self.cfg, NOW)  # an earlier run, inside the 45 minute TTL
+        reaper._brief_cache.clear()
+        reaper._fresh_this_run.clear()  # a new process: nothing read yet
+        with mock.patch.object(reaper, "run", return_value=(0, fresh)) as run, \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "oracle_json", return_value=js):
+            rec = ss.judge(s, reaper, self.cfg, NOW)
+            return rec, run.call_count
+
+    def test_a_cached_wait_that_is_now_an_agent_step_is_not_done(self):
+        rec, reads = self.judge(session(claims=[(REPO, "6945")]), WAIT_OWNER, AGENT_UNCLAIMED.replace("7050", "6945"))
+        self.assertEqual((rec["state"], reads), ("UNKNOWN", 1))
+        self.assertIn("fresh-brief-changed:#6945", rec["reasons"])
+
+    def test_a_done_that_survives_the_fresh_read_costs_one_read_and_confirm_close_adds_none(self):
+        s = session(claims=[(REPO, "6945")])
+        rec, reads = self.judge(s, WAIT_OWNER, WAIT_OWNER)
+        self.assertEqual((rec["state"], reads), ("DONE", 1))
+        with mock.patch.object(reaper, "run", side_effect=AssertionError("a second read")):
+            self.assertEqual(reaper.refresh_briefs(s, self.cfg, NOW), [])  # what confirm_close() asks
+        self.assertEqual(reaper._brief_cache[(REPO, "6945")], WAIT_OWNER)
+
+    def test_a_loop_whose_cached_check_by_wait_has_expired_is_not_done(self):
+        loop = session(kind="bg", name="loop #6945 check-by", tmux="loop #6945 check-by")
+        due = {"pending_check_by": ""}  # a fresh oracle_json that sees no pending check-by
+        rec, reads = self.judge(loop, WAIT_OWNER, WAIT_OWNER, due)
+        self.assertEqual((rec["state"], reads), ("DONE", 1))  # the cached wait, still a wait: unchanged
+        rec, reads = self.judge(loop, WAIT_OWNER, AGENT_MINE.replace("7026", "6945"), due)
+        self.assertEqual((rec["state"], reads), ("WORKING", 1))  # the wait is now this session's agent step
+
+    def test_a_not_done_session_is_not_read_again(self):
+        rec, reads = self.judge(session(claims=[(REPO, "6945")], status="busy"), WAIT_OWNER, WAIT_OWNER)
+        self.assertEqual((rec["state"], reads), ("WORKING", 0))
+
+    def test_a_failed_confirmation_is_not_done(self):
+        with mock.patch.object(reaper, "refresh_briefs", side_effect=OSError("boom")), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]):
+            rec = ss.judge(session(), reaper, self.cfg, NOW)
+        self.assertEqual((rec["state"], rec["reasons"]), ("UNKNOWN", ["error:OSError: boom"]))
 
 
 class ClaimStepTrailer(unittest.TestCase):
