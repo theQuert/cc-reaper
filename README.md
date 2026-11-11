@@ -876,7 +876,7 @@ model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper
   and its `.pub` exist, so it never generates a key or writes metadata. One bad host, or one damaged
   state entry (read back as `ok`, so the host is told again), never stops the others.
 - **Tell:** once per host per state change; while the state stays, again at most every
-  `GDW_REALERT_MINUTES` (120), for `disk-high` only (a host that stays `unreadable` is told once); one `recovered` line when it clears (only for a state that was told).
+  `GDW_REALERT_MINUTES` (120), for `disk-high` only (a host that stays `unreadable` is told once, then once a day); one `recovered` line when it clears (only for a state that was told).
   Shadow (`GDW_APPLY=0`): a `would alert <host> <kind> used=..% avail=..GB inodes=..%` line in
   `~/.cc-reaper/logs/gce-disk-watch.log`, nothing else. Apply: one
   `GCE-DISK ALERT|STILL|RECOVERED host=<host> kind=<kind> used=.. avail=.. inodes=..` log line and a
