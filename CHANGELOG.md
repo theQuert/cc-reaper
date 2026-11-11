@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+- **worktree-janitor: a transcript a session moved no longer keeps every tree of the pass (stima-api #7881).** A Claude
+  session that enters a worktree has its transcript moved to that worktree's project directory. The sweep lists
+  transcripts once and spends minutes judging trees, so the listed path could be gone when a candidate asked, which
+  read as "could not be parsed", one unknown record, and (in the default spot-check mode, which decides as `global`
+  does) every clean landed idle tree of the pass kept: 4 of the 35 removal passes that examined trees on 2026-11-11, 3-4 trees each. The
+  session id's transcript is now looked up where it went (only when it is found in exactly one place) and read there; a session whose last cwd is a tree claims it (scope `moved-cwd`).
+  A transcript that is nowhere, unreadable or without a cwd is still an unknown record.
+
 ### Removed
 - **cc-reaper no longer writes to Neo's inbox, reads relay requests or nudges sessions (stima-api #7079).** The Grok
   bot keeps three abilities: it reads the Eng board, talks progress with the founder and opens tmux sessions on the

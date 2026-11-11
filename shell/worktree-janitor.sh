@@ -2210,9 +2210,81 @@ _cc_wj_scan_active_sessions() { # <recent-session grace hours>
 # Return 0 when a structured tool call in the current two human user turns names the
 # target, 1 when none does, and 2 when the transcript cannot be parsed. Live claims and
 # recent leases intentionally share this parser.
+#
+# A Claude session that enters a worktree has its transcript moved to that worktree's project
+# directory, so a path the scan listed minutes ago can be gone by the time a candidate asks
+# (stima-api#7881: a sweep spends 15 minutes on 147 trees, and every session that starts in the
+# primary checkout and moves into a task worktree moves its transcript). Read as an unparsable
+# record, one ordinary move kept every tree of the pass: 4 of the 35 removal passes that examined trees on 2026-11-11,
+# each holding back 3-4 clean, landed, idle worktrees. The same session id's transcript is looked
+# up where it went and read there; when none or more than one can be found, or its cwd or content
+# cannot be read, the answer is still 2 (kept, as before). Anything that cannot be decided stays 2.
+#
+# Prints the one readable transcript that replaces the missing transcript $1; status 1 when $1
+# exists, is not a Claude `<session id>.jsonl`, or the session id is not found in exactly one
+# place (none, or several: which one the session writes cannot be told, as in the live scan).
+_cc_wj_transcript_moved() { # <transcript>
+  local t="$1" projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}" base sid found
+  [ ! -e "$t" ] || return 1
+  base="${t##*/}"; sid="${base%.jsonl}"
+  [ "$sid" != "$base" ] || return 1
+  printf '%s\n' "$sid" | grep -Eqx "$_CC_WJ_UUID_RE" || return 1
+  [ -d "$projects" ] || return 1
+  found="$(_cc_wj_with_timeout 15 find "$projects" -maxdepth 2 -type f -name "$base" -print 2>/dev/null)" || return 1
+  [ "$(printf '%s\n' "$found" | grep -c .)" -eq 1 ] || return 1
+  case "$found" in *$'\t'*) return 1 ;; esac
+  printf '%s\n' "$found"
+}
+
+# The cwd the moved transcript $1 last recorded, resolved, printed. Status 1 when that directory
+# no longer exists (it can claim no tree), 2 when it cannot be told.
+_cc_wj_moved_cwd() { # <moved transcript>
+  local cwd
+  cwd="$(_cc_wj_transcript_tail_query claude-cwd "$1")" || return 2
+  case "$cwd" in /*) ;; *) return 2 ;; esac
+  [ -e "$cwd" ] || return 1
+  _cc_wj_claim_cwd "$cwd" || return 2
+}
+
+# Point the session records at the transcript's new path, so the next candidate reads it without
+# another `find` (as _cc_wj_reconcile_codex_archive swaps a Codex record), and make the cwd claim
+# the scan could not make: an active claim for a live session's record, a recent one otherwise.
+_cc_wj_transcript_relocate() { # <old path> <new path> <resolved cwd or empty> <activity epoch>
+  local old="$1" new="$2" cwd="$3" activity="$4" sid live
+  sid="${new##*/}"; sid="${sid%.jsonl}"
+  live="$(printf '%s\n' "$_CC_WJ_ACTIVE_TRANSCRIPTS" |
+    O="$old" awk -F '\t' '$1 == "Claude" && $3 == ENVIRON["O"] { f = 1 } END { print f + 0 }')"
+  _CC_WJ_ACTIVE_TRANSCRIPTS="$(printf '%s\n' "$_CC_WJ_ACTIVE_TRANSCRIPTS" |
+    O="$old" N="$new" awk -F '\t' -v OFS='\t' 'NF { if ($1 == "Claude" && $3 == ENVIRON["O"]) $3 = ENVIRON["N"]; print }')"
+  _CC_WJ_RECENT_TRANSCRIPTS="$(printf '%s\n' "$_CC_WJ_RECENT_TRANSCRIPTS" |
+    O="$old" N="$new" awk -F '\t' -v OFS='\t' 'NF { if ($1 == "Claude" && $3 == ENVIRON["O"]) $3 = ENVIRON["N"]; print }')"
+  [ -n "$cwd" ] || return 0
+  if [ "$live" = 1 ]; then
+    _cc_wj_active_add_claim Claude "$cwd" "$sid"
+  else
+    _cc_wj_recent_add_claim Claude "$cwd" "$sid" "$activity" moved
+  fi
+}
+
+# Set by _cc_wj_transcript_claims_path to what a status 0 rests on: structured-tool-call, or
+# moved-cwd when the session moved into the tree after the scan.
+_CC_WJ_CLAIM_SCOPE="structured-tool-call"
+
 _cc_wj_transcript_claims_path() { # <harness> <transcript> <resolved target>
-  local harness="$1" transcript="$2" wt="$3" alt mode rc
+  local harness="$1" transcript="$2" wt="$3" alt mode rc moved cwd crc activity
+  _CC_WJ_CLAIM_SCOPE="structured-tool-call"
   case "$wt" in /private/*) alt="${wt#/private}" ;; *) alt="/private$wt" ;; esac
+  if [ "$harness" = Claude ] && [ ! -e "$transcript" ] && moved="$(_cc_wj_transcript_moved "$transcript")"; then
+    cwd="$(_cc_wj_moved_cwd "$moved")"; crc=$?
+    [ "$crc" -ne 2 ] || return 2
+    activity="$(_cc_wj_mtime_epoch "$moved")" || return 2
+    [ "$crc" -eq 0 ] || cwd=""
+    _cc_wj_transcript_relocate "$transcript" "$moved" "$cwd" "$activity"
+    if [ -n "$cwd" ]; then
+      case "${cwd%/}/" in "${wt%/}/"*) _CC_WJ_CLAIM_SCOPE="moved-cwd"; return 0 ;; esac
+    fi
+    transcript="$moved"
+  fi
   [ -r "$transcript" ] || return 2
   case "$harness" in
     Claude) mode=claude-claim ;;
@@ -2272,7 +2344,7 @@ RECENT_CLAIMS
     fi
     if [ "$rc" -eq 0 ] && [ "$activity" -gt "$best_activity" ]; then
       best_activity="$activity"; best_harness="$harness"; best_cwd="$wt"
-      best_sid="$sid"; best_state="$claim_state"; best_scope="structured-tool-call"
+      best_sid="$sid"; best_state="$claim_state"; best_scope="$_CC_WJ_CLAIM_SCOPE"
     fi
   done <<RECENT_TRANSCRIPTS
 $_CC_WJ_RECENT_TRANSCRIPTS
@@ -2314,7 +2386,7 @@ RECENT_CLAIMS
         [ -n "$transcript" ] || continue
         _cc_wj_transcript_claims_path "$harness" "$transcript" "$target"; rc=$?
         [ "$rc" -ne 2 ] || { printf 'ERROR\tharness=%s\tid=%s\treason=unreadable-live-transcript\n' "$harness" "$sid"; return 2; }
-        [ "$rc" -eq 0 ] && printf 'LIVE_TOOL\tharness=%s\tid=%s\tpath=%s\tscope=current-two-user-turns\n' "$harness" "$sid" "$target"
+        [ "$rc" -eq 0 ] && printf 'LIVE_TOOL\tharness=%s\tid=%s\tpath=%s\tscope=%s\n' "$harness" "$sid" "$target" "$([ "$_CC_WJ_CLAIM_SCOPE" = moved-cwd ] && echo moved-cwd || echo current-two-user-turns)"
       done <<LIVE_TRANSCRIPTS
 $_CC_WJ_ACTIVE_TRANSCRIPTS
 LIVE_TRANSCRIPTS
@@ -2325,8 +2397,9 @@ LIVE_TRANSCRIPTS
         [ "$rc" -eq 0 ] || continue
         age=$((now - activity)); [ "$age" -lt 0 ] && age=0
         remaining=$((grace * 3600 - age)); [ "$remaining" -lt 0 ] && remaining=0
-        printf 'RECENT_TOOL\tharness=%s\tid=%s\tstate=%s\tpath=%s\tlast_activity=%s\tage=%ss\tremaining=%ss\tscope=current-two-user-turns\n' \
-          "$harness" "$sid" "$claim_state" "$target" "$(_cc_wj_epoch_iso "$activity")" "$age" "$remaining"
+        printf 'RECENT_TOOL\tharness=%s\tid=%s\tstate=%s\tpath=%s\tlast_activity=%s\tage=%ss\tremaining=%ss\tscope=%s\n' \
+          "$harness" "$sid" "$claim_state" "$target" "$(_cc_wj_epoch_iso "$activity")" "$age" "$remaining" \
+          "$([ "$_CC_WJ_CLAIM_SCOPE" = moved-cwd ] && echo moved-cwd || echo current-two-user-turns)"
       done <<RECENT_TRANSCRIPTS
 $_CC_WJ_RECENT_TRANSCRIPTS
 RECENT_TRANSCRIPTS
@@ -2445,6 +2518,8 @@ ACTIVE_CLAIMS
     fi
     if [ "$rc" -eq 0 ]; then
       _CC_WJ_ACTIVE_REASON="active $harness session $sid has a structured tool call in its current two user turns naming this worktree"
+      [ "$_CC_WJ_CLAIM_SCOPE" != moved-cwd ] ||
+        _CC_WJ_ACTIVE_REASON="active $harness session $sid moved its cwd into this worktree after the scan"
       return 0
     fi
   done <<ACTIVE_TRANSCRIPTS
