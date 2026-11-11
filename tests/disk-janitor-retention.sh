@@ -1,0 +1,668 @@
+#!/usr/bin/env bash
+# TAP-style tests for the host retention rules in shell/disk-janitor.sh and
+# shell/retention-helper.py (stima-api#7881).
+#
+# Every fixture lives in a mktemp directory; nothing outside it is read or removed, and the
+# janitor runs with HOME pointed into it. Each safety property has a test, and each test has a
+# mutant: the script and helper are copied, one exact string is replaced (the replacement must
+# match once, so a stale anchor fails loudly), and the test must FAIL against the copy.
+#
+#   bash tests/disk-janitor-retention.sh            the cases and the mutants
+#   bash tests/disk-janitor-retention.sh --no-mutants
+set -u
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="$ROOT_DIR/shell"
+failures=0
+PIDS_FILE="$(mktemp)"
+WORK="$(cd "$(mktemp -d)" && pwd -P)"
+
+ok() { printf 'ok - %s\n' "$1"; }
+nok() { printf 'not ok - %s\n' "$1"; failures=$((failures + 1)); }
+
+cleanup() {
+  local p
+  while IFS= read -r p; do [ -n "$p" ] && kill "$p" 2>/dev/null; done < "$PIDS_FILE"
+  rm -rf "$WORK" "$PIDS_FILE"
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------- fixtures
+
+mkstubs() {  # <dir>
+  mkdir -p "$1"
+  # df: only the `-Pk` shape the janitor uses; available KiB from FAKE_DF_AVAIL_KB.
+  cat > "$1/df" <<'STUB'
+#!/bin/sh
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf '/dev/disk1s1 976490576 1000 %s 1%% /\n' "${FAKE_DF_AVAIL_KB:-10485760}"
+STUB
+  cat > "$1/go" <<'STUB'
+#!/bin/sh
+printf '%s %s\n' "${GOCACHE:-unset}" "$*" >> "${GO_CALLS:?}"
+exit 0
+STUB
+  cat > "$1/gh" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "${GH_CALLS:?}"
+[ "${GH_FAIL:-0}" = 1 ] && exit 1
+cat "${GH_CLOSED:?}"
+STUB
+  cat > "$1/lsof-stub" <<'STUB'
+#!/bin/sh
+printf 'p1\nn/\n'
+[ -r "${LSOF_EXTRA:-/nonexistent}" ] && cat "$LSOF_EXTRA"
+exit 0
+STUB
+  chmod +x "$1/df" "$1/go" "$1/gh" "$1/lsof-stub"
+}
+
+begin() {  # sets T, FH and the env every case runs under
+  T="$(cd "$(mktemp -d "$WORK/case.XXXXXX")" && pwd -P)"
+  FH="$T/home"; mkdir -p "$FH" "$T/state" "$T/sessions" "$T/outside"
+  mkstubs "$T/bin"
+  : > "$T/go.calls"; : > "$T/gh.calls"; : > "$T/gh.closed"
+  BASE_ENV=(HOME="$FH" PATH="$T/bin:$PATH" CC_DJ_CONFIG=/dev/null CC_DJ_LOG="$T/dj.log"
+    CC_DJ_STATE_DIR="$T/state/" CC_DJ_SPOTCHECK_LOG="$T/spot.log" CC_DJ_SESSIONS_DIR="$T/sessions"
+    CC_DJ_RET_GO_BUSY=0 CC_DJ_RET_LSOF="$T/bin/lsof-stub" CC_DJ_RET_GH="$T/bin/gh"
+    GO_CALLS="$T/go.calls" GH_CALLS="$T/gh.calls" GH_CLOSED="$T/gh.closed"
+    CC_DJ_RET_GCLOUD_MODE=off CC_DJ_RET_RELEASE_MODE=off CC_DJ_RET_SCRATCH_MODE=off
+    CC_DJ_RET_PROJECTS_MODE=off CC_DJ_RET_GOCACHE_MODE=off CC_DJ_RET_EVIDENCE_MODE=off CC_DJ_RET_DEV_MODE=off
+    CC_DJ_RET_GCLOUD_DIR="$T/none/gcloud" CC_DJ_RET_RELEASE_DIR="$T/none/release"
+    CC_DJ_RET_SCRATCH_ROOT="$T/none/scratch" CC_DJ_RET_PROJECTS_DIR="$T/none/projects"
+    CC_DJ_RET_GOCACHE_DIR="$T/none/gocache" CC_DJ_RET_HELMWAY_DIR="$T/none/helmway"
+    CC_DJ_RET_HANDOFFS_DIR="$T/none/handoffs")
+}
+
+jr() { env "${BASE_ENV[@]}" "$@"; }       # jr K=V ... bash script args
+run() { local sd="$1"; shift; jr "$@" bash "$sd/disk-janitor.sh" ${RUN_ARG:---retention} > "$T/out" 2>&1; }
+
+# Sets the mtime of a path and everything under it to N days ago (deepest first).
+age() {  # <path> <days>
+  local stamp; stamp="$(date -v-"$2"d +%Y%m%d%H%M)"
+  find "$1" -depth -exec touch -h -t "$stamp" {} +
+}
+
+has() { grep -q -- "$1" "$T/dj.log" && return 0; echo "  (log lacks: $1)"; grep "retention:" "$T/dj.log" | tail -4 | sed "s/^/    /"; return 1; }
+enc() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+spawn_sleeper() {  # prints a pid; the process lives until cleanup
+  ( nohup sleep 600 >/dev/null 2>&1 & echo $! ) | tail -1 | tee -a "$PIDS_FILE"
+}
+write_session() {  # <pid> <session id> <cwd>
+  printf '{"pid": %s, "sessionId": "%s", "cwd": "%s"}\n' "$1" "$2" "$3" > "$T/sessions/$1.json"
+}
+alive() { kill -0 "$1" 2>/dev/null; }
+
+UUID_A=aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa
+UUID_B=bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb
+UUID_C=cccccccc-3333-4333-8333-cccccccccccc
+UUID_D=dddddddd-4444-4444-8444-dddddddddddd
+UUID_E=eeeeeeee-5555-4555-8555-eeeeeeeeeeee
+UUID_F=ffffffff-6666-4666-8666-ffffffffffff
+UUID_G=99999999-7777-4777-8777-999999999999
+UUID_H=88888888-8888-4888-8888-888888888888
+
+# ---------------------------------------------------------------------------- the cases
+# Each takes the directory holding the disk-janitor.sh and retention-helper.py under test and
+# returns 0 when every property holds.
+
+t_gcloud() {
+  local sd="$1" L r=0
+  begin; L="$T/gcloud/logs"
+  mkdir -p "$L/2026.10.01" "$L/2026.11.11" "$L/2026.11.01"
+  echo old > "$L/2026.10.01/a.log"; echo new > "$L/2026.11.11/b.log"; echo ten > "$L/2026.11.01/c.log"; echo keepme > "$T/outside/keep.txt"
+  ln -s "$T/outside" "$L/linkdir"; ln -s "$T/outside/keep.txt" "$L/linkfile"
+  age "$L/2026.10.01" 20; age "$L/2026.11.01" 10; age "$T/outside" 40
+  # Shadow lists exactly the one real old file: a symlinked directory or file is not a candidate.
+  run "$sd" CC_DJ_RET_GCLOUD_MODE=shadow CC_DJ_RET_GCLOUD_DIR="$L"
+  has 'rule=gcloud-logs mode=shadow candidates=1 bytes=4 ' || { echo "  shadow count/bytes wrong"; r=1; }
+  [ -f "$L/2026.10.01/a.log" ] || { echo "  shadow removed a file"; r=1; }
+  run "$sd" CC_DJ_RET_GCLOUD_MODE=apply CC_DJ_RET_GCLOUD_DIR="$L"
+  has 'rule=gcloud-logs mode=apply candidates=1 bytes=4 .* removed=1' || { echo "  apply line wrong"; r=1; }
+  [ ! -e "$L/2026.10.01/a.log" ] || { echo "  old file survived"; r=1; }
+  [ ! -d "$L/2026.10.01" ] || { echo "  emptied dir survived"; r=1; }
+  [ -f "$L/2026.11.11/b.log" ] && [ -f "$L/2026.11.01/c.log" ] || { echo "  a file younger than the window was removed"; r=1; }
+  [ -f "$T/outside/keep.txt" ] || { echo "  file outside the root removed through a symlink"; r=1; }
+  [ -L "$L/linkdir" ] && [ -L "$L/linkfile" ] || { echo "  symlink removed"; r=1; }
+  : > "$T/dj.log"
+  run "$sd" CC_DJ_RET_GCLOUD_MODE=apply CC_DJ_RET_GCLOUD_DIR="$L"
+  has 'candidates=0 bytes=0 .* removed=0' || { echo "  second run is not a no-op"; r=1; }
+  return $r
+}
+
+t_gcloud_root_symlink() {
+  local sd="$1" r=0
+  begin
+  mkdir -p "$T/real/logs"; echo old > "$T/real/logs/a.log"; age "$T/real/logs" 30
+  ln -s "$T/real/logs" "$T/linked"
+  run "$sd" CC_DJ_RET_GCLOUD_MODE=apply CC_DJ_RET_GCLOUD_DIR="$T/linked"
+  [ -f "$T/real/logs/a.log" ] || { echo "  a symlinked root was followed"; r=1; }
+  has 'skipped: root .* is a symlink' || { echo "  no skip line"; r=1; }
+  return $r
+}
+
+t_release() {
+  local sd="$1" R i r=0
+  begin; R="$T/rel"; mkdir -p "$R"
+  for i in 1 2 3 4 5 6 7 8; do mkdir -p "$R/r$i"; echo x > "$R/r$i/f"; age "$R/r$i" $((i + 2)); done
+  touch "$R/r8/fresh"; touch -t "$(date -v-10d +%Y%m%d%H%M)" "$R/r8"    # old dir, file inside modified now
+  mkdir -p "$T/outside/rundir"; echo z > "$T/outside/rundir/f"; age "$T/outside" 30
+  ln -s "$T/outside/rundir" "$R/linkrun"
+  run "$sd" CC_DJ_RET_RELEASE_MODE=shadow CC_DJ_RET_RELEASE_DIR="$R"
+  has 'rule=release-owner mode=shadow candidates=2 ' || { echo "  shadow should list r6 and r7 only"; r=1; }
+  [ -d "$R/r6" ] || { echo "  shadow removed"; r=1; }
+  run "$sd" CC_DJ_RET_RELEASE_MODE=apply CC_DJ_RET_RELEASE_DIR="$R"
+  for i in 1 2 3 4 5; do [ -d "$R/r$i" ] || { echo "  r$i (newest five) removed"; r=1; }; done
+  [ ! -d "$R/r6" ] && [ ! -d "$R/r7" ] || { echo "  r6/r7 survived"; r=1; }
+  [ -d "$R/r8" ] || { echo "  a run modified inside 24 h was removed"; r=1; }
+  [ -f "$T/outside/rundir/f" ] || { echo "  symlinked run followed"; r=1; }
+  : > "$T/dj.log"; run "$sd" CC_DJ_RET_RELEASE_MODE=apply CC_DJ_RET_RELEASE_DIR="$R"
+  has 'candidates=0 .* removed=0' || { echo "  second run is not a no-op"; r=1; }
+  return $r
+}
+
+scratch_fixture() {  # builds T/tmp/claude-501 with one dir per verdict; sets S SL
+  S="$T/tmp/claude-501"; P="$S/-Users-x-proj"; mkdir -p "$P" "$S/homepage"
+  local u
+  for u in $UUID_A $UUID_B $UUID_C $UUID_D $UUID_E $UUID_G; do mkdir -p "$P/$u/scratchpad"; echo data > "$P/$u/scratchpad/f"; done
+  mkdir -p "$P/scratchpad" "$S/homepage/$UUID_F"; echo d > "$S/homepage/$UUID_F/f"; echo d > "$P/scratchpad/f"
+  mkdir -p "$T/outside/uu"; echo keep > "$T/outside/uu/f"; ln -s "$T/outside/uu" "$P/$UUID_H"
+  for u in $UUID_A $UUID_B $UUID_D $UUID_E $UUID_G; do age "$P/$u" 6; done
+  age "$S/homepage" 6; age "$P/scratchpad" 6; age "$T/outside" 6
+  touch "$P/$UUID_C/scratchpad/fresh"          # C: modified now
+  # B: its session record names a live pid. D: a live process names it on its command line.
+  # E: a process holds a file in it (lsof). G: nothing: the one that goes.
+  local pid; pid="$(spawn_sleeper)"; write_session "$pid" "$UUID_B" "$T"
+  ( nohup bash -c "exec -a 'claude --session-id $UUID_D' sleep 600" >/dev/null 2>&1 & echo $! >> "$PIDS_FILE" )
+  printf 'n%s\n' "$P/$UUID_E/scratchpad/f" > "$T/lsof.extra"
+  sleep 0.3
+}
+
+t_scratch() {
+  local sd="$1" r=0 S P
+  begin; scratch_fixture
+  run "$sd" CC_DJ_RET_SCRATCH_MODE=apply CC_DJ_RET_SCRATCH_ROOT="$S" LSOF_EXTRA="$T/lsof.extra"
+  [ ! -d "$P/$UUID_G" ] && [ ! -d "$P/$UUID_A" ] || { echo "  a dead old scratchpad survived"; r=1; }
+  [ -d "$P/$UUID_B" ] || { echo "  a live session's scratchpad (record) was removed"; r=1; }
+  [ -d "$P/$UUID_D" ] || { echo "  a live session's scratchpad (command line) was removed"; r=1; }
+  [ -d "$P/$UUID_E" ] || { echo "  a held scratchpad was removed"; r=1; }
+  [ -d "$P/$UUID_C" ] || { echo "  a recent scratchpad was removed"; r=1; }
+  [ -d "$S/homepage/$UUID_F" ] || { echo "  a protected (homepage) scratchpad was removed"; r=1; }
+  [ -d "$P/scratchpad" ] || { echo "  a directory that is not a session id was removed"; r=1; }
+  [ -f "$T/outside/uu/f" ] || { echo "  a symlinked session directory was followed"; r=1; }
+  has 'rule=scratchpads mode=apply candidates=2 .* removed=2 .*kept_live=2 kept_held=1 kept_protected=1 kept_recent=1' || { echo "  report line wrong"; r=1; }
+  : > "$T/dj.log"; run "$sd" CC_DJ_RET_SCRATCH_MODE=apply CC_DJ_RET_SCRATCH_ROOT="$S" LSOF_EXTRA="$T/lsof.extra"
+  has 'candidates=0 .* removed=0' || { echo "  second run is not a no-op"; r=1; }
+  return $r
+}
+
+t_scratch_unknown_keeps() {
+  local sd="$1" r=0 S P
+  begin; scratch_fixture
+  rm -rf "$T/sessions"        # the live-session records cannot be read: unknown means keep
+  run "$sd" CC_DJ_RET_SCRATCH_MODE=apply CC_DJ_RET_SCRATCH_ROOT="$S" LSOF_EXTRA="$T/lsof.extra"
+  [ -d "$P/$UUID_G" ] || { echo "  removed a scratchpad with live sessions unreadable"; r=1; }
+  has 'rule=scratchpads skipped: live sessions cannot be read' || { echo "  no skip line"; r=1; }
+  return $r
+}
+
+t_scratch_lsof_unknown_keeps() {
+  local sd="$1" r=0 S P
+  begin; scratch_fixture
+  run "$sd" CC_DJ_RET_SCRATCH_MODE=apply CC_DJ_RET_SCRATCH_ROOT="$S" CC_DJ_RET_LSOF=/usr/bin/true
+  [ -d "$P/$UUID_G" ] || { echo "  removed a scratchpad with lsof unusable"; r=1; }
+  has 'rule=scratchpads skipped: lsof cannot report' || { echo "  no skip line"; r=1; }
+  return $r
+}
+
+t_scratch_default_shadow() {
+  local sd="$1" r=0 S P
+  begin; scratch_fixture
+  run "$sd" CC_DJ_RET_SCRATCH_MODE= CC_DJ_RET_SCRATCH_ROOT="$S" LSOF_EXTRA="$T/lsof.extra"
+  [ -d "$P/$UUID_G" ] || { echo "  default mode removed (should be shadow)"; r=1; }
+  has 'rule=scratchpads mode=shadow candidates=2 ' || { echo "  default is not shadow"; r=1; }
+  return $r
+}
+
+projects_fixture() {  # sets B PR
+  B="$T/gh"; PR="$T/proj"
+  mkdir -p "$B/repo-worktrees/exists-one" "$B/repo-worktrees/exists-two/web/next" "$B/repo-worktrees/gone-old" "$PR" "$T/outside/pj"
+  local n
+  for n in "$B/repo-worktrees/gone-old" "$B/repo-worktrees/gone-recent" "$B/repo-worktrees/exists-one" "$B/repo-worktrees/exists-two/web/next" "$B/plain" "$B/gone-parent-worktrees/x"; do
+    mkdir -p "$PR/$(enc "$n")"; echo transcript > "$PR/$(enc "$n")/s.jsonl"
+  done
+  rmdir "$B/repo-worktrees/gone-old" 2>/dev/null
+  echo keep > "$T/outside/pj/f"; ln -s "$T/outside/pj" "$PR/$(enc "$B/repo-worktrees/gone-link")"
+  age "$PR" 20; age "$T/outside" 20
+  touch "$PR/$(enc "$B/repo-worktrees/gone-recent")/s.jsonl"
+}
+
+t_projects() {
+  local sd="$1" r=0 B PR
+  begin; projects_fixture
+  run "$sd" CC_DJ_RET_PROJECTS_MODE=shadow CC_DJ_RET_PROJECTS_DIR="$PR"
+  has 'rule=projects mode=shadow candidates=1 ' || { echo "  shadow should find only gone-old"; r=1; }
+  [ -d "$PR/$(enc "$B/repo-worktrees/gone-old")" ] || { echo "  shadow removed"; r=1; }
+  run "$sd" CC_DJ_RET_PROJECTS_MODE=apply CC_DJ_RET_PROJECTS_DIR="$PR"
+  [ ! -d "$PR/$(enc "$B/repo-worktrees/gone-old")" ] || { echo "  gone worktree's transcripts survived"; r=1; }
+  [ -d "$PR/$(enc "$B/repo-worktrees/gone-recent")" ] || { echo "  a recently written one was removed"; r=1; }
+  [ -d "$PR/$(enc "$B/repo-worktrees/exists-one")" ] || { echo "  an existing worktree's transcripts removed"; r=1; }
+  [ -d "$PR/$(enc "$B/repo-worktrees/exists-two/web/next")" ] || { echo "  a subdirectory of an existing worktree removed"; r=1; }
+  [ -d "$PR/$(enc "$B/plain")" ] || { echo "  a non-worktree project removed"; r=1; }
+  [ -d "$PR/$(enc "$B/gone-parent-worktrees/x")" ] || { echo "  unresolvable parent was not kept"; r=1; }
+  [ -f "$T/outside/pj/f" ] || { echo "  a symlinked project dir was followed"; r=1; }
+  : > "$T/dj.log"; run "$sd" CC_DJ_RET_PROJECTS_MODE=apply CC_DJ_RET_PROJECTS_DIR="$PR"
+  has 'candidates=0 .* removed=0' || { echo "  second run is not a no-op"; r=1; }
+  return $r
+}
+
+t_projects_default_shadow() {
+  local sd="$1" r=0 B PR
+  begin; projects_fixture
+  run "$sd" CC_DJ_RET_PROJECTS_MODE= CC_DJ_RET_PROJECTS_DIR="$PR"
+  [ -d "$PR/$(enc "$B/repo-worktrees/gone-old")" ] && has 'rule=projects mode=shadow candidates=1' || { echo "  default is not shadow"; r=1; }
+  return $r
+}
+
+t_gocache() {
+  local sd="$1" r=0 n
+  begin; mkdir -p "$T/gocache/ab"; head -c 100000 /dev/zero > "$T/gocache/ab/entry"
+  # Above the threshold (100 GB free, act at 40): nothing.
+  run "$sd" CC_DJ_RET_GOCACHE_MODE=apply CC_DJ_RET_GOCACHE_DIR="$T/gocache" FAKE_DF_AVAIL_KB=104857600
+  [ ! -s "$T/go.calls" ] || { echo "  cleaned with plenty of free space"; r=1; }
+  # The act threshold is CC_RW_DISK_ACT_GB: 10 GB free is not under 5.
+  run "$sd" CC_DJ_RET_GOCACHE_MODE=apply CC_DJ_RET_GOCACHE_DIR="$T/gocache" FAKE_DF_AVAIL_KB=10485760 CC_RW_DISK_ACT_GB=5
+  [ ! -s "$T/go.calls" ] || { echo "  ignored CC_RW_DISK_ACT_GB"; r=1; }
+  # Under it, but a go build is running.
+  run "$sd" CC_DJ_RET_GOCACHE_MODE=apply CC_DJ_RET_GOCACHE_DIR="$T/gocache" FAKE_DF_AVAIL_KB=10485760 CC_DJ_RET_GO_BUSY=1
+  [ ! -s "$T/go.calls" ] || { echo "  cleaned under a running go build"; r=1; }
+  # Report-only: bytes, no clean, no stamp.
+  RUN_ARG=--retention-report run "$sd" CC_DJ_RET_GOCACHE_MODE=apply CC_DJ_RET_GOCACHE_DIR="$T/gocache" FAKE_DF_AVAIL_KB=10485760
+  [ ! -s "$T/go.calls" ] && [ ! -e "$T/state/retention-go-cache.stamp" ] || { echo "  report mode cleaned or stamped"; r=1; }
+  has 'rule=go-cache mode=shadow candidates=1 bytes=[1-9]' || { echo "  report line has no bytes"; r=1; }
+  # Under the threshold: one clean, with the cache dir named, and a stamp.
+  run "$sd" CC_DJ_RET_GOCACHE_MODE=apply CC_DJ_RET_GOCACHE_DIR="$T/gocache" FAKE_DF_AVAIL_KB=10485760
+  n="$(wc -l < "$T/go.calls" | tr -d ' ')"
+  [ "$n" = 1 ] && grep -q "^$T/gocache clean -cache" "$T/go.calls" || { echo "  expected one 'go clean -cache' on the cache dir, got $n"; r=1; }
+  [ -e "$T/state/retention-go-cache.stamp" ] || { echo "  no stamp"; r=1; }
+  # Second run the same day: the stamp holds it back.
+  run "$sd" CC_DJ_RET_GOCACHE_MODE=apply CC_DJ_RET_GOCACHE_DIR="$T/gocache" FAKE_DF_AVAIL_KB=10485760
+  n="$(wc -l < "$T/go.calls" | tr -d ' ')"
+  [ "$n" = 1 ] || { echo "  cleaned twice in a day ($n)"; r=1; }
+  return $r
+}
+
+t_evidence() {
+  local sd="$1" r=0 H E calls
+  begin; H="$T/handoffs"; E="$T/helm"
+  mkdir -p "$H/i100-old" "$H/i200-open" "$H/i300-fresh" "$H/i400" "$H/notes" "$E/2026-10-01-a" "$E/2026-10-02-b" "$E/2026-10-03-c" "$E/2026-10-04-d" "$T/outside/ev"
+  echo x > "$H/i100-old/f"; echo x > "$H/i200-open/f"; echo x > "$H/i300-fresh/f"; echo x > "$H/i400/f"; echo x > "$H/notes/f"; : > "$H/i999.md"
+  echo x > "$E/2026-10-01-a/100-x.md"; echo x > "$E/2026-10-02-b/100-x.md"; echo x > "$E/2026-10-02-b/200-y.md"
+  echo x > "$E/2026-10-03-c/abc.txt"; echo '{"issue": 400}' > "$E/2026-10-04-d/manifest.json"
+  echo keep > "$T/outside/ev/f"; ln -s "$T/outside/ev" "$H/i100-link"
+  age "$H" 20; age "$E" 20; age "$T/outside" 20
+  touch "$H/i300-fresh/new"
+  printf '100\n300\n400\n' > "$T/gh.closed"
+  # Default (shadow): everything stays, bytes are reported per directory.
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE= CC_DJ_RET_HELMWAY_DIR="$E" CC_DJ_RET_HANDOFFS_DIR="$H"
+  [ -d "$H/i100-old" ] && [ -d "$E/2026-10-01-a" ] || { echo "  default mode removed"; r=1; }
+  has 'rule=evidence mode=shadow candidates=4 bytes=[1-9]' || { echo "  shadow should list i100-old, i400, 2026-10-01-a, 2026-10-04-d"; r=1; }
+  grep -q 'rule=evidence WOULD-REMOVE .*i100-old' "$T/spot.log" || { echo "  no per-directory line with the reason"; r=1; }
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HELMWAY_DIR="$E" CC_DJ_RET_HANDOFFS_DIR="$H"
+  [ ! -d "$H/i100-old" ] && [ ! -d "$H/i400" ] && [ ! -d "$E/2026-10-01-a" ] && [ ! -d "$E/2026-10-04-d" ] || { echo "  closed and quiet directories survived"; r=1; }
+  [ -d "$H/i200-open" ] || { echo "  an open issue's directory was removed"; r=1; }
+  [ -d "$H/i300-fresh" ] || { echo "  a recently written directory was removed"; r=1; }
+  [ -d "$E/2026-10-02-b" ] || { echo "  a directory naming an open issue as well was removed"; r=1; }
+  [ -d "$E/2026-10-03-c" ] || { echo "  a directory naming no issue was removed"; r=1; }
+  [ -d "$H/notes" ] && [ -e "$H/i999.md" ] || { echo "  something that is not an i<N> directory was removed"; r=1; }
+  [ -f "$T/outside/ev/f" ] || { echo "  a symlinked directory was followed"; r=1; }
+  calls="$(wc -l < "$T/gh.calls" | tr -d ' ')"
+  [ "$calls" = 2 ] || { echo "  expected one gh read per run (2 runs), saw $calls"; r=1; }
+  : > "$T/dj.log"; run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HELMWAY_DIR="$E" CC_DJ_RET_HANDOFFS_DIR="$H"
+  has 'candidates=0 .* removed=0' || { echo "  second run is not a no-op"; r=1; }
+  return $r
+}
+
+t_evidence_gh_failure() {
+  local sd="$1" r=0 H
+  begin; H="$T/handoffs"; mkdir -p "$H/i100"; echo x > "$H/i100/f"; age "$H" 20
+  printf '100\n' > "$T/gh.closed"
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HANDOFFS_DIR="$H" GH_FAIL=1
+  [ -d "$H/i100" ] || { echo "  removed a directory with the issue state unknown"; r=1; }
+  has 'gh issue list failed' || { echo "  failure not logged"; r=1; }
+  return $r
+}
+
+# A git worktree fixture built from plumbing only (no checkout, so the suite stays tiny): a repo
+# whose main points at an empty-tree commit, and a linked worktree $T/wt/feat on its own branch.
+dev_fixture() {  # sets REPO WT FEAT_SHA
+  REPO="$T/repo"; WT="$T/wt/feat"
+  local g="$REPO/.git" tree c1 c2 gd
+  mkdir -p "$g/objects" "$g/refs/heads" "$WT"
+  printf 'ref: refs/heads/main\n' > "$g/HEAD"
+  printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n' > "$g/config"
+  tree="$(git --git-dir="$g" hash-object -t tree -w /dev/null)"
+  c1="$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t git --git-dir="$g" commit-tree "$tree" -m base)"
+  c2="$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t git --git-dir="$g" commit-tree "$tree" -p "$c1" -m work)"
+  printf '%s\n' "$c1" > "$g/refs/heads/main"; printf '%s\n' "$c2" > "$g/refs/heads/feat"
+  gd="$g/worktrees/feat"; mkdir -p "$gd"
+  printf 'ref: refs/heads/feat\n' > "$gd/HEAD"; printf '../..\n' > "$gd/commondir"; printf '%s\n' "$WT/.git" > "$gd/gitdir"
+  printf 'gitdir: %s\n' "$gd" > "$WT/.git"
+  FEAT_SHA="$c2"
+  echo f > "$WT/file"; age "$WT" 30; age "$REPO" 30
+}
+# The devprocs cases match on a unique marker, never on the default pattern: the machine running
+# the suite has real `next dev` servers, and no case may be able to judge one of them.
+MARK="retention-test-marker-$$"
+spawn_dev() {  # <cwd> [trap-term]: a process that looks like `next dev`, reparented to launchd
+  local pf="$T/pid.$RANDOM"
+  ( cd "$1"; nohup bash -c "${2:+trap '' TERM;} echo \$\$ > '$pf'; exec -a 'node ./node_modules/.bin/next dev --port 1 $MARK' sleep 600" >/dev/null 2>&1 & )
+  sleep 0.5; cat "$pf" | tee -a "$PIDS_FILE"
+}
+devrun() { run "$1" CC_DJ_RET_DEV_MODE="$2" CC_DJ_RET_DEV_MIN_AGE_HOURS="${AGE_H:-0}" CC_DJ_RET_DEV_GRACE_SECONDS=1 \
+  CC_DJ_RET_DEV_BASE=main CC_DJ_RET_DEV_IDLE_DAYS=7 CC_DJ_RET_DEV_MATCH="$MARK"; }
+
+t_dev() {
+  local sd="$1" r=0 REPO WT pid
+  begin; dev_fixture; write_session "$$" "$UUID_A" "$T/elsewhere"
+  pid="$(spawn_dev "$WT")"
+  devrun "$sd" shadow
+  alive "$pid" || { echo "  shadow stopped the process"; r=1; }
+  has "WOULD-STOP $pid pid=$pid .*cwd=$WT worktree=idle owner=dead" || { echo "  shadow line lacks cwd, state, owner"; r=1; }
+  has 'rule=dev-processes mode=shadow candidates=1' || { echo "  shadow count wrong"; r=1; }
+  devrun "$sd" apply; sleep 0.5
+  alive "$pid" && { echo "  the dead-owner dev process was not stopped"; r=1; }
+  return $r
+}
+
+t_dev_sigkill() {
+  local sd="$1" r=0 REPO WT pid
+  begin; dev_fixture; write_session "$$" "$UUID_A" "$T/elsewhere"
+  pid="$(spawn_dev "$WT" ignore-term)"
+  devrun "$sd" apply; sleep 0.5
+  alive "$pid" && { echo "  a process ignoring SIGTERM survived the grace"; r=1; }
+  return $r
+}
+
+t_dev_young_keeps() {
+  local sd="$1" r=0 REPO WT pid
+  begin; dev_fixture; write_session "$$" "$UUID_A" "$T/elsewhere"
+  pid="$(spawn_dev "$WT")"
+  AGE_H=999 devrun "$sd" apply
+  alive "$pid" || { echo "  a process younger than the minimum age was stopped"; r=1; }
+  return $r
+}
+
+t_dev_active_worktree_keeps() {
+  local sd="$1" r=0 REPO WT pid
+  begin; dev_fixture; write_session "$$" "$UUID_A" "$T/elsewhere"; touch "$WT/file"
+  pid="$(spawn_dev "$WT")"
+  devrun "$sd" apply
+  alive "$pid" || { echo "  a process in an active, unmerged worktree was stopped"; r=1; }
+  return $r
+}
+
+t_dev_merged_worktree_stops() {
+  local sd="$1" r=0 REPO WT pid
+  begin; dev_fixture; write_session "$$" "$UUID_A" "$T/elsewhere"
+  printf '%s\n' "$FEAT_SHA" > "$REPO/.git/refs/heads/main"; touch "$WT/file"   # main moved up to feat: merged, and not idle
+  pid="$(spawn_dev "$WT")"
+  devrun "$sd" apply; sleep 0.5
+  alive "$pid" && { echo "  a process in a merged worktree was not stopped"; r=1; }
+  return $r
+}
+
+t_dev_primary_keeps() {
+  local sd="$1" r=0 REPO WT pid
+  begin; dev_fixture; write_session "$$" "$UUID_A" "$T/elsewhere"
+  pid="$(spawn_dev "$REPO")"
+  devrun "$sd" apply
+  alive "$pid" || { echo "  a process in a primary checkout was stopped"; r=1; }
+  return $r
+}
+
+t_dev_live_session_keeps() {
+  local sd="$1" r=0 REPO WT pid sp
+  begin; dev_fixture
+  sp="$(spawn_sleeper)"; write_session "$sp" "$UUID_A" "$WT"      # a live session works in that worktree
+  pid="$(spawn_dev "$WT")"
+  devrun "$sd" apply
+  alive "$pid" || { echo "  a process whose worktree has a live session was stopped"; r=1; }
+  return $r
+}
+
+t_dev_claude_ancestor_keeps() {
+  local sd="$1" r=0 REPO WT pid
+  begin; dev_fixture; write_session "$$" "$UUID_A" "$T/elsewhere"
+  cat > "$T/inner.sh" <<'EOS'
+#!/bin/bash
+(cd "$1" && exec -a "node ./node_modules/.bin/next dev --port 1 $3" sleep 600) &
+echo $! > "$2"
+wait
+EOS
+  ( nohup bash -c "exec -a claude bash '$T/inner.sh' '$WT' '$T/childpid' '$MARK'" >/dev/null 2>&1 & echo $! >> "$PIDS_FILE" )
+  sleep 0.8; pid="$(cat "$T/childpid")"; echo "$pid" >> "$PIDS_FILE"
+  devrun "$sd" apply
+  alive "$pid" || { echo "  a process under a live claude ancestor was stopped"; r=1; }
+  return $r
+}
+
+t_dev_never_kill_keeps() {
+  local sd="$1" r=0 REPO WT pid
+  begin; dev_fixture; write_session "$$" "$UUID_A" "$T/elsewhere"
+  pid="$(spawn_dev "$WT")"
+  CC_NEVER_KILL_PIDS="$pid" devrun "$sd" apply
+  alive "$pid" || { echo "  stopped a pid on CC_NEVER_KILL_PIDS"; r=1; }
+  return $r
+}
+
+t_dev_unknown_keeps() {
+  local sd="$1" r=0 REPO WT pid
+  begin; dev_fixture; rm -rf "$T/sessions"       # no way to read the sessions: unknown means keep
+  pid="$(spawn_dev "$WT")"
+  devrun "$sd" apply
+  alive "$pid" || { echo "  stopped a process with the owner unknown"; r=1; }
+  return $r
+}
+
+t_dev_match_default() {
+  local sd="$1" r=0 pat hpat
+  begin
+  pat="$(env HOME="$FH" CC_DJ_CONFIG=/dev/null bash -c '. "$1"; printf "%s" "$CC_DJ_RET_DEV_MATCH"' _ "$sd/disk-janitor.sh")"
+  hpat="$(python3 -I - "$sd/retention-helper.py" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r'"--match", default=r"(.*)"\)', src)
+print(m.group(1) if m else "", end="")
+PY
+)"
+  [ "$pat" = "$hpat" ] || { echo "  the script and helper default patterns differ"; r=1; }
+  python3 -I - "$pat" <<'PY' || r=1
+import re, sys
+p = re.compile(sys.argv[1])
+yes = ["node ./node_modules/.bin/next dev --hostname 127.0.0.1 --port 4117", "node proxy.mjs 5278 4495",
+       "node /tmp/x/frameproxy.mjs 4496 4495", "next-server (v16.4.3)", "npm exec next dev -p 4140", "node /a/node_modules/.bin/vite --port 3"]
+no = ["vim notes.txt", "claude --session-id x", "/bin/zsh -l", "node server.js", "git log --oneline"]
+bad = [c for c in yes if not p.search(c)] + [c for c in no if p.search(c)]
+if bad:
+    print("  default pattern misjudges:", bad)
+    sys.exit(1)
+PY
+  return $r
+}
+
+t_report_forces_shadow() {
+  local sd="$1" r=0 L
+  begin; L="$T/gcloud/logs"; mkdir -p "$L"; echo old > "$L/a.log"; age "$L" 30
+  RUN_ARG=--retention-report run "$sd" CC_DJ_RET_GCLOUD_MODE=apply CC_DJ_RET_GCLOUD_DIR="$L"
+  [ -f "$L/a.log" ] || { echo "  --retention-report deleted"; r=1; }
+  has 'rule=gcloud-logs mode=shadow candidates=1 bytes=4 ' || { echo "  no byte report"; r=1; }
+  return $r
+}
+
+t_bad_mode_is_shadow() {
+  local sd="$1" r=0 L
+  begin; L="$T/gcloud/logs"; mkdir -p "$L"; echo old > "$L/a.log"; age "$L" 30
+  run "$sd" CC_DJ_RET_GCLOUD_MODE=bogus CC_DJ_RET_GCLOUD_DIR="$L"
+  [ -f "$L/a.log" ] || { echo "  an unknown mode deleted"; r=1; }
+  return $r
+}
+
+t_defaults() {
+  local sd="$1" r=0 out
+  begin
+  out="$(env HOME="$FH" CC_DJ_CONFIG=/dev/null bash -c 'unset CC_RW_DISK_ACT_GB; . "$1"; echo "$CC_DJ_RET_GCLOUD_MODE $CC_DJ_RET_RELEASE_MODE $CC_DJ_RET_GOCACHE_MODE $CC_DJ_RET_SCRATCH_MODE $CC_DJ_RET_PROJECTS_MODE $CC_DJ_RET_EVIDENCE_MODE $CC_DJ_RET_DEV_MODE $CC_DJ_RET_GOCACHE_ACT_GB $CC_DJ_RET_GCLOUD_DAYS $CC_DJ_RET_RELEASE_KEEP $CC_DJ_RET_SCRATCH_DAYS $CC_DJ_RET_PROJECTS_DAYS $CC_DJ_RET_EVIDENCE_DAYS $CC_DJ_RET_DEV_MIN_AGE_HOURS"' _ "$sd/disk-janitor.sh" 2>&1)"
+  [ "$out" = "apply apply apply shadow shadow shadow shadow 40 14 5 3 7 7 168" ] || { echo "  defaults are: $out"; r=1; }
+  out="$(env HOME="$FH" CC_DJ_CONFIG=/dev/null CC_RW_DISK_ACT_GB=33 bash -c '. "$1"; echo "$CC_DJ_RET_GOCACHE_ACT_GB"' _ "$sd/disk-janitor.sh" 2>&1)"
+  [ "$out" = 33 ] || { echo "  go-cache threshold does not follow CC_RW_DISK_ACT_GB ($out)"; r=1; }
+  return $r
+}
+
+t_gcloud_default_apply() {
+  local sd="$1" r=0 L
+  begin; L="$T/gcloud/logs"; mkdir -p "$L"; echo old > "$L/a.log"; age "$L" 30
+  run "$sd" CC_DJ_RET_GCLOUD_MODE= CC_DJ_RET_GCLOUD_DIR="$L"
+  [ ! -e "$L/a.log" ] || { echo "  the default mode for gcloud logs is not apply"; r=1; }
+  return $r
+}
+
+t_remove_guards() {
+  local sd="$1" r=0 root list
+  begin; root="$T/root"; mkdir -p "$root/real" "$T/outside/d"; echo a > "$T/outside/d/f"; echo b > "$T/outside/loose"
+  ln -s "$T/outside/d" "$root/linkdir"; ln -s "$T/outside/loose" "$root/linkfile"
+  list="$T/list"; echo ok > "$root/real/ok"
+  printf '%s\0' "$T/outside/loose" "$root/linkfile" "$root/linkdir/f" "$root/linkdir" "$root/real/ok" > "$list"
+  # An empty root must be refused: a `${1:?}` that became empty would let "/?*" match anything.
+  ( env HOME="$FH" CC_DJ_CONFIG=/dev/null CC_DJ_LOG="$T/dj.log" bash -c '. "$1"; _CC_DJ_RET_DEADLINE=999999; _cc_dj_ret_remove_list "" "$2" f' _ "$sd/disk-janitor.sh" "$list" ) >/dev/null 2>&1 && { echo "  an empty root was accepted"; r=1; }
+  [ -f "$T/outside/loose" ] || { echo "  empty root removed an outside file"; r=1; }
+  ( env HOME="$FH" CC_DJ_CONFIG=/dev/null CC_DJ_LOG="$T/dj.log" bash -c '. "$1"; _CC_DJ_RET_DEADLINE=999999; _cc_dj_ret_remove_list "$2" "$3" f' _ "$sd/disk-janitor.sh" "$root" "$list" ) >/dev/null 2>&1
+  [ ! -e "$root/real/ok" ] || { echo "  the control file inside the root was not removed (the function did nothing)"; r=1; }
+  [ -f "$T/outside/loose" ] || { echo "  removed a path outside the root"; r=1; }
+  [ -L "$root/linkfile" ] || { echo "  removed a symlink"; r=1; }
+  [ -f "$T/outside/d/f" ] || { echo "  removed through a symlinked directory"; r=1; }
+  [ -L "$root/linkdir" ] || { echo "  removed a symlinked directory"; r=1; }
+  return $r
+}
+
+t_wired_into_check() {
+  local sd="$1"
+  awk '/^_cc_dj_check\(\)/{f=1} f && /^  _cc_dj_retention$/{found=1} f && /^}/{exit} END{exit !found}' "$sd/disk-janitor.sh"
+}
+
+t_retention_off() {
+  local sd="$1" r=0 L
+  begin; L="$T/gcloud/logs"; mkdir -p "$L"; echo old > "$L/a.log"; age "$L" 30
+  run "$sd" CC_DJ_RETENTION=off CC_DJ_RET_GCLOUD_MODE=apply CC_DJ_RET_GCLOUD_DIR="$L"
+  [ -f "$L/a.log" ] || { echo "  CC_DJ_RETENTION=off still deleted"; r=1; }
+  return $r
+}
+
+CASES="t_gcloud t_gcloud_root_symlink t_gcloud_default_apply t_release t_scratch t_scratch_unknown_keeps
+t_scratch_lsof_unknown_keeps t_scratch_default_shadow t_projects t_projects_default_shadow t_gocache
+t_evidence t_evidence_gh_failure t_dev t_dev_sigkill t_dev_young_keeps t_dev_active_worktree_keeps
+t_dev_merged_worktree_stops t_dev_primary_keeps t_dev_live_session_keeps t_dev_claude_ancestor_keeps
+t_dev_never_kill_keeps t_dev_unknown_keeps t_dev_match_default t_report_forces_shadow t_bad_mode_is_shadow t_defaults t_remove_guards
+t_wired_into_check t_retention_off"
+
+for c in $CASES; do
+  if "$c" "$SRC"; then ok "$c"; else nok "$c"; fi
+done
+
+# ---------------------------------------------------------------------------- mutants
+
+[ "${1:-}" = --no-mutants ] && { echo "1..$((failures))"; [ "$failures" -eq 0 ]; exit; }
+
+mutant() {  # <label> <file> <old> <new> <case...>
+  local label="$1" file="$2" old="$3" new="$4" dir rc=0 c; shift 4
+  # M2_OLD/M2_NEW: a second replacement in the same file, for a guard backed by a second layer.
+  dir="$(mktemp -d "$WORK/mut.XXXXXX")"
+  cp "$SRC/disk-janitor.sh" "$SRC/retention-helper.py" "$dir/"
+  if ! python3 - "$dir/$file" "$old" "$new" "${M2_OLD:-}" "${M2_NEW:-}" <<'PY'
+import sys
+p, old, new, old2, new2 = sys.argv[1:6]
+s = open(p).read()
+for o, n in ((old, new), (old2, new2)):
+    if not o:
+        continue
+    if s.count(o) != 1:
+        sys.exit(1)
+    s = s.replace(o, n)
+open(p, "w").write(s)
+PY
+  then nok "mutant $label: anchor not found exactly once"; return; fi
+  for c in "$@"; do
+    if "$c" "$dir" >/dev/null 2>&1; then
+      nok "mutant NOT caught: $label (case $c still passes)"; rc=1
+    fi
+  done
+  [ "$rc" -eq 0 ] && ok "mutant caught: $label"
+  return 0
+}
+
+J=disk-janitor.sh; H=retention-helper.py
+
+# 1 gcloud: age window, symlinks, mode
+mutant "gcloud: any age is old enough" $J '-type f -mmin +"$((days * 1440))" -print0' '-type f -mmin +0 -print0' t_gcloud
+mutant "gcloud: find follows symlinks" $J 'find "$root" -type f -mmin' 'find -L "$root" -type f -mmin' t_gcloud
+mutant "gcloud: default mode is shadow" $J 'CC_DJ_RET_GCLOUD_MODE:-apply' 'CC_DJ_RET_GCLOUD_MODE:-shadow' t_gcloud_default_apply t_defaults
+mutant "root symlink is followed" $J 'if [ -L "$dir" ]; then _cc_dj_log "retention: rule=$rule skipped: root $dir is a symlink"; return 1; fi' ':' t_gcloud_root_symlink
+# 2 release-owner
+mutant "release: keeps none of the newest" $J '[ "$i" -gt "$keep" ] || continue' '[ "$i" -gt 0 ] || continue' t_release
+mutant "release: ignores the 24 h guard" $J '[ -z "$recent" ] || continue' ': "$recent"' t_release
+mutant "release: lists symlinked run dirs" $J 'find "$root" -mindepth 1 -maxdepth 1 -type d -print0' 'find -L "$root" -mindepth 1 -maxdepth 1 -type d -print0' t_release
+# 3 scratchpads
+mutant "scratch: live session ignored" $J 'if printf '"'"'%s\n'"'"' "$live" | grep -qxF -- "$sid"; then' 'if false; then' t_scratch
+mutant "scratch: holder ignored" $J 'if grep -qxF -- "n$p" "$snap" || grep -qF -- "n$p/" "$snap"; then' 'if false; then' t_scratch
+mutant "scratch: protected names ignored" $J 'if _cc_dj_protected_tree "$p" >/dev/null; then' 'if false; then' t_scratch
+mutant "scratch: unreadable sessions do not keep" $J 'if ! live="$(_cc_dj_ret_live_ids 2>/dev/null)"; then' 'if ! live="$(_cc_dj_ret_live_ids 2>/dev/null)" && false; then' t_scratch_unknown_keeps
+mutant "scratch: unusable lsof does not keep" $J ' || ! grep -q '"'"'^n/'"'"' "$snap"; then' '; then' t_scratch_lsof_unknown_keeps
+mutant "scratch: age window ignored" $J 'find "$p" -mmin -"$((days * 1440))" -print -quit' 'find "$p" -mmin -0 -print -quit' t_scratch
+mutant "scratch: default mode is apply" $J 'CC_DJ_RET_SCRATCH_MODE:-shadow' 'CC_DJ_RET_SCRATCH_MODE:-apply' t_scratch_default_shadow t_defaults
+# 4 projects
+mutant "projects: recent files do not keep" $H 'if newest_within(d, days * 86400):' 'if False:' t_projects
+mutant "projects: existing worktree does not keep" $H '                if leaf == e or leaf.startswith(e + "-"):' '                if False:' t_projects
+mutant "projects: unresolvable parent does not keep" $H 'if not resolved_any:' 'if False:' t_projects
+mutant "projects: default mode is apply" $J 'CC_DJ_RET_PROJECTS_MODE:-shadow' 'CC_DJ_RET_PROJECTS_MODE:-apply' t_projects_default_shadow t_defaults
+# 5 go cache
+mutant "go-cache: no free-space threshold" $J 'if [ "$free_kb" -ge $(( act_gb * 1048576 )) ]; then' 'if false; then' t_gocache
+mutant "go-cache: no stamp" $J 'if [ "$rc" -eq 0 ]; then touch "$stamp"; detail' 'if [ "$rc" -eq 0 ]; then : ; detail' t_gocache
+mutant "go-cache: ignores a running build" $J '1) _cc_dj_ret_report go-cache "$mode" 0 0 0 "a go build or test is running; not cleaning (cache_bytes=$bytes)"; return 0 ;;' '1) ;;' t_gocache
+mutant "go-cache: threshold ignores CC_RW_DISK_ACT_GB" $J 'CC_DJ_RET_GOCACHE_ACT_GB:-${CC_RW_DISK_ACT_GB:-40}' 'CC_DJ_RET_GOCACHE_ACT_GB:-40' t_gocache t_defaults
+# 6 evidence
+mutant "evidence: open issue does not keep" $H '        if still:' '        if False:' t_evidence
+mutant "evidence: a directory naming no issue goes" $H '        if not nums:' '        if False:' t_evidence
+mutant "evidence: recent files do not keep" $H '                if newest_within(p, a.days * 86400):
+                    continue' '                if False:
+                    continue' t_evidence
+mutant "evidence: unknown issue state counts as closed" $H 'closed = closed_issues(a.repo, a.gh, a.limit)' 'closed = closed_issues(a.repo, a.gh, a.limit) or set(range(10**6))' t_evidence_gh_failure
+mutant "evidence: default mode is apply" $J 'CC_DJ_RET_EVIDENCE_MODE:-shadow' 'CC_DJ_RET_EVIDENCE_MODE:-apply' t_evidence t_defaults
+# 7 dev processes
+mutant "dev: claude ancestor ignored" $H '        if is_agent(p["cmd"]):' '        if False:' t_dev_claude_ancestor_keeps
+mutant "dev: live session cwd ignored" $H '        if c == real or c.startswith(real + "/"):' '        if False:' t_dev_live_session_keeps
+mutant "dev: unreadable sessions do not keep" $H 'return None, None, "session directory %s unreadable" % sessions_dir' 'return [], set(), None' t_dev_unknown_keeps
+mutant "dev: age gate ignored" $H '        if row["age"] < a.min_age_hours * 3600:' '        if False:' t_dev_young_keeps
+mutant "dev: primary checkout treated as worktree" $H 'os.path.realpath(gd) == os.path.realpath(cd)' 'False' t_dev_primary_keeps
+mutant "dev: active worktree stopped" $H 'return top, "active" if recent else "idle"' 'return top, "idle"' t_dev_active_worktree_keeps
+mutant "dev: merged is not recognised" $H '    if rc == 0:
+        return top, "merged"' '    if False:
+        return top, "merged"' t_dev_merged_worktree_stops
+mutant "dev: no SIGKILL after the grace" $H '                os.kill(pid, signal.SIGKILL)' '                pass' t_dev_sigkill
+mutant "dev: CC_NEVER_KILL_PIDS ignored" $H '        if never_kill(pid, rows):' '        if False:' t_dev_never_kill_keeps
+mutant "dev: default mode is apply" $J 'CC_DJ_RET_DEV_MODE:-shadow' 'CC_DJ_RET_DEV_MODE:-apply' t_defaults
+mutant "dev: default pattern drifts in the script" $J '\S*proxy\.mjs|vite(?: |$)|react' '\S*proxy\.mjs|react' t_dev_match_default
+# shared safety
+mutant "report mode deletes" $J 'if [ "${_CC_DJ_RET_REPORT:-0}" = 1 ]; then echo shadow; else echo apply; fi' 'echo apply' t_report_forces_shadow
+mutant "unknown mode deletes" $J '    *) echo shadow ;;' '    *) echo apply ;;' t_bad_mode_is_shadow
+mutant "removal guard: variables unchecked" $J 'local root="${1:?}" list="${2:?}" kind="${3:?}" p par' 'local root="${1:-}" list="${2:-}" kind="${3:-d}" p par' t_remove_guards
+M2_OLD='case "$par/" in "$root"/*) ;; *) _cc_dj_log "retention: refused $p: parent resolves outside $root"; continue ;; esac' M2_NEW=':' \
+  mutant "removal guard: outside the root" $J 'case "$p" in "$root"/?*) ;; *) _cc_dj_log "retention: refused $p: not inside $root"; continue ;; esac' ':' t_remove_guards
+mutant "removal guard: symlink target" $J 'if [ -L "$p" ]; then _cc_dj_log "retention: refused $p: is a symlink"; continue; fi' ':' t_remove_guards
+mutant "removal guard: symlinked parent" $J 'case "$par/" in "$root"/*) ;; *) _cc_dj_log "retention: refused $p: parent resolves outside $root"; continue ;; esac' ':' t_remove_guards
+mutant "not wired into --check" $J '  _cc_dj_retention
+
+  # By GB' '
+  # By GB' t_wired_into_check
+mutant "CC_DJ_RETENTION=off ignored" $J 'if [ "$CC_DJ_RETENTION" = off ]; then' 'if false; then' t_retention_off
+
+echo "1..done failures=$failures"
+[ "$failures" -eq 0 ]

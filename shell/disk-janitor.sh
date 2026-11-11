@@ -7,7 +7,7 @@
 
 _cc_dj_usage() {
   cat <<'EOF'
-Usage: disk-janitor --check | --clean
+Usage: disk-janitor --check | --clean | --retention | --retention-report
 
 Disk space monitoring and rebuildable-cache cleanup for cc-reaper.
 
@@ -17,6 +17,8 @@ Modes:
             proved abandoned: orphaned headless Chrome, unreferenced cdp-* profiles,
             idle wrangler logs, unheld Chrome code-sign clones, and (once a day)
             Docker builder cache unused for 24 hours.
+  --retention         Run the host retention rules now, each in its own mode.
+  --retention-report  The same, every rule forced to shadow: report bytes, delete nothing.
   --clean   Delete rebuildable caches, prune Docker builder cache unused for
             168 hours, and thin TM snapshots when below threshold. Never
             removes images, containers or volumes.
@@ -85,6 +87,17 @@ Environment:
   CC_DJ_ACT_TRIM_SECONDS   Bound on the worktree regenerable trim it runs (default: 900); the
                            janitor gets half of it as CC_WJ_SWEEP_BUDGET_SECONDS
   CC_DJ_ALERT_ISSUE     owner/repo#N to comment on after acting; unset = log only
+  CC_DJ_RETENTION       on or off: the host retention rules below (default: on); every rule has
+                        CC_DJ_RET_<RULE>_MODE = apply | shadow | off (a bad value reads as shadow):
+                        GCLOUD (apply; files under ~/.config/gcloud/logs older than _DAYS, 14),
+                        RELEASE (apply; ~/.claude/jobs/release-owner run dirs past the newest _KEEP, 5,
+                        never one modified within _RECENT_HOURS, 24), SCRATCH (shadow; session
+                        scratchpads quiet _DAYS, 3, with no live session), PROJECTS (shadow; transcripts
+                        of worktrees that no longer exist, quiet _DAYS, 7), GOCACHE (apply; `go clean
+                        -cache` under _ACT_GB free, default CC_RW_DISK_ACT_GB, at most once per
+                        _INTERVAL_SECONDS), EVIDENCE (shadow; helmway-evidence and handoffs i<N> dirs
+                        of closed issues quiet _DAYS, 7), DEV (shadow; dev servers 168 h old in a merged
+                        or idle worktree with no live Claude owner). CC_DJ_RET_BUDGET_SECONDS bounds a run.
   CC_DJ_GROWTH_TARGETS  Growth targets for --check (default: ~/.cc-reaper/growth-targets.tsv)
   CC_DJ_GROWTH_INTERVAL_HOURS / _BUDGET_SECONDS / _WINDOW_HOURS / _ALERT_GB / _KEY_TIMEOUT
                         Sampling interval per target (6), time budget per run (240),
@@ -138,6 +151,39 @@ CC_DJ_GO_BUILD_FREE_GB="${CC_DJ_GO_BUILD_FREE_GB:-35}"
 CC_DJ_NEW_STEPS_MODE="${CC_DJ_NEW_STEPS_MODE:-spotcheck}"
 CC_DJ_ACT_TRIM_SECONDS="${CC_DJ_ACT_TRIM_SECONDS:-900}"
 CC_DJ_ALERT_ISSUE="${CC_DJ_ALERT_ISSUE:-}"
+# Host retention (stima-api#7881): see "Host retention" below. Modes are apply, shadow or off.
+# Rules 1, 2 and 5 apply by default; the rest report only until the operator flips them.
+CC_DJ_RETENTION="${CC_DJ_RETENTION:-on}"
+CC_DJ_RET_BUDGET_SECONDS="${CC_DJ_RET_BUDGET_SECONDS:-900}"
+CC_DJ_RET_GCLOUD_MODE="${CC_DJ_RET_GCLOUD_MODE:-apply}"
+CC_DJ_RET_GCLOUD_DAYS="${CC_DJ_RET_GCLOUD_DAYS:-14}"
+CC_DJ_RET_GCLOUD_DIR="${CC_DJ_RET_GCLOUD_DIR:-$HOME/.config/gcloud/logs}"
+CC_DJ_RET_RELEASE_MODE="${CC_DJ_RET_RELEASE_MODE:-apply}"
+CC_DJ_RET_RELEASE_KEEP="${CC_DJ_RET_RELEASE_KEEP:-5}"
+CC_DJ_RET_RELEASE_RECENT_HOURS="${CC_DJ_RET_RELEASE_RECENT_HOURS:-24}"
+CC_DJ_RET_RELEASE_DIR="${CC_DJ_RET_RELEASE_DIR:-$HOME/.claude/jobs/release-owner}"
+CC_DJ_RET_SCRATCH_MODE="${CC_DJ_RET_SCRATCH_MODE:-shadow}"
+CC_DJ_RET_SCRATCH_DAYS="${CC_DJ_RET_SCRATCH_DAYS:-3}"
+CC_DJ_RET_SCRATCH_ROOT="${CC_DJ_RET_SCRATCH_ROOT:-/private/tmp/claude-$(id -u)}"
+CC_DJ_RET_PROJECTS_MODE="${CC_DJ_RET_PROJECTS_MODE:-shadow}"
+CC_DJ_RET_PROJECTS_DAYS="${CC_DJ_RET_PROJECTS_DAYS:-7}"
+CC_DJ_RET_PROJECTS_DIR="${CC_DJ_RET_PROJECTS_DIR:-$HOME/.claude/projects}"
+CC_DJ_RET_PROJECTS_MATCH="${CC_DJ_RET_PROJECTS_MATCH:--worktrees-}"
+CC_DJ_RET_GOCACHE_MODE="${CC_DJ_RET_GOCACHE_MODE:-apply}"
+CC_DJ_RET_GOCACHE_ACT_GB="${CC_DJ_RET_GOCACHE_ACT_GB:-${CC_RW_DISK_ACT_GB:-40}}"
+CC_DJ_RET_GOCACHE_INTERVAL_SECONDS="${CC_DJ_RET_GOCACHE_INTERVAL_SECONDS:-86400}"
+CC_DJ_RET_EVIDENCE_MODE="${CC_DJ_RET_EVIDENCE_MODE:-shadow}"
+CC_DJ_RET_EVIDENCE_DAYS="${CC_DJ_RET_EVIDENCE_DAYS:-7}"
+CC_DJ_RET_EVIDENCE_REPO="${CC_DJ_RET_EVIDENCE_REPO:-theQuert/stima-api}"
+CC_DJ_RET_HELMWAY_DIR="${CC_DJ_RET_HELMWAY_DIR:-$HOME/.codex/helmway-evidence}"
+CC_DJ_RET_HANDOFFS_DIR="${CC_DJ_RET_HANDOFFS_DIR:-$HOME/handoffs}"
+CC_DJ_RET_DEV_MODE="${CC_DJ_RET_DEV_MODE:-shadow}"
+CC_DJ_RET_DEV_MIN_AGE_HOURS="${CC_DJ_RET_DEV_MIN_AGE_HOURS:-168}"
+CC_DJ_RET_DEV_IDLE_DAYS="${CC_DJ_RET_DEV_IDLE_DAYS:-7}"
+CC_DJ_RET_DEV_GRACE_SECONDS="${CC_DJ_RET_DEV_GRACE_SECONDS:-10}"
+CC_DJ_RET_DEV_BASE="${CC_DJ_RET_DEV_BASE:-origin/main}"
+_cc_dj_dev_match_default='(?:^|[\s/])(?:next dev|next-server|\S*proxy\.mjs|vite(?: |$)|react-scripts start|webpack serve)'
+CC_DJ_RET_DEV_MATCH="${CC_DJ_RET_DEV_MATCH:-$_cc_dj_dev_match_default}"
 CC_DJ_LOG="${CC_DJ_LOG:-$HOME/.cc-reaper/logs/disk-janitor.log}"
 CC_DJ_STATE_DIR="${CC_DJ_STATE_DIR:-$HOME/.cc-reaper/state/}"
 # growth-watch.py reads its settings from the environment, and the config file sets them
@@ -950,6 +996,419 @@ _cc_dj_alert() {
 }
 
 # ---------------------------------------------------------------------------
+# Host retention (stima-api#7881): age-expired or regenerable artifacts of our own tooling
+# ---------------------------------------------------------------------------
+#
+# Seven rules, each with a mode knob (CC_DJ_RET_<RULE>_MODE: apply, shadow or off; anything else
+# reads as shadow) and one report line giving bytes. Shadow lists what apply would remove (item
+# lines to CC_DJ_SPOTCHECK_LOG) and removes nothing. `--retention-report` forces every rule to
+# shadow for one run. Run from --check each hour, and by hand.
+#
+#   gcloud-logs      files under ~/.config/gcloud/logs older than CC_DJ_RET_GCLOUD_DAYS (14)
+#   release-owner    run dirs under ~/.claude/jobs/release-owner past the newest CC_DJ_RET_RELEASE_KEEP
+#                    (5), never one with a file modified in CC_DJ_RET_RELEASE_RECENT_HOURS (24)
+#   scratchpads      <CC_DJ_RET_SCRATCH_ROOT>/*/<session-uuid>, nothing in it modified for
+#                    CC_DJ_RET_SCRATCH_DAYS (3) and no live session, holder or protected name
+#   projects         ~/.claude/projects/<encoded worktree path> whose worktree directory is gone and
+#                    that nothing under has changed for CC_DJ_RET_PROJECTS_DAYS (7)
+#   go-cache         `go clean -cache` when free space is under CC_DJ_RET_GOCACHE_ACT_GB (default
+#                    CC_RW_DISK_ACT_GB, 40) and no run in CC_DJ_RET_GOCACHE_INTERVAL_SECONDS (86400)
+#   evidence         ~/.codex/helmway-evidence/* and ~/handoffs/i<N>* quiet for CC_DJ_RET_EVIDENCE_DAYS
+#                    (7) whose every named issue is CLOSED (one gh read per run)
+#   dev-processes    next dev / proxy.mjs / ... running CC_DJ_RET_DEV_MIN_AGE_HOURS (168)+ in a merged
+#                    or idle worktree whose Claude session is gone; SIGTERM, then SIGKILL
+#
+# Safety, the same for all: a root is canonicalised and refused when it is itself a symlink; a
+# candidate is an entry found without following symlinks and is re-checked (inside the root, not a
+# symlink) right before removal; removal is by the explicit path from the list just computed, never
+# a glob; a rule that cannot read its inputs skips and logs; unknown keeps.
+
+# Sets _CC_DJ_RET_ROOT to the canonical root; fails (and logs) when the root cannot be trusted.
+_cc_dj_ret_root() {  # <rule> <dir>
+  local rule="$1" dir="$2" real
+  _CC_DJ_RET_ROOT=""
+  if [ -z "$dir" ] || [ "${dir#/}" = "$dir" ]; then _cc_dj_log "retention: rule=$rule skipped: root '$dir' is not an absolute path"; return 1; fi
+  dir="${dir%/}"
+  if [ -L "$dir" ]; then _cc_dj_log "retention: rule=$rule skipped: root $dir is a symlink"; return 1; fi
+  if [ ! -d "$dir" ]; then _cc_dj_log "retention: rule=$rule skipped: root $dir does not exist"; return 1; fi
+  real="$(cd -P "$dir" 2>/dev/null && pwd -P)" || { _cc_dj_log "retention: rule=$rule skipped: cannot read root $dir"; return 1; }
+  _CC_DJ_RET_ROOT="$real"
+}
+
+# The effective mode of a rule: its knob, off stays off, a bad value is shadow, report forces shadow.
+_cc_dj_ret_mode() {  # <value>
+  case "$1" in
+    off) echo off ;;
+    apply) if [ "${_CC_DJ_RET_REPORT:-0}" = 1 ]; then echo shadow; else echo apply; fi ;;
+    *) echo shadow ;;
+  esac
+}
+
+_cc_dj_ret_num() {  # <name> <value> <min>: prints the number, or fails with a log line
+  case "$2" in ''|*[!0-9]*) _cc_dj_log "retention: $1=$2 is not a whole number; its rule is skipped"; return 1 ;; esac
+  [ "$((10#$2))" -ge "$3" ] || { _cc_dj_log "retention: $1=$2 is under $3; its rule is skipped"; return 1; }
+  echo $((10#$2))
+}
+
+# One line per rule: bytes in the rule's own words, and in GiB.
+_cc_dj_ret_report() {  # <rule> <mode> <candidates> <bytes> <removed> [detail]
+  local gib
+  gib="$(awk -v b="${4:-0}" 'BEGIN{printf "%.3f", b/1073741824}')"
+  _cc_dj_log "retention: rule=$1 mode=$2 candidates=$3 bytes=${4:-0} gib=$gib removed=$5${6:+ $6}"
+}
+
+_cc_dj_ret_spot() {  # <rule> <text>
+  local slog="${CC_DJ_SPOTCHECK_LOG:-$HOME/.cc-reaper/logs/spotcheck-disk-janitor.log}"
+  mkdir -p "$(dirname "$slog")" 2>/dev/null || true
+  printf '[%s] run=%s step=retention rule=%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "${_CC_DJ_RET_RUN:-0}" "$1" "$2" >> "$slog" 2>/dev/null || true
+}
+
+# True when the time budget of this retention run is spent.
+_cc_dj_ret_over_budget() { [ "$SECONDS" -ge "${_CC_DJ_RET_DEADLINE:-0}" ]; }
+
+_cc_dj_ret_bytes_of() {  # <path>: allocated bytes, 0 when unreadable
+  du -sk "$1" 2>/dev/null | awk 'NR==1 && $1 ~ /^[0-9]+$/ { printf "%d", $1 * 1024; found=1 } END { if (!found) printf "0" }'
+}
+
+# Removes the paths in NUL-separated $2 under canonical root $1, one explicit path at a time.
+# kind d removes a directory tree, f a file. Sets _CC_DJ_RET_REMOVED. Each path is checked again
+# right before: inside the root and not a symlink.
+_cc_dj_ret_remove_list() {  # <root> <list> <kind>
+  local root="${1:?}" list="${2:?}" kind="${3:?}" p par
+  _CC_DJ_RET_REMOVED=0
+  while IFS= read -r -d '' p; do
+    [ -n "$p" ] || continue
+    case "$p" in "$root"/?*) ;; *) _cc_dj_log "retention: refused $p: not inside $root"; continue ;; esac
+    if [ -L "$p" ]; then _cc_dj_log "retention: refused $p: is a symlink"; continue; fi
+    # The parent, physically resolved, is still inside the root: no symlinked directory on the way.
+    par="$(cd -P -- "${p%/*}" 2>/dev/null && pwd -P)" || { _cc_dj_log "retention: refused $p: parent unreadable"; continue; }
+    case "$par/" in "$root"/*) ;; *) _cc_dj_log "retention: refused $p: parent resolves outside $root"; continue ;; esac
+    if _cc_dj_ret_over_budget; then _cc_dj_log "retention: time budget spent; the rest waits for the next run"; break; fi
+    if [ "$kind" = d ]; then
+      if [ -d "$p" ] && rm -rf -- "$p"; then _CC_DJ_RET_REMOVED=$((_CC_DJ_RET_REMOVED + 1)); fi
+    else
+      if [ -f "$p" ] && rm -f -- "$p"; then _CC_DJ_RET_REMOVED=$((_CC_DJ_RET_REMOVED + 1)); fi
+    fi
+  done < "$list"
+  return 0
+}
+
+_cc_dj_ret_gcloud() {
+  local mode days root list n bytes=0 d parents
+  mode="$(_cc_dj_ret_mode "$CC_DJ_RET_GCLOUD_MODE")"; [ "$mode" = off ] && return 0
+  days="$(_cc_dj_ret_num CC_DJ_RET_GCLOUD_DAYS "$CC_DJ_RET_GCLOUD_DAYS" 1)" || return 0
+  _cc_dj_ret_root gcloud-logs "$CC_DJ_RET_GCLOUD_DIR" || return 0
+  root="$_CC_DJ_RET_ROOT"
+  list="$CC_DJ_STATE_DIR/retention.$$.gcloud"
+  # -type f without -L: a symlink is not listed, and none is descended.
+  if ! find "$root" -type f -mmin +"$((days * 1440))" -print0 > "$list" 2>/dev/null; then
+    _cc_dj_log "retention: rule=gcloud-logs skipped: cannot list $root"; rm -f "$list"; return 0
+  fi
+  n="$(tr -cd '\000' < "$list" | wc -c | tr -d ' ')"
+  if [ "$n" -gt 0 ]; then
+    bytes="$(xargs -0 /usr/bin/stat -f %z < "$list" 2>/dev/null | awk '{ s += $1 } END { printf "%d", s }')"
+  fi
+  _cc_dj_ret_spot gcloud-logs "mode=$mode count=$n bytes=$bytes root=$root"
+  if [ "$mode" = apply ] && [ "$n" -gt 0 ]; then
+    parents="$CC_DJ_STATE_DIR/retention.$$.gcloud.dirs"
+    tr '\000' '\n' < "$list" | sed 's|/[^/]*$||' | sort -u -r > "$parents"
+    _cc_dj_ret_remove_list "$root" "$list" f
+    # Directories the removal emptied: rmdir takes an empty one only, by explicit path.
+    while IFS= read -r d; do
+      case "$d" in "$root"/?*) rmdir -- "$d" 2>/dev/null || true ;; esac
+    done < "$parents"
+    rm -f "$parents"
+    _cc_dj_ret_report gcloud-logs apply "$n" "$bytes" "$_CC_DJ_RET_REMOVED" "older_than=${days}d"
+  else
+    _cc_dj_ret_report gcloud-logs "$mode" "$n" "$bytes" 0 "older_than=${days}d"
+  fi
+  rm -f "$list"
+}
+
+_cc_dj_ret_release_owner() {
+  local mode keep hours root list all p m n bytes=0 b recent
+  mode="$(_cc_dj_ret_mode "$CC_DJ_RET_RELEASE_MODE")"; [ "$mode" = off ] && return 0
+  keep="$(_cc_dj_ret_num CC_DJ_RET_RELEASE_KEEP "$CC_DJ_RET_RELEASE_KEEP" 0)" || return 0
+  hours="$(_cc_dj_ret_num CC_DJ_RET_RELEASE_RECENT_HOURS "$CC_DJ_RET_RELEASE_RECENT_HOURS" 1)" || return 0
+  _cc_dj_ret_root release-owner "$CC_DJ_RET_RELEASE_DIR" || return 0
+  root="$_CC_DJ_RET_ROOT"
+  list="$CC_DJ_STATE_DIR/retention.$$.release"; all="$CC_DJ_STATE_DIR/retention.$$.release.all"
+  : > "$list"
+  if ! find "$root" -mindepth 1 -maxdepth 1 -type d -print0 > "$all" 2>/dev/null; then
+    _cc_dj_log "retention: rule=release-owner skipped: cannot list $root"; rm -f "$list" "$all"; return 0
+  fi
+  # Newest first by the directory's own mtime; the first KEEP are kept whatever their age.
+  local ranked="$CC_DJ_STATE_DIR/retention.$$.release.rank" i=0
+  while IFS= read -r -d '' p; do
+    case "$p" in *$'\n'*) continue ;; esac
+    m="$(/usr/bin/stat -f %m "$p" 2>/dev/null)" || continue
+    printf '%s\t%s\n' "$m" "$p"
+  done < "$all" | sort -rn > "$ranked"
+  while IFS=$'\t' read -r m p; do
+    i=$((i + 1))
+    [ "$i" -gt "$keep" ] || continue
+    # Anything inside modified within the window keeps the run; a walk that fails keeps it too.
+    recent="$(find "$p" -mmin -"$((hours * 60))" -print -quit 2>/dev/null)" || continue
+    [ -z "$recent" ] || continue
+    printf '%s\0' "$p" >> "$list"
+  done < "$ranked"
+  n="$(tr -cd '\000' < "$list" | wc -c | tr -d ' ')"
+  while IFS= read -r -d '' p; do
+    b="$(_cc_dj_ret_bytes_of "$p")"; bytes=$((bytes + b))
+    _cc_dj_ret_spot release-owner "item=$p bytes=$b"
+  done < "$list"
+  if [ "$mode" = apply ] && [ "$n" -gt 0 ]; then
+    _cc_dj_ret_remove_list "$root" "$list" d
+    _cc_dj_ret_report release-owner apply "$n" "$bytes" "$_CC_DJ_RET_REMOVED" "keep=$keep recent=${hours}h"
+  else
+    _cc_dj_ret_report release-owner "$mode" "$n" "$bytes" 0 "keep=$keep recent=${hours}h"
+  fi
+  rm -f "$list" "$all" "$ranked"
+}
+
+# Session ids that count as live, one per line (a pid-alive record's id, plus every UUID on a
+# running command line). Fails when the records or the process list cannot be read, or when a
+# claude process runs while no record is live (the record format moved).
+_cc_dj_ret_live_ids() {
+  local dir="${CC_DJ_SESSIONS_DIR:-$HOME/.claude/sessions}"
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -I - "$dir" <<'PY'
+import json, os, re, subprocess, sys
+d = sys.argv[1]
+if not os.path.isdir(d):
+    sys.exit(1)
+ids, records = set(), 0
+for n in os.listdir(d):
+    if not re.match(r"^\d+\.json$", n):
+        continue
+    try:
+        rec = json.load(open(os.path.join(d, n)))
+        pid = int(rec["pid"])
+    except Exception:
+        sys.exit(1)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        continue
+    except PermissionError:
+        pass
+    records += 1
+    if rec.get("sessionId"):
+        ids.add(rec["sessionId"])
+out = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True)
+if out.returncode != 0 or not out.stdout.strip():
+    sys.exit(1)
+ids |= set(re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", out.stdout))
+if records == 0 and subprocess.run(["pgrep", "-x", "claude"], capture_output=True).returncode == 0:
+    sys.exit(1)
+print("\n".join(sorted(ids)))
+PY
+}
+
+_cc_dj_ret_scratchpads() {
+  local mode days root list all p sid live snap why n bytes=0 b lsof_bin
+  local kept_live=0 kept_held=0 kept_prot=0 kept_recent=0
+  mode="$(_cc_dj_ret_mode "$CC_DJ_RET_SCRATCH_MODE")"; [ "$mode" = off ] && return 0
+  days="$(_cc_dj_ret_num CC_DJ_RET_SCRATCH_DAYS "$CC_DJ_RET_SCRATCH_DAYS" 1)" || return 0
+  _cc_dj_ret_root scratchpads "$CC_DJ_RET_SCRATCH_ROOT" || return 0
+  root="$_CC_DJ_RET_ROOT"
+  # Liveness first: without it nothing is judged (unknown means keep).
+  if ! live="$(_cc_dj_ret_live_ids 2>/dev/null)"; then
+    _cc_dj_log "retention: rule=scratchpads skipped: live sessions cannot be read; every scratchpad is kept"; return 0
+  fi
+  lsof_bin="${CC_DJ_RET_LSOF:-lsof}"
+  snap="$CC_DJ_STATE_DIR/retention.$$.lsof"
+  if ! command -v "$lsof_bin" >/dev/null 2>&1 || ! "$lsof_bin" -nP -Fn > "$snap" 2>/dev/null || ! grep -q '^n/' "$snap"; then
+    _cc_dj_log "retention: rule=scratchpads skipped: lsof cannot report open files; every scratchpad is kept"; rm -f "$snap"; return 0
+  fi
+  list="$CC_DJ_STATE_DIR/retention.$$.scratch"; all="$CC_DJ_STATE_DIR/retention.$$.scratch.all"
+  : > "$list"
+  if ! find "$root" -mindepth 2 -maxdepth 2 -type d -print0 > "$all" 2>/dev/null; then
+    _cc_dj_log "retention: rule=scratchpads skipped: cannot list $root"; rm -f "$list" "$all" "$snap"; return 0
+  fi
+  while IFS= read -r -d '' p; do
+    if _cc_dj_ret_over_budget; then _cc_dj_log "retention: rule=scratchpads time budget spent; the rest waits"; break; fi
+    sid="${p##*/}"
+    case "$sid" in
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+      *) continue ;;
+    esac
+    # Newest mtime inside (the directory included) must be older than the window; a failed walk keeps it.
+    if ! why="$(find "$p" -mmin -"$((days * 1440))" -print -quit 2>/dev/null)"; then kept_recent=$((kept_recent + 1)); continue; fi
+    [ -z "$why" ] || { kept_recent=$((kept_recent + 1)); continue; }
+    if printf '%s\n' "$live" | grep -qxF -- "$sid"; then kept_live=$((kept_live + 1)); continue; fi
+    if grep -qxF -- "n$p" "$snap" || grep -qF -- "n$p/" "$snap"; then kept_held=$((kept_held + 1)); continue; fi
+    if _cc_dj_protected_tree "$p" >/dev/null; then kept_prot=$((kept_prot + 1)); continue; fi
+    printf '%s\0' "$p"
+  done < "$all" > "$list"
+  rm -f "$snap" "$all"
+  n="$(tr -cd '\000' < "$list" | wc -c | tr -d ' ')"
+  while IFS= read -r -d '' p; do
+    b="$(_cc_dj_ret_bytes_of "$p")"; bytes=$((bytes + b))
+    _cc_dj_ret_spot scratchpads "item=$p bytes=$b"
+  done < "$list"
+  why="older_than=${days}d kept_live=$kept_live kept_held=$kept_held kept_protected=$kept_prot kept_recent=$kept_recent"
+  if [ "$mode" = apply ] && [ "$n" -gt 0 ]; then
+    _cc_dj_ret_remove_list "$root" "$list" d
+    _cc_dj_ret_report scratchpads apply "$n" "$bytes" "$_CC_DJ_RET_REMOVED" "$why"
+  else
+    _cc_dj_ret_report scratchpads "$mode" "$n" "$bytes" 0 "$why"
+  fi
+  rm -f "$list"
+}
+
+_cc_dj_ret_projects() {
+  local mode days root helper list out kind name why n=0 bytes=0 b kept=0
+  mode="$(_cc_dj_ret_mode "$CC_DJ_RET_PROJECTS_MODE")"; [ "$mode" = off ] && return 0
+  days="$(_cc_dj_ret_num CC_DJ_RET_PROJECTS_DAYS "$CC_DJ_RET_PROJECTS_DAYS" 1)" || return 0
+  _cc_dj_ret_root projects "$CC_DJ_RET_PROJECTS_DIR" || return 0
+  root="$_CC_DJ_RET_ROOT"
+  helper="${CC_DJ_RET_HELPER:-$(dirname "${BASH_SOURCE[0]}")/retention-helper.py}"
+  if [ ! -r "$helper" ] || ! command -v python3 >/dev/null 2>&1; then
+    _cc_dj_log "retention: rule=projects skipped: $helper or python3 not found"; return 0
+  fi
+  list="$CC_DJ_STATE_DIR/retention.$$.projects"; : > "$list"
+  out="$(python3 -I "$helper" projects --root "$root" --days "$days" --match="$CC_DJ_RET_PROJECTS_MATCH" 2>&1)" || {
+    _cc_dj_log "retention: rule=projects skipped: helper failed"; rm -f "$list"; return 0; }
+  while IFS=$'\t' read -r kind name why; do
+    case "$kind" in
+      CAND)
+        # An encoded name holds only letters, digits and dashes; anything else is not ours.
+        case "$name" in ''|*[!A-Za-z0-9-]*) continue ;; esac
+        b="$(_cc_dj_ret_bytes_of "$root/$name")"; bytes=$((bytes + b)); n=$((n + 1))
+        printf '%s\0' "$root/$name" >> "$list"
+        _cc_dj_ret_spot projects "item=$root/$name bytes=$b reason=$why" ;;
+      KEEP) kept=$((kept + 1)) ;;
+      ERR) _cc_dj_log "retention: rule=projects $name" ;;
+    esac
+  done <<< "$out"
+  if [ "$mode" = apply ] && [ "$n" -gt 0 ]; then
+    _cc_dj_ret_remove_list "$root" "$list" d
+    _cc_dj_ret_report projects apply "$n" "$bytes" "$_CC_DJ_RET_REMOVED" "quiet=${days}d kept_worktree_named=$kept"
+  else
+    _cc_dj_ret_report projects "$mode" "$n" "$bytes" 0 "quiet=${days}d kept_worktree_named=$kept"
+  fi
+  rm -f "$list"
+}
+
+_cc_dj_ret_go_cache() {
+  local mode act_gb interval dir stamp now last free_kb bytes=0 rc=0 detail
+  mode="$(_cc_dj_ret_mode "$CC_DJ_RET_GOCACHE_MODE")"; [ "$mode" = off ] && return 0
+  act_gb="$(_cc_dj_ret_num CC_DJ_RET_GOCACHE_ACT_GB "$CC_DJ_RET_GOCACHE_ACT_GB" 1)" || return 0
+  interval="$(_cc_dj_ret_num CC_DJ_RET_GOCACHE_INTERVAL_SECONDS "$CC_DJ_RET_GOCACHE_INTERVAL_SECONDS" 60)" || return 0
+  dir="${CC_DJ_RET_GOCACHE_DIR:-}"
+  if [ -z "$dir" ]; then
+    command -v go >/dev/null 2>&1 || { _cc_dj_log "retention: rule=go-cache skipped: go not found"; return 0; }
+    dir="$(go env GOCACHE 2>/dev/null)"
+  fi
+  _cc_dj_ret_root go-cache "$dir" || return 0
+  dir="$_CC_DJ_RET_ROOT"
+  free_kb="$(_cc_dj_free_kb)"
+  case "$free_kb" in ''|*[!0-9]*) _cc_dj_log "retention: rule=go-cache skipped: free space unreadable"; return 0 ;; esac
+  if [ "$free_kb" -ge $(( act_gb * 1048576 )) ]; then
+    _cc_dj_ret_report go-cache "$mode" 0 0 0 "free=$(_cc_dj_fmt_kb_delta "$free_kb") is not under ${act_gb}GB"; return 0
+  fi
+  stamp="$CC_DJ_STATE_DIR/retention-go-cache.stamp"
+  now="$(date +%s)"
+  last="$(/usr/bin/stat -f %m "$stamp" 2>/dev/null || echo 0)"
+  if [ $(( now - last )) -lt "$interval" ]; then
+    _cc_dj_ret_report go-cache "$mode" 0 0 0 "free=$(_cc_dj_fmt_kb_delta "$free_kb") but cleaned within ${interval}s (stamp)"; return 0
+  fi
+  bytes="$(_cc_dj_ret_bytes_of "$dir")"
+  case "${CC_DJ_RET_GO_BUSY:-}" in
+    1) _cc_dj_ret_report go-cache "$mode" 0 0 0 "a go build or test is running; not cleaning (cache_bytes=$bytes)"; return 0 ;;
+    0) ;;
+    *) if _cc_dj_ret_go_running; then
+         _cc_dj_ret_report go-cache "$mode" 0 0 0 "a go build or test is running; not cleaning (cache_bytes=$bytes)"; return 0
+       fi ;;
+  esac
+  _cc_dj_ret_spot go-cache "mode=$mode bytes=$bytes dir=$dir free_kb=$free_kb"
+  if [ "$mode" = apply ]; then
+    command -v go >/dev/null 2>&1 || { _cc_dj_log "retention: rule=go-cache skipped: go not found"; return 0; }
+    _cc_dj_run_bounded 600 env GOCACHE="$dir" go clean -cache >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then touch "$stamp"; detail="free_trigger=${act_gb}GB"; else detail="go clean failed rc=$rc"; fi
+    _cc_dj_ret_report go-cache apply 1 "$bytes" "$([ "$rc" -eq 0 ] && echo 1 || echo 0)" "$detail"
+  else
+    _cc_dj_ret_report go-cache "$mode" 1 "$bytes" 0 "free_trigger=${act_gb}GB"
+  fi
+}
+
+# Is a go build or test compiling right now. Its own function so the process probe stays one
+# plain pattern match (it only reads the process table; it signals nothing).
+_cc_dj_ret_go_running() {
+  pgrep -f 'go (build|test|run|vet)|/pkg/tool/.*/(compile|link)' >/dev/null 2>&1
+}
+
+# The python rules print one line per item; the log gets the totals and every stop.
+_cc_dj_ret_helper_rule() {  # <rule> <mode> <helper args...>
+  local rule="$1" mode="$2" helper out line kind rest cand=0 bytes=0 removed=0 b
+  shift 2
+  helper="${CC_DJ_RET_HELPER:-$(dirname "${BASH_SOURCE[0]}")/retention-helper.py}"
+  if [ ! -r "$helper" ] || ! command -v python3 >/dev/null 2>&1; then
+    _cc_dj_log "retention: rule=$rule skipped: $helper or python3 not found"; return 0
+  fi
+  out="$(python3 -I "$helper" "$@" 2>&1)" || { _cc_dj_log "retention: rule=$rule skipped: helper failed: $(printf '%s' "$out" | tail -1)"; return 0; }
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    kind="${line%%$'\t'*}"; rest="${line#*$'\t'}"
+    case "$kind" in
+      WOULD-REMOVE|REMOVED)
+        b="$(printf '%s' "$rest" | awk -F'\t' '{print $2}')"; case "$b" in ''|*[!0-9]*) b=0 ;; esac
+        cand=$((cand + 1)); bytes=$((bytes + b)); [ "$kind" = REMOVED ] && removed=$((removed + 1))
+        _cc_dj_ret_spot "$rule" "$kind $(printf '%s' "$rest" | tr '\t' ' ')" ;;
+      WOULD-STOP|STOPPED)
+        cand=$((cand + 1)); [ "$kind" = STOPPED ] && removed=$((removed + 1))
+        _cc_dj_ret_spot "$rule" "$kind $(printf '%s' "$rest" | tr '\t' ' ')"
+        _cc_dj_log "retention: rule=$rule $kind $(printf '%s' "$rest" | tr '\t' ' ')" ;;
+      KEEP) _cc_dj_ret_spot "$rule" "KEEP $(printf '%s' "$rest" | tr '\t' ' ')" ;;
+      ERR) _cc_dj_log "retention: rule=$rule $rest" ;;
+    esac
+  done <<< "$out"
+  _cc_dj_ret_report "$rule" "$mode" "$cand" "$bytes" "$removed"
+}
+
+_cc_dj_ret_evidence() {
+  local mode days
+  mode="$(_cc_dj_ret_mode "$CC_DJ_RET_EVIDENCE_MODE")"; [ "$mode" = off ] && return 0
+  days="$(_cc_dj_ret_num CC_DJ_RET_EVIDENCE_DAYS "$CC_DJ_RET_EVIDENCE_DAYS" 1)" || return 0
+  _cc_dj_ret_helper_rule evidence "$mode" evidence --mode "$([ "$mode" = apply ] && echo apply || echo shadow)" \
+    --days "$days" --repo "$CC_DJ_RET_EVIDENCE_REPO" --gh "${CC_DJ_RET_GH:-gh}" \
+    --root "helmway:$CC_DJ_RET_HELMWAY_DIR" --root "handoffs:$CC_DJ_RET_HANDOFFS_DIR"
+}
+
+_cc_dj_ret_dev_processes() {
+  local mode hours idle grace
+  mode="$(_cc_dj_ret_mode "$CC_DJ_RET_DEV_MODE")"; [ "$mode" = off ] && return 0
+  hours="$(_cc_dj_ret_num CC_DJ_RET_DEV_MIN_AGE_HOURS "$CC_DJ_RET_DEV_MIN_AGE_HOURS" 0)" || return 0
+  idle="$(_cc_dj_ret_num CC_DJ_RET_DEV_IDLE_DAYS "$CC_DJ_RET_DEV_IDLE_DAYS" 0)" || return 0
+  grace="$(_cc_dj_ret_num CC_DJ_RET_DEV_GRACE_SECONDS "$CC_DJ_RET_DEV_GRACE_SECONDS" 0)" || return 0
+  _cc_dj_ret_helper_rule dev-processes "$mode" devprocs --mode "$([ "$mode" = apply ] && echo apply || echo shadow)" \
+    --min-age-hours "$hours" --idle-days "$idle" --grace "$grace" --base "$CC_DJ_RET_DEV_BASE" \
+    --sessions-dir "${CC_DJ_SESSIONS_DIR:-$HOME/.claude/sessions}" --match="$CC_DJ_RET_DEV_MATCH"
+}
+
+# Entry: every rule once, each under the shared time budget. Never fails the caller.
+_cc_dj_retention() {  # [--report]
+  _CC_DJ_RET_REPORT=0
+  [ "${1:-}" = --report ] && _CC_DJ_RET_REPORT=1
+  _cc_dj_init_dirs || return 0
+  if [ "$CC_DJ_RETENTION" = off ]; then _cc_dj_log "retention: CC_DJ_RETENTION=off; not run"; return 0; fi
+  _CC_DJ_RET_RUN="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  case "$CC_DJ_RET_BUDGET_SECONDS" in ''|*[!0-9]*) _cc_dj_log "retention: CC_DJ_RET_BUDGET_SECONDS=$CC_DJ_RET_BUDGET_SECONDS is not a number; not run"; return 0 ;; esac
+  _CC_DJ_RET_DEADLINE=$(( SECONDS + 10#$CC_DJ_RET_BUDGET_SECONDS ))
+  _cc_dj_log "retention: start run=$_CC_DJ_RET_RUN report_only=$_CC_DJ_RET_REPORT"
+  _cc_dj_ret_gcloud
+  _cc_dj_ret_release_owner
+  _cc_dj_ret_scratchpads
+  _cc_dj_ret_projects
+  _cc_dj_ret_go_cache
+  _cc_dj_ret_evidence
+  _cc_dj_ret_dev_processes
+  _cc_dj_log "retention: end run=$_CC_DJ_RET_RUN"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # --check mode
 # ---------------------------------------------------------------------------
 _cc_dj_check() {
@@ -1002,6 +1461,8 @@ _cc_dj_check() {
   _cc_dj_builder_prune_daily
   _cc_dj_template_prune_daily
   _cc_dj_orbstack_report
+  # Age-expired byproducts of our own tooling, before the act so it sees the space they freed.
+  _cc_dj_retention
 
   # By GB, apart from the % notice above: 30 GB is 6% of this host's volume.
   _cc_dj_low_disk_act "$(_cc_dj_free_kb)"
@@ -1948,6 +2409,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
       ;;
     --clean)
       _cc_dj_clean
+      ;;
+    --retention)
+      _cc_dj_retention
+      ;;
+    --retention-report)
+      _cc_dj_retention --report
       ;;
     -h|--help)
       _cc_dj_usage

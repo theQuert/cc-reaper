@@ -303,6 +303,9 @@ _run_dj() {
     export CC_DJ_ACT_FREE_GB="${CC_DJ_ACT_FREE_GB:-off}"
     # The daily template prune likewise: only the group that tests it turns it on.
     export CC_DJ_TEMPLATE_DAILY="${CC_DJ_TEMPLATE_DAILY:-off}"
+    # The host retention rules (stima-api#7881) read the machine's own directories and process
+    # table; tests/disk-janitor-retention.sh is where they run, against fixtures.
+    export CC_DJ_RETENTION="${CC_DJ_RETENTION:-off}"
     # The new act steps read these; a stray value from the caller's shell must not point
     # them at the real template store or the real sessions directory.
     unset NODE_MODULES_TEMPLATE_STORE
