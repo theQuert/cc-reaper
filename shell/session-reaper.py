@@ -70,6 +70,7 @@ DEFAULTS = {
     "ORACLE_ROOT": "/Users/stimaclaw/GitHub/stima-api",  # checkout whose `scripts/ci/delivery_state.py N --brief` judges an idle session's open claims
     "ORACLE_CACHE_DIR": "~/.cc-reaper/state/oracle-brief",  # one brief per issue, reused for ORACLE_CACHE_MINUTES (GitHub REST budget)
     "ORACLE_CACHE_MINUTES": "10",
+    "ORACLE_TIMEOUT_SECONDS": "60",  # one --brief read; 30 s timed out under load with 8 parallel reads (stima-api #7061)
     "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
     "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # stall-watch.py writes <session id>.json here; empty: off
     "STALL_MARK_HOURS": "12",  # a mark not refreshed for this long is stale and ignored
@@ -503,7 +504,7 @@ def oracle_brief(repo, num, cfg, now):
     except (OSError, ValueError, KeyError, TypeError):
         pass
     root = os.path.expanduser(cfg["ORACLE_ROOT"])
-    rc, out = run(["python3", "scripts/ci/delivery_state.py", str(num), "--brief", "--repo", repo], 30, cwd=root)
+    rc, out = run(["python3", "scripts/ci/delivery_state.py", str(num), "--brief", "--repo", repo], float(cfg["ORACLE_TIMEOUT_SECONDS"]), cwd=root)
     brief = out if rc == 0 and out.startswith("delivery #") else None
     if brief is not None:
         try:
