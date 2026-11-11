@@ -513,7 +513,7 @@ t_defaults() {
   local sd="$1" r=0 out
   begin
   out="$(env HOME="$FH" CC_DJ_CONFIG=/dev/null bash -c 'unset CC_RW_DISK_ACT_GB; . "$1"; echo "$CC_DJ_RET_GCLOUD_MODE $CC_DJ_RET_RELEASE_MODE $CC_DJ_RET_GOCACHE_MODE $CC_DJ_RET_SCRATCH_MODE $CC_DJ_RET_PROJECTS_MODE $CC_DJ_RET_EVIDENCE_MODE $CC_DJ_RET_DEV_MODE $CC_DJ_RET_GOCACHE_ACT_GB $CC_DJ_RET_GCLOUD_DAYS $CC_DJ_RET_RELEASE_KEEP $CC_DJ_RET_SCRATCH_DAYS $CC_DJ_RET_PROJECTS_DAYS $CC_DJ_RET_EVIDENCE_DAYS $CC_DJ_RET_DEV_MIN_AGE_HOURS $CC_DJ_RET_CODEX_DAYS"' _ "$sd/disk-janitor.sh" 2>&1)"
-  [ "$out" = "apply apply apply shadow shadow apply shadow 40 14 5 3 7 7 168 0" ] || { echo "  defaults are: $out"; r=1; }
+  [ "$out" = "apply apply apply shadow shadow shadow shadow 40 14 5 3 7 7 168 0" ] || { echo "  defaults are: $out"; r=1; }
   out="$(env HOME="$FH" CC_DJ_CONFIG=/dev/null CC_RW_DISK_ACT_GB=33 bash -c '. "$1"; echo "$CC_DJ_RET_GOCACHE_ACT_GB"' _ "$sd/disk-janitor.sh" 2>&1)"
   [ "$out" = 33 ] || { echo "  go-cache threshold does not follow CC_RW_DISK_ACT_GB ($out)"; r=1; }
   return $r
@@ -698,8 +698,8 @@ t_codex() {
   [ -d "$C/worktrees/clean" ] && [ -f "$x/a.jsonl" ] && [ -d "$h/2026-11-01-a" ] || { echo "  shadow removed"; r=1; }
   has 'rule=evidence mode=shadow candidates=4 bytes=[1-9]' || { echo "  shadow should list helmway a, worktree clean, a.jsonl, dir1"; r=1; }
   grep -q 'rule=evidence WOULD-REMOVE .*/worktrees/clean [0-9]* clean, every commit is on a remote' "$T/spot.log" || { echo "  no per-worktree line with the reason"; r=1; }
-  # The default mode is apply, and nothing is aged: the files above were written a moment ago.
-  codexrun "$sd" ""
+  # Nothing is aged: the files above were written a moment ago.
+  codexrun "$sd" apply
   [ ! -d "$h/2026-11-01-a" ] || { echo "  helmway-evidence of a closed issue survived (no age applies)"; r=1; }
   [ ! -d "$C/worktrees/clean" ] || { echo "  a clean worktree with every commit on a remote survived"; r=1; }
   [ ! -e "$x/a.jsonl" ] && [ ! -d "$x/dir1" ] || { echo "  archived sessions survived"; r=1; }
@@ -716,7 +716,7 @@ t_codex() {
   [ -f "$C/auth.json" ] && [ -f "$C/config.toml" ] && [ -f "$C/packages/p/f" ] && [ -f "$C/plugins/q/f" ] \
     && [ -f "$C/state.sqlite" ] && [ -f "$C/sessions/rollout.jsonl" ] || { echo "  something outside the three roots was touched"; r=1; }
   has 'rule=evidence mode=apply candidates=4 .* removed=4' || { echo "  apply report wrong"; r=1; }
-  : > "$T/dj.log"; codexrun "$sd" ""
+  : > "$T/dj.log"; codexrun "$sd" apply
   has 'candidates=0 .* removed=0' || { echo "  second run is not a no-op"; r=1; }
   return $r
 }
@@ -748,6 +748,16 @@ t_evidence_date_names() {
   [ ! -d "$E/2026-11-07-c" ] || { echo "  i<N> no longer names an issue"; r=1; }
   [ ! -d "$E/2026-11-08-d" ] || { echo "  issue-<N> no longer names an issue"; r=1; }
   [ ! -d "$E/2026-11-09-e" ] || { echo "  #<N> no longer names an issue"; r=1; }
+  return $r
+}
+
+# Rule 6 ships shadow: with the mode knob unset a closed, old evidence directory stays and the report says shadow.
+t_evidence_default_shadow() {
+  local sd="$1" r=0 H
+  begin; H="$T/handoffs"; mkdir -p "$H/i100"; echo x > "$H/i100/f"; age "$H" 20; printf '100\n' > "$T/gh.closed"
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE= CC_DJ_RET_HANDOFFS_DIR="$H"
+  [ -d "$H/i100" ] || { echo "  the default mode for the evidence rule removed a directory"; r=1; }
+  has 'rule=evidence mode=shadow candidates=1' || { echo "  the default report is not shadow with the candidate"; r=1; }
   return $r
 }
 
@@ -871,7 +881,7 @@ t_scratch_lsof_unknown_keeps t_scratch_default_shadow t_projects t_projects_defa
 t_evidence t_evidence_gh_failure t_dev t_dev_sigkill t_dev_young_keeps t_dev_active_worktree_keeps
 t_dev_merged_worktree_stops t_dev_primary_keeps t_dev_live_session_keeps t_dev_claude_ancestor_keeps
 t_dev_never_kill_keeps t_dev_unknown_keeps t_dev_match_default t_report_forces_shadow t_bad_mode_is_shadow t_defaults t_remove_guards
-t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing t_codex t_codex_lsof_unknown_keeps t_evidence_date_names t_codex_days t_codex_worktree_shapes t_evidence_bare_names t_evidence_bare_numbers_keep t_codex_nested_repo"
+t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing t_codex t_codex_lsof_unknown_keeps t_evidence_date_names t_codex_days t_codex_worktree_shapes t_evidence_bare_names t_evidence_bare_numbers_keep t_evidence_default_shadow t_codex_nested_repo"
 
 for c in $CASES; do
   if "$c" "$SRC"; then ok "$c"; else nok "$c"; fi
@@ -942,7 +952,7 @@ mutant "evidence: open issue does not keep" $H '        if still:' '        if F
 mutant "evidence: a directory naming no issue goes" $H '        if not strong:' '        if False:' t_evidence t_evidence_bare_numbers_keep
 mutant "evidence: recent files do not keep" $H '                if days_of(kind) > 0 and newest_within(p, days_of(kind) * 86400):' '                if False:' t_evidence
 mutant "evidence: unknown issue state counts as closed" $H 'closed = closed_issues(a.repo, a.gh, a.limit)' 'closed = closed_issues(a.repo, a.gh, a.limit) or set(range(10**6))' t_evidence_gh_failure
-mutant "evidence: default mode is shadow" $J 'CC_DJ_RET_EVIDENCE_MODE:-apply' 'CC_DJ_RET_EVIDENCE_MODE:-shadow' t_codex t_defaults
+mutant "evidence: default mode is apply" $J 'CC_DJ_RET_EVIDENCE_MODE:-shadow' 'CC_DJ_RET_EVIDENCE_MODE:-apply' t_evidence_default_shadow t_defaults
 # F1 issue names
 mutant "evidence: the old entry regex reads a date as an issue" $H 'ENTRY_ISSUE = re.compile(r"^(?:i|issue-?|#)" + _NUM)' 'ENTRY_ISSUE = re.compile(r"^(?:i)?(\d{3,6})(?:[-_.]|$)")' t_evidence_date_names
 mutant "evidence: a date counts as a number" $H '_NOT_DATE = r"(?!(?:19|20)\d{2}[-_.](?:0[1-9]|1[0-2])(?!\d))"' '_NOT_DATE = r""' t_evidence_date_names

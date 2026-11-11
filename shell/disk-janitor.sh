@@ -95,7 +95,7 @@ Environment:
                         scratchpads quiet _DAYS, 3, with no live session), PROJECTS (shadow; transcripts
                         of worktrees that no longer exist, quiet _DAYS, 7), GOCACHE (apply; `go clean
                         -cache` under _ACT_GB free, default CC_RW_DISK_ACT_GB, at most once per
-                        _INTERVAL_SECONDS), EVIDENCE (apply; helmway-evidence dirs of closed issues, handoffs i<N> dirs of closed
+                        _INTERVAL_SECONDS), EVIDENCE (shadow; helmway-evidence dirs of closed issues, handoffs i<N> dirs of closed
                         issues quiet _DAYS, 7; ~/.codex/worktrees entries that are clean with every commit
                         on a remote and ~/.codex/archived_sessions entries, none held by a process; _CODEX_DAYS, 0,
                         is the age for ~/.codex paths), DEV (shadow; dev servers 168 h old in a merged
@@ -174,7 +174,7 @@ CC_DJ_RET_PROJECTS_MATCH="${CC_DJ_RET_PROJECTS_MATCH:--worktrees-}"
 CC_DJ_RET_GOCACHE_MODE="${CC_DJ_RET_GOCACHE_MODE:-apply}"
 CC_DJ_RET_GOCACHE_ACT_GB="${CC_DJ_RET_GOCACHE_ACT_GB:-${CC_RW_DISK_ACT_GB:-40}}"
 CC_DJ_RET_GOCACHE_INTERVAL_SECONDS="${CC_DJ_RET_GOCACHE_INTERVAL_SECONDS:-86400}"
-CC_DJ_RET_EVIDENCE_MODE="${CC_DJ_RET_EVIDENCE_MODE:-apply}"
+CC_DJ_RET_EVIDENCE_MODE="${CC_DJ_RET_EVIDENCE_MODE:-shadow}"
 CC_DJ_RET_EVIDENCE_DAYS="${CC_DJ_RET_EVIDENCE_DAYS:-7}"
 CC_DJ_RET_EVIDENCE_REPO="${CC_DJ_RET_EVIDENCE_REPO:-theQuert/stima-api}"
 CC_DJ_RET_CODEX_DAYS="${CC_DJ_RET_CODEX_DAYS:-0}"
