@@ -8,14 +8,8 @@
   transcripts once and spends minutes judging trees, so the listed path could be gone when a candidate asked, which
   read as "could not be parsed", one unknown record, and (in the default spot-check mode, which decides as `global`
   does) every clean landed idle tree of the pass kept: 4 of the 35 removal passes that examined trees on 2026-11-11, 3-4 trees each. The
-  session id's transcript is now looked up where it went and read there; a session whose last cwd is a tree claims it.
+  session id's transcript is now looked up where it went (only when it is found in exactly one place) and read there; a session whose last cwd is a tree claims it (scope `moved-cwd`).
   A transcript that is nowhere, unreadable or without a cwd is still an unknown record.
-
-### Added
-- **worktree-janitor: low-disk floor (stima-api #7881).** Under `CC_WJ_LOW_DISK_FREE_GB` (default 25, `off` or 0
-  disables) free on the volume holding `$HOME`, an applying or scheduled run logs `LOW-DISK` and writes one line to
-  `~/.cc-reaper/state/low-disk-warning`; a run above the floor removes it. A SessionStart hook can print it with
-  `cat ~/.cc-reaper/state/low-disk-warning 2>/dev/null`. An alert only: nothing is deleted, no decision changes.
 
 ### Removed
 - **cc-reaper no longer writes to Neo's inbox, reads relay requests or nudges sessions (stima-api #7079).** The Grok

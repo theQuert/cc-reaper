@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# worktree-janitor (stima-api#7881): two things the 2026-11-11 audit of the Mac mini's disk found.
+# worktree-janitor (stima-api#7881): the Mac mini disk audit of 2026-11-11.
 #
-# 1. A Claude session that enters a worktree has its transcript moved to that worktree's project
+# A Claude session that enters a worktree has its transcript moved to that worktree's project
 #    directory. The sweep lists transcripts once, spends minutes judging trees, and then asks the
 #    listed path: gone, so "could not be parsed", so one unknown record, so (under the default
 #    spot-check mode, which decides as `global` does) every clean landed idle tree of the pass was
@@ -16,11 +16,11 @@
 #      M6  the moved transcript records no cwd                          -> 2
 #      M7  a stale path that is no session id's transcript              -> 2
 #      M8  the transcript did not move                                  -> as before
-# 2. The low-disk floor: under CC_WJ_LOW_DISK_FREE_GB (default 25) free, an applying or scheduled
-#    run logs LOW-DISK and writes one line for a SessionStart hook; a run above it removes the line;
-#    a report run, an unreadable free figure and `off` leave things as they are. Nothing is deleted.
+#      M9  the session id is found in two places                        -> 2 (as the live scan)
+#      M10 after a move the records point at the new path, the claim is moved-cwd, and
+#          the cwd claim stays for the next candidate
 #
-# Real git repository and a local bare origin; df, lsof and gh are stubs. TAP-style; set WJ_SCRIPT
+# Real git repository and a local bare origin; lsof and gh are stubs. TAP-style; set WJ_SCRIPT
 # to test another copy of the janitor.
 set -uo pipefail
 
@@ -63,12 +63,6 @@ case " $* " in
   *) printf 'p1\nn/dev/null\n' ;;
 esac
 STUB
-# df prints what DF_KB says; DF_KB unset or empty prints no figure at all.
-cat > "$STUBS/df" <<'STUB'
-#!/usr/bin/env bash
-printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-[ -z "${DF_KB:-}" ] || printf '/dev/x 482344960 1 %s 98%% /System/Volumes/Data\n' "$DF_KB"
-STUB
 chmod +x "$STUBS"/*
 
 export CC_WJ_CONFIG="$T/no-config" CC_WJ_ROOT="$T" CC_WJ_LOG="$T/wj.log" CC_WJ_STATE_DIR="$T/state"
@@ -77,7 +71,7 @@ export CC_WJ_CLAUDE_SESSIONS="$SESSIONS" CC_WJ_CLAUDE_PROJECTS="$PROJECTS"
 export CC_WJ_CODEX_LOCKS="$T/no-codex-locks" CC_WJ_CODEX_STATE_DB="$T/no-codex.sqlite"
 export CC_WJ_ARCHIVE_DIR="$T/no-archive" CC_WJ_TRANSCRIPT_RETRY_SECONDS=0
 export CC_WJ_LAUNCHAGENTS_DIRS="$T/no-launchagents" CC_WJ_SPOTCHECK_LOG="$T/spot.log"
-unset CC_WJ_NEW_RULES_MODE CC_WJ_UNKNOWN_SESSION_SCOPE CC_WJ_DENY_NAMES CC_WJ_LOW_DISK_FREE_GB
+unset CC_WJ_NEW_RULES_MODE CC_WJ_UNKNOWN_SESSION_SCOPE CC_WJ_DENY_NAMES
 export PATH="$STUBS:$PATH" WJ T PRIMARY PROJECTS
 
 enc() { printf '%s' "$1" | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g'; }
@@ -183,42 +177,42 @@ mk "$PRIMARY" "$SID" "$PRIMARY"
 out="$(TREE="$T/wt-B" bash -c 'set +u; . "$WJ"; _cc_wj_transcript_claims_path Codex "$PROJECTS/x/'"$SID"'.jsonl" "$TREE"; echo "rc=$?"' 2>&1)"
 eq "M7: a missing Codex path is not looked up under Claude's projects: rc=2" "$out" "rc=2"
 
-# ─── The low-disk floor ───────────────────────────────────────────────────────
 
-WARN="$T/state/low-disk-warning"
-JLOG="$T/wj.log"
-# `--scheduled` without CC_WJ_SCHEDULE_APPLY reports only, so these runs remove nothing; the
-# floor speaks for a scheduled run either way. $1 is DF_KB, the rest env assignments.
-floor_run() { # <free kb> [VAR=value]...
-  local kb="$1"; shift
-  env DF_KB="$kb" "$@" bash "$WJ" --scheduled --repo "$PRIMARY" >"$T/floor.out" 2>&1
-}
-NINE_FOUR=9856614      # 9.4 GiB
-FORTY=41943040         # 40 GiB
+# ─── M9: the session id is found in two places ────────────────────────────────
 
-rm -f "$WARN"; : > "$JLOG"
-floor_run "$NINE_FOUR"
-check "floor: 9.4 GiB free is under the default 25 GiB: one warning line is written" test "$(grep -c . "$WARN")" -eq 1
-check "  and it says LOW DISK, the free figure and the floor" bash -c 'grep -q "LOW DISK: 9.4GiB free (floor 25GiB)" "$1"' _ "$WARN"
-check "  and the janitor log says LOW-DISK" grep -q 'LOW-DISK: free 9.4GiB < 25GiB floor' "$JLOG"
-check "  and nothing was deleted: both worktrees stand" test -d "$T/wt-B" -a -d "$T/wt-C"
-floor_run "$FORTY"
-refute "floor: 40 GiB free: the warning is gone" test -e "$WARN"
-floor_run "$NINE_FOUR" CC_WJ_LOW_DISK_FREE_GB=5
-refute "floor: a configured floor of 5 GiB: 9.4 GiB free is no warning" test -e "$WARN"
-floor_run "$NINE_FOUR" CC_WJ_LOW_DISK_FREE_GB=banana
-check "floor: a garbled floor is the default 25 GiB, not off" test -s "$WARN"
-floor_run "$NINE_FOUR" CC_WJ_LOW_DISK_FREE_GB=off
-refute "floor: off: no warning, and the old one is removed" test -e "$WARN"
-floor_run "$NINE_FOUR"; before="$(cat "$WARN")"
-floor_run ""
-check "floor: an unreadable free figure leaves the warning as it was" test "$(cat "$WARN")" = "$before"
-rm -f "$WARN"
-env DF_KB="$NINE_FOUR" bash "$WJ" --repo "$PRIMARY" >"$T/floor.out" 2>&1
-refute "floor: a plain report run is read-only and writes no warning" test -e "$WARN"
-env DF_KB="$NINE_FOUR" bash "$WJ" --repo "$PRIMARY" --apply >"$T/floor.out" 2>&1
-check "floor: an --apply run warns too" test -s "$WARN"
-check "  and a worktree it removed still left the line (the run deleted only landed trees)" test "$(grep -c . "$WARN")" -eq 1
+two_copies="mv_t '$PRIMARY' '$T/wt-C' $SID; mkdir -p '$(dirname "$(tpath "$T/wt-B" "$SID")")'; cp '$(tpath "$T/wt-C" "$SID")' '$(tpath "$T/wt-B" "$SID")'"
+rm -f "$(tpath "$T/wt-C" "$SID")" "$(tpath "$T/wt-B" "$SID")"; mk "$PRIMARY" "$SID" "$PRIMARY" "$T/wt-B/x"
+out="$(ask "$two_copies" "$T/wt-B" global)"
+eq "M9: two copies of the transcript: rc=2, even though both name the tree" "$out" "rc=2 unknown=0"
+rm -f "$(tpath "$T/wt-C" "$SID")" "$(tpath "$T/wt-B" "$SID")"; mk "$PRIMARY" "$SID" "$PRIMARY" "$T/wt-B/x"
+out="$(ask "$two_copies" "$T/wt-B")"
+eq "M9: two copies, tree scope: an unknown record, not a claim" "$out" "rc=1 unknown=1"
+rm -f "$(tpath "$T/wt-C" "$SID")" "$(tpath "$T/wt-B" "$SID")"
+
+# ─── M10: after a move, the records follow it ─────────────────────────────────
+
+FIND_LOG="$T/find.log"; export FIND_LOG
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FIND_LOG"\nexec /usr/bin/find "$@"\n' > "$STUBS/find"; chmod +x "$STUBS/find"
+mk "$PRIMARY" "$SID" "$PRIMARY"
+OLD="$(tpath "$PRIMARY" "$SID")"; NEW="$(tpath "$T/wt-C" "$SID")"; export OLD NEW
+: > "$FIND_LOG"
+out="$(BETWEEN="$BETWEEN" bash -c '
+  set +u
+  . "$WJ"
+  _cc_wj_scan_claude_recent 24 || exit 9
+  eval "$BETWEEN"
+  _cc_wj_recent_claim "$T/wt-C" 24 tool; c=$?
+  reason="$_CC_WJ_RECENT_REASON"
+  _cc_wj_recent_claim "$T/wt-B" 24 tool; b=$?
+  _cc_wj_recent_claim "$T/wt-C" 24 cwd; c2=$?
+  newp=$(printf "%s\n" "$_CC_WJ_RECENT_TRANSCRIPTS" | awk -F"\t" -v p="$NEW" "\$3 == p" | grep -c .)
+  oldp=$(printf "%s\n" "$_CC_WJ_RECENT_TRANSCRIPTS" | awk -F"\t" -v p="$OLD" "\$3 == p" | grep -c .)
+  echo "B=$b C=$c C-cwd-mode=$c2 $(printf "%s" "$reason" | grep -o "scope=[a-z-]*") new=$newp old=$oldp"
+' 2>&1)"
+eq "M10: one tree is not claimed; the tree the session moved into is, as moved-cwd; the claim outlives the call; the records point at the new path" \
+  "$out" "B=1 C=0 C-cwd-mode=0 scope=moved-cwd new=1 old=0"
+eq "M10: the session id was searched for once for two candidates" "$(grep -c -- '-maxdepth 2' "$FIND_LOG")" "1"
+rm -f "$NEW" "$STUBS/find"
 
 [ "$failures" -eq 0 ] && echo "# all passed" || echo "# $failures failed"
 exit "$failures"
