@@ -26,8 +26,12 @@ to local files (and a local notification).
   cadence a host is read at most every GDW_READ_EVERY_MINUTES (30; GDW_KNOWN_EVERY_MINUTES, 60, for a known-unreadable
           one). A host not due keeps its stored kind and state, is logged `not-due` and spawns nothing. A host that is
           disk-high, unreadable (not by design) or has a write pending is due every run, so a tell is never delayed.
-  record  every run logs one line per host and one summary line (hosts, read, high, unreadable, would-alert,
-          alerted, recovered, failures): the spot-check record.
+  record  a host's line is logged when its state changes (read kind, told kind, known-unreadable: not the reason, the
+          numbers or the fails counter), and the summary line (hosts, read, high, unreadable, would-alert, alerted,
+          recovered, failures) when a host line was, a tell was made or a failure happened. A run that changes
+          nothing logs nothing (stima-api #7904: 1778 identical runs, 515 timeouts for two hosts that cannot be read).
+          A host that stays unreadable is told once and then once a day (UNREADABLE_REALERT_S), not every
+          GDW_REALERT_MINUTES; disk-high is told again every GDW_REALERT_MINUTES.
 
 Config: defaults, then GDW_CONFIG (~/.cc-reaper/gce-disk-watch.conf, KEY=VALUE), then GDW_* environment variables.
 """
@@ -259,6 +263,9 @@ def osascript_notify(title, text):
         raise OSError(f"osascript exit {p.returncode}")
 
 
+UNREADABLE_REALERT_S = 24 * 3600  # a host that stays unreadable is told again once a day
+
+
 class Watch:
     def __init__(self, cfg, runner=gcloud_runner, notifier=osascript_notify, clock=time.time):
         self.cfg, self.runner, self.notifier, self.clock = cfg, runner, notifier, clock
@@ -313,7 +320,7 @@ class Watch:
         gap = max(0.0, number(self.cfg, key)) * 60 - max(0.0, number(self.cfg, "GDW_DUE_SLACK_SECONDS"))
         return now - e["read_at"] >= gap or e["read_at"] > now
 
-    def one_host(self, host, r, book, now, every, rounds, counts, failures):
+    def one_host(self, host, r, book, now, every, rounds, counts, failures, printed):
         read_kind = r["kind"]
         counts["read"] += r["metrics"] is not None
         counts[HIGH] += read_kind == HIGH
@@ -330,7 +337,11 @@ class Watch:
         else:
             kind = OK if quiet else prev["kind"]
         held = (" known-unreadable" if known else f" fails={fails}/{rounds}") if read_kind == UNREADABLE else ""
-        self.log(f"host {host} {read_kind} {numbers(r)}{held}")
+        shown = f"{read_kind}/{kind}{'/known' if known else ''}"
+        if printed.get(host) != shown:
+            self.log(f"host {host} {read_kind} {numbers(r)}{held}")
+            counts["changed"] += 1
+        printed[host] = shown
         if kind != prev["kind"]:
             # A recovery is told only for a state something was told about; a never-told one just clears.
             notice = "alert" if kind != OK else ("recover" if prev["told"] and not quiet else None)
@@ -338,7 +349,10 @@ class Watch:
                      "sent": None, "told": False}
         else:
             entry = prev
-            if kind != OK and not entry["todo"] and entry["sent"] is not None and now - entry["sent"] >= every:
+            # disk-high is told again every GDW_REALERT_MINUTES; a host that stays unreadable once a day, because a
+            # full root disk can also make the host unreadable and one missed ALERT would be the last word on it.
+            wait = every if kind == HIGH else max(every, UNREADABLE_REALERT_S) if kind == UNREADABLE else None
+            if wait is not None and not entry["todo"] and entry["sent"] is not None and now - entry["sent"] >= wait:
                 entry.update(notice="realert", todo=self.channels("realert"))
         entry["fails"] = fails
         entry["read_at"] = now
@@ -371,7 +385,9 @@ class Watch:
         state_path = path_of(self.cfg, "GDW_STATE")
         state = load_state(state_path)
         book = state.setdefault(mode, {})  # shadow and apply keep separate books: a switch to apply alerts afresh
-        failures, counts = [], {"read": 0, HIGH: 0, UNREADABLE: 0, "would": 0, "alerted": 0, "recovered": 0, "not_due": 0}
+        failures, counts = [], {"read": 0, HIGH: 0, UNREADABLE: 0, "would": 0, "alerted": 0, "recovered": 0, "not_due": 0, "changed": 0}
+        printed = state.setdefault("printed", {})
+        printed = printed[mode] if isinstance(printed.get(mode), dict) else printed.setdefault(mode, {})
         bad = [h for h in hosts if not NAME_RE.fullmatch(h)]
         for h in bad:
             failures.append(f"host name refused: {h!r}")
@@ -391,24 +407,28 @@ class Watch:
         for host in hosts:
             if host not in readings:
                 counts["not_due"] += 1
-                self.log(f"host {host} not-due kind={(valid_entry(book.get(host)) or {'kind': OK})['kind']}")
                 continue
             r = readings[host]
             if r["kind"] == UNREADABLE:
                 known = " known" if host in self.cfg["GDW_KNOWN_UNREADABLE"].split() else ""
                 unread.append(f"{host}({r.get('reason') or 'unknown'}{known})")
             try:
-                self.one_host(host, r, book, now, every, rounds, counts, failures)
+                self.one_host(host, r, book, now, every, rounds, counts, failures, printed)
             except Exception as e:  # noqa: BLE001 - one bad entry never aborts the round; the host starts afresh
                 book.pop(host, None)
                 failures.append(f"{host}: round failed ({type(e).__name__}): state reset for this host")
         for host in list(book):
             if host not in hosts:
                 del book[host]  # a host no longer watched is forgotten
+        for host in list(printed):
+            if host not in hosts:
+                del printed[host]
         try:
             save_state(state_path, state)
         except OSError as e:
             failures.append(f"state write failed: {e}")
+        if not (counts["changed"] or counts["would"] or counts["alerted"] or counts["recovered"] or failures):
+            return 0
         self.log(f"{mode}: {len(hosts)} hosts, {counts['read']} read, {counts[HIGH]} high, {counts[UNREADABLE]} unreadable, "
                  f"{counts['would']} would-alert, {counts['alerted']} alerted, {counts['recovered']} recovered, "
                  f"{len(failures)} failures, read={len(readings)} not_due={counts['not_due']}" + (f"; unreadable: {' '.join(unread)}" if unread else ""))
@@ -447,7 +467,7 @@ def valid_entry(e):
 def load_state(path):
     try:
         st = json.loads(path.read_text())
-        return {k: v for k, v in st.items() if k in ("shadow", "apply") and isinstance(v, dict)} if isinstance(st, dict) else {}
+        return {k: v for k, v in st.items() if k in ("shadow", "apply", "printed") and isinstance(v, dict)} if isinstance(st, dict) else {}
     except (OSError, ValueError):
         return {}
 

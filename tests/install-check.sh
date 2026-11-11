@@ -58,9 +58,9 @@ out="$(run --check 2>&1)"; rc=$?
   && ok "a missing deployed script is drift" || bad "missing script: rc=$rc: $out"
 run >/dev/null 2>&1
 
-sed -i '' 's|<integer>600</integer>|<integer>601</integer>|' "$H/Library/LaunchAgents/com.cc-reaper.guard.plist"
+sed -i '' 's|<integer>3600</integer>|<integer>3601</integer>|' "$H/Library/LaunchAgents/com.cc-reaper.disk-check.plist"
 out="$(run --check 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'DRIFT.*com.cc-reaper.guard.plist' \
+[ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'DRIFT.*com.cc-reaper.disk-check.plist' \
   && ok "an edited LaunchAgent is drift" || bad "edited plist: rc=$rc: $out"
 run >/dev/null 2>&1
 
@@ -83,25 +83,25 @@ out="$(run --check 2>&1)"; rc=$?
   && ok "an operator-edited policy is reported, not drift" || bad "edited conf: rc=$rc: $out"
 
 # ─── The repository is the source of truth for every agent (EL-T24-STORAGE-LOAD-REAPER) ───
-# The session reaper, stall watch and wip backup were copied in by hand, and reclaim-byproducts'
+# The session reaper and wip backup were copied in by hand, and reclaim-byproducts'
 # agent lived nowhere in the repository: --check could not see any of them drift.
 R="$H/.cc-reaper"; L="$H/Library/LaunchAgents"
-for f in session-reaper.py stall-watch.py wip-backup.sh gce-disk-watch.py; do
+for f in session-reaper.py wip-backup.sh gce-disk-watch.py; do
   if [ -x "$R/$f" ] && cmp -s "$ROOT_DIR/shell/$f" "$R/$f"; then ok "the installer deploys $f"
   else bad "the installer did not deploy $f"; fi
 done
 # Each acts once loaded, and RunAtLoad runs it at once: a host where it is not loaded gets the
 # command, never a start and never a plist launchd would load at the next login.
-for a in session-reaper stall-watch reclaim-byproducts gce-disk-watch; do
+for a in session-reaper reclaim-byproducts gce-disk-watch; do
   if [ ! -e "$L/com.cc-reaper.$a.plist" ] && [ ! -e "$S/com.cc-reaper.$a.loaded" ]; then ok "the installer leaves $a stopped where it is not loaded"
   else bad "the installer started $a on a host where it was not loaded"; fi
 done
 out="$(run --check 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q 'stopped  session-reaper has no LaunchAgent' \
   && ok "a stopped agent is named, not drift" || bad "stopped agent check: rc=$rc"
-for a in session-reaper stall-watch reclaim-byproducts gce-disk-watch; do : > "$S/com.cc-reaper.$a.loaded"; done
+for a in session-reaper reclaim-byproducts gce-disk-watch; do : > "$S/com.cc-reaper.$a.loaded"; done
 run >/dev/null 2>&1
-for a in session-reaper stall-watch reclaim-byproducts gce-disk-watch; do
+for a in session-reaper reclaim-byproducts gce-disk-watch; do
   if [ -e "$L/com.cc-reaper.$a.plist" ] && [ -e "$S/com.cc-reaper.$a.loaded" ]; then ok "the installer updates $a where it is loaded"
   else bad "the installer did not update loaded $a"; fi
 done
@@ -159,7 +159,7 @@ fi
 # booting it out and back in resets launchd's run counter, the record that its schedule fires.
 : > "$S/calls"
 run >/dev/null 2>&1
-if ! grep -E '^(bootout|bootstrap) .*com\.cc-reaper\.(resource-watch|session-reaper|stall-watch|reclaim-byproducts|wip-backup|guard)' "$S/calls" >/dev/null; then
+if ! grep -E '^(bootout|bootstrap) .*com\.cc-reaper\.(resource-watch|session-reaper|reclaim-byproducts|wip-backup)' "$S/calls" >/dev/null; then
   ok "a re-run reloads no agent that is current and loaded"
 else bad "a re-run reloaded current agents: $(grep -E '^(bootout|bootstrap)' "$S/calls" | tr '\n' ';')"; fi
 sed -i '' 's|<integer>1800</integer>|<integer>1801</integer>|' "$L/com.cc-reaper.session-reaper.plist"
@@ -174,5 +174,34 @@ grep -q 'bootstrap .*com.cc-reaper.session-reaper.plist' "$S/calls" && cmp -s \
 out="$(run --check 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q 'note     1 hand-deploy backups' && [ -e "$R/session-reaper.py.bak-test" ] \
   && ok "a hand-deploy backup is reported and left in place" || bad "backup note: rc=$rc"
+
+# ─── Retired agents (stima-api #7904): guard, orbstack-memory-trim, stall-watch ───
+# A host that still has them loaded gets them booted out and their plist and script removed; one
+# that never had them sees no error, no call and no output; --check calls a leftover drift.
+RETIRED="guard orbstack-memory-trim stall-watch"
+for a in $RETIRED; do
+  : > "$S/com.cc-reaper.$a.loaded"; : > "$L/com.cc-reaper.$a.plist"
+done
+: > "$R/guard-runner.sh"; : > "$R/orbstack-memory-trim.sh"; : > "$R/stall-watch.py"
+out="$(run --check 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'RETIRED.*com.cc-reaper.stall-watch.plist' &&
+  printf '%s\n' "$out" | grep -q 'RETIRED.*guard-runner.sh' \
+  && ok "a retired agent or script still installed is drift" || bad "retired agents: rc=$rc: $out"
+: > "$S/calls"
+run >/dev/null 2>&1
+gone=1
+for a in $RETIRED; do
+  [ ! -e "$L/com.cc-reaper.$a.plist" ] && [ ! -e "$S/com.cc-reaper.$a.loaded" ] &&
+    grep -q "^bootout .*com.cc-reaper.$a\$" "$S/calls" || gone=0
+done
+for f in guard-runner.sh orbstack-memory-trim.sh stall-watch.py; do [ ! -e "$R/$f" ] || gone=0; done
+[ "$gone" -eq 1 ] && ok "an install boots out the retired agents and removes their plists and scripts" \
+  || bad "retired agents left: $(ls "$L" "$R" | grep -E 'guard|orbstack|stall' | tr '\n' ' ') calls: $(grep -E 'guard|orbstack|stall' "$S/calls" | tr '\n' ';')"
+: > "$S/calls"
+out="$(run 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -Eq '^(bootout|unload|bootstrap) .*(guard|orbstack|stall)' "$S/calls" && ! printf '%s\n' "$out" | grep -q 'retired agent' \
+  && ok "a host with none of them sees no bootout and no line" || bad "second run: rc=$rc calls: $(grep -E '^(bootout|unload|bootstrap)' "$S/calls" | tr '\n' ';')"
+out="$(run --check 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "and checks clean again" || bad "after retirement: rc=$rc: $(printf '%s\n' "$out" | grep -v current)"
 
 [ "$failures" -eq 0 ] && echo "install-check: all passed" || { echo "install-check: $failures failed"; exit 1; }

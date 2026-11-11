@@ -38,24 +38,28 @@ fi
 # What step 5 deploys under ~/.cc-reaper, and the LaunchAgents it renders: one list, read by
 # the deploy and by --check, so the check can never compare a different set than was shipped.
 CC_PAYLOAD="shell/resource-watch.sh shell/resource-watch-judge.py shell/disk-janitor.sh shell/worktree-janitor.sh
-shell/cc-monitor.sh shell/claude-cleanup.sh shell/guard-runner.sh shell/chrome-clone-janitor.py
+shell/cc-monitor.sh shell/claude-cleanup.sh shell/chrome-clone-janitor.py
 shell/growth-watch.py shell/host-temp-reaper.py shell/dev-server-reaper.py shell/retention-helper.py shell/reclaim-byproducts.sh
-shell/orbstack-memory-trim.sh shell/session-reaper.py shell/stall-watch.py shell/wip-backup.sh
+shell/session-reaper.py shell/wip-backup.sh
 shell/gce-disk-watch.py shell/session_state.py hooks/worktree-session-end.sh hooks/stop-cleanup-orphans.sh"
-# session-reaper, stall-watch and gce-disk-watch ship report-only (APPLY=0, STALL_APPLY=0,
-# GDW_APPLY=0 in their policy), so scheduling them changes nothing until the operator's policy says so. reclaim-byproducts' agent
+# session-reaper and gce-disk-watch ship report-only (APPLY=0, GDW_APPLY=0 in their policy), so scheduling them changes nothing until the operator's policy says so. reclaim-byproducts' agent
 # is the one its own --install-launchd 2h writes, byte for byte.
-CC_AGENTS="resource-watch disk-check weekly-clean guard worktree-janitor orbstack-memory-trim
-session-reaper stall-watch reclaim-byproducts gce-disk-watch"
+CC_AGENTS="resource-watch disk-check weekly-clean worktree-janitor
+session-reaper reclaim-byproducts gce-disk-watch"
+# Retired 2026-11-12 (stima-api #7904): measured idle (guard 1339 runs, all clear; orbstack-memory-trim 3347 runs,
+# 1 action; stall-watch 9044 runs, no mark, report or alert). An install boots out a copy still loaded and removes
+# the plist and the script; --check calls one still present drift.
+CC_RETIRED_AGENTS="guard orbstack-memory-trim stall-watch"
+CC_RETIRED_SCRIPTS="guard-runner.sh orbstack-memory-trim.sh stall-watch.py"
 # Opt-in agents: deployed and compared only on a host that opted in, by an installed agent or its
 # policy file. wip-backup pushes snapshots that include untracked files to each repository's
 # remote under a host-specific label, so a fresh install must never start it.
 CC_OPTIN_AGENTS="wip-backup"
 # Agents this installer updates only where they are already loaded. Each acts once loaded
 # (session-reaper closes sessions under an APPLY=1 policy, reclaim-byproducts deletes, wip-backup
-# pushes untracked files, stall-watch and gce-disk-watch alert), and RunAtLoad runs them at once; an operator who
+# pushes untracked files, gce-disk-watch alerts), and RunAtLoad runs them at once; an operator who
 # booted one out or disabled it, or a host that never ran it, gets the command, never a start.
-CC_NOSTART_AGENTS="session-reaper stall-watch reclaim-byproducts wip-backup gce-disk-watch"
+CC_NOSTART_AGENTS="session-reaper reclaim-byproducts wip-backup gce-disk-watch"
 # Policies the operator owns: installed when absent, never overwritten, a difference reported.
 CC_POLICIES="worktree-janitor.conf disk-janitor.conf growth-targets.tsv session-reaper.conf gce-disk-watch.conf"
 
@@ -148,7 +152,10 @@ if [ "${1:-}" = "--check" ]; then
   rm -f "$rendered"
   # What an install retires: still present means it was never re-run, and the retired
   # inventory agent would race the janitor with its own rule.
-  for f in "$REAPER_DIR/lifecycle-reclaim.sh" "$PLIST_DIR/com.claude.worktree-inventory.plist"; do
+  retired="$REAPER_DIR/lifecycle-reclaim.sh $PLIST_DIR/com.claude.worktree-inventory.plist"
+  for a in $CC_RETIRED_AGENTS; do retired="$retired $PLIST_DIR/com.cc-reaper.$a.plist"; done
+  for f in $CC_RETIRED_SCRIPTS; do retired="$retired $REAPER_DIR/$f"; done
+  for f in $retired; do
     [ ! -e "$f" ] || { echo "RETIRED  $f is still installed"; drift=1; }
   done
   for f in $CC_POLICIES; do
@@ -579,9 +586,6 @@ mkdir -p "$REAPER_DIR/logs" "$REAPER_DIR/state"
 PLIST_DIR="$HOME_DIR/Library/LaunchAgents"
 mkdir -p "$PLIST_DIR"
 
-# claude-cleanup + guard-runner ship too: the guard agent sources the DEPLOYED
-# claude-cleanup.sh (a launchd agent has no TCC access to a ~/Documents checkout),
-# with guard-runner.sh next to it.
 for f in $CC_PAYLOAD; do
   _cc_deploy "$SCRIPT_DIR/$f" "$REAPER_DIR/$(basename "$f")"
 done
@@ -622,8 +626,7 @@ else
   echo "  disk policy preserved at $DJ_CONFIG (repository default differs; review with diff)"
 fi
 
-# The session reaper's and stall watch's policy: both ship report-only, and a host that turned
-# either on keeps its own copy.
+# The session reaper's policy: it ships report-only, and a host that turned it on keeps its own copy.
 SR_CONFIG="$REAPER_DIR/session-reaper.conf"
 if [ ! -e "$SR_CONFIG" ]; then
   cp "$SCRIPT_DIR/config/session-reaper.conf" "$SR_CONFIG"
@@ -692,6 +695,19 @@ done
 rm -f "$AGENT_RENDERED"
 _cc_report_failed_agents
 
+# Retired agents: boot out a loaded copy, then remove its plist and script. There is nothing to do on
+# a host that never had them, so a second run, or a fresh host, prints nothing and changes nothing.
+for AGENT in $CC_RETIRED_AGENTS; do
+  RETIRED_LABEL="com.cc-reaper.$AGENT"; RETIRED_PLIST="$PLIST_DIR/$RETIRED_LABEL.plist"
+  if [ -e "$RETIRED_PLIST" ] || launchctl print "$AGENT_UI/$RETIRED_LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$AGENT_UI/$RETIRED_LABEL" >/dev/null 2>&1 ||
+      { [ ! -e "$RETIRED_PLIST" ] || launchctl unload "$RETIRED_PLIST" >/dev/null 2>&1; } || true
+    rm -f "${PLIST_DIR:?}/$RETIRED_LABEL.plist"
+    echo "  retired agent $RETIRED_LABEL (booted out, plist removed)"
+  fi
+done
+for f in $CC_RETIRED_SCRIPTS; do rm -f "${REAPER_DIR:?}/$f"; done
+
 # One destructive policy owner. Leaving the old Claude inventory agent loaded would run
 # its Claude-only six-hour rule beside the shared 48-hour janitor, so the weaker policy
 # could still win a race after a successful install. Boot it out and move its plist to a
@@ -712,10 +728,7 @@ echo "  disk-check:     read-only disk + TM-snapshot check every hour"
 echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
 echo "  worktree-janitor: every $WORKTREE_INTERVAL_SECONDS seconds + at load; 48h idle policy from ~/.cc-reaper/worktree-janitor.conf"
 echo "                    SessionEnd trigger: ~/.cc-reaper/worktree-session-end.sh <claude|codex>"
-echo "  guard:          runaway-MCP reaper every 10 min (60+ minutes of sustained CPU samples; re-checks and signals each known MCP PID alone)"
-echo "  orbstack-memory-trim: drops the OrbStack guest's caches every 15 min when its VM holds over a quarter of RAM (no-op without OrbStack)"
 echo "  session-reaper: every 30 min, report-only until APPLY=1 in ~/.cc-reaper/session-reaper.conf"
-echo "  stall-watch:    every 2 min, shadow until STALL_APPLY=1 in the same policy"
 echo "  reclaim-byproducts: every 2h and at load, if the last reap is over an hour old"
 echo "  gce-disk-watch: every 10 min, reads the GCE CI hosts' root disk over IAP; shadow until GDW_APPLY=1 in ~/.cc-reaper/gce-disk-watch.conf"
 

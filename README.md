@@ -69,7 +69,7 @@ script and LaunchAgent with the checkout, changes nothing, and exits 1 on any di
 Policy files you tuned (`*.conf`, `growth-targets.tsv`) are listed, never counted as drift.
 A deployed script that is not mode 755 is drift (`MODE`); a LaunchAgent is compared as a
 property list, so one rewritten by `plutil` or PlistBuddy with the same values is current.
-Every agent is installed from `launchd/`, including the session reaper, stall watch and
+Every agent is installed from `launchd/`, including the session reaper and
 reclaim-byproducts; `wip-backup` stays opt-in (installed and compared only where its plist or
 `~/.cc-reaper/wip-backup.conf` exists). Hand-deploy backups (`*.bak-*`) are counted, never removed.
 An update leaves an agent that is current and loaded alone, so launchd's run counter survives it.
@@ -261,6 +261,8 @@ proc-janitor status   # check daemon health
 
 ## Automatic Session Guard
 
+Run by hand since 2026-11-12: its LaunchAgent `com.cc-reaper.guard` (and `guard-runner.sh`) was retired after 1339 scheduled runs found nothing (stima-api #7904); `install.sh` boots it out and removes it.
+
 `claude-guard` is an automatic session reaper that prevents runaway resource consumption. It operates in three phases:
 
 1. **FD-leak session kill** — Sessions whose open file descriptor count exceeds `CC_MAX_FD` are killed immediately. This addresses the [widely reported FD exhaustion issue](https://github.com/anthropics/claude-code/issues/29888) where VM processes leak ~6,200 FDs/hour, eventually causing system-wide "Operation not permitted" errors.
@@ -285,7 +287,7 @@ claude-guard --dry-run  # preview without killing
 | `CC_RUNAWAY_MIN` | **30** in `cc-monitor`, **60** in `claude-guard` | Monitor: elapsed age of a currently hot process. Guard: sustained CPU-time intervals across runs, keyed by PID and start time; setting this variable overrides both floors |
 | `CC_RUNAWAY_GRACE_SEC` | 5 | Initial wait before a further three-second re-check of each selected MCP server; only the same still-hot PID is signalled |
 | `CC_RUNAWAY_DISABLE` | 0 | Set to `1` to skip `claude-guard`'s runaway phase entirely |
-| `CC_RUNAWAY_SPARE_IN_USE` | 1 (always 1 under the guard LaunchAgent) | A runaway MCP server a live Claude or Codex session uses is named and not signalled: a CLI among its ancestors (stdio), or a CLI, or a process descended from one, connected to a TCP port it listens on (lsof; an lsof that cannot answer spares it). `0` restores the old reach for an interactive `claude-guard` |
+| `CC_RUNAWAY_SPARE_IN_USE` | 1 | A runaway MCP server a live Claude or Codex session uses is named and not signalled: a CLI among its ancestors (stdio), or a CLI, or a process descended from one, connected to a TCP port it listens on (lsof; an lsof that cannot answer spares it). `0` restores the old reach for an interactive `claude-guard` |
 | `CC_NEVER_KILL_PIDS` | `70987 4565` | Pids, space- or comma-separated, that no cc-reaper path signals, nor any process descended from one: `claude-cleanup`/`claude-guard`, the orphan monitor, the Stop hook, `dev-server-reaper.py` and `host-temp-reaper.py`. Each refusal logs `never-kill <pid>`. Empty protects no pid; an unreadable process table protects every pid |
 
 Example: lower the thresholds for constrained machines:
@@ -508,7 +510,6 @@ What cc-reaper reclaims under rule 5 on its own:
 | A dev server (`npm run dev/preview/start`, `wrangler dev`, `next dev/start`, `vite`, `react-scripts start`) that serves nobody | `dev-server-reaper.py` from the hourly `--check`: launcher reparented to launchd, 6h old, cwd in a linked worktree, no agent in the tree or its process group, no live session claim (`worktree-janitor.sh --claims`), nothing publishing it (a listening process taking its worktree as an argument, such as a review front, or a `tailscale serve` handler to its port), and either not listening on the `--port` it names or the 20 above it (stopped at once), or, for a hot-reload dev server (`react-scripts start`, `next dev`, `vite` but not `vite preview`, `webpack serve`, judged from the commands its tree runs), listening with no TCP connection to that port (any port it listens on, for `react-scripts start`) at every hourly run, no two more than 2h apart, for 12h - 3h while the kernel memory pressure level is 2+, now or in any sample of the last hour in `CC_DEV_SERVER_PRESSURE_LOG` (`mp=<level>` lines; unset by default, export it from `disk-janitor.conf`) - and again before stopping. It runs beside the rest of `--check`, not after it, so a slow low-disk trim cannot delay it. A listening server without hot reload (`next start`, `vite preview`, `wrangler dev`) holds no connection between requests and is always taken as serving. TERM, then KILL after 10s, each pid only while its start time matches. `CC_DJ_DEV_SERVER_REAP=report` (default) lists, `apply` stops and comments on `CC_DJ_ALERT_ISSUE`. A tree with a connection or a publisher is only listed. The same pass stops an orphaned esbuild `--service` (the stdio build service a `wrangler dev` or `vite` leaves when it dies): a `node_modules` esbuild binary reparented to launchd, 6h old, no child, no socket but its dead stdio pair, no agent or launcher left in its process group, cwd in a linked worktree with no live claim, rechecked before the signal |
 | Worktrees | `worktree-janitor.sh` (landed, unheld, no session, idle) |
 | Session scratchpads (`/tmp/claude-<uid>/<project>/<session>`), anonymous Docker volumes, the go build cache, old reclaim archives, dead caches you list | `reclaim-byproducts.sh` under its own LaunchAgent `com.cc-reaper.reclaim-byproducts` (every 2h and at login, `--if-stale`, gate 60 min): a scratchpad only when the harness's `~/.claude/hooks/path-in-use.sh` says free, idle 24h (6h under disk pressure with no live session record). `install.sh` schedules it from `launchd/com.cc-reaper.reclaim-byproducts.plist`, the plist `~/.cc-reaper/reclaim-byproducts.sh --install-launchd 2h` writes; that command additionally fires the real agent as a dry run to prove launchd's `/bin/bash` has Full Disk Access, and retires the skills-era `com.claude.reclaim-byproducts`. `--dry-run` reports, `--self-test` runs the suite from a checkout |
-| OrbStack guest page cache holding host memory (macOS pressure never reaches the Linux guest) | `orbstack-memory-trim.sh` under `com.cc-reaper.orbstack-memory-trim`, every 15 min: when the OrbStack VM process holds more than a quarter of RAM (`ORBSTACK_TRIM_LIMIT_MIB`), a throwaway privileged container on the `orbstack` context drops the guest's clean caches. Nothing restarts or is deleted; a hung trim is killed after `ORBSTACK_TRIM_TIMEOUT_SECONDS` (120). No-op without OrbStack. Log: `~/.cc-reaper/logs/orbstack-memory-trim.log` |
 
 ### Growth watch
 
@@ -842,60 +843,11 @@ launchctl bootout gui/$(id -u)/com.cc-reaper.session-reaper
 rm -f ~/Library/LaunchAgents/com.cc-reaper.session-reaper.plist ~/.cc-reaper/session-reaper.py
 ```
 
-### Stall watch (account switch / rate limit)
+### Stall watch (retired)
 
-`shell/stall-watch.py` finds sessions stalled by a `/login` account switch or a spent quota, reports
-each once, and marks them so the reaper keeps them. It runs every 2 minutes from
-`com.cc-reaper.stall-watch`, calls no model, and **only prints what it would report until the deployed
-config sets `STALL_APPLY=1`**. **It never types into a pane** (stima-api #5212): its only tmux calls are
-`display` and `capture-pane`, and `tmux_ro` raises on any other subcommand. Re-enabling Remote Control is
-a person's step.
-
-- **Detect:** each live interactive session's screen is hashed (with the cursor) and re-scanned only
-  when the hash changed. Fingerprints: `weekly-limit` (`hit your weekly limit`), `remote-disconnected`
-  (a line that is `Remote Control disconnected` followed by `—` or the end, cleared by a later
-  `/remote-control is active`), `rate-limit-429` (`429` or `rate_limit_error` in an `API Error` line, or
-  `status 429` in a `⎿` result). Each pattern is anchored to the exact shape of Claude Code's own line, so
-  quoted text, `Read 429 lines`, `#429 merged` or `rate_limit.go` are not stalls; `interrupted-idle` (`[Request interrupted by
-  user]` or `Interrupted · What should Claude do instead?` just above an empty prompt; it counts only with
-  `Login successful` on that screen or `STALL_FLEET_MIN` panes at once, since one Esc is not a switch).
-- **Report:** once per event, keyed by (pane, fingerprint, session id), as one `STALL <session-name> ...` line in
-  the log (`~/.cc-reaper/logs/stall-watch.log`) with `` `claude --resume <id> --remote-control <name>` ``.
-  Nothing is written to any inbox. An event ends when its fingerprint leaves the screen.
-- **Mark:** only with `STALL_APPLY=1` (a mark holds the reaper, so shadow never writes one):
-  `STALL_MARK_DIR/<session id>.json`, refreshed each run; `session-reaper.py` then keeps the session with
-  `stalled:<fingerprint>`. A mark expires `STALL_MARK_HOURS` (12) after its last refresh and
-  `STALL_MARK_MAX_HOURS` (48) after the event was first seen, however often it is refreshed. Cleanup removes
-  only files with the mark schema, and a shared directory (`~/.claude/sessions`, `~/.cc-reaper`, ...) is
-  refused as `STALL_MARK_DIR`. A failed tmux read (timeout, empty capture) or a missing `ps` table keeps
-  the previous pane, event and mark and reports nothing.
-- **Prompt left unanswered:** a permission prompt (`Do you want to proceed?` with `1. Yes` ...
-  `N. No`), plan approval (`Would you like to proceed?` ... `No, keep planning`), folder trust
-  (`1. Yes, I trust this folder` / `2. No, exit`, or the older `Do you trust the files in this folder?`) or
-  an AskUserQuestion menu (`☐ <header>`, numbered options, `Enter to select · ↑/↓ to navigate`) that is
-  live at the bottom of a pane, with no `❯` input line below it, is aged from its first sighting per
-  (session id, prompt fingerprint); the fingerprint is the prompt's title, question and first option label,
-  without the option cursor, preview box or wrap width. Past `STALL_PROMPT_MINUTES` (10; 0 is off) it is
-  flagged with its age: with `STALL_APPLY=1`, or `STALL_PROMPT_APPLY=1` alone (marks and STALL entries stay
-  shadow; #128), one `PROMPT-STALL <session-name> ...` log line (numbers, kind and session
-  name; an AskUserQuestion also its question as `menu="…"`: one line, 80 characters, no quote, backtick, control or
-  format character, key-like text `[redacted]`; other kinds carry no screen text), in shadow one `would alert prompt`
-  line, once per prompt instance. While the same prompt stays it gets a `still on screen` log line at most
-  every `STALL_PROMPT_REALERT_MINUTES` (120), never a second alert. A
-  prompt that leaves the screen is forgotten; a malformed stored entry is dropped and seen afresh. With
-  `STALL_PUSH=1` (#130) a new prompt alert also pings `STALL_PUSH_KEY` (the Better Stack founder-decision heartbeat,
-  read from `STALL_PUSH_ENV`) at `/fail` once, which pages the founder's device: numbers, kind and session name only,
-  the URL never printed; a failed push is a failure line and is retried once a tick, up to 5 ticks. release-owner-driver's 5-minute success ping on the same heartbeat
-  resolves that incident after the page; a dedicated heartbeat removes that. The prompt is never answered.
-
-```bash
-install -m 755 shell/stall-watch.py ~/.cc-reaper/stall-watch.py
-install -m 755 shell/session-reaper.py ~/.cc-reaper/session-reaper.py   # reads the marks
-# append the STALL_* block of config/session-reaper.conf to ~/.cc-reaper/session-reaper.conf
-python3 ~/.cc-reaper/stall-watch.py                       # shadow; prints would-report lines
-cp launchd/com.cc-reaper.stall-watch.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-reaper.stall-watch.plist
-```
+`stall-watch.py` and its LaunchAgent were retired 2026-11-12 (stima-api #7904): 9044 runs wrote no mark, report or alert.
+`install.sh` boots out `com.cc-reaper.stall-watch` and removes its plist and script. `session-reaper.py` still honours a
+`STALL_MARK_DIR/<session id>.json` mark if one is put there.
 
 ## GCE disk watch (shadow until enabled)
 
@@ -924,7 +876,7 @@ model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper
   and its `.pub` exist, so it never generates a key or writes metadata. One bad host, or one damaged
   state entry (read back as `ok`, so the host is told again), never stops the others.
 - **Tell:** once per host per state change; while the state stays, again at most every
-  `GDW_REALERT_MINUTES` (120); one `recovered` line when it clears (only for a state that was told).
+  `GDW_REALERT_MINUTES` (120), for `disk-high` only (a host that stays `unreadable` is told once, then once a day); one `recovered` line when it clears (only for a state that was told).
   Shadow (`GDW_APPLY=0`): a `would alert <host> <kind> used=..% avail=..GB inodes=..%` line in
   `~/.cc-reaper/logs/gce-disk-watch.log`, nothing else. Apply: one
   `GCE-DISK ALERT|STILL|RECOVERED host=<host> kind=<kind> used=.. avail=.. inodes=..` log line and a
@@ -932,10 +884,11 @@ model, and **only logs what it would tell until `GDW_APPLY=1`** in `~/.cc-reaper
   is logged `ERROR` and stays pending in `~/.cc-reaper/state/gce-disk-watch.json`, so the next run
   retries that channel alone. Shadow and apply keep separate state, so turning apply on tells a
   standing state afresh.
-- **Record:** each run logs one line per host and one summary line
-  (`<n> hosts, <n> read, <n> high, <n> unreadable, <n> would-alert, <n> alerted, <n> recovered,
-  <n> failures; unreadable: <host>(<reason>[ known]) ...`), the spot-check record. With the shipped
-  policy the summary counts the two known-unreadable hosts every round; `known` marks them.
+- **Record:** a host's line is logged when its state changes (read kind, told kind, known-unreadable: not the
+  reason, the numbers or the `fails` counter) and the summary line when a host line was, a tell was made or
+  a failure happened; a run that changes nothing logs nothing (stima-api #7904).
+  The summary (`<n> hosts, <n> read, <n> high, <n> unreadable, <n> would-alert, <n> alerted, <n> recovered,
+  <n> failures; unreadable: <host>(<reason>[ known]) ...`) counts the known-unreadable hosts too; `known` marks them.
 
 ```bash
 ./install.sh   # deploys the script and the shadow policy; never starts the agent unasked
@@ -1040,7 +993,6 @@ cc-reaper/
 │   ├── com.cc-reaper.resource-watch.plist  # System snapshot agent (10-min interval)
 │   ├── com.cc-reaper.disk-check.plist      # Read-only disk check agent (hourly)
 │   ├── com.cc-reaper.weekly-clean.plist    # Rebuildable-cache clean agent (Sun 04:00)
-│   ├── com.cc-reaper.orbstack-memory-trim.plist # OrbStack guest cache trim (15-min interval)
 │   ├── com.cc-reaper.wip-backup.plist      # Opt-in WIP snapshots to refs/wip/macmini/* (10-min interval)
 │   └── com.cc-reaper.worktree-janitor.plist # Shared worktree sweep (6-hour interval)
 ├── proc-janitor/
@@ -1051,7 +1003,6 @@ cc-reaper/
 │   ├── resource-watch.sh           # System snapshot + threshold alerting
 │   ├── disk-janitor.sh             # Disk check (--check) / rebuildable-cache clean (--clean)
 │   ├── growth-watch.py             # Budgeted per-target size samples + growth alerts
-│   ├── orbstack-memory-trim.sh     # Drops OrbStack guest caches when its VM holds over 1/4 of RAM
 │   ├── wip-backup.sh               # Opt-in: snapshot active worktrees to refs/wip/<label>/<branch>
 │   └── worktree-janitor.sh         # Git worktree inventory + gated removal (dry-run default)
 ├── tests/

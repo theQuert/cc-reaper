@@ -349,6 +349,18 @@ _cc_wj_log_write() {
   printf "[%s] %s\n" "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$log" 2>/dev/null || true
 }
 
+# A log line a sweep repeats unchanged (stima-api#7904) is written when its text differs from the one this
+# key last wrote, not every sweep. The last text is one small file per key in the state directory; a file
+# that cannot be written, or read, writes the line, as before.
+_cc_wj_log_write_changed() { # <key> <text>
+  local last
+  last="$(_cc_wj_state_dir)/last-logged-$1"
+  [ "$(cat "$last" 2>/dev/null)" != "$2" ] || return 0
+  _cc_wj_log_write "$2"
+  mkdir -p "$(_cc_wj_state_dir)" 2>/dev/null || true
+  printf '%s\n' "$2" > "$last" 2>/dev/null || true
+}
+
 # ─── Repo discovery ───────────────────────────────────────────────────────────
 
 # Emit one path per line: each directory directly under root that is a git repo
@@ -6270,7 +6282,7 @@ KEEP
       done
       if [ "$already" -eq 0 ]; then
         git -C "$repo" worktree prune 2>/dev/null || true
-        _cc_wj_log_write "pruned: $repo"
+        _cc_wj_log_write_changed "pruned-$(printf '%s' "$repo" | cksum | cut -d' ' -f1)" "pruned: $repo"
         pruned_repos+=("$repo")
       fi
     done
@@ -6283,7 +6295,7 @@ KEEP
     if [ "$apply" -eq 1 ]; then
       printf "Summary: trimmed=%d  reclaimed=%s GB  kept=%d\n" \
         "$total_trimmed" "$gb_str" "$total_kept"
-      _cc_wj_log_write "trim summary: trimmed=$total_trimmed reclaimed=${total_trim_reclaimed}B kept=$total_kept"
+      _cc_wj_log_write_changed trim-summary "trim summary: trimmed=$total_trimmed reclaimed=${total_trim_reclaimed}B kept=$total_kept"
     else
       printf "Summary: trim-candidates=%d  kept=%d  (dry-run; use --apply --trim-regenerable to remove)\n" \
         "$total_trim_candidates" "$total_kept"
@@ -6293,7 +6305,7 @@ KEEP
     gb_str=$(awk -v b="$total_reclaimed" 'BEGIN { printf "%.2f", b / 1073741824 }')
     printf "Summary: removed=%d  reclaimed=%s GB  kept=%d\n" \
       "$total_removed" "$gb_str" "$total_kept"
-    _cc_wj_log_write "summary: removed=$total_removed reclaimed=${total_reclaimed}B kept=$total_kept"
+    _cc_wj_log_write_changed summary "summary: removed=$total_removed reclaimed=${total_reclaimed}B kept=$total_kept"
   else
     printf "Summary: removable=%d  kept=%d  (dry-run; use --apply to remove)  pushed=%d  wip=%d  estimated-reclaimable=%s GB\n" \
       "$total_removable" "$total_kept" "$total_pushed" "$total_wip" \

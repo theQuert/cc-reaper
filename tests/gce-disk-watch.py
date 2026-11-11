@@ -165,6 +165,7 @@ class Runs(Base):
         rc, lines, _ = self.run_once(bad)
         self.assertEqual(rc, 0)
         self.assertNotIn("would alert", "\n".join(lines))  # one unreadable round is not told
+        self.assertIn("host stima-ci-ctl-1 ok used=41%", "\n".join(lines))  # a host is logged the first time it is seen
         self.assertIn("host stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255 fails=1/2", "\n".join(lines))
         self.assertIn("unreadable: stima-ci-1(exit-255) stima-ci-2(timeout) stima-ci-3(runner-RuntimeError) "
                       "stima-ci-deploy-1(no-df-output)", self.summary(lines))
@@ -175,7 +176,6 @@ class Runs(Base):
         self.assertIn("would alert stima-ci-2 unreadable used=? avail=? inodes=? reason=timeout", "\n".join(lines))
         self.assertIn("would alert stima-ci-3 unreadable used=? avail=? inodes=? reason=runner-RuntimeError", "\n".join(lines))
         self.assertIn("would alert stima-ci-deploy-1 unreadable used=? avail=? inodes=? reason=no-df-output", "\n".join(lines))
-        self.assertIn("host stima-ci-ctl-1 ok used=41%", "\n".join(lines))
         self.assertIn("5 hosts, 1 read, 0 high, 4 unreadable, 4 would-alert", self.summary(lines))
         self.assertNotIn("garbage", "\n".join(lines))  # the command's output never reaches a record
 
@@ -194,7 +194,7 @@ class Runs(Base):
             self.clock.t += 600
             rc, lines, _ = self.run_once(full, GDW_APPLY="1")
             self.assertEqual(rc, 0)
-            self.assertIn("0 alerted", self.summary(lines))
+            self.assertEqual(lines, [])  # an unchanged state writes no line at all
         self.assertEqual(len(self.alerts()), 1)
         self.assertEqual(len(self.notes), 1)
         self.clock.t += 600  # a different bad state is a new state change
@@ -204,6 +204,34 @@ class Runs(Base):
         self.run_once({"stima-ci-ctl-1": (255, "", None)}, GDW_APPLY="1")
         self.assertEqual(len(self.alerts()), 2)
         self.assertIn("kind=unreadable", self.alerts()[1])
+
+    def test_a_host_that_stays_unreadable_is_logged_and_told_once_not_every_run(self):
+        # stima-api #7904: stima-ci-2 timed out or refused (the reason flips) on 266 runs in a row, each logged.
+        flip = [{"stima-ci-2": (None, "", "timeout")}, {"stima-ci-2": (255, "", None)}]
+        for i in range(60):  # 10 hours, past several re-alert windows
+            self.run_once(flip[i % 2], GDW_APPLY="1")
+            self.clock.t += 600
+        log = (self.tmp / "logs" / "gce-disk-watch.log").read_text()
+        self.assertEqual(len([l for l in log.splitlines() if " host stima-ci-2 " in l]), 2)  # fails=1/2, then told
+        self.assertEqual(len(self.alerts()), 1)  # one ALERT, no STILL inside a day for an unreadable host
+        self.assertEqual(len(self.notes), 1)
+        for i in range(90):  # 15 more hours: past one day since the ALERT, short of two
+            self.run_once(flip[i % 2], GDW_APPLY="1")
+            self.clock.t += 600
+        self.assertEqual(len(self.alerts()), 2)  # told again once a day: a full root disk also reads as unreadable
+        self.assertEqual(len(self.notes), 2)
+
+    def test_a_changed_number_is_not_a_changed_state_and_a_changed_state_is_logged(self):
+        self.run_once({})
+        self.clock.t += 600
+        _, lines, _ = self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL, None)})
+        self.assertIn("host stima-ci-ctl-1 disk-high used=100%", "\n".join(lines))
+        self.clock.t += 600
+        _, lines, _ = self.run_once({"stima-ci-ctl-1": (0, CTL1_FULL.replace("100%", "99%"), None)})
+        self.assertEqual(lines, [])
+        self.clock.t += 600
+        _, lines, _ = self.run_once({})
+        self.assertIn("host stima-ci-ctl-1 ok used=41%", "\n".join(lines))
 
     def test_re_alert_window(self):
         full = {"stima-ci-ctl-1": (0, CTL1_FULL, None)}
@@ -233,7 +261,7 @@ class Runs(Base):
         self.assertEqual(len([a for a in self.alerts() if a.startswith("GCE-DISK RECOVERED host=stima-ci-ctl-1")]), 1)
         self.assertRegex(self.alerts()[1], r"^GCE-DISK RECOVERED host=stima-ci-ctl-1 kind=\S+ used=41% avail=28\.9GB inodes=7% ")
         self.assertEqual(len(self.notes), 2)
-        self.assertIn("0 recovered", self.summary(lines))
+        self.assertEqual(lines, [])  # the recovery was told once; the quiet runs after it say nothing
         # A healthy host never says it recovered.
         self.assertNotIn("host=stima-ci-1 ", "\n".join(self.alerts()))
 
@@ -259,7 +287,7 @@ class Runs(Base):
         self.assertIn("1 alerted", self.summary(lines))
         self.assertNotIn("would alert", "\n".join(lines))
         st = json.loads((self.tmp / "state" / "gce-disk-watch.json").read_text())
-        self.assertEqual(set(st), {"apply"})
+        self.assertEqual(set(st), {"apply", "printed"})
         written = sorted(str(p.relative_to(self.tmp)) for p in self.tmp.rglob("*") if p.is_file() and p.parent.name != "ssh")
         self.assertEqual(written, ["logs/gce-disk-watch.log", "state/gce-disk-watch.json"])  # no handoffs, no inbox, no events.log
 
@@ -381,13 +409,15 @@ class Review(Base):
 
     def test_a_known_unreadable_host_is_read_every_round_and_never_told_unreadable(self):
         refused = {"stima-ci-1": (255, "", None)}
-        for _ in range(4):
+        for i in range(4):
             _, lines, runner = self.run_once(refused, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
+            first = lines if i == 0 else first
             self.clock.t += 600
         self.assertIn("stima-ci-1", [c[0] for c in runner.calls])  # still read
         self.assertEqual(self.alerts(), [])
-        self.assertIn("host stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255 known-unreadable", "\n".join(lines))
-        self.assertIn("unreadable: stima-ci-1(exit-255 known)", self.summary(lines))
+        self.assertIn("host stima-ci-1 unreadable used=? avail=? inodes=? reason=exit-255 known-unreadable", "\n".join(first))
+        self.assertIn("unreadable: stima-ci-1(exit-255 known)", self.summary(first))
+        self.assertEqual(lines, [])  # and it is not logged again while it stays that way
         # Not every host: an unlisted one still tells after its rounds.
         self.run_once({"stima-ci-2": (255, "", None)}, GDW_APPLY="1", GDW_KNOWN_UNREADABLE="stima-ci-1")
         self.clock.t += 600
@@ -523,9 +553,9 @@ class Cadence(Base):
         self.assertEqual(reads[6], sorted(HOSTS))  # 60 min: all, known ones included
         total = sum(len(r) for r in reads)
         self.assertEqual(total, 5 + 3 + 5 + 0)  # versus 35 reads at every run
-        _, lines, _ = self.cad(refused)
-        self.assertTrue(any(l.endswith("host stima-ci-2 not-due kind=ok") for l in lines))
-        self.assertIn("read=0 not_due=5", self.summary(lines))
+        _, lines, runner = self.cad(refused)
+        self.assertEqual(runner.calls, [])  # not due: nothing read
+        self.assertEqual(lines, [])  # and nothing logged
 
     def test_slack_lets_a_slightly_early_start_read(self):
         self.cad({})
