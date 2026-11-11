@@ -69,7 +69,9 @@ DEFAULTS = {
     "CHECKBY_REPO": "theQuert/stima-api",  # the only repo the oracle reads; a claim elsewhere is UNKNOWN (kept)
     "ORACLE_ROOT": "/Users/stimaclaw/GitHub/stima-api",  # checkout whose `scripts/ci/delivery_state.py N --brief` judges an idle session's open claims
     "ORACLE_CACHE_DIR": "~/.cc-reaper/state/oracle-brief",  # one brief per issue, reused for ORACLE_CACHE_MINUTES (GitHub REST budget)
-    "ORACLE_CACHE_MINUTES": "10",
+    # Longer than the 30-minute launchd interval, so a brief read by one run serves the next (stima-api#7904: at 10 the
+    # cache never outlived a run). A session about to close re-reads its claims fresh first (confirm_close()).
+    "ORACLE_CACHE_MINUTES": "45",
     "ORACLE_TIMEOUT_SECONDS": "60",  # one --brief read; 30 s timed out under load with 8 parallel reads (stima-api #7061)
     "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
     "STALL_MARK_DIR": "~/.cc-reaper/state/stalled",  # stall-watch.py writes <session id>.json here; empty: off
@@ -485,6 +487,25 @@ def checkby_state(repo, num, cfg):
 
 
 _brief_cache = {}
+_fresh_this_run = set()  # (repo, num) keys whose brief was read from the oracle in this run: taken as is, never read twice
+
+
+def _read_brief(repo, num, cfg, now):
+    """One `delivery_state.py N --brief` run; the brief is cached on disk and in memory, None when the oracle cannot say."""
+    key = (repo, str(num))
+    cache = Path(os.path.expanduser(cfg["ORACLE_CACHE_DIR"])) / f"{repo.replace('/', '_')}-{num}.json"
+    root = os.path.expanduser(cfg["ORACLE_ROOT"])
+    rc, out = run(["python3", "scripts/ci/delivery_state.py", str(num), "--brief", "--repo", repo], float(cfg["ORACLE_TIMEOUT_SECONDS"]), cwd=root)
+    brief = out if rc == 0 and out.startswith("delivery #") else None
+    if brief is not None:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"at": now, "brief": brief}))
+        except OSError:
+            pass
+    _brief_cache[key] = brief
+    _fresh_this_run.add(key)
+    return brief
 
 
 def oracle_brief(repo, num, cfg, now):
@@ -499,21 +520,47 @@ def oracle_brief(repo, num, cfg, now):
     try:
         d = json.loads(cache.read_text())
         if 0 <= now - d["at"] < ttl and isinstance(d["brief"], str):
-            _brief_cache[key] = d["brief"]
-            return d["brief"]
+            # setdefault: a fresh read that landed in memory while this thread read the disk must not be overwritten by the older
+            # disk value, or a DONE could rest on it as if it were read in this run
+            return _brief_cache.setdefault(key, d["brief"])
     except (OSError, ValueError, KeyError, TypeError):
         pass
-    root = os.path.expanduser(cfg["ORACLE_ROOT"])
-    rc, out = run(["python3", "scripts/ci/delivery_state.py", str(num), "--brief", "--repo", repo], float(cfg["ORACLE_TIMEOUT_SECONDS"]), cwd=root)
-    brief = out if rc == 0 and out.startswith("delivery #") else None
-    if brief is not None:
-        try:
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(json.dumps({"at": now, "brief": brief}))
-        except OSError:
-            pass
-    _brief_cache[key] = brief
-    return brief
+    return _read_brief(repo, num, cfg, now)
+
+
+def fresh_brief(repo, num, cfg, now):
+    """The brief read from the oracle in this run: a key already read in this run is taken as is (no second read);
+    otherwise it is read now, whatever the disk or memory cache holds, and replaces both."""
+    if repo != cfg["CHECKBY_REPO"]:
+        return None
+    if (repo, str(num)) in _fresh_this_run:
+        return _brief_cache.get((repo, str(num)))
+    return _read_brief(repo, num, cfg, now)
+
+
+def refresh_briefs(s, cfg, now, extra=(), used=None):
+    """Numbers whose brief, once read in this run, differs from the one a verdict was built on. Looks at every issue a
+    verdict on `s` rests on: its claims, `extra` refs (a loop's own #N), and, for a session with no claim, the issues
+    its text names (what oracle_claims() looked at). The cache outlives a run (45 minutes), so a verdict that releases
+    a session may not rest on it (stima-api#7904).
+
+    `used` maps (repo, number) to the brief that verdict used (session_state.judge()): the key is read here when no one
+    read it in this run, then the brief now in memory is compared with the one used. Another session's judgement may have
+    read the key between this verdict's use and now, so that a key is in `_fresh_this_run` proves nothing about `used`.
+    A key whose read in this run failed (None) is changed under `used`: it supports no DONE. Without `used`
+    (confirm_close(), which runs after the judging threads), a key already read in this run counts unchanged."""
+    refs = list(dict.fromkeys([*(s.get("claims") or ()), *((r, str(n)) for r, n in extra),
+                               *(() if s.get("claims") else ((cfg["CHECKBY_REPO"], n) for n in named_issues(s, cfg)))]))
+    changed = []
+    for r, n in refs:
+        key = (r, str(n))
+        if used is None and key in _fresh_this_run:
+            continue
+        old = _brief_cache.get(key) if used is None else used.get(key)
+        cur = fresh_brief(r, n, cfg, now)  # a key already read in this run is taken as is
+        if r == cfg["CHECKBY_REPO"] and (cur != old or (used is not None and cur is None)):
+            changed.append(str(n))
+    return changed
 
 
 BRIEF_STATE_RE = re.compile(r"\Adelivery #\d+: (\w+)")
@@ -1685,11 +1732,18 @@ def _brief_kind(brief):
     return k.group(1) if k else ""
 
 
+def can_close_now(s, cfg):
+    """Idle past the session's own threshold: the only kind of session a run can close, so the only kind whose claims
+    the oracle is asked about (stima-api#7904). A busy, shell or waiting session, or an idle one still under the
+    threshold, is kept whatever the oracle says."""
+    return s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg)
+
+
 def judge_order(s, cfg):
     """Sort key: the sessions most likely to close come first, so a budget cut leaves only the busy ones unjudged
     (#6477: 13 of 18 ended `unjudged:run-budget`, so nothing was ever reaped). Idle past the threshold before the
     rest, protected last (they never close), fewer claims first (an issue each costs a lookup), longest idle first."""
-    idle = s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg)
+    idle = can_close_now(s, cfg)
     names = [n for n in (s["tmux"], s.get("name")) if n]
     return (2 if protected(cfg, *names) else 0 if idle else 1, len(s["claims"]), -s["idle_min"])
 
@@ -1702,11 +1756,15 @@ def prefetch(sessions, cfg, now):
     started by PREFETCH_BUDGET is dropped. Failures leave the cache empty: decide() retries."""
     batch_issue_states([ref for s in sessions for ref in s.get("claims") or ()])
     jobs = []
-    for s in sessions:
+    for s in sorted(sessions, key=lambda x: judge_order(x, cfg)):  # candidates first: a budget cut drops the busy ones
         done = DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"])
-        idle = s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg)
+        idle = can_close_now(s, cfg)
+        # An oracle brief is read only for a session this run can close (stima-api#7904), or one whose waiting keyword
+        # makes _decide() ask whether a claim is a person's step (person_step()): the label, not the verdict.
+        brief = idle or bool(not s["asking"] and waiting_re(cfg).search(DONE_RE.sub("", s["last_text"])))
         for r, n in s.get("claims") or ():
-            jobs.append(lambda r=r, n=n: oracle_brief(r, n, cfg, now))
+            if brief:
+                jobs.append(lambda r=r, n=n: oracle_brief(r, n, cfg, now))
             jobs.append(lambda r=r, n=n, sid=s["sid"]: claim_time(r, n, sid))
             if done and idle:
                 jobs.append(lambda r=r, n=n: checkby_state(r, n, cfg))
@@ -1731,23 +1789,59 @@ def claim_briefs(refs, cfg, now):
     return [(ref, oracle_brief(ref[0], ref[1], cfg, now)) for ref in refs]
 
 
+# Per-session results of decide() that a re-decide on a changed brief must recompute, never carry over.
+DECIDE_RESULTS = ("oracle_not_mine", "state_close", "state_shadow", "state_held", "state_error", "claim_marks",
+                  "done_grace_shadow", "done_grace_error", "oracle_not_mine_shadow", "oracle_not_mine_error",
+                  "false_waiting")
+
+
+def confirm_close(s, cfg, keep):
+    """`keep` after a fresh look at what a close rests on, for a session decide() would close (empty `keep`).
+
+    The brief cache outlives a run (ORACLE_CACHE_MINUTES 45 > the 30-minute interval, stima-api#7904), so a close is the
+    one verdict that may not rest on it: closing a session that still has a step is the costly direction, and the
+    cache is keyed on the issue, not on what the issue said a moment ago. refresh_briefs() reads each claim's brief from
+    the oracle now, and for a session with no claim the issues its text names (the alarm path's `named-claim:` gate).
+    A key already read in this run (by session_state.judge()'s own confirmation, or a cache miss) is not read again.
+    Nothing changed: `keep` stands. A brief changed, or came back unreadable: the session is decided again on the fresh
+    briefs, the state record is dropped (it was judged on the old ones, so it releases nothing) and every earlier result
+    is cleared. What that second decide does with an unreadable brief is what decide() always does: a claim path keeps
+    the session (`issue-unknown:`), but a session ending in SESSION-DONE never read the claim's brief for anything but
+    a check-by, so it closes as it did before this function. Only a session about to close pays the reads."""
+    if keep:
+        return keep
+    changed = refresh_briefs(s, cfg, time.time())
+    if not changed:
+        return keep
+    for k in DECIDE_RESULTS:
+        s.pop(k, None)
+    s["state"] = None
+    s["brief_changed"] = changed
+    return decide(s, cfg)
+
+
 def person_step(s, cfg, now=None):
     """True when the oracle's step for one of the session's worktree claims is a stop (a person's)."""
     at = now if now is not None else time.time()
     return any(_brief_kind(b) == "stop" for _, b in claim_briefs(s["claims"], cfg, at))
 
 
+def named_issues(s, cfg, limit=8):
+    """The issue numbers (`#N` in the session's name or last text, not already a claim) oracle_claims() looks at."""
+    named = []
+    for n in NAMED_RE.findall(f"{s.get('name', '')}\n{s['last_text']}"):
+        if n not in named and (cfg["CHECKBY_REPO"], n) not in s["claims"]:
+            named.append(n)
+    return named[:limit]
+
+
 def oracle_claims(s, cfg, now, limit=8):
     """Issues the session names (`#N` in its last text or name) whose oracle brief says THIS session is the
     claimant (its id or a worktree marker it owns); the claim a worktree-less session has no branch for."""
     repo = cfg["CHECKBY_REPO"]
-    named = []
-    for n in NAMED_RE.findall(f"{s.get('name', '')}\n{s['last_text']}"):
-        if n not in named and (repo, n) not in s["claims"]:
-            named.append(n)
     mine = [w["marker"] for w in s["owned"] if w.get("marker")]
     out = []
-    for n in named[:limit]:
+    for n in named_issues(s, cfg, limit):
         c = CLAIMANT_RE.search(oracle_brief(repo, n, cfg, now) or "")
         if c and (_same_session(c.group(1), s["sid"]) or any(_same_session(c.group(1), m) for m in mine)):
             out.append((repo, n))
@@ -2524,6 +2618,7 @@ def report_line(s, keep, outcome):
     why += [f"state DONE ({s['state_close']} apply)"] if s.get("state_close") else []
     why += [f"state DONE held: {_cell(s['state_held'], 120)}"] if s.get("state_held") else []
     why += [f"state error: {_cell(s['state_error'], 120)}"] if s.get("state_error") else []
+    why += ["fresh brief changed: " + ",".join(f"#{n}" for n in s["brief_changed"])] if s.get("brief_changed") else []
     if s.get("claim_why"):  # name why no claim was found
         keep = [f"claim-unknown({s['claim_why']})" if k == "claim-unknown" else k for k in keep]
     blocked = [", ".join(f"blocked: #{n}" for n in s["blocked"])] if s.get("blocked") else []
@@ -2609,12 +2704,18 @@ def main(argv=None):
             if args.only and s["tmux"] != args.only:
                 continue
             if time.monotonic() - RUN_START > RUN_BUDGET:
-                rows.append(report_line(s, ["unjudged:run-budget"], "keep"))
-                seen.append((s, ["unjudged:run-budget"], "keep"))
+                # `working`: not read, it cannot close this run whatever the oracle says; `unjudged:run-budget`: it
+                # could have closed and the budget ran out first (stima-api#7904)
+                why = ["unjudged:run-budget"] if can_close_now(s, cfg) else \
+                    ["working:" + (f"status:{s['status']}" if s["status"] != "idle"
+                                   else f"idle:{s['idle_min']:.0f}<{idle_threshold(s, cfg):g}min")]
+                rows.append(report_line(s, why, "keep"))
+                seen.append((s, why, "keep"))
                 continue
             keep, outcome = [], "error"
             try:
                 keep = decide(s, cfg)
+                keep = confirm_close(s, cfg, keep)
                 if s.get("done_grace_error"):
                     notes.append(f"{s['tmux']} ({s['sid']}): DONE_GRACE shadow: {s['done_grace_error']}")
                 if s.get("oracle_not_mine_error"):

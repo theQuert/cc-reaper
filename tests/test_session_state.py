@@ -59,6 +59,30 @@ WAIT_AHEAD = WAIT_SCHEDULED.replace("6633", "6634").replace("2026-11-03T07:23:00
 FALSE_CLAIM_BRANCHES = ("canary-main-1031", "chore/uiux-sync-1026", "uiux-accept-1029", "claude/prompt-size-403-4389")
 
 
+REAL_REFRESH = reaper.refresh_briefs
+_refresh_patch = mock.patch.object(reaper, "refresh_briefs", return_value=[])
+
+
+class FreshState(unittest.TestCase):
+    """Every test that touches the reaper's brief caches starts and ends with both empty, whatever ran before."""
+
+    def setUp(self):
+        reaper._brief_cache.clear()
+        reaper._fresh_this_run.clear()
+        self.addCleanup(reaper._brief_cache.clear)
+        self.addCleanup(reaper._fresh_this_run.clear)
+
+
+def setUpModule():
+    # judge() confirms a DONE on briefs read fresh (stima-api#7904); these tests mock the oracle, so that read is off
+    # unless a test turns the real one on (Confirmed)
+    _refresh_patch.start()
+
+
+def tearDownModule():
+    _refresh_patch.stop()
+
+
 def transcript(tmp, text="Merged.\n\nSESSION-DONE: nothing left, #7026 merged"):
     """transcript_facts() of a recorded transcript: a prompt 20 min ago, the reply 10 min ago."""
     path = tmp / "t.jsonl"
@@ -278,6 +302,169 @@ class Judge(unittest.TestCase):
         with mock.patch.object(reaper, "oracle_brief", return_value=brief), \
              mock.patch.object(reaper, "worktree_state", return_value=[]):
             self.assertEqual(reaper._decide(dict(s), CFG, NOW), ["issue-unknown:#6837"])
+
+
+class OracleReads(unittest.TestCase):
+    """stima-api#7904: only a session a run can close pays for the oracle."""
+
+    def run_judge(self, s, briefs=None, **cfg):
+        calls = []
+
+        def brief(r, n, c, now):
+            calls.append(("brief", str(n)))
+            return (briefs or {}).get(str(n))
+
+        def js(r, n, c):
+            calls.append(("json", str(n)))
+        with mock.patch.object(reaper, "oracle_brief", side_effect=brief), \
+             mock.patch.object(reaper, "worktree_state", side_effect=lambda w, c: list(w.get("problems", []))), \
+             mock.patch.object(reaper, "oracle_json", side_effect=js), \
+             mock.patch.object(reaper, "oracle_claims", side_effect=lambda *a: calls.append(("named",)) or []):
+            return ss.judge(s, reaper, dict(CFG, **cfg), NOW), calls
+
+    def test_a_busy_session_with_claims_makes_no_oracle_call_and_is_working(self):
+        for status in ("busy", "shell", "waiting"):
+            rec, calls = self.run_judge(session(status=status, idle_min=500, claims=[(REPO, "7026"), (REPO, "6945")]),
+                                        {"7026": AGENT_MINE})
+            self.assertEqual((calls, rec["state"], rec["reasons"]), ([], "WORKING", [f"status:{status}"]))
+            self.assertEqual([(c["issue"], c["read"]) for c in rec["claims"]], [(7026, False), (6945, False)])
+
+    def test_a_session_idle_under_the_threshold_makes_no_oracle_call(self):
+        rec, calls = self.run_judge(session(idle_min=59, claims=[(REPO, "7026")], owned=[wt("a")]), {"7026": AGENT_MINE})
+        self.assertEqual((calls, rec["state"], rec["reasons"]), ([], "WORKING", ["idle:59<60min"]))
+        rec, calls = self.run_judge(session(kind="bg", name="loop #7026 x", idle_min=10))
+        self.assertEqual((calls, rec["state"]), ([], "WORKING"))
+        self.assertEqual(rec["claims"][0]["source"], "name")  # the loop's #N is listed, unread
+
+    def test_the_done_grace_threshold_decides_when_the_oracle_is_read(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        facts = transcript(tmp)  # a session that said SESSION-DONE
+        for grace in ("shadow", "off"):  # the grace is not live: IDLE_MINUTES holds
+            rec, calls = self.run_judge(session(idle_min=10, claims=[(REPO, "6000")], **facts), {"6000": CLOSED},
+                                        DONE_GRACE=grace)
+            self.assertEqual(calls, [])
+        rec, calls = self.run_judge(session(idle_min=10, claims=[(REPO, "6000")], **facts), {"6000": CLOSED},
+                                    DONE_GRACE="apply")
+        self.assertEqual((calls, rec["state"]), ([("brief", "6000")], "DONE"))  # past the 5 minute grace
+
+    def test_a_session_idle_long_enough_is_read_and_judged_as_before(self):
+        rec, calls = self.run_judge(session(claims=[(REPO, "7026")]), {"7026": AGENT_MINE})
+        self.assertEqual((calls, rec["state"], rec["claims"][0]["mine"]), ([("brief", "7026")], "WORKING", True))
+        self.assertNotIn("read", rec["claims"][0])
+        rec, calls = self.run_judge(session(claims=[(REPO, "6000")]), {"6000": CLOSED})
+        self.assertEqual((calls, rec["state"]), ([("brief", "6000")], "DONE"))
+        rec, calls = self.run_judge(session(), named=None)  # no branch claim: the named-issue lookup is asked
+        self.assertEqual(calls, [("named",)])
+
+    def test_judge_all_judges_the_candidates_first_longest_idle_first_and_returns_input_order(self):
+        order = []
+        sessions = [session(sid="b", name="b", status="busy", idle_min=900, claims=[(REPO, "1")]),
+                    session(sid="y", name="y", idle_min=30, claims=[(REPO, "2")]),
+                    session(sid="m", name="m", idle_min=100, claims=[(REPO, "3")]),
+                    session(sid="o", name="o", idle_min=300, claims=[(REPO, "4")])]
+        with mock.patch.object(reaper, "oracle_brief", side_effect=lambda r, n, c, now: order.append(str(n))), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "oracle_json", return_value=None), \
+             mock.patch.object(reaper, "oracle_claims", return_value=[]):
+            recs = ss.judge_all(reaper, sessions, CFG, NOW, workers=1)
+        self.assertEqual(order, ["4", "3"])  # only the two candidates, 300 minutes idle before 100
+        self.assertEqual([x["sid"] for x in recs], ["b", "y", "m", "o"])
+
+
+class Confirmed(FreshState):
+    """stima-api#7904: DONE is what the dispatcher stops a session on, and the brief cache outlives a run: a DONE stands
+    only on briefs read in this run."""
+
+    def setUp(self):
+        super().setUp()
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        self.cfg = dict(CFG, ORACLE_CACHE_DIR=d, ORACLE_ROOT=d)
+        p = mock.patch.object(reaper, "refresh_briefs", REAL_REFRESH)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def judge(self, s, cached, fresh, js=None):
+        """judge() of `s` when run A cached `cached` for #6945 and the oracle answers `fresh` now; (record, reads)."""
+        with mock.patch.object(reaper, "run", return_value=(0, cached)):
+            reaper.oracle_brief(REPO, "6945", self.cfg, NOW)  # an earlier run, inside the 45 minute TTL
+        reaper._brief_cache.clear()
+        reaper._fresh_this_run.clear()  # a new process: nothing read yet
+        with mock.patch.object(reaper, "run", return_value=(0, fresh)) as run, \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "oracle_json", return_value=js):
+            rec = ss.judge(s, reaper, self.cfg, NOW)
+            return rec, run.call_count
+
+    def test_a_cached_wait_that_is_now_an_agent_step_is_not_done(self):
+        rec, reads = self.judge(session(claims=[(REPO, "6945")]), WAIT_OWNER, AGENT_UNCLAIMED.replace("7050", "6945"))
+        self.assertEqual((rec["state"], reads), ("UNKNOWN", 1))
+        self.assertIn("fresh-brief-changed:#6945", rec["reasons"])
+
+    def test_a_done_that_survives_the_fresh_read_costs_one_read_and_confirm_close_adds_none(self):
+        s = session(claims=[(REPO, "6945")])
+        rec, reads = self.judge(s, WAIT_OWNER, WAIT_OWNER)
+        self.assertEqual((rec["state"], reads), ("DONE", 1))
+        with mock.patch.object(reaper, "run", side_effect=AssertionError("a second read")):
+            self.assertEqual(reaper.refresh_briefs(s, self.cfg, NOW), [])  # what confirm_close() asks
+        self.assertEqual(reaper._brief_cache[(REPO, "6945")], WAIT_OWNER)
+
+    def test_a_loop_whose_cached_check_by_wait_has_expired_is_not_done(self):
+        loop = session(kind="bg", name="loop #6945 check-by", tmux="loop #6945 check-by")
+        due = {"pending_check_by": ""}  # a fresh oracle_json that sees no pending check-by
+        rec, reads = self.judge(loop, WAIT_OWNER, WAIT_OWNER, due)
+        self.assertEqual((rec["state"], reads), ("DONE", 1))  # the cached wait, still a wait: unchanged
+        rec, reads = self.judge(loop, WAIT_OWNER, AGENT_MINE.replace("7026", "6945"), due)
+        self.assertEqual((rec["state"], reads), ("WORKING", 1))  # the wait is now this session's agent step
+
+    def interleaved(self, fresh_read):
+        """Session X (`loop #6945`) is judged on the cached brief S; during its `oracle_json` wait another session's
+        judgement reads the same key fresh (`fresh_read`: what the oracle answers); then X's DONE is confirmed."""
+        loop = session(kind="bg", name="loop #6945 check-by", tmux="loop #6945 check-by")
+        with mock.patch.object(reaper, "run", return_value=(0, WAIT_OWNER)):
+            reaper.oracle_brief(REPO, "6945", self.cfg, NOW)  # run A's brief: S
+        reaper._brief_cache.clear()
+        reaper._fresh_this_run.clear()
+        seen = []
+
+        def other_session_reads(repo, n, cfg):
+            if not seen:  # thread B: fresh-reads the key X already used, and stores it
+                seen.append(reaper.fresh_brief(REPO, "6945", self.cfg, NOW))
+            return {"pending_check_by": ""}
+        with mock.patch.object(reaper, "run", return_value=fresh_read) as run, \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "oracle_json", side_effect=other_session_reads):
+            rec = ss.judge(loop, reaper, self.cfg, NOW)
+        return rec, run.call_count, seen
+
+    def test_a_done_on_a_brief_another_session_replaced_in_this_run_is_judged_again_on_the_new_one(self):
+        rec, reads, seen = self.interleaved((0, AGENT_MINE.replace("7026", "6945")))
+        self.assertEqual(seen, [AGENT_MINE.replace("7026", "6945")])
+        self.assertEqual((rec["state"], reads), ("WORKING", 1))  # not DONE on S; judged on the new value, one read
+        self.assertIn("own-step:#6945 agent check-by", rec["reasons"])
+        self.assertIn("fresh-brief-changed:#6945", rec["reasons"])
+
+    def test_a_done_whose_key_another_session_failed_to_read_is_not_done(self):
+        rec, reads, seen = self.interleaved((1, ""))
+        self.assertEqual(seen, [None])
+        self.assertNotEqual(rec["state"], "DONE")
+        self.assertEqual((rec["state"], reads), ("UNKNOWN", 1))
+
+    def test_a_done_on_a_brief_that_stayed_the_same_is_confirmed_without_a_second_read(self):
+        rec, reads, seen = self.interleaved((0, WAIT_OWNER))
+        self.assertEqual((rec["state"], reads), ("DONE", 1))
+        self.assertNotIn("fresh-brief-changed:#6945", rec["reasons"])
+
+    def test_a_not_done_session_is_not_read_again(self):
+        rec, reads = self.judge(session(claims=[(REPO, "6945")], status="busy"), WAIT_OWNER, WAIT_OWNER)
+        self.assertEqual((rec["state"], reads), ("WORKING", 0))
+
+    def test_a_failed_confirmation_is_not_done(self):
+        with mock.patch.object(reaper, "refresh_briefs", side_effect=OSError("boom")), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]):
+            rec = ss.judge(session(), reaper, self.cfg, NOW)
+        self.assertEqual((rec["state"], rec["reasons"]), ("UNKNOWN", ["error:OSError: boom"]))
 
 
 class ClaimStepTrailer(unittest.TestCase):
