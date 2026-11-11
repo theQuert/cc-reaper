@@ -544,6 +544,102 @@ t_remove_guards() {
   return $r
 }
 
+# A rule root must be ours and closed to group and others: anyone who can write it can swap an
+# entry for a symlink between the listing and the removal.
+t_root_mode() {
+  local sd="$1" r=0 L H E S P
+  begin; L="$T/gcloud/logs"; mkdir -p "$L"; echo old > "$L/a.log"; age "$L" 30; chmod 777 "$L"
+  run "$sd" CC_DJ_RET_GCLOUD_MODE=apply CC_DJ_RET_GCLOUD_DIR="$L"
+  [ -f "$L/a.log" ] || { echo "  a mode-777 gcloud root was used"; r=1; }
+  has 'rule=gcloud-logs skipped: root .* mode 777' || { echo "  no skip line (gcloud)"; r=1; }
+  begin; scratch_fixture; chmod 777 "$S"
+  run "$sd" CC_DJ_RET_SCRATCH_MODE=apply CC_DJ_RET_SCRATCH_ROOT="$S" LSOF_EXTRA="$T/lsof.extra"
+  [ -d "$P/$UUID_G" ] || { echo "  a mode-777 scratch root was used"; r=1; }
+  has 'rule=scratchpads skipped: root .* mode 777' || { echo "  no skip line (scratch)"; r=1; }
+  begin; H="$T/handoffs"; mkdir -p "$H/i100"; echo x > "$H/i100/f"; age "$H" 20; printf '100\n' > "$T/gh.closed"; chmod 777 "$H"
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HANDOFFS_DIR="$H"
+  [ -d "$H/i100" ] || { echo "  a mode-777 evidence root was used"; r=1; }
+  begin; E="$T/handoffs"; mkdir -p "$E/i100"; echo x > "$E/i100/f"; age "$E" 20; printf '100\n' > "$T/gh.closed"; chmod 775 "$E"
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HANDOFFS_DIR="$E"
+  [ -d "$E/i100" ] || { echo "  a group-writable evidence root was used"; r=1; }
+  return $r
+}
+
+t_root_uid() {
+  local sd="$1" r=0 L H other
+  other=$(( $(id -u) + 1 ))
+  begin; L="$T/gcloud/logs"; mkdir -p "$L"; echo old > "$L/a.log"; age "$L" 30
+  run "$sd" CC_DJ_RET_UID="$other" CC_DJ_RET_GCLOUD_MODE=apply CC_DJ_RET_GCLOUD_DIR="$L"
+  [ -f "$L/a.log" ] || { echo "  a root owned by another uid was used (gcloud)"; r=1; }
+  has 'rule=gcloud-logs skipped: root .* owned by uid' || { echo "  no skip line"; r=1; }
+  begin; H="$T/handoffs"; mkdir -p "$H/i100"; echo x > "$H/i100/f"; age "$H" 20; printf '100\n' > "$T/gh.closed"
+  run "$sd" CC_DJ_RET_UID="$other" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HANDOFFS_DIR="$H"
+  [ -d "$H/i100" ] || { echo "  a root owned by another uid was used (evidence)"; r=1; }
+  # Control: our own uid works.
+  run "$sd" CC_DJ_RET_EVIDENCE_MODE=apply CC_DJ_RET_HANDOFFS_DIR="$H"
+  [ ! -d "$H/i100" ] || { echo "  control: a root of our own uid was refused"; r=1; }
+  return $r
+}
+
+# safe_rmtree itself, called directly: the walk is fd-relative and never follows a symlink.
+t_safe_rmtree() {
+  local sd="$1" r=0 R out
+  begin; R="$T/r"
+  mkdir -p "$R/a/b/leaf" "$T/out/leaf" "$T/r2"; echo f > "$R/a/b/leaf/f"; echo keep > "$T/out/leaf/f"
+  ln -s "$T/out" "$R/lnk"; ln -s "$T/out/leaf" "$R/linkleaf"; chmod 755 "$R"
+  cat > "$T/unit.py" <<'PY'
+import importlib.util, os, shutil, sys
+spec = importlib.util.spec_from_file_location("rh", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+mode, root, path = sys.argv[2:5]
+if mode == "nofdsafe":
+    shutil.rmtree.avoids_symlink_attacks = False
+try:
+    m.safe_rmtree(root, path)
+    print("REMOVED")
+except OSError as e:
+    print("REFUSED", e)
+PY
+  u() { python3 -I "$T/unit.py" "$sd/retention-helper.py" "$@" 2>&1; }
+  out="$(u normal "$R" "$R/lnk/leaf")"
+  case "$out" in REFUSED*) ;; *) echo "  removed through a symlinked parent: $out"; r=1 ;; esac
+  [ -f "$T/out/leaf/f" ] || { echo "  the file behind the symlinked parent is gone"; r=1; }
+  out="$(u normal "$R" "$R/linkleaf")"
+  case "$out" in REFUSED*) ;; *) echo "  removed a symlinked leaf: $out"; r=1 ;; esac
+  [ -f "$T/out/leaf/f" ] || { echo "  the file behind the symlinked leaf is gone"; r=1; }
+  out="$(u normal "$R" "$R/a/../../out/leaf")"
+  case "$out" in REFUSED*) ;; *) echo "  followed a .. component: $out"; r=1 ;; esac
+  [ -f "$T/out/leaf/f" ] || { echo "  the file reached through .. is gone"; r=1; }
+  out="$(u normal "$R" "$T/out/leaf")"
+  case "$out" in REFUSED*) ;; *) echo "  removed a path outside the root: $out"; r=1 ;; esac
+  [ -f "$T/out/leaf/f" ] || { echo "  the path outside the root is gone"; r=1; }
+  out="$(u nofdsafe "$R" "$R/a/b/leaf")"
+  case "$out" in REFUSED*) ;; *) echo "  removed although shutil.rmtree is not symlink-attack safe: $out"; r=1 ;; esac
+  [ -d "$R/a/b/leaf" ] || { echo "  removed with the unsafe rmtree"; r=1; }
+  mkdir -p "$T/r2/x"; chmod 777 "$T/r2"
+  out="$(u normal "$T/r2" "$T/r2/x")"
+  case "$out" in REFUSED*) ;; *) echo "  removed under a mode-777 root: $out"; r=1 ;; esac
+  [ -d "$T/r2/x" ] || { echo "  the mode-777 root's entry is gone"; r=1; }
+  out="$(u normal "$R" "$R/a/b/leaf")"
+  [ "$out" = REMOVED ] && [ ! -d "$R/a/b/leaf" ] || { echo "  control: a plain removal failed: $out"; r=1; }
+  return $r
+}
+
+# The parent of a listed path is swapped for a symlink after the listing: nothing outside is deleted.
+t_swap_after_listing() {
+  local sd="$1" r=0 root list
+  begin; root="$T/root"; mkdir -p "$root/proj/$UUID_A" "$root/proj2/$UUID_B" "$T/outside/$UUID_A"
+  echo in > "$root/proj/$UUID_A/f"; echo in > "$root/proj2/$UUID_B/f"; echo keep > "$T/outside/$UUID_A/f"; chmod 755 "$root"
+  list="$T/list"; printf '%s\0' "$root/proj/$UUID_A" "$root/proj2/$UUID_B" > "$list"
+  mv "$root/proj" "$T/proj.aside" && ln -s "$T/outside" "$root/proj"        # the swap, after the listing
+  ( env HOME="$FH" CC_DJ_CONFIG=/dev/null CC_DJ_LOG="$T/dj.log" bash -c '. "$1"; _CC_DJ_RET_DEADLINE=999999; _cc_dj_ret_remove_list "$2" "$3" d' _ "$sd/disk-janitor.sh" "$root" "$list" ) >/dev/null 2>&1
+  [ -f "$T/outside/$UUID_A/f" ] || { echo "  a parent swapped for a symlink redirected the delete outside the root"; r=1; }
+  [ ! -d "$root/proj2/$UUID_B" ] || { echo "  control: an untouched listed path was not removed"; r=1; }
+  has 'REFUSED' || { echo "  the refusal was not logged"; r=1; }
+  return $r
+}
+
 t_wired_into_check() {
   local sd="$1"
   awk '/^_cc_dj_check\(\)/{f=1} f && /^  _cc_dj_retention$/{found=1} f && /^}/{exit} END{exit !found}' "$sd/disk-janitor.sh"
@@ -562,7 +658,7 @@ t_scratch_lsof_unknown_keeps t_scratch_default_shadow t_projects t_projects_defa
 t_evidence t_evidence_gh_failure t_dev t_dev_sigkill t_dev_young_keeps t_dev_active_worktree_keeps
 t_dev_merged_worktree_stops t_dev_primary_keeps t_dev_live_session_keeps t_dev_claude_ancestor_keeps
 t_dev_never_kill_keeps t_dev_unknown_keeps t_dev_match_default t_report_forces_shadow t_bad_mode_is_shadow t_defaults t_remove_guards
-t_wired_into_check t_retention_off"
+t_wired_into_check t_retention_off t_root_mode t_root_uid t_safe_rmtree t_swap_after_listing"
 
 for c in $CASES; do
   if "$c" "$SRC"; then ok "$c"; else nok "$c"; fi
@@ -658,6 +754,14 @@ M2_OLD='case "$par/" in "$root"/*) ;; *) _cc_dj_log "retention: refused $p: pare
   mutant "removal guard: outside the root" $J 'case "$p" in "$root"/?*) ;; *) _cc_dj_log "retention: refused $p: not inside $root"; continue ;; esac' ':' t_remove_guards
 mutant "removal guard: symlink target" $J 'if [ -L "$p" ]; then _cc_dj_log "retention: refused $p: is a symlink"; continue; fi' ':' t_remove_guards
 mutant "removal guard: symlinked parent" $J 'case "$par/" in "$root"/*) ;; *) _cc_dj_log "retention: refused $p: parent resolves outside $root"; continue ;; esac' ':' t_remove_guards
+mutant "root trust: owner and mode unchecked (bash)" $J 'if [ "$own" != "${CC_DJ_RET_UID:-$(id -u)}" ] || [ $(( 8#$mode & 8#022 )) -ne 0 ]; then' 'if false; then' t_root_mode t_root_uid
+mutant "root trust: owner unchecked (bash)" $J 'if [ "$own" != "${CC_DJ_RET_UID:-$(id -u)}" ] || [ $(( 8#$mode & 8#022 )) -ne 0 ]; then' 'if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then' t_root_uid
+mutant "root trust: mode unchecked (bash)" $J 'if [ "$own" != "${CC_DJ_RET_UID:-$(id -u)}" ] || [ $(( 8#$mode & 8#022 )) -ne 0 ]; then' 'if [ "$own" != "${CC_DJ_RET_UID:-$(id -u)}" ]; then' t_root_mode
+mutant "root trust: owner and mode unchecked (helper)" $H 'return st.st_uid == want_uid() and (st.st_mode & 0o022) == 0' 'return True' t_root_mode t_root_uid
+mutant "removal: root descriptor not re-checked" $H '        if not trusted_stat(os.fstat(fd)):' '        if False:' t_safe_rmtree
+mutant "removal: components followed through symlinks" $H 'flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW' 'flags = os.O_RDONLY | os.O_DIRECTORY' t_safe_rmtree t_swap_after_listing
+mutant "removal: unsafe rmtree allowed" $H 'if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):' 'if False:' t_safe_rmtree
+mutant "removal: .. components allowed" $H 'if any(p in ("", ".", "..") for p in parts):' 'if False:' t_safe_rmtree
 mutant "not wired into --check" $J '  _cc_dj_retention
 
   # By GB' '

@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -71,11 +72,81 @@ def disk_bytes(path):
     return total
 
 
+def want_uid():
+    raw = os.environ.get("CC_DJ_RET_UID", "")
+    return int(raw) if raw.isdigit() else os.getuid()
+
+
+def trusted_stat(st):
+    """A root is trusted only when we own it and neither group nor others can write it: anyone who
+    can write a directory can rename an entry in it for a symlink between a listing and a removal."""
+    return st.st_uid == want_uid() and (st.st_mode & 0o022) == 0
+
+
 def real_root(root):
-    """The canonical root, or None when it is missing, not a directory, or itself a symlink."""
+    """The canonical root, or None when it is missing, not a directory, itself a symlink, or not
+    owned by us / writable by group or others."""
     if os.path.islink(root) or not os.path.isdir(root):
         return None
+    if not trusted_stat(os.lstat(root)):
+        return None
     return os.path.realpath(root)
+
+
+def safe_rmtree(root, path):
+    """Remove the directory tree `path` under `root` without ever following a symlink: the root is
+    opened O_NOFOLLOW and its ownership and mode are checked on the descriptor, every component
+    down to the parent is opened O_NOFOLLOW|O_DIRECTORY relative to the one before, and the leaf
+    is removed with shutil.rmtree(dir_fd=...). A path swapped for a symlink after it was listed
+    fails the open. Raises OSError (with the reason) when it refuses."""
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        raise OSError("shutil.rmtree is not symlink-attack safe on this platform; refusing to remove")
+    root = root.rstrip("/")
+    if not path.startswith(root + "/"):
+        raise OSError("not inside the root")
+    parts = path[len(root) + 1:].split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise OSError("path has an empty, . or .. component")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(root, flags)
+    try:
+        if not trusted_stat(os.fstat(fd)):
+            raise OSError("root is not owned by us or is writable by group or others")
+        for comp in parts[:-1]:
+            nfd = os.open(comp, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        leaf = parts[-1]
+        st = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode):
+            raise OSError("is a symlink")
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError("is not a directory")
+        shutil.rmtree(leaf, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def cmd_remove(a):
+    """Remove each directory in the NUL-separated list under the verified root, by explicit path,
+    within the time budget. One line per path: REMOVED or REFUSED with the reason."""
+    root = real_root(a.root)
+    if root is None:
+        print("ERR\troot %s is missing, a symlink, or not owned by us / writable by others" % a.root)
+        return 0
+    deadline = time.time() + a.seconds
+    with open(a.list, "rb") as f:
+        paths = [p.decode("utf-8", "surrogateescape") for p in f.read().split(b"\0") if p]
+    for p in paths:
+        if time.time() >= deadline:
+            print("ERR\ttime budget spent; the rest waits for the next run")
+            break
+        try:
+            safe_rmtree(root, p)
+            print("REMOVED\t%s" % p)
+        except OSError as e:
+            print("REFUSED\t%s\t%s" % (p, e))
+    return 0
 
 
 def inside(root, path):
@@ -279,7 +350,7 @@ def cmd_evidence(a):
             if newest_within(p, a.days * 86400) or not inside(root, p) or os.path.islink(p):
                 print("KEEP\t%s\t0\tchanged since it was listed" % p)
                 continue
-            shutil.rmtree(p)
+            safe_rmtree(root, p)
             removed += 1
             print("REMOVED\t%s\t%d\tclosed %s, quiet for %s+ days" % (p, b, label, a.days))
         except OSError as e:
@@ -550,6 +621,11 @@ def main(argv=None):
     p.add_argument("--days", type=int, default=7)
     p.add_argument("--match", default="-worktrees-")
     p.set_defaults(fn=cmd_projects)
+    r = sub.add_parser("remove")
+    r.add_argument("--root", required=True)
+    r.add_argument("--list", required=True)
+    r.add_argument("--seconds", type=float, default=900)
+    r.set_defaults(fn=cmd_remove)
     e = sub.add_parser("evidence")
     e.add_argument("--mode", choices=["shadow", "apply"], default="shadow")
     e.add_argument("--root", action="append", default=[], help="helmway:<dir> or handoffs:<dir>")

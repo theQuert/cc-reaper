@@ -1032,6 +1032,15 @@ _cc_dj_ret_root() {  # <rule> <dir>
   if [ -L "$dir" ]; then _cc_dj_log "retention: rule=$rule skipped: root $dir is a symlink"; return 1; fi
   if [ ! -d "$dir" ]; then _cc_dj_log "retention: rule=$rule skipped: root $dir does not exist"; return 1; fi
   real="$(cd -P "$dir" 2>/dev/null && pwd -P)" || { _cc_dj_log "retention: rule=$rule skipped: cannot read root $dir"; return 1; }
+  # Owned by us, and not writable by group or others: anyone who can write the root can swap an
+  # entry for a symlink between the listing and the removal.
+  local own mode
+  read -r own mode < <(/usr/bin/stat -f '%u %Lp' "$real" 2>/dev/null) || own=""
+  case "$own$mode" in ''|*[!0-9' ']*) _cc_dj_log "retention: rule=$rule skipped: cannot stat root $real"; return 1 ;; esac
+  if [ "$own" != "${CC_DJ_RET_UID:-$(id -u)}" ] || [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+    _cc_dj_log "retention: rule=$rule skipped: root $real is owned by uid $own with mode $mode (it must be ours and not writable by group or others)"
+    return 1
+  fi
   _CC_DJ_RET_ROOT="$real"
 }
 
@@ -1071,11 +1080,30 @@ _cc_dj_ret_bytes_of() {  # <path>: allocated bytes, 0 when unreadable
 }
 
 # Removes the paths in NUL-separated $2 under canonical root $1, one explicit path at a time.
-# kind d removes a directory tree, f a file. Sets _CC_DJ_RET_REMOVED. Each path is checked again
-# right before: inside the root and not a symlink.
+# kind d removes a directory tree, f a single regular file. Sets _CC_DJ_RET_REMOVED. A file is
+# checked again right before (inside the root, not a symlink, parent still inside the root). A
+# directory tree is removed by retention-helper.py with an fd-relative walk (O_NOFOLLOW on every
+# component, shutil.rmtree(dir_fd=...)), so a parent swapped for a symlink after the listing cannot
+# redirect the delete; bash only hands it the list.
 _cc_dj_ret_remove_list() {  # <root> <list> <kind>
-  local root="${1:?}" list="${2:?}" kind="${3:?}" p par
+  local root="${1:?}" list="${2:?}" kind="${3:?}" p par helper out line left
   _CC_DJ_RET_REMOVED=0
+  if [ "$kind" = d ]; then
+    helper="${CC_DJ_RET_HELPER:-$(dirname "${BASH_SOURCE[0]}")/retention-helper.py}"
+    if [ ! -r "$helper" ] || ! command -v python3 >/dev/null 2>&1; then
+      _cc_dj_log "retention: $helper or python3 not found; nothing removed"; return 0
+    fi
+    left=$(( ${_CC_DJ_RET_DEADLINE:-0} - SECONDS )); [ "$left" -ge 1 ] || left=1
+    out="$(python3 -I "$helper" remove --root "$root" --list "$list" --seconds "$left" 2>&1)" || {
+      _cc_dj_log "retention: directory removal failed: $(printf '%s' "$out" | tail -1)"; return 0; }
+    while IFS= read -r line; do
+      case "$line" in
+        REMOVED*) _CC_DJ_RET_REMOVED=$((_CC_DJ_RET_REMOVED + 1)) ;;
+        REFUSED*|ERR*) _cc_dj_log "retention: $(printf '%s' "$line" | tr '\t' ' ')" ;;
+      esac
+    done <<< "$out"
+    return 0
+  fi
   while IFS= read -r -d '' p; do
     [ -n "$p" ] || continue
     case "$p" in "$root"/?*) ;; *) _cc_dj_log "retention: refused $p: not inside $root"; continue ;; esac
@@ -1084,11 +1112,7 @@ _cc_dj_ret_remove_list() {  # <root> <list> <kind>
     par="$(cd -P -- "${p%/*}" 2>/dev/null && pwd -P)" || { _cc_dj_log "retention: refused $p: parent unreadable"; continue; }
     case "$par/" in "$root"/*) ;; *) _cc_dj_log "retention: refused $p: parent resolves outside $root"; continue ;; esac
     if _cc_dj_ret_over_budget; then _cc_dj_log "retention: time budget spent; the rest waits for the next run"; break; fi
-    if [ "$kind" = d ]; then
-      if [ -d "$p" ] && rm -rf -- "$p"; then _CC_DJ_RET_REMOVED=$((_CC_DJ_RET_REMOVED + 1)); fi
-    else
-      if [ -f "$p" ] && rm -f -- "$p"; then _CC_DJ_RET_REMOVED=$((_CC_DJ_RET_REMOVED + 1)); fi
-    fi
+    if [ -f "$p" ] && rm -f -- "$p"; then _CC_DJ_RET_REMOVED=$((_CC_DJ_RET_REMOVED + 1)); fi
   done < "$list"
   return 0
 }
@@ -1394,6 +1418,8 @@ _cc_dj_retention() {  # [--report]
   _cc_dj_init_dirs || return 0
   if [ "$CC_DJ_RETENTION" = off ]; then _cc_dj_log "retention: CC_DJ_RETENTION=off; not run"; return 0; fi
   _CC_DJ_RET_RUN="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  # The uid a rule root must belong to; exported so the helper judges roots the same way.
+  CC_DJ_RET_UID="${CC_DJ_RET_UID:-$(id -u)}"; export CC_DJ_RET_UID
   case "$CC_DJ_RET_BUDGET_SECONDS" in ''|*[!0-9]*) _cc_dj_log "retention: CC_DJ_RET_BUDGET_SECONDS=$CC_DJ_RET_BUDGET_SECONDS is not a number; not run"; return 0 ;; esac
   _CC_DJ_RET_DEADLINE=$(( SECONDS + 10#$CC_DJ_RET_BUDGET_SECONDS ))
   _cc_dj_log "retention: start run=$_CC_DJ_RET_RUN report_only=$_CC_DJ_RET_REPORT"
