@@ -76,9 +76,9 @@ Environment:
                           hours untouched (default: 168; 0 never trims a dirty worktree)
   CC_WJ_TRIM_DIRTY_IDLE_HOURS_PRESSURE
                           Under disk pressure a worktree with uncommitted files waits this long
-                          instead (default: 24; 0 disables; never longer than the knob above).
-                          A rule on probation: CC_WJ_NEW_RULES_MODE=spotcheck only logs
-                          rule=dirty-pressure, auto lets it decide
+                          instead (default: 24, the installed config sets 6; 0 disables; never longer than
+                          the knob above). Listed in CC_WJ_PROMOTED_RULES by the installed config;
+                          otherwise CC_WJ_NEW_RULES_MODE=spotcheck only logs rule=dirty-pressure
   CC_WJ_PUSHED_IDLE_HOURS A clean worktree kept only as unlanded, whose HEAD a fetched
                           refs/remotes/origin/* ref already contains, is removable after this
                           many hours idle (default: 72; 0 disables). Needs CC_WJ_RECLAIM_PUSHED=1.
@@ -142,7 +142,8 @@ Environment:
                          logged (rule session-unknown-per-tree). global keeps every worktree
   CC_WJ_DENY_NAMES      Whitespace-separated names; a worktree whose directory name or branch
                          contains one, or that a live Claude session of that name stands in, is
-                         never trimmed or removed (default: none; the installed config sets it)
+                         never removed; a trim keeps the tree and treats it like any other
+                         (default: none; the installed config sets it)
 
 A worktree is removable only when it holds nothing a command cannot rebuild - or that an
 archive: line in .worktree-regenerable lets --apply copy out first - no process
@@ -5260,7 +5261,8 @@ _cc_wj_run_inner() {
   local total_reclaimed=0
   local total_trim_candidates=0
   local total_trimmed=0
-  local total_trim_reclaimed=0
+  local total_trim_reclaimed=0 trim_df_before=""
+  [ "$trim" -eq 1 ] && [ "$apply" -eq 1 ] && trim_df_before="$(_cc_wj_free_kb)"
   local prune_repos=()
 
   # Holder scans, taken once per run into files and taken again right before each removal.
@@ -5557,8 +5559,11 @@ DEFERRED_LINE
         continue
       fi
 
-      # Named in CC_WJ_DENY_NAMES: nothing in it is trimmed or removed, in either phase.
-      if _cc_wj_denied "$wt_path" "$branch"; then
+      # Named in CC_WJ_DENY_NAMES: the tree is never removed. A trim keeps the worktree, its
+      # branch and everything authored, so a named tree goes through the trim phase like any
+      # other, under every gate it asks (holder, live session, inbound link, idle window): a
+      # live session of that name is a holder there (stima-api#8198).
+      if [ "$trim" -eq 0 ] && _cc_wj_denied "$wt_path" "$branch"; then
         printf "  WORKTREE  %s\n" "$wt_path"
         printf "    branch=%s  dirty=%s  active=n/a\n" "$branch" "$dirty"
         printf "    classification: KEEP(%s)\n" "$_CC_WJ_DENY_REASON"
@@ -6318,8 +6323,19 @@ KEEP
   if [ "$trim" -eq 1 ]; then
     gb_str="$(awk -v b="$total_trim_reclaimed" 'BEGIN { printf "%.2f", b / 1073741824 }')"
     if [ "$apply" -eq 1 ]; then
-      printf "Summary: trimmed=%d  reclaimed=%s GB  kept=%d\n" \
-        "$total_trimmed" "$gb_str" "$total_kept"
+      # `reclaimed` is the sum of `du` over the removed directories. On APFS a directory cloned
+      # from a template frees little of that, so the volume's own free-space change is printed
+      # beside it: what the phase really gave back, other writers' traffic included.
+      local df_after df_gb="?"
+      df_after="$(_cc_wj_free_kb)"
+      case "$trim_df_before:$df_after" in
+        *[!0-9:]*|:*|*:) ;;
+        *) df_gb="$(awk -v b="$trim_df_before" -v a="$df_after" 'BEGIN { printf "%.2f", (a - b) / 1048576 }')" ;;
+      esac
+      # df-freed is in the printed summary only: the logged line is written when it changes, and a
+      # free-space figure changes every sweep.
+      printf "Summary: trimmed=%d  reclaimed=%s GB  kept=%d  df-freed=%s GB\n" \
+        "$total_trimmed" "$gb_str" "$total_kept" "$df_gb"
       _cc_wj_log_write_changed trim-summary "trim summary: trimmed=$total_trimmed reclaimed=${total_trim_reclaimed}B kept=$total_kept"
     else
       printf "Summary: trim-candidates=%d  kept=%d  (dry-run; use --apply --trim-regenerable to remove)\n" \

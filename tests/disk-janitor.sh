@@ -912,6 +912,43 @@ _mk_gocache; _gb_big; : > "$SPOT"
 FAKE_LSOF_PARTIAL=1 CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
 expect_yes "go-build lsof bound: a listing that exits 1 part-way deletes nothing in auto" test -f "$GB/0a/1111-a" -a -f "$GB/0a/1111-d"
 expect_yes "go-build lsof bound: and is reported unusable" grep -q 'verdict=nothing-deleted reason=lsof-unusable' "$SPOT"
+# HASH-d executable directories (go1.24 caches a `go run` binary as <xx>/<hash>-d/<name>; 19.6 of
+# 26.7 GiB of the live cache on 2026-11-13, stima-api#8198): listed as one entry each, aged by the
+# newest mtime inside, removed whole; one used inside the window, or held open, stays.
+_gb_hd() {  # <dir under cache> <dir age> <file age>, as `date -v` offsets
+  local d="$GB/$1"
+  mkdir -p "$d"; printf 'binary' > "$d/one-api"
+  touch -t "$(date -v-"$3" +%Y%m%d%H%M)" "$d/one-api"; touch -t "$(date -v-"$2" +%Y%m%d%H%M)" "$d"
+}
+_mk_gocache_hd() {
+  _mk_gocache
+  _gb_hd 0a/aaaa-d 3H 3H      # idle: listed and removed
+  _gb_hd 0a/bbbb-d 3H 5M      # directory old, executable used five minutes ago: kept
+  _gb_hd ff/cccc-d 5M 5M      # fresh: kept
+  _gb_hd 0a/dddd-d 3H 3H      # idle, and a process has its executable open
+}
+_mk_gocache_hd; _gb_run 15
+expect_yes "go-build-age dirs spotcheck: an idle executable directory is one entry, counted with the files" \
+  grep -Eq 'step=go-build-age end mode=spotcheck rule=go-build-age count=4 bytes=[0-9]+ verdict=would-remove' "$SPOT"
+expect_yes "go-build-age dirs spotcheck: and nothing is deleted" test -f "$GB/0a/aaaa-d/one-api" -a -f "$GB/0a/1111-a"
+_mk_gocache_hd; printf '%s\n' "$GB/0a/dddd-d/one-api" > "$SANDBOX/lsof-open"
+FAKE_LSOF_OPEN="$SANDBOX/lsof-open" CC_DJ_NEW_STEPS_MODE=auto _gb_run 15
+expect_no "go-build-age dirs auto: an idle executable directory is removed whole" test -e "$GB/0a/aaaa-d"
+expect_yes "go-build-age dirs auto: one whose executable was used inside the window stays" test -f "$GB/0a/bbbb-d/one-api"
+expect_yes "go-build-age dirs auto: so does a fresh one" test -f "$GB/ff/cccc-d/one-api"
+expect_yes "go-build-age dirs auto: and one a process holds open, executable and directory" test -f "$GB/0a/dddd-d/one-api"
+expect_yes "go-build-age dirs auto: the files still go and the other files stay" bash -c '! test -e "$1/0a/1111-a" && test -f "$1/0a/7777-d" && test -f "$1/README"' _ "$GB"
+expect_yes "go-build-age dirs auto: the log counts the held directory" \
+  grep -Eq 'step=go-build-age end mode=auto rule=go-build-age count=4 bytes=[0-9]+ rc=0 verdict=removed trigger=low-free removed=3 held=1' "$SPOT"
+# The ONLY executable directory is old but holds a member used inside the window: the listing is
+# still complete (the last directory's "fresh" verdict is not a failed find), the idle files go.
+_mk_gocache; _gb_hd 0a/bbbb-d 3H 5M; : > "$SPOT"; CC_DJ_NEW_STEPS_MODE=auto _gb_run 15
+expect_no "go-build-age dirs: a last directory kept as fresh does not make the listing incomplete" grep -q 'listing=incomplete' "$SPOT"
+expect_no "go-build-age dirs: and the idle regular files are still removed" test -e "$GB/0a/1111-a"
+expect_yes "go-build-age dirs: and the directory with a member used inside the window stays" test -f "$GB/0a/bbbb-d/one-api"
+_mk_gocache_hd; _gb_big; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
+expect_no "go-build cap auto: an idle executable directory goes with the cap trigger too" test -e "$GB/0a/aaaa-d"
+expect_yes "go-build cap auto: a directory inside the window stays" test -f "$GB/0a/bbbb-d/one-api"
 rm -f "$SANDBOX/lsof-open"
 mkdir -p "$SANDBOX/gb-uiux/uiux"; _mk_gocache; mv "$GB" "$SANDBOX/gb-uiux/uiux/go-build"
 CC_DJ_NEW_STEPS_MODE=auto GB_DIR="$SANDBOX/gb-uiux/uiux/go-build" _gb_run 15
@@ -1088,6 +1125,18 @@ expect_yes "go cache: nothing outside the hex subdirectories, whatever its name"
 expect_no "go cache: go clean is never run" grep -q "clean" "$GO_CAPTURE"
 expect_yes "go cache: the trim is a target that ran" \
   grep -q "clean: target 'go build cache (unused 3d+)' done" "$SANDBOX/dj.log"
+
+# An executable directory (<xx>/<hash>-d/<name>, go1.24 and later) is an entry too, aged by the
+# newest mtime inside it and removed whole (stima-api#8198).
+_gocache_fixture
+for f in 0a/aaaa-d 0a/bbbb-d ff/cccc-d fuzz/pkg/dddd-d; do mkdir -p "$FAKE_GOCACHE/$f"; printf x > "$FAKE_GOCACHE/$f/one-api"; done
+touch -t "$(date -v-10d +%Y%m%d%H%M)" "$FAKE_GOCACHE/0a/aaaa-d/one-api" "$FAKE_GOCACHE/0a/bbbb-d" "$FAKE_GOCACHE/0a/aaaa-d" "$FAKE_GOCACHE/fuzz/pkg/dddd-d/one-api" "$FAKE_GOCACHE/fuzz/pkg/dddd-d"
+_reset_captures
+_run_dj --clean 80 0
+expect_no "go cache: an executable directory unused for 10 days is removed whole" test -e "$FAKE_GOCACHE/0a/aaaa-d"
+expect_yes "go cache: one whose executable was used just now stays, though its directory is old" test -f "$FAKE_GOCACHE/0a/bbbb-d/one-api"
+expect_yes "go cache: a fresh one stays" test -f "$FAKE_GOCACHE/ff/cccc-d/one-api"
+expect_yes "go cache: one under fuzz/ stays" test -f "$FAKE_GOCACHE/fuzz/pkg/dddd-d/one-api"
 
 _gocache_fixture
 _reset_captures

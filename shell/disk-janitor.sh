@@ -649,19 +649,45 @@ _cc_dj_go_build_held() {  # <dir> <outfile>
   return 0
 }
 
-# How many listed entries ($2, NUL-separated) are in the held set ($1, one path per line).
-_cc_dj_go_build_count_held() {  # <held> <list>
+# How many listed entries (the NUL-separated lists after $1) are in the held set ($1, one path per
+# line). A held path holds its ancestors too, so an entry directory is held when anything inside it is:
+# a running `go run` executable is open as <cache>/<xx>/<hash>-d/<name>.
+_cc_dj_go_build_count_held() {  # <held> <list>...
   [ -s "$1" ] || { printf 0; return; }
-  perl -e 'open(H, "<", $ARGV[0]) or exit 2; my %h; while (<H>) { chomp; $h{$_} = 1 } close H;
-           $/ = "\0"; open(L, "<", $ARGV[1]) or exit 2; my $n = 0;
-           while (my $f = <L>) { chomp $f; $n++ if $h{$f} } print $n' "$1" "$2" 2>/dev/null || printf unknown
+  perl -e 'open(H, "<", shift @ARGV) or exit 2; my %h;
+           while (<H>) { chomp; $h{$_} = 1; my $q = $_; while ($q =~ s{/[^/]+$}{}) { $h{$q} = 1 } } close H;
+           $/ = "\0"; my $n = 0;
+           for my $lf (@ARGV) { open(L, "<", $lf) or exit 2; while (my $f = <L>) { chomp $f; $n++ if $h{$f} } close L }
+           print $n' "$@" 2>/dev/null || printf unknown
 }
 # The listed entries ($2) that are not in the held set ($1), NUL-separated, in order. Nonzero when
 # it could not be built, and the caller then deletes nothing.
 _cc_dj_go_build_unheld() {  # <held> <list>
-  perl -e 'open(H, "<", $ARGV[0]) or exit 2; my %h; while (<H>) { chomp; $h{$_} = 1 } close H;
+  perl -e 'open(H, "<", $ARGV[0]) or exit 2; my %h;
+           while (<H>) { chomp; $h{$_} = 1; my $q = $_; while ($q =~ s{/[^/]+$}{}) { $h{$q} = 1 } } close H;
            $/ = "\0"; open(L, "<", $ARGV[1]) or exit 2;
            while (my $f = <L>) { chomp $f; print $f, "\0" unless $h{$f} } close STDOUT or exit 3' "$1" "$2"
+}
+
+# The `<hash>-d` DIRECTORIES one level under the two-hex-digit subdirectories, NUL-separated: since
+# go1.24 `go run` and `go tool` cache their executable as <xx>/<hash>-d/<name>, 19.6 of the 26.7 GiB of
+# the live cache on 2026-11-13, and the regular-file selectors never saw them (stima-api#8198). One is
+# listed only when it is older than <age> minutes AND so is everything inside it: its age is its newest
+# member's. It is removed whole. find does not follow symlinks, so a symlinked entry is not a directory
+# here. A find that fails part-way is a non-zero status, and the caller deletes nothing from the list.
+_cc_dj_go_cache_dirs() {  # <cache> <age minutes>
+  (
+    set -o pipefail
+    local inside
+    find "$1" -mindepth 2 -maxdepth 2 -path "$1/[0-9a-f][0-9a-f]/*-d" -type d -mmin +"$2" -print0 2>/dev/null |
+    while IFS= read -r -d '' d; do
+      # Only an inner find that exits 0 with no output makes a directory stale: one that fails
+      # (unreadable, vanished) keeps it, and this status is the outer find's alone.
+      if inside="$(find "$d" ! -mmin +"$2" -print -quit 2>/dev/null)" && [ -z "$inside" ]; then
+        printf '%s\0' "$d"
+      fi
+    done
+  )
 }
 
 # Go build cache age trim (rule go-build-age), a step added to the act after 2026-10-24
@@ -687,9 +713,10 @@ _cc_dj_go_build_unheld() {  # <held> <list>
 # system-wide lsof listing taken right before the delete: an entry any process holds open is taken
 # off the list, and an lsof that cannot report deletes nothing (verdict=nothing-deleted
 # reason=lsof-unusable). Only regular files one
-# level under the two-hex-digit subdirectories: never README, trim.txt or other top-level files
-# (an old testexpire.txt deleted would make expired test results valid again), never the
-# directories, never through a symlink (find does not follow them, and a symlinked cache root
+# level under the two-hex-digit subdirectories and the `<hash>-d` directories there
+# (_cc_dj_go_cache_dirs): never README, trim.txt or other top-level files
+# (an old testexpire.txt deleted would make expired test results valid again), never another
+# directory, never through a symlink (find does not follow them, and a symlinked cache root
 # is refused).
 #
 # One find pass lists the candidates, one stat pass sums their sizes; auto then removes exactly
@@ -700,7 +727,7 @@ _cc_dj_go_build_unheld() {  # <held> <list>
 _cc_dj_act_go_build_age() {
   local step_before="$1" age="$CC_DJ_GO_BUILD_MAX_AGE_MIN" mode="$CC_DJ_NEW_STEPS_MODE"
   local low_gb dir why slog runid list sizes bound deadline left rc count bytes sample label
-  local trigger soft_kb cap_kb cache_kb="" du_out mbound held held_n=0 keep kept_n
+  local trigger soft_kb cap_kb cache_kb="" du_out mbound held held_n=0 keep kept_n dlist dkeep dcount dbytes
   _CC_DJ_STEP_LINES=""
   label="go build cache age trim"
   [ "$age" = off ] && return 0
@@ -791,18 +818,24 @@ _cc_dj_act_go_build_age() {
   _cc_dj_spot() { printf '[%s] run=%s step=go-build-age %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$runid" "$*" >> "$slog" 2>/dev/null || true; }
   _cc_dj_spot "start mode=$mode rule=go-build-age dir=$dir max_age_min=$age trigger=$trigger${cache_kb:+ cache_kb=$cache_kb}"
   list="$CC_DJ_STATE_DIR/go-build-age.$$.list"; sizes="$CC_DJ_STATE_DIR/go-build-age.$$.sizes"
+  dlist="$CC_DJ_STATE_DIR/go-build-age.$$.dlist"; dkeep="$CC_DJ_STATE_DIR/go-build-age.$$.dkeep"
   deadline=$(( $(date +%s) + bound ))
   # find does not follow symlinks (-P is its default): a symlinked hex directory is not
   # descended, and a symlinked entry is not -type f.
   rc=0
   _cc_dj_run_bounded "$bound" find "$dir" -mindepth 2 -maxdepth 2 -path "$dir/[0-9a-f][0-9a-f]/*" \
     -type f ! -name README ! -name trim.txt -mmin +"$age" -print0 > "$list" 2>/dev/null || rc=$?
-  count="$(tr -cd '\000' < "$list" 2>/dev/null | wc -c | tr -d ' ')"; count="${count:-0}"
+  : > "$dlist"
+  if [ "$rc" -eq 0 ]; then
+    left=$(( deadline - $(date +%s) )); [ "$left" -ge 1 ] || left=1
+    _cc_dj_run_bounded "$left" _cc_dj_go_cache_dirs "$dir" "$age" > "$dlist" 2>/dev/null || rc=$?
+  fi
+  count="$(cat "$list" "$dlist" 2>/dev/null | tr -cd '\000' | wc -c | tr -d ' ')"; count="${count:-0}"
   if [ "$rc" -ne 0 ]; then
     # 124 is the bound; anything else is find failing part-way. Either way the list may be
     # cut mid-path, so nothing is deleted from it.
     _cc_dj_spot "end mode=$mode rule=go-build-age listing=incomplete rc=$rc partial_count=$count verdict=nothing-deleted"
-    unset -f _cc_dj_spot; rm -f "$list" "$sizes"
+    unset -f _cc_dj_spot; rm -f "$list" "$sizes" "$dlist"
     _CC_DJ_STEP_LINES="- $label ($mode): listing $dir did not finish (rc=$rc, bound ${bound}s); nothing deleted; run=$runid in $slog"
     return 0
   fi
@@ -814,8 +847,15 @@ _cc_dj_act_go_build_age() {
     rc=0
     _cc_dj_run_bounded "$left" /bin/sh -c 'exec xargs -0 /usr/bin/stat -f %z < "$1"' _ "$list" > "$sizes" 2>/dev/null || rc=$?
     bytes="$(awk '{ s += $1 } END { printf "%d", s }' "$sizes" 2>/dev/null)"; bytes="${bytes:-0}"
+    # A directory entry weighs what `du` says of it, as one unit.
+    if [ -s "$dlist" ]; then
+      left=$(( deadline - $(date +%s) )); [ "$left" -ge 1 ] || left=1
+      _cc_dj_run_bounded "$left" /bin/sh -c 'exec xargs -0 /usr/bin/du -sk < "$1"' _ "$dlist" > "$sizes" 2>/dev/null || rc=$?
+      dbytes="$(awk '{ s += $1 * 1024 } END { printf "%d", s }' "$sizes" 2>/dev/null)"
+      bytes=$(( bytes + ${dbytes:-0} ))
+    fi
     [ "$rc" -eq 0 ] || bytes="${bytes}+"
-    sample="$(tr '\000' '\n' < "$list" | head -3 | tr '\n' ' ')"; sample="${sample% }"
+    sample="$(cat "$list" "$dlist" | tr '\000' '\n' | head -3 | tr '\n' ' ')"; sample="${sample% }"
   fi
   if [ "$count" -eq 0 ]; then
     _cc_dj_spot "end mode=$mode rule=go-build-age count=0 bytes=0 verdict=none"
@@ -823,7 +863,7 @@ _cc_dj_act_go_build_age() {
   elif [ "$mode" = spotcheck ]; then
     # What an auto run would skip: the entries a process holds open right now, from one lsof.
     held="$CC_DJ_STATE_DIR/go-build-age.$$.held"
-    if _cc_dj_go_build_held "$dir" "$held"; then held_n="$(_cc_dj_go_build_count_held "$held" "$list")"; else held_n="unknown"; fi
+    if _cc_dj_go_build_held "$dir" "$held"; then held_n="$(_cc_dj_go_build_count_held "$held" "$list" "$dlist")"; else held_n="unknown"; fi
     rm -f "$held"
     _cc_dj_spot "end mode=spotcheck rule=go-build-age count=$count bytes=$bytes verdict=would-remove decision=would-remove trigger=$trigger held=$held_n sample=$sample"
     _CC_DJ_STEP_LINES="- $label (spotcheck, rule go-build-age): would remove $count entries ($bytes bytes) unused ${age}+ min in $dir; trigger $trigger; nothing deleted; run=$runid in $slog"
@@ -837,27 +877,33 @@ _cc_dj_act_go_build_age() {
       # is taken off the list, and an lsof that cannot report deletes nothing.
       held="$CC_DJ_STATE_DIR/go-build-age.$$.held"; keep="$CC_DJ_STATE_DIR/go-build-age.$$.keep"
       if ! _cc_dj_go_build_held "$dir" "$held"; then
-        rm -f "$held" "$keep"
+        rm -f "$held" "$keep" "$dkeep"
         _cc_dj_spot "end mode=auto rule=go-build-age count=$count bytes=$bytes verdict=nothing-deleted reason=lsof-unusable trigger=$trigger"
         _CC_DJ_STEP_LINES="- $label (auto): lsof cannot report open files, so holders cannot be ruled out; nothing deleted; run=$runid in $slog"
-        unset -f _cc_dj_spot; rm -f "$list" "$sizes"
+        unset -f _cc_dj_spot; rm -f "$list" "$sizes" "$dlist"
         return 0
       fi
-      held_n="$(_cc_dj_go_build_count_held "$held" "$list")"
+      held_n="$(_cc_dj_go_build_count_held "$held" "$list" "$dlist")"
       _cc_dj_go_build_unheld "$held" "$list" > "$keep" 2>/dev/null || { : > "$keep"; held_n="unknown"; }
-      kept_n="$(tr -cd '\000' < "$keep" 2>/dev/null | wc -c | tr -d ' ')"; kept_n="${kept_n:-0}"
-      # rm -f without -r: a path that became a directory since the listing is left; a path
-      # that became a symlink loses the link, never its target.
+      _cc_dj_go_build_unheld "$held" "$dlist" > "$dkeep" 2>/dev/null || { : > "$dkeep"; held_n="unknown"; }
+      kept_n="$(cat "$keep" "$dkeep" 2>/dev/null | tr -cd '\000' | wc -c | tr -d ' ')"; kept_n="${kept_n:-0}"
+      # Files: rm -f without -r, so a path that became a directory since the listing is left, and
+      # a path that became a symlink loses the link, never its target. The `<hash>-d` directories
+      # are what the listing named, removed whole; a symlink that replaced one loses only itself.
       rc=0
-      if [ "$kept_n" -gt 0 ]; then
+      if [ -s "$keep" ]; then
         _cc_dj_run_bounded "$left" /bin/sh -c 'exec xargs -0 rm -f -- < "$1"' _ "$keep" >/dev/null 2>&1 || rc=$?
+      fi
+      if [ -s "$dkeep" ]; then
+        left=$(( deadline - $(date +%s) )); [ "$left" -ge 1 ] || left=1
+        _cc_dj_run_bounded "$left" /bin/sh -c 'exec xargs -0 rm -rf -- < "$1"' _ "$dkeep" >/dev/null 2>&1 || rc=$?
       fi
       _cc_dj_spot "end mode=auto rule=go-build-age count=$count bytes=$bytes rc=$rc verdict=removed trigger=$trigger removed=$kept_n held=$held_n sample=$sample"
       _CC_DJ_STEP_LINES="- $label (auto, rule go-build-age): removed $count entries ($bytes bytes listed) unused ${age}+ min in $dir; trigger $trigger (rc=$rc; $(_cc_dj_fmt_kb_delta $(( $(_cc_dj_free_kb) - step_before ))) freed)$([ "$held_n" != 0 ] && printf '; %s held open and kept' "$held_n"); run=$runid in $slog"
-      rm -f "$held" "$keep"
+      rm -f "$held" "$keep" "$dkeep"
     fi
   fi
-  unset -f _cc_dj_spot; rm -f "$list" "$sizes"
+  unset -f _cc_dj_spot; rm -f "$list" "$sizes" "$dlist"
   return 0
 }
 
@@ -1899,8 +1945,23 @@ _cc_dj_go_cache_trim() {
     return 0
   fi
   _cc_dj_clean_target "go build cache (unused ${CC_DJ_GO_CACHE_TRIM_DAYS}d+)" \
-    find "$dir" -mindepth 2 -maxdepth 2 -path "$dir/[0-9a-f][0-9a-f]/*" -type f \
-      \( -name '*-a' -o -name '*-d' \) -mmin +"$(( CC_DJ_GO_CACHE_TRIM_DAYS * 1440 ))" -delete
+    _cc_dj_go_cache_age_trim "$dir" "$(( CC_DJ_GO_CACHE_TRIM_DAYS * 1440 ))"
+}
+
+# The trim itself: the files, then the `<hash>-d` directories (_cc_dj_go_cache_dirs), each removed whole.
+# Status 0 only when both finished.
+_cc_dj_go_cache_age_trim() {  # <cache> <age minutes>
+  local dir="$1" age="$2" d rc=0 dirs
+  find "$dir" -mindepth 2 -maxdepth 2 -path "$dir/[0-9a-f][0-9a-f]/*" -type f \
+    \( -name '*-a' -o -name '*-d' \) -mmin +"$age" -delete || rc=$?
+  dirs="$(mktemp "${TMPDIR:-/tmp}/go-cache-dirs.XXXXXX")" || return 1
+  if _cc_dj_go_cache_dirs "$dir" "$age" > "$dirs"; then
+    while IFS= read -r -d '' d; do rm -rf -- "${d:?}" || rc=$?; done < "$dirs"
+  else
+    rc=1
+  fi
+  rm -f "$dirs"
+  return "$rc"
 }
 
 # Every process's full command line (`ww`: an MCP server's path into ~/.npm/_npx is long, and

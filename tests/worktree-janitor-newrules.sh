@@ -4,7 +4,7 @@
 #   primary-skills-link  nor does a .claude/skills or .claude/commands link into the primary checkout
 #   CC_WJ_NEW_RULES_MODE spotcheck (default) logs what they would trim or remove and changes nothing;
 #                        auto lets them decide
-#   CC_WJ_DENY_NAMES     a named worktree is never trimmed or removed
+#   CC_WJ_DENY_NAMES     a named worktree is never removed; it is trimmed like any other tree
 #   inbound-symlink      a tree that another worktree's node_modules symlink points into is kept
 #                        (active in every mode: a keep only makes the sweep safer); a dead link
 #                        is reported, never counted; a failed scan keeps
@@ -210,8 +210,13 @@ check "  and keeps the worktree, its link and its own work" \
   bash -c '[ -L "$1/.claude/skills" ] && [ -f "$1/trimme.txt" ] && git -C "$1" rev-parse -q --verify HEAD' _ "$T/wt-trimme"
 check "auto: a held tree keeps its node_modules" test -d "$T/wt-trimheld/node_modules"
 check "  and says it is held" says "$T/trim-auto.txt" trimheld "KEEP(active-session)"
-check "deny: a deny-listed tree keeps its node_modules" test -d "$T/wt-homepage-bento/node_modules"
-check "deny: so does the one a deny-listed session stands in" test -d "$T/wt-sessiondeny/node_modules"
+# The list keeps the tree for removal, and a trim keeps it too: only its regenerable directories
+# go, under the same predicate as any other tree (stima-api#8198).
+refute "deny: a deny-listed tree with no holder has its node_modules trimmed, like any other" test -e "$T/wt-homepage-bento/node_modules"
+check "  and keeps the worktree, its branch and its files" \
+  bash -c 'test -f "$1/wt-homepage-bento/README.md" && git -C "$2" show-ref -q --verify refs/heads/homepage-bento' _ "$T" "$PRIMARY"
+check "  and the report still says KEEP(deny-listed) for removal" judged "$T/report-auto.txt" homepage-bento "KEEP(deny-listed:homepage)"
+check "deny: the tree a live deny-listed session stands in keeps its node_modules (a holder, not the list)" test -d "$T/wt-sessiondeny/node_modules"
 
 # Nothing to trim is answered before the claim lookups and the idle walk.
 walked() { grep -F -- "-mmin" "$FIND_LOG" | grep -qF -- "$1 "; }
