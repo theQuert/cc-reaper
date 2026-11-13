@@ -1168,6 +1168,17 @@ OUT="$(HD_MIN_AGE=2000 hd_cap_run "$R")"
 check "a window longer than every entry's age takes no directory" "$(hd_left "$R")" \
   "^./cc/old1-d ./cc/old2-d ./dd/fresh-d ./dd/inwin-d $"
 
+# A name with a newline reaches the newline-separated victim list as two lines; the piece that is
+# not `<cache>/<xx>/<entry>` must never reach `rm -rf` (here a relative `victim-d` beside the cwd).
+R="$WORK/hd4"; hd_cap_fixture "$R"; mkdir -p "$R/cwd/victim-d"; : > "$R/cwd/victim-d/keep"
+touch -t "$(mins_ago 600)" "$R/cwd/victim-d/keep" "$R/cwd/victim-d"   # idle, so the split-off line names a stale directory
+mkdir -p "$R/gc/cc/$(printf 'nl\nvictim-d')"; mib "$R/gc/cc/$(printf 'nl\nvictim-d')/one-api" 4
+touch -t "$(mins_ago 500)" "$R/gc/cc/$(printf 'nl\nvictim-d')/one-api" "$R/gc/cc/$(printf 'nl\nvictim-d')"
+OUT="$(cd "$R/cwd" && hd_cap_run "$R")"
+check "a victim-list line outside <cache>/<xx>/<entry> (a newline-split name) is not removed" \
+  "$(test -f "$R/cwd/victim-d/keep" && echo victim-kept)" "victim-kept"
+check "  and the drop is logged" "$OUT" "dropped [0-9]* list line"
+
 # The age trim: --go-cache (3 days) and its dry run's count.
 hd_trim_fixture() {
   local root="$1"

@@ -1361,7 +1361,8 @@ go_cache_dirs() {
   "$FIND" "$GO_CACHE_DIR" -mindepth 2 -maxdepth 2 -path "$GO_CACHE_DIR/[0-9a-f][0-9a-f]/*-d" -type d 2>/dev/null |
   while IFS= read -r d; do
     # One member modified inside the window, the directory itself included, keeps the unit.
-    inside="$("$FIND" "$d" ! -mmin +"$min" -print -quit 2>/dev/null)"
+    # A find that fails (unreadable, vanished) is neither: the directory is kept out of both lists.
+    inside="$("$FIND" "$d" ! -mmin +"$min" -print -quit 2>/dev/null)" || continue
     if [ -z "$inside" ]; then [ "$want" = stale ] && printf '%s\n' "$d"
     else [ "$want" = fresh ] && printf '%s\n' "$d"; fi
   done
@@ -1385,6 +1386,23 @@ go_cache_rows() {
   return 0
 }
 
+# Lines that are exactly `<GO_CACHE_DIR>/<two hex digits>/<one component ending -a or -d>` pass;
+# anything else is dropped before an `rm -rf`, and the count goes to stderr. A name with a newline
+# in it reaches a newline-separated list as several lines, and only the pieces of that shape are
+# trusted as paths (stima-api#8198).
+go_entry_filter() {
+  local l n=0
+  while IFS= read -r l; do
+    case "$l" in
+      "$GO_CACHE_DIR"/[0-9a-f][0-9a-f]/*/*|"$GO_CACHE_DIR"/[0-9a-f][0-9a-f]/) n=$((n + 1)) ;;
+      "$GO_CACHE_DIR"/[0-9a-f][0-9a-f]/?*-[ad]) printf '%s\n' "$l" ;;
+      *) n=$((n + 1)) ;;
+    esac
+  done
+  [ "$n" -eq 0 ] || log "go cache: dropped $n list line(s) that are not a cache entry before deleting" >&2
+  return 0
+}
+
 # The files Go's own trim removes: `<hash>-a` and `<hash>-d` in the two-hex-digit
 # subdirectories, and the `<hash>-d` directories (go_cache_dirs), each removed as one unit.
 # Nothing at the top: an old `testexpire.txt` deleted here would make
@@ -1394,7 +1412,7 @@ go_stale_entries() {
   "$FIND" "$GO_CACHE_DIR" -mindepth 2 -maxdepth 2 -path "$GO_CACHE_DIR/[0-9a-f][0-9a-f]/*" \
     \( -name '*-a' -o -name '*-d' \) -type f -mmin +"$GO_TRIM_MINUTES" "$@" 2>/dev/null
   local d
-  go_cache_dirs stale "$GO_TRIM_MINUTES" | while IFS= read -r d; do
+  go_cache_dirs stale "$GO_TRIM_MINUTES" | { if [ "${1:-}" = -delete ]; then go_entry_filter; else cat; fi; } | while IFS= read -r d; do
     if [ "${1:-}" = -delete ]; then rm -rf -- "${d:?}" 2>/dev/null; else printf '%s\n' "$d"; fi
   done
   return 0
@@ -1517,7 +1535,7 @@ go_lru_cap() {
     log "go cache cap WOULD delete ${n} file(s) oldest-first (cache is $(as_gb "$before"), max ${GO_CAP_MAX_GB}GB, target ${GO_CAP_TARGET_GB}GB, none modified within ${GO_CAP_MIN_AGE_MIN}m)"
   else
     # -r: an entry is a file or a `<hash>-d` directory, and only those are in the list.
-    tr '\n' '\0' < "$list" | xargs -0 rm -rf 2>/dev/null
+    go_entry_filter < "$list" | tr '\n' '\0' | xargs -0 rm -rf 2>/dev/null
     after="$(kb_of "$GO_CACHE_DIR")"
     log "go cache cap: $(as_gb "$before") is over ${GO_CAP_MAX_GB}GB; deleted ${n} file(s) oldest-first, none modified within ${GO_CAP_MIN_AGE_MIN}m -> $(as_gb "$after") (target ${GO_CAP_TARGET_GB}GB)"
     if [ "${after:-0}" -gt "$target_kb" ]; then
