@@ -1351,13 +1351,53 @@ go_is_running() {
 
 go_cache_gb() { du -sm "$GO_CACHE_DIR" 2>/dev/null | awk '{printf "%d", $1/1024}'; }
 
+# The `<hash>-d` DIRECTORIES in the two-hex-digit subdirectories, the other entry form: since
+# go1.24 `go run` and `go tool` cache their executable as `<xx>/<hash>-d/<name>`, 19.6 of the
+# 26.7 GiB of this host's cache on 2026-11-13, and every selector below used to list regular
+# files only (stima-api#8198). `go_cache_dirs stale <min>` prints those whose newest mtime,
+# the directory's own or anything inside, is older than <min> minutes; `fresh` prints the rest.
+go_cache_dirs() {
+  local want="$1" min="$2" d inside
+  "$FIND" "$GO_CACHE_DIR" -mindepth 2 -maxdepth 2 -path "$GO_CACHE_DIR/[0-9a-f][0-9a-f]/*-d" -type d 2>/dev/null |
+  while IFS= read -r d; do
+    # One member modified inside the window, the directory itself included, keeps the unit.
+    inside="$("$FIND" "$d" ! -mmin +"$min" -print -quit 2>/dev/null)"
+    if [ -z "$inside" ]; then [ "$want" = stale ] && printf '%s\n' "$d"
+    else [ "$want" = fresh ] && printf '%s\n' "$d"; fi
+  done
+  return 0
+}
+
+# Both entry forms, one row each: "<mtime> <512-byte blocks> <path>". A directory's mtime is its
+# newest member's and its blocks are `du`'s, so it sorts and counts as the one unit it is removed as.
+# `go_cache_rows stale <min>` is what is older than <min> minutes, `fresh` what is not.
+go_cache_rows() {
+  local want="$1" min="$2" d m kb age
+  if [ "$want" = stale ]; then age=( -mmin +"$min" ); else age=( ! -mmin +"$min" ); fi
+  "$FIND" "$GO_CACHE_DIR" -mindepth 2 -maxdepth 2 -path "$GO_CACHE_DIR/[0-9a-f][0-9a-f]/*" \
+    \( -name '*-a' -o -name '*-d' \) -type f "${age[@]}" \
+    -exec /usr/bin/stat -f '%m %b %N' {} + 2>/dev/null
+  go_cache_dirs "$want" "$min" | while IFS= read -r d; do
+    m="$("$FIND" "$d" -exec /usr/bin/stat -f '%m' {} + 2>/dev/null | sort -n | tail -n 1)"
+    kb="$(kb_of "$d")"
+    printf '%s %s %s\n' "${m:-0}" "$((kb * 2))" "$d"
+  done
+  return 0
+}
+
 # The files Go's own trim removes: `<hash>-a` and `<hash>-d` in the two-hex-digit
-# subdirectories. Nothing at the top: an old `testexpire.txt` deleted here would make
+# subdirectories, and the `<hash>-d` directories (go_cache_dirs), each removed as one unit.
+# Nothing at the top: an old `testexpire.txt` deleted here would make
 # test results `go clean -testcache` had expired valid again. Nothing in `fuzz/`, which
 # holds generated corpora Go's trim leaves alone. Extra arguments go to find (`-delete`).
 go_stale_entries() {
   "$FIND" "$GO_CACHE_DIR" -mindepth 2 -maxdepth 2 -path "$GO_CACHE_DIR/[0-9a-f][0-9a-f]/*" \
     \( -name '*-a' -o -name '*-d' \) -type f -mmin +"$GO_TRIM_MINUTES" "$@" 2>/dev/null
+  local d
+  go_cache_dirs stale "$GO_TRIM_MINUTES" | while IFS= read -r d; do
+    if [ "${1:-}" = -delete ]; then rm -rf -- "${d:?}" 2>/dev/null; else printf '%s\n' "$d"; fi
+  done
+  return 0
 }
 
 reap_go_cache() {
@@ -1443,17 +1483,16 @@ reap_go_cache() {
 
 # The size cap. Age alone cannot hold a cache that grows 26 GiB/hour (2026-10-14): every
 # worktree path is a new key, so the same packages are rebuilt and cached once per tree.
-# Above CC_GO_CACHE_MAX_GB, files go oldest-mtime-first until CC_GO_CACHE_TARGET_GB is left,
-# and never a file modified within CC_GO_CACHE_MIN_AGE_MIN minutes. The same entries as
-# go_stale_entries (`<hash>-a`/`-d` in the two-hex-digit subdirectories), so the top-level
-# files and fuzz/ stay. A deleted entry is a miss, never an error.
+# Above CC_GO_CACHE_MAX_GB, entries go oldest-mtime-first until CC_GO_CACHE_TARGET_GB is left,
+# and never an entry modified within CC_GO_CACHE_MIN_AGE_MIN minutes. The same entries as
+# go_stale_entries (`<hash>-a`/`-d` files and `<hash>-d` directories in the two-hex-digit
+# subdirectories, go_cache_rows), so the top-level files and fuzz/ stay. A deleted entry is a
+# miss, never an error.
 # go_lru_victims <size KiB> <target KiB> <min age minutes> prints the victims' paths.
 go_lru_victims() {
   local size_kb="$1" target_kb="$2" min_age="$3" need_blocks
   need_blocks=$(( (size_kb - target_kb) * 2 ))   # stat %b counts 512-byte blocks
-  "$FIND" "$GO_CACHE_DIR" -mindepth 2 -maxdepth 2 -path "$GO_CACHE_DIR/[0-9a-f][0-9a-f]/*" \
-    \( -name '*-a' -o -name '*-d' \) -type f -mmin +"$min_age" \
-    -exec /usr/bin/stat -f '%m %b %N' {} + 2>/dev/null \
+  go_cache_rows stale "$min_age" \
     | sort -n | awk -v need="$need_blocks" '
         { sum += $2; sub(/^[0-9]+ [0-9]+ /, ""); print; if (sum >= need) exit }'
 }
@@ -1477,10 +1516,16 @@ go_lru_cap() {
   if [ "$DRY" -eq 1 ]; then
     log "go cache cap WOULD delete ${n} file(s) oldest-first (cache is $(as_gb "$before"), max ${GO_CAP_MAX_GB}GB, target ${GO_CAP_TARGET_GB}GB, none modified within ${GO_CAP_MIN_AGE_MIN}m)"
   else
-    tr '\n' '\0' < "$list" | xargs -0 rm -f 2>/dev/null
+    # -r: an entry is a file or a `<hash>-d` directory, and only those are in the list.
+    tr '\n' '\0' < "$list" | xargs -0 rm -rf 2>/dev/null
     after="$(kb_of "$GO_CACHE_DIR")"
     log "go cache cap: $(as_gb "$before") is over ${GO_CAP_MAX_GB}GB; deleted ${n} file(s) oldest-first, none modified within ${GO_CAP_MIN_AGE_MIN}m -> $(as_gb "$after") (target ${GO_CAP_TARGET_GB}GB)"
-    [ "${after:-0}" -le "$target_kb" ] || log "go cache cap: still over the target; what remains was modified within ${GO_CAP_MIN_AGE_MIN}m"
+    if [ "${after:-0}" -gt "$target_kb" ]; then
+      # Measured, not asserted: what is left inside the window, and what is not an entry at all.
+      local within_kb
+      within_kb="$(go_cache_rows fresh "$((10#$GO_CAP_MIN_AGE_MIN))" | awk '{ s += $2 } END { printf "%d", s / 2 }')"
+      log "go cache cap: still over the target; $(as_gb "$after") remains, $(as_mb "$within_kb")MiB of it modified within ${GO_CAP_MIN_AGE_MIN}m (measured), $(as_mb "$(( after > within_kb ? after - within_kb : 0 ))")MiB not a removable entry (top-level files, fuzz/, or an entry the cap skipped)"
+    fi
   fi
   rm -f "$list"
 }

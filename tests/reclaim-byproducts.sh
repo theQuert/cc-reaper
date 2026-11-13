@@ -1121,6 +1121,73 @@ check "--go-cache trims the go cache under pressure" "$OUT_GO_ONLY" \
   "ceiling 3GB" "scratchpad"
 check "--go-cache writes no stamp" "$OUT_GO_ONLY" "No such file"
 
+# ---------------------------------------------------------------- HASH-d executable directories
+# Since go1.24 `go run` and `go tool` cache their executable as `<xx>/<hash>-d/<name>`, a
+# directory, and on 2026-11-13 those held 19.6 of the cache's 26.7 GiB while every selector
+# listed regular files only (stima-api#8198). A directory is aged by the newest mtime inside
+# it and removed as one unit; one modified inside the window is never taken.
+mins_ago() { date -v-"$1"M +%Y%m%d%H%M 2>/dev/null || date -d "$1 minutes ago" +%Y%m%d%H%M; }
+mib() { dd if=/dev/zero of="$1" bs=1048576 count="${2:-1}" 2>/dev/null; }
+# hd_dir <parent> <entry name> <MiB> <dir age min> <file age min>
+hd_dir() {
+  local d="$1/$2"
+  mkdir -p "$d"; mib "$d/one-api" "$3"
+  touch -t "$(mins_ago "$5")" "$d/one-api"
+  touch -t "$(mins_ago "$4")" "$d"
+}
+# Two idle executable directories (4 MiB each, 400 and 300 minutes), one whose directory is old
+# but whose executable was used 5 minutes ago, one used 5 minutes ago: 12 MiB in all.
+hd_cap_fixture() {
+  local root="$1"
+  rm -rf "$root"; mkdir -p "$root/gc/cc" "$root/gc/dd" "$root/home"
+  hd_dir "$root/gc/cc" old1-d 4 400 400
+  hd_dir "$root/gc/cc" old2-d 4 300 300
+  hd_dir "$root/gc/dd" inwin-d 2 300 5
+  hd_dir "$root/gc/dd" fresh-d 2 5 5
+}
+hd_cap_run() { # root, then the arguments (default --go-cache-cap); env from the caller
+  local root="$1"; shift
+  env HOME="$root/home" BYPRODUCT_GO_CACHE_DIR="$root/gc" BYPRODUCT_LOG="$root/log" \
+    CC_GO_CACHE_MAX_GB=0.0078125 CC_GO_CACHE_TARGET_GB=0.001953125 \
+    CC_GO_CACHE_MIN_AGE_MIN="${HD_MIN_AGE:-60}" \
+    bash "$SCRIPT" "${@:---go-cache-cap}" 2>&1
+}
+hd_left() { (cd "$1/gc" && find . -mindepth 2 -maxdepth 2 -name '*-d' | sort | tr '\n' ' '); }
+
+R="$WORK/hd1"; hd_cap_fixture "$R"
+OUT="$(hd_cap_run "$R")"
+check "--go-cache-cap removes executable directories idle past the window, as one unit" \
+  "$(hd_left "$R")" "^./dd/fresh-d ./dd/inwin-d $"
+check "  and says it deleted both" "$OUT" "deleted 2 file(s) oldest-first"
+check "  and keeps one whose executable was used inside the window, though its directory is old" \
+  "$(hd_left "$R")" "inwin-d"
+check "  and measures what remains inside the window (4 MiB) instead of asserting it" "$OUT" \
+  "still over the target.* 4\.[0-9]MiB of it modified within 60m (measured)"
+R="$WORK/hd3"; hd_cap_fixture "$R"
+OUT="$(HD_MIN_AGE=2000 hd_cap_run "$R")"
+check "a window longer than every entry's age takes no directory" "$(hd_left "$R")" \
+  "^./cc/old1-d ./cc/old2-d ./dd/fresh-d ./dd/inwin-d $"
+
+# The age trim: --go-cache (3 days) and its dry run's count.
+hd_trim_fixture() {
+  local root="$1"
+  build_fixture "$root"; go_ceiling_fixture "$root"
+  mkdir -p "$root/gocache/dd"
+  hd_dir "$root/gocache/dd" idle-d 1 5760 5760   # four days
+  hd_dir "$root/gocache/dd" hot-d 1 5760 60      # directory four days old, executable used an hour ago
+  hd_dir "$root/gocache/dd" new-d 1 60 60
+}
+hd_trim_left() { (cd "$1/gocache/dd" && find . -mindepth 1 -maxdepth 1 -type d | sort | tr '\n' ' '); }
+hd_trim_fixture "$WORK/ht"
+OUT="$(PATH_PREFIX_OVERRIDE="$WORK/ht/gobin" _run "$WORK/ht" "$SCRIPT" --dry-run)"
+check "the age trim's dry run counts an idle executable directory beside the two idle files" "$OUT" \
+  "go cache WOULD trim 3 entr"
+hd_trim_fixture "$WORK/ht2"
+PATH_PREFIX_OVERRIDE="$WORK/ht2/gobin" _run "$WORK/ht2" "$SCRIPT" --go-cache >/dev/null
+check "--go-cache removes an executable directory idle past the age" "$(hd_trim_left "$WORK/ht2")" \
+  "^./hot-d ./new-d $"
+check "  and keeps a directory holding a file used inside the age" "$(hd_trim_left "$WORK/ht2")" "hot-d"
+
 # ---------------------------------------------------------------- mutations
 
 # Each entry: label | sed program applied to a copy of the script | pattern that must
