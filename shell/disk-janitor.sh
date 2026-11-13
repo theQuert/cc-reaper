@@ -678,9 +678,14 @@ _cc_dj_go_build_unheld() {  # <held> <list>
 _cc_dj_go_cache_dirs() {  # <cache> <age minutes>
   (
     set -o pipefail
+    local inside
     find "$1" -mindepth 2 -maxdepth 2 -path "$1/[0-9a-f][0-9a-f]/*-d" -type d -mmin +"$2" -print0 2>/dev/null |
     while IFS= read -r -d '' d; do
-      [ -z "$(find "$d" ! -mmin +"$2" -print -quit 2>/dev/null)" ] && printf '%s\0' "$d"
+      # Only an inner find that exits 0 with no output makes a directory stale: one that fails
+      # (unreadable, vanished) keeps it, and this status is the outer find's alone.
+      if inside="$(find "$d" ! -mmin +"$2" -print -quit 2>/dev/null)" && [ -z "$inside" ]; then
+        printf '%s\0' "$d"
+      fi
     done
   )
 }

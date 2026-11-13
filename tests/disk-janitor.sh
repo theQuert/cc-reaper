@@ -940,6 +940,12 @@ expect_yes "go-build-age dirs auto: and one a process holds open, executable and
 expect_yes "go-build-age dirs auto: the files still go and the other files stay" bash -c '! test -e "$1/0a/1111-a" && test -f "$1/0a/7777-d" && test -f "$1/README"' _ "$GB"
 expect_yes "go-build-age dirs auto: the log counts the held directory" \
   grep -Eq 'step=go-build-age end mode=auto rule=go-build-age count=4 bytes=[0-9]+ rc=0 verdict=removed trigger=low-free removed=3 held=1' "$SPOT"
+# The ONLY executable directory is old but holds a member used inside the window: the listing is
+# still complete (the last directory's "fresh" verdict is not a failed find), the idle files go.
+_mk_gocache; _gb_hd 0a/bbbb-d 3H 5M; : > "$SPOT"; CC_DJ_NEW_STEPS_MODE=auto _gb_run 15
+expect_no "go-build-age dirs: a last directory kept as fresh does not make the listing incomplete" grep -q 'listing=incomplete' "$SPOT"
+expect_no "go-build-age dirs: and the idle regular files are still removed" test -e "$GB/0a/1111-a"
+expect_yes "go-build-age dirs: and the directory with a member used inside the window stays" test -f "$GB/0a/bbbb-d/one-api"
 _mk_gocache_hd; _gb_big; CC_DJ_NEW_STEPS_MODE=auto CC_DJ_GO_BUILD_CAP_GB=0.001 _gb_run 80
 expect_no "go-build cap auto: an idle executable directory goes with the cap trigger too" test -e "$GB/0a/aaaa-d"
 expect_yes "go-build cap auto: a directory inside the window stays" test -f "$GB/0a/bbbb-d/one-api"
