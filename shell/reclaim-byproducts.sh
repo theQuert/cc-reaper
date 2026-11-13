@@ -815,7 +815,13 @@ GREP1
   croot="${PROJECTS_DIR%/}"
   case "${CODEX_SESSIONS_DIR%/}/" in "$croot"/*) croot="" ;; esac
   case "$croot/" in "${CODEX_SESSIONS_DIR%/}"/*) croot="" ;; esac
-  awk -F: -v self="${CLAUDE_CODE_SESSION_ID:-}" -v claude="$croot" "$MENTION_AWK" "$work/raw" | sort -u > "$work/index" || { rm -rf "$work"; return 1; }
+  # awk's own status is read, never sort's alone: an awk that died midway would leave a short
+  # index that reads as "no transcript names these", and the phase would delete on it. A failed
+  # extraction is a lookup that did not finish: nothing cached, every directory kept.
+  awk -F: -v self="${CLAUDE_CODE_SESSION_ID:-}" -v claude="$croot" "$MENTION_AWK" "$work/raw" > "$work/mentions"
+  rc=$?
+  [ "$rc" -eq 0 ] || { MENTION_WHY="the index extraction ended with status $rc"; rm -rf "$work"; return 2; }
+  sort -u "$work/mentions" > "$work/index" || { rm -rf "$work"; return 1; }
   cp "$work/index" "$1" 2>/dev/null || { rm -rf "$work"; return 1; }
   # Cached only by a run that can delete: a dry run writes nothing. The fingerprint goes last,
   # and is removed first, so a torn write reads as a miss, never as a match.

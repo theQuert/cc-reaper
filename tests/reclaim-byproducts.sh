@@ -1990,7 +1990,7 @@ exists "$WORK/l" $SID7 && pass "a gate answer with a non-mention reason keeps th
 #   R1 only in a tool_result line of the alive session       R2 only in a task-notification line
 #   R3 in a typed queue line                                 R4 in an assistant tool_use line
 #   R5 only in a tool_result line of its own transcript      R6 same, in <sid>/subagents/x.jsonl
-#   R7 only in a Codex tool-output line
+#   R7 only in a Codex tool_result-shaped line, the same line as R1 (only the root differs)
 R1=31313131-3131-3131-3131-313131313131
 R2=32323232-3232-3232-3232-323232323232
 R3=38383838-3838-3838-3838-383838383838
@@ -2013,7 +2013,7 @@ rule_fixture() {
   printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls %s"}}]}}\n' "$s/$R4" >> "$t/$SID8.jsonl"
   printf '{"type":"user","message":{"content":[{"type":"tool_result","content":"ls %s"}]}}\n' "$s/$R5" > "$t/$R5.jsonl"
   printf '{"type":"user","message":{"content":[{"type":"tool_result","content":"ls %s"}]}}\n' "$s/$R6" > "$t/$R6/subagents/x.jsonl"
-  printf '{"type":"response_item","payload":{"type":"function_call_output","output":"{\\"type\\":\\"tool_result\\"} ls %s"}}\n' "$s/$R7" > "$c/rollout-9.jsonl"
+  printf '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"drwxr-xr-x %s"}]}}\n' "$s/$R7" > "$c/rollout-9.jsonl"
 }
 rule_fixture "$WORK/l"
 OUT="$(run_real "$WORK/l" "$SCRIPT")"
@@ -2025,6 +2025,38 @@ check "7106 (e): the directory's own transcript counts even for a tool_result li
 check "7106 (e): so does a <sid>/subagents transcript" "$OUT" "spot-check: .*$R6" "scratchpad reaped: .*$R6"
 check "7106 (f): a Codex transcript keeps the old rule: a tool-output-shaped line counts" "$OUT" "spot-check: .*$R7" "scratchpad reaped: .*$R7"
 check "7106: a plain-text mention (not a classifiable line) still counts" "$OUT" "scratchpad kept: .*$SIDI — named by session $SID8, which is alive"
+
+# Where the two transcript roots sit. The tool-output rule belongs to the Claude root alone, and a
+# file that could be under both keeps the old rule (as in path-in-use.sh): when one root holds the
+# other the rule is off. Two roots that only share a string prefix are not nested.
+#   RC: only in a tool_result line of the alive session's transcript, under the Claude root
+#   RX: only in a tool_result line of a Codex transcript
+root_fixture() {  # <root> <claude root> <codex root>
+  local root="$1" cl="$2" cx="$3" sid
+  build_fixture "$root"
+  mkdir -p "$root/home/.claude/sessions" "$cl/proj" "$cx"
+  printf '{"pid":%s,"sessionId":"%s"}\n' "$$" "$SID8" > "$root/home/.claude/sessions/$$.json"
+  for sid in $R1 $R2; do
+    mkdir -p "$root/scratch/proj/$sid"; : > "$root/scratch/proj/$sid/out.txt"
+    touch -t "$OLD_TS" "$root/scratch/proj/$sid/out.txt" "$root/scratch/proj/$sid"
+  done
+  printf '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"drwxr-xr-x %s"}]}}\n' "$root/scratch/proj/$R1" > "$cl/proj/$SID8.jsonl"
+  printf '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"drwxr-xr-x %s"}]}}\n' "$root/scratch/proj/$R2" > "$cx/rollout-9.jsonl"
+}
+roots_case() {  # <label> <root> <claude root> <codex root> <RC is "kept"|"reaped">
+  local label="$1" root="$2" cl="$3" cx="$4" want="$5" out
+  root_fixture "$root" "$cl" "$cx"
+  out="$(BYPRODUCT_PROJECTS_DIR="$cl" BYPRODUCT_CODEX_SESSIONS_DIR="$cx" run_real "$root" "$SCRIPT")"
+  check "7106 roots: $label: the Codex transcript's tool_result line counts" "$out" "spot-check: .*$R2" "scratchpad reaped: .*$R2"
+  if [ "$want" = kept ]; then
+    check "7106 roots: $label: the tool-output rule is off, the Claude transcript's tool_result line counts" "$out" "scratchpad kept: .*$R1 — named by session $SID8, which is alive" "scratchpad reaped: .*$R1"
+  else
+    check "7106 roots: $label: the tool-output rule applies under the Claude root" "$out" "scratchpad reaped: .*$R1" "scratchpad kept: .*$R1"
+  fi
+}
+roots_case "the Codex root inside the Claude root" "$WORK/n1" "$WORK/n1/home/.claude/projects" "$WORK/n1/home/.claude/projects/cx" kept
+roots_case "the Claude root inside the Codex root" "$WORK/n2" "$WORK/n2/home/cx/claude" "$WORK/n2/home/cx" kept
+roots_case "two roots that share a string prefix, /x/proj and /x/proj2" "$WORK/n3" "$WORK/n3/home/x/proj" "$WORK/n3/home/x/proj2" reaped
 
 # ------------------------------- path-in-use.sh alone decides liveness (stima-api#7106, 2026-11-08)
 #
@@ -2456,6 +2488,12 @@ g3_failclosed "a grep that exits 2" "transcript lookup failed" "BYPRODUCT_GREP_B
 g3_failclosed "a grep binary that is not there" "transcript lookup failed" "BYPRODUCT_GREP_BIN=$EQ/no-such-grep"
 printf '#!/usr/bin/env bash\nkill -9 $$\n' > "$EQ/grep-sig"; chmod +x "$EQ/grep-sig"
 g3_failclosed "a grep killed by a signal" "transcript lookup failed" "BYPRODUCT_GREP_BIN=$EQ/grep-sig"
+# The extraction step too (stima-api#7106): an awk that dies leaves an empty or short index, which
+# would read as "no transcript names anything". Only the awk that builds the index (the one given
+# -v claude=) is made to fail; every other awk in the script is the real one.
+G3_PRE='mkdir -p "$EQ/awkbin"; printf "#!/bin/sh\ncase \"\$*\" in *\"-v claude=\"*) echo \"awk: boom\" >&2; exit 3 ;; esac\nexec /usr/bin/awk \"\$@\"\n" > "$EQ/awkbin/awk"; chmod +x "$EQ/awkbin/awk"'
+g3_failclosed "an awk that fails while building the index" "transcript lookup failed (the index extraction ended with status 3)" "PATH_PREFIX_OVERRIDE=$EQ/awkbin"
+G3_PRE=""; G3_POST=""
 G3_PRE='mkdir -p "$EQ/home/.claude/projects/-locked"; chmod 000 "$EQ/home/.claude/projects/-locked"'
 G3_POST='chmod 755 "$EQ/home/.claude/projects/-locked"'
 g3_failclosed "a find that cannot read a directory" "transcript lookup failed"
