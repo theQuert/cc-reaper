@@ -267,14 +267,15 @@ them decide.
   0 turns it off) instead of 168 before its ignored regenerable directories are trimmed. Only those
   directories are ever listed, so the uncommitted files stay. The ordinary knob at 0 still means never.
 
-### Names nothing may touch
+### Names that are never removed
 
 `CC_WJ_DENY_NAMES` (whitespace-separated; the installed config sets
 `homepage uiux verify-signin-redesign`) keeps a worktree as `KEEP(deny-listed:<name>)` in the
-removal sweep and the trim alike when its directory name or branch contains a name, or when a
-live Claude session registered under that name stands at or under it. A live session's tool
-calls already veto through the ordinary claim gate; this one holds whatever the claim windows
-say.
+removal sweep when its directory name or branch contains a name, or when a live Claude session
+registered under that name stands at or under it. The list guarantees the tree is never
+REMOVED. A trim, which lists only ignored regenerable directories and never the tree, treats a
+named tree like any other tree under the usual gates. A live session's tool calls already veto
+through the ordinary claim gate; this one holds whatever the claim windows say.
 
 ### A record that cannot be read keeps the trees it could be about
 
