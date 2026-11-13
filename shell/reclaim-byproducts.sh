@@ -709,11 +709,37 @@ mention_fingerprint() {  # <listfile> <seconds-left>
 # The extraction rule: the regex (@ROOT@ is the scratch root's name) and the awk program that
 # turns the matches into the index. Both are hashed into the cache key (mention_fingerprint), so
 # a change to either can never be served an index built by the other.
-MENTION_RE_TMPL='@ROOT@/[^/" \\]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-MENTION_AWK='{
+#
+# The line rule is path-in-use.sh's (stima-api #7106), so that the two never disagree about what
+# names a directory: grep is run with -n, and besides the paths it also reports three markers,
+# so the awk program can tell the kind of line each path was on. In a transcript under the
+# Claude root a path on a line that carries "type":"tool_result", or that starts
+# {"type":"queue-operation" and holds "content":"<task-notification>, is a tool's output
+# printed back and names nothing, unless the transcript's own path holds that session id (the
+# session's own file and <id>/subagents/*.jsonl). A Codex transcript, a line that is neither,
+# and any doubt record the path: the index only ever errs towards keeping a directory.
+# `claude` is the Claude root, empty when one root holds the other.
+MENTION_RE_TMPL='^\{"type":"queue-operation"|"type":"tool_result"|"content":"<task-notification>|@ROOT@/[^/" \\]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+MENTION_AWK='
+function flush(   i, sid, out) {
+        out = !(tr || (qo && tn)) || !isclaude
+        for (i = 1; i <= nm; i++) {
+                sid = substr(pm[i], length(pm[i]) - 35)
+                if (out || index(path, sid) > 0) print pm[i] "\t" base
+        }
+        nm = 0; tr = 0; qo = 0; tn = 0
+}
+{
         n = split($1, a, "/"); f = a[n]
         if (self != "" && f == self ".jsonl") next
-        m = $2; sub(/^[^\/]*\//, "", m); print m "\t" f }'
+        if ($1 SUBSEP $2 != key) { flush(); key = $1 SUBSEP $2; path = $1; base = f; isclaude = (claude != "" && index($1, claude "/") == 1) }
+        m = $0; sub(/^[^:]*:[^:]*:/, "", m)
+        if (m == "{\"type\":\"queue-operation\"") qo = 1
+        else if (m == "\"type\":\"tool_result\"") tr = 1
+        else if (m == "\"content\":\"<task-notification>") tn = 1
+        else { sub(/^[^\/]*\//, "", m); pm[++nm] = m }
+}
+END { flush() }'
 # Why a lookup ended with status 2 when it was not the clock (empty for the clock); for the log.
 MENTION_WHY=""
 
@@ -726,7 +752,7 @@ MENTION_WHY=""
 # The old answer for a path was one `grep -qF` per spelling per transcript; this is one pass for
 # every path, and no pass at all while the corpus is unchanged.
 build_mention_index() {  # <outfile>
-  local d any=0 root rc left start=$SECONDS work list fp="" budget="$MENTION_BUDGET_SECONDS"
+  local d any=0 root croot rc left start=$SECONDS work list fp="" budget="$MENTION_BUDGET_SECONDS"
   root="${SCRATCH_ROOT##*/}"
   for d in "$PROJECTS_DIR" "$CODEX_SESSIONS_DIR"; do
     [ -d "$d" ] || continue
@@ -771,7 +797,7 @@ build_mention_index() {  # <outfile>
     # not finish, and an empty or partial index is never used or cached.
     cat > "$work/grep1.sh" <<'GREP1'
 g="$1"; re="$2"; err="$3"; shift 3
-"$g" -HoE "$re" "$@"; r=$?
+"$g" -HnoE "$re" "$@"; r=$?
 [ "$r" -le 1 ] || { echo "$r" > "$err"; exit 255; }
 exit 0
 GREP1
@@ -784,7 +810,18 @@ GREP1
   else
     : > "$work/raw"
   fi
-  awk -F: -v self="${CLAUDE_CODE_SESSION_ID:-}" "$MENTION_AWK" "$work/raw" | sort -u > "$work/index" || { rm -rf "$work"; return 1; }
+  # The Claude root gets the tool-output rule; so that a file under both roots keeps the old
+  # rule, it is empty when one root holds the other (as in path-in-use.sh).
+  croot="${PROJECTS_DIR%/}"
+  case "${CODEX_SESSIONS_DIR%/}/" in "$croot"/*) croot="" ;; esac
+  case "$croot/" in "${CODEX_SESSIONS_DIR%/}"/*) croot="" ;; esac
+  # awk's own status is read, never sort's alone: an awk that died midway would leave a short
+  # index that reads as "no transcript names these", and the phase would delete on it. A failed
+  # extraction is a lookup that did not finish: nothing cached, every directory kept.
+  awk -F: -v self="${CLAUDE_CODE_SESSION_ID:-}" -v claude="$croot" "$MENTION_AWK" "$work/raw" > "$work/mentions"
+  rc=$?
+  [ "$rc" -eq 0 ] || { MENTION_WHY="the index extraction ended with status $rc"; rm -rf "$work"; return 2; }
+  sort -u "$work/mentions" > "$work/index" || { rm -rf "$work"; return 1; }
   cp "$work/index" "$1" 2>/dev/null || { rm -rf "$work"; return 1; }
   # Cached only by a run that can delete: a dry run writes nothing. The fingerprint goes last,
   # and is removed first, so a torn write reads as a miss, never as a match.
