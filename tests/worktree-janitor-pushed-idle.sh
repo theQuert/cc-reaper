@@ -196,5 +196,31 @@ check "auto --apply keeps the unpushed tree" test -d "$T/wt-pi-unpushed"
 check "auto --apply keeps the held tree and the one a live session stands in" test -d "$T/wt-pi-held" -a -d "$T/wt-pi-session"
 check "auto --apply keeps the tree with a tracked edit and the recent one" test -d "$T/wt-pi-dirty" -a -d "$T/wt-pi-recent"
 
+# ─── dirty-pressure, promoted by the shipped config (stima-api#8198) ───────────
+# config/worktree-janitor.conf lists dirty-pressure in CC_WJ_PROMOTED_RULES and sets the pressure
+# wait to 6 hours, so under pressure a dirty tree idle for 6 hours with no holder loses its
+# regenerable directories, with no CC_WJ_NEW_RULES_MODE and no wait knob in the environment.
+mkwt dp-8;        echo edited >> "$T/wt-dp-8/README.md";        echo scratch > "$T/wt-dp-8/uncommitted.txt"; cache dp-8
+mkwt dp-3;        echo edited >> "$T/wt-dp-3/README.md";        cache dp-3
+# web/next/package.json is tracked, so git lists web/next/node_modules itself and not a collapsed `?? web/`.
+mkwt dp-donor;    mkdir -p "$T/wt-dp-donor/web/next/node_modules/pkg"; echo '{}' > "$T/wt-dp-donor/web/next/package.json"
+G -C "$T/wt-dp-donor" add web/next/package.json; G -C "$T/wt-dp-donor" commit -qm web
+echo edited >> "$T/wt-dp-donor/README.md"; echo pkg > "$T/wt-dp-donor/web/next/node_modules/pkg/index.js"
+mkwt dp-consumer; mkdir -p "$T/wt-dp-consumer/web/next"; ln -s "$T/wt-dp-donor/web/next/node_modules" "$T/wt-dp-consumer/web/next/node_modules"
+printf 'p79\nn%s\n' "$T/wt-dp-consumer" >> "$LSOF_CWD_FILE"
+for n in dp-8 dp-donor dp-consumer; do age "$n" 8; done
+age dp-3 3
+: > "$SPOT"
+CC_WJ_CONFIG="$ROOT_DIR/config/worktree-janitor.conf" CC_WJ_PRESSURE_FREE_GB=99999 wj --trim-regenerable --apply > "$T/trim-shipped.txt"
+refute "dirty-pressure (shipped config): a dirty tree idle for 8 hours has its node_modules trimmed" test -e "$T/wt-dp-8/node_modules"
+check "  and keeps its uncommitted files, the worktree and its branch" \
+  bash -c 'grep -q edited "$1/wt-dp-8/README.md" && test -f "$1/wt-dp-8/uncommitted.txt" && git -C "$1/wt-dp-8" rev-parse -q --verify HEAD && git -C "$2" show-ref -q --verify refs/heads/dp-8' _ "$T" "$PRIMARY"
+check "dirty-pressure (shipped config): a dirty tree touched 3 hours ago keeps its node_modules" test -d "$T/wt-dp-3/node_modules"
+check "dirty-pressure (shipped config): a held tree keeps its node_modules" test -d "$T/wt-dp-held/node_modules"
+check "dirty-pressure (shipped config): an inbound-symlink target keeps its node_modules" test -d "$T/wt-dp-donor/web/next/node_modules/pkg"
+check "  and says why" judged "$T/trim-shipped.txt" dp-donor "KEEP(inbound-symlink:wt-dp-consumer)"
+check "dirty-pressure (shipped config): the trim reports the free-space delta beside its du figure" \
+  grep -Eq '^Summary: trimmed=[0-9]+  reclaimed=[0-9.]+ GB  kept=[0-9]+  df-freed=-?[0-9.]+ GB$' "$T/trim-shipped.txt"
+
 if [ "$failures" -eq 0 ]; then echo "# all passed"; else echo "# $failures failed"; fi
 [ "$failures" -eq 0 ]
