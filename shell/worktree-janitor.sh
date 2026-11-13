@@ -6332,9 +6332,11 @@ KEEP
         *[!0-9:]*|:*|*:) ;;
         *) df_gb="$(awk -v b="$trim_df_before" -v a="$df_after" 'BEGIN { printf "%.2f", (a - b) / 1048576 }')" ;;
       esac
+      # df-freed is in the printed summary only: the logged line is written when it changes, and a
+      # free-space figure changes every sweep.
       printf "Summary: trimmed=%d  reclaimed=%s GB  kept=%d  df-freed=%s GB\n" \
         "$total_trimmed" "$gb_str" "$total_kept" "$df_gb"
-      _cc_wj_log_write_changed trim-summary "trim summary: trimmed=$total_trimmed reclaimed=${total_trim_reclaimed}B kept=$total_kept df_freed=${df_gb}GB"
+      _cc_wj_log_write_changed trim-summary "trim summary: trimmed=$total_trimmed reclaimed=${total_trim_reclaimed}B kept=$total_kept"
     else
       printf "Summary: trim-candidates=%d  kept=%d  (dry-run; use --apply --trim-regenerable to remove)\n" \
         "$total_trim_candidates" "$total_kept"
