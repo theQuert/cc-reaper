@@ -260,6 +260,7 @@ def judge_all(r, sessions, cfg, now, workers=8):
     def work(i):
         with lock:
             started[i] = time.monotonic()
+        err = None
         try:
             rec = judge(sessions[i], r, cfg, now)
         except Exception as e:  # judge() answers its own failures; this is the last net
