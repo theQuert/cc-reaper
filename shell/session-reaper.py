@@ -73,6 +73,8 @@ DEFAULTS = {
     # Longer than the 30-minute launchd interval, so a brief read by one run serves the next (stima-api#7904: at 10 the
     # cache never outlived a run). A session about to close re-reads its claims fresh first (confirm_close()).
     "ORACLE_CACHE_MINUTES": "45",
+    "BG_RELEASE_HOURS": "12",  # shell-child / subagent-active stop keeping a pane-idle session this long idle; 0: never (cc-reaper#173)
+    "JUDGE_TIMEOUT_SECONDS": "120",  # one session's judgement; past it the session is KEEP judge-timeout (cc-reaper#173)
     "ORACLE_TIMEOUT_SECONDS": "60",  # one --brief read; 30 s timed out under load with 8 parallel reads (stima-api #7061)
     "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
     "DISPATCH_FILE": "~/.claude/state/dispatcher-routes.json",  # dispatcher routes a card to a live session; empty: off
@@ -173,11 +175,38 @@ def load_config(path):
 
 
 def run(cmd, timeout=30, cwd=None):
+    """(rc, stdout). On a timeout the whole process group is killed: subprocess.run() alone waits for the pipes a
+    grandchild still holds, which is how one stuck `gh` cost a round its whole budget (cc-reaper#173)."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
-        return p.returncode, p.stdout
-    except (OSError, subprocess.TimeoutExpired):
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd,
+                             start_new_session=True)
+    except OSError:
         return 1, ""
+    try:
+        out, _ = p.communicate(timeout=timeout)
+        return p.returncode, out
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            p.kill()
+        try:
+            p.communicate(timeout=5)
+        except Exception:
+            pass
+        return 1, ""
+    except OSError:
+        return 1, ""
+
+
+def bg_released(s, cfg):
+    """shell-child and subagent-active no longer keep a session whose pane is idle and that has been idle past
+    BG_RELEASE_HOURS; every other gate still applies (cc-reaper#173)."""
+    try:
+        hours = float(cfg.get("BG_RELEASE_HOURS") or 0)
+    except ValueError:
+        return False
+    return hours > 0 and s.get("status") == "idle" and float(s.get("idle_min") or 0) >= hours * 60
 
 
 # ---------- processes ----------
@@ -185,8 +214,8 @@ def run(cmd, timeout=30, cwd=None):
 def ps_table():
     """{pid: (ppid, lstart, command)}; lstart in UTC, the form session files record."""
     env = dict(os.environ, LC_ALL="C", TZ="UTC")
-    out = subprocess.run(
-        ["ps", "-A", "-o", "pid=,ppid=,lstart=,command="], capture_output=True, text=True, env=env
+    out = subprocess.run(  # a timeout raises: an empty table would read as every session gone
+        ["ps", "-A", "-o", "pid=,ppid=,lstart=,command="], capture_output=True, text=True, env=env, timeout=60
     ).stdout
     table = {}
     for line in out.splitlines():
@@ -1656,7 +1685,7 @@ def _decide(s, cfg, now=None):
         keep.append(f"status:{s['status']}")
     elif s["idle_min"] < idle_threshold(s, cfg):
         keep.append(f"idle:{s['idle_min']:.0f}<{idle_threshold(s, cfg):g}min")
-    if s["bg_shells"]:
+    if s["bg_shells"] and not bg_released(s, cfg):
         keep.append("shell-child")
     if s["loop"]:
         keep.append("loop-pending")
@@ -1673,7 +1702,7 @@ def _decide(s, cfg, now=None):
             keep.append("waiting")
         elif not (DONE_RE.search(s["last_text"]) and not live_work(s["last_text"], now if now is not None else time.time())):
             keep.append("waiting-keyword")
-    if s.get("sub_active"):
+    if s.get("sub_active") and not bg_released(s, cfg):
         keep.append("subagent-active")
     if cfg["PROMPT_RE"] and re.search(cfg["PROMPT_RE"], s.get("screen_tail", ""), re.I):
         keep.append("handoff-pending:prompt")
@@ -1939,7 +1968,8 @@ def shadow_verdict(s, cfg, keep, now):
         judge(claims)  # worktree claims: decide() already briefed them, so these hit the cache
     out = {"would_close": "", "blocked": blocked, "claims": claims}
     never = [n for n in (s["tmux"], s.get("name")) if n]
-    if (not keep or not idle or blocked or s["asking"] or s["bg_shells"] or s.get("sub_active")
+    if (not keep or not idle or blocked or s["asking"]
+            or ((s["bg_shells"] or s.get("sub_active")) and not bg_released(s, cfg))
             or any(not k.startswith(SOFT_KEEP) for k in keep)
             or any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in never)
             or protected(cfg, *never)):

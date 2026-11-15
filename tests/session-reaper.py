@@ -31,6 +31,30 @@ def session(**kw):
     return s
 
 
+class BgRelease(unittest.TestCase):
+    """cc-reaper#173: shell-child and subagent-active release a pane-idle session idle past BG_RELEASE_HOURS."""
+
+    def keep(self, **kw):
+        with mock.patch.object(reaper, "worktree_state", side_effect=lambda w, c: w.get("problems", [])):
+            return reaper.decide(session(**kw), CFG)
+
+    def test_released_when_long_idle(self):
+        self.assertEqual(self.keep(bg_shells=[1], sub_active=2, idle_min=13 * 60), [])
+
+    def test_kept_when_short_busy_or_unpushed(self):
+        self.assertEqual(self.keep(bg_shells=[1], idle_min=11 * 60), ["shell-child"])
+        self.assertEqual(self.keep(sub_active=1, idle_min=11 * 60), ["subagent-active"])
+        self.assertIn("status:busy", self.keep(bg_shells=[1], idle_min=13 * 60, status="busy"))
+        owned = [{"path": Path("/w/a"), "marker": "sid-1", "branch": "b", "problems": ["unpushed:1"]}]
+        self.assertTrue(self.keep(bg_shells=[1], idle_min=13 * 60, owned=owned))
+
+    def test_run_kills_a_grandchild_holding_the_pipe(self):
+        t0 = time.monotonic()
+        rc, out = reaper.run(["sh", "-c", "sleep 30 & wait"], timeout=1)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertLess(time.monotonic() - t0, 10)
+
+
 class Decide(unittest.TestCase):
     def keep(self, **kw):
         def brief(r, n, cfg, now):  # the oracle's view follows self.states: CLOSED ends, anything else is owed to sid-1
