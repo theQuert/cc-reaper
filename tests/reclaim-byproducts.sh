@@ -2285,11 +2285,24 @@ OUT="$(run_real "$WORK/m" "$SCRIPT")"
 exists "$WORK/m" $SIDM && fail "done marker: an aged marked tree with nothing later was kept" \
   || pass "done marker: aged, with nothing written after the marker, it goes"
 
-marked_fixture "$WORK/m"
+# cc-reaper#172 review: another session that names it and is resumable keeps it, even when its
+# transcript is older than path-in-use.sh's 24h window. SIDR is that session, closed today.
+SIDR=17171717-1717-1717-1717-171717171717
+THIRTY_H_AGO="$(date -v-30H +%Y%m%d%H%M 2>/dev/null || date -d '30 hours ago' +%Y%m%d%H%M)"
+marked_fixture "$WORK/m"; age_marked "$WORK/m"
+printf 'it worked in %s/proj/%s\n' "$WORK/m/scratch" "$SIDM" > "$WORK/m/home/.claude/projects/proj/$SIDR.jsonl"
+touch -t "$THIRTY_H_AGO" "$WORK/m/home/.claude/projects/proj/$SIDR.jsonl"
+printf '## %s Neo closed (claude --resume <sid>)\n- r %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$SIDR" > "$WORK/m/closed-sessions.md"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && pass "done marker: named by a resumable session, kept" \
+  || fail "done marker: removed a scratchpad a resumable session names"
+check "  and says who" "$OUT" "scratchpad: .*$SIDM is marked done, but named by session $SIDR, closed within 2d and resumable"
+rm -f "$WORK/m/closed-sessions.md"
+
+marked_fixture "$WORK/m"; age_marked "$WORK/m"
 OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
-exists "$WORK/m" $SIDM && [ -d "$WORK/m/home/.claude/jobs/${SIDM:0:8}" ] && pass "done marker: unset, it is spotcheck and removes nothing" \
-  || fail "done marker: the default removed a marked directory"
-check "  and logs what it would remove" "$OUT" "scratchpad spot-check: .*$SIDM .*marked done and removable"
+exists "$WORK/m" $SIDM && fail "done marker: unset, an aged marked tree was kept (the default is auto)" \
+  || pass "done marker: unset, it is auto and an aged marked tree goes"
 check "  but not what the gate calls IN USE (#7106)" "$OUT" "job dir kept: .*/${SIDN:0:8} — marked done, but path-in-use.sh:" "spot-check: .*$SIDN"
 
 marked_fixture "$WORK/m"
@@ -2334,11 +2347,11 @@ uu_transcript() {  # <root>: the session's own transcript, last written two days
   : > "$1/home/.claude/projects/proj/$UU.jsonl"; touch -t "$TWO_D_AGO" "$1/home/.claude/projects/proj/$UU.jsonl"
 }
 marked_fixture "$WORK/m"
-OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+OUT="$(CC_RB_DONE_MARKER=spotcheck run_real "$WORK/m" "$SCRIPT")"
 exists "$WORK/m" $UU && fail "P2-A A: an unmarked 40-day-idle scratchpad was kept" || pass "P2-A A: no marker, 40 d idle: reaped by the idle rule"
 check "  and the log says reaped" "$OUT" "scratchpad reaped: .*$UU"
 marked_fixture "$WORK/m"; mark "$WORK/m/scratch/proj/$UU" $UU "$OLD_TS"
-OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+OUT="$(CC_RB_DONE_MARKER=spotcheck run_real "$WORK/m" "$SCRIPT")"
 exists "$WORK/m" $UU && fail "P2-A B: a spotcheck-kept marked scratchpad escaped the idle rule" \
   || pass "P2-A B: 40 d old marker naming it, spotcheck: reaped by the idle rule"
 check "  and the spotcheck line says the idle rule still judges it" "$OUT" "scratchpad spot-check: .*$UU .*marked done and removable.*the idle rule still judges it"
@@ -2353,7 +2366,7 @@ OUT="$(CC_RB_DONE_MARKER=auto run_real "$WORK/m" "$SCRIPT")"
 exists "$WORK/m" $UU && fail "P2-A D: unmarked, transcript 2 d ago, auto: kept" || pass "P2-A D: no marker, transcript 2 d ago, auto: reaped"
 # The idle rule's own keeps survive a marker: written just now, it stays.
 marked_fixture "$WORK/m"; mark "$WORK/m/scratch/proj/$UU" $UU; touch "$WORK/m/scratch/proj/$UU/fresh"
-OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
+OUT="$(CC_RB_DONE_MARKER=spotcheck run_real "$WORK/m" "$SCRIPT")"
 exists "$WORK/m" $UU && pass "P2-A: a marked scratchpad written just now is still kept by the idle rule (spotcheck)" || fail "P2-A: a marked, fresh scratchpad was removed"
 unset CC_RB_DONE_MARKER
 
