@@ -171,9 +171,9 @@ RB_STATE_DIR="${CC_RB_STATE_DIR:-$HOME/.cc-reaper/state}"
 # neither it nor its session's transcript changed more than DONE_SLACK_SECONDS after the marker
 # (the reaper's own /exit lands after it; anything later is a session that went on working).
 # `auto` removes, `spotcheck` only logs what it would remove, `off` reads no marker.
-# spotcheck first, for one cycle, as every new deletion class here (CC_RB_NEW_RULES_MODE): it logs
-# what it would remove and removes nothing; auto lets it decide (stima-api#7106 review P3-4).
-DONE_MARKER_MODE="${CC_RB_DONE_MARKER:-spotcheck}"
+# It shipped as spotcheck (stima-api#7106 review P3-4) and graduated to auto on 2026-11-15: every
+# job directory its spot-check lines called removable (26) was free under path-in-use.sh.
+DONE_MARKER_MODE="${CC_RB_DONE_MARKER:-auto}"
 DONE_SLACK_SECONDS="${CC_RB_DONE_SLACK_SECONDS:-600}"
 case "$DONE_MARKER_MODE" in
   auto|spotcheck|off) ;;
