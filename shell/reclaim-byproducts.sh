@@ -780,6 +780,13 @@ build_mention_index() {  # <outfile>
     # names this path": keep everything, as for the clock.
     [ "$rc" -eq 0 ] || { MENTION_WHY="find exited $rc in $d"; rm -rf "$work"; return 2; }
   done
+  # A session resumable for RESUME_DAYS may have last written before the window: its transcript
+  # is read too (the caller's resumable set; cc-reaper#172 review). Few files, read whatever their age.
+  for d in ${resum:-}; do
+    for t in "$PROJECTS_DIR"/*/"$d".jsonl; do
+      [ -f "$t" ] && "$FIND" "$t" -mmin +"$((IDLE_HOURS * 60 - 1))" -print0 >> "$list" 2>/dev/null
+    done
+  done
   _mention_left || { rm -rf "$work"; return 2; }
   fp="$(mention_fingerprint "$list" "$left")" || { rc=$?; [ "$rc" -ne 124 ] || { rm -rf "$work"; return 2; }; fp=""; }
   if [ -n "$fp" ] && [ -r "$MENTION_CACHE" ] && [ "$(cat "$MENTION_CACHE.fp" 2>/dev/null)" = "$fp" ]; then
@@ -1083,7 +1090,21 @@ reap_scratchpads() {
     # reap_done_marked keeps the directory (spotcheck, a later write, a holder, a live session),
     # the idle rule below still judges it, so a marker never subtracts the old reap.
     if [ "$DONE_MARKER_MODE" != off ] && [ "$(done_marker_session "$d")" = "$sid" ]; then
-      if reap_done_marked "$d" "$sid" scratchpad "$live_ok" "$live_set" "$prot" \
+      # Another session that names it and is alive or resumable may still work from it, and
+      # path-in-use.sh reads only the last 24h of transcripts while a session resumes for
+      # RESUME_DAYS (Opus review of cc-reaper#172). The idle rule below asks the same question.
+      why=""
+      if [ "$midx_ok" -ne 1 ]; then why="transcripts could not be searched for who names it"
+      else
+        for m in $(awk -F'\t' -v k="$proj/$sid" '$1 == k { print $2 }' "$midx"); do
+          m="${m%.jsonl}"; [ "$m" != "$sid" ] || continue
+          if printf '%s\n' "$live_set" | grep -qxF "$m"; then why="named by session $m, which is alive"; break; fi
+          if [ -n "$resum" ] && printf '%s\n' "$resum" | grep -qxF "$m"; then why="named by session $m, closed within ${RESUME_DAYS}d and resumable"; break; fi
+        done
+      fi
+      if [ -n "$why" ]; then
+        log "scratchpad: $d is marked done, but $why; the idle rule judges it"
+      elif reap_done_marked "$d" "$sid" scratchpad "$live_ok" "$live_set" "$prot" \
            "the idle rule still judges it"; then
         reaped=$((reaped + 1)); bytes=$((bytes + DONE_KB))
         continue

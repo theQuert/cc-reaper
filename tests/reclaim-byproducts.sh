@@ -2285,6 +2285,20 @@ OUT="$(run_real "$WORK/m" "$SCRIPT")"
 exists "$WORK/m" $SIDM && fail "done marker: an aged marked tree with nothing later was kept" \
   || pass "done marker: aged, with nothing written after the marker, it goes"
 
+# cc-reaper#172 review: another session that names it and is resumable keeps it, even when its
+# transcript is older than path-in-use.sh's 24h window. SIDR is that session, closed today.
+SIDR=17171717-1717-1717-1717-171717171717
+THIRTY_H_AGO="$(date -v-30H +%Y%m%d%H%M 2>/dev/null || date -d '30 hours ago' +%Y%m%d%H%M)"
+marked_fixture "$WORK/m"; age_marked "$WORK/m"
+printf 'it worked in %s/proj/%s\n' "$WORK/m/scratch" "$SIDM" > "$WORK/m/home/.claude/projects/proj/$SIDR.jsonl"
+touch -t "$THIRTY_H_AGO" "$WORK/m/home/.claude/projects/proj/$SIDR.jsonl"
+printf '## %s Neo closed (claude --resume <sid>)\n- r %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$SIDR" > "$WORK/m/closed-sessions.md"
+OUT="$(run_real "$WORK/m" "$SCRIPT")"
+exists "$WORK/m" $SIDM && pass "done marker: named by a resumable session, kept" \
+  || fail "done marker: removed a scratchpad a resumable session names"
+check "  and says who" "$OUT" "scratchpad: .*$SIDM is marked done, but named by session $SIDR, closed within 2d and resumable"
+rm -f "$WORK/m/closed-sessions.md"
+
 marked_fixture "$WORK/m"; age_marked "$WORK/m"
 OUT="$(CC_RB_DONE_MARKER= run_real "$WORK/m" "$SCRIPT")"
 exists "$WORK/m" $SIDM && fail "done marker: unset, an aged marked tree was kept (the default is auto)" \
