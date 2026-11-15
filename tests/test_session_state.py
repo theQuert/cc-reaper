@@ -304,24 +304,6 @@ class Judge(unittest.TestCase):
             self.assertEqual(reaper._decide(dict(s), CFG, NOW), ["issue-unknown:#6837"])
 
 
-class BgRelease(Judge):
-    """cc-reaper#173: shell-child and subagent-active stop keeping a long-idle pane-idle session."""
-
-    def test_released_after_bound(self):
-        rec = self.judge(session(bg_shells=[5], sub_active=2, idle_min=13 * 60))
-        self.assertEqual(rec["state"], "DONE")
-        self.assertEqual(rec["bg_work"], [])
-
-    def test_kept_under_bound_busy_or_disabled(self):
-        self.assertEqual(self.judge(session(bg_shells=[5], idle_min=11 * 60))["reasons"], ["shell-child"])
-        self.assertEqual(self.judge(session(bg_shells=[5], idle_min=13 * 60), BG_RELEASE_HOURS="0")["reasons"], ["shell-child"])
-        self.assertEqual(self.judge(session(bg_shells=[5], idle_min=13 * 60, status="busy"))["state"], "WORKING")
-
-    def test_unpushed_work_still_keeps(self):
-        rec = self.judge(session(bg_shells=[5], idle_min=13 * 60, owned=[wt("a", ["unpushed:1"])]))
-        self.assertEqual(rec["state"], "PUSH")
-
-
 class JudgeTimeout(unittest.TestCase):
     def test_hung_judgement_is_kept_and_others_judged(self):
         sessions = [session(sid="hang", name="hang"), session(sid="ok1", name="ok1"), session(sid="ok2", name="ok2")]

@@ -73,7 +73,6 @@ DEFAULTS = {
     # Longer than the 30-minute launchd interval, so a brief read by one run serves the next (stima-api#7904: at 10 the
     # cache never outlived a run). A session about to close re-reads its claims fresh first (confirm_close()).
     "ORACLE_CACHE_MINUTES": "45",
-    "BG_RELEASE_HOURS": "12",  # shell-child / subagent-active stop keeping a pane-idle session this long idle; 0: never (cc-reaper#173)
     "JUDGE_TIMEOUT_SECONDS": "120",  # one session's judgement; past it the session is KEEP judge-timeout (cc-reaper#173)
     "ORACLE_TIMEOUT_SECONDS": "60",  # one --brief read; 30 s timed out under load with 8 parallel reads (stima-api #7061)
     "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
@@ -198,15 +197,6 @@ def run(cmd, timeout=30, cwd=None):
     except OSError:
         return 1, ""
 
-
-def bg_released(s, cfg):
-    """shell-child and subagent-active no longer keep a session whose pane is idle and that has been idle past
-    BG_RELEASE_HOURS; every other gate still applies (cc-reaper#173)."""
-    try:
-        hours = float(cfg.get("BG_RELEASE_HOURS") or 0)
-    except ValueError:
-        return False
-    return hours > 0 and s.get("status") == "idle" and float(s.get("idle_min") or 0) >= hours * 60
 
 
 # ---------- processes ----------
@@ -1685,7 +1675,7 @@ def _decide(s, cfg, now=None):
         keep.append(f"status:{s['status']}")
     elif s["idle_min"] < idle_threshold(s, cfg):
         keep.append(f"idle:{s['idle_min']:.0f}<{idle_threshold(s, cfg):g}min")
-    if s["bg_shells"] and not bg_released(s, cfg):
+    if s["bg_shells"]:
         keep.append("shell-child")
     if s["loop"]:
         keep.append("loop-pending")
@@ -1702,7 +1692,7 @@ def _decide(s, cfg, now=None):
             keep.append("waiting")
         elif not (DONE_RE.search(s["last_text"]) and not live_work(s["last_text"], now if now is not None else time.time())):
             keep.append("waiting-keyword")
-    if s.get("sub_active") and not bg_released(s, cfg):
+    if s.get("sub_active"):
         keep.append("subagent-active")
     if cfg["PROMPT_RE"] and re.search(cfg["PROMPT_RE"], s.get("screen_tail", ""), re.I):
         keep.append("handoff-pending:prompt")
@@ -1968,8 +1958,7 @@ def shadow_verdict(s, cfg, keep, now):
         judge(claims)  # worktree claims: decide() already briefed them, so these hit the cache
     out = {"would_close": "", "blocked": blocked, "claims": claims}
     never = [n for n in (s["tmux"], s.get("name")) if n]
-    if (not keep or not idle or blocked or s["asking"]
-            or ((s["bg_shells"] or s.get("sub_active")) and not bg_released(s, cfg))
+    if (not keep or not idle or blocked or s["asking"] or s["bg_shells"] or s.get("sub_active")
             or any(not k.startswith(SOFT_KEEP) for k in keep)
             or any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["NEVER_CLOSE"].split() for n in never)
             or protected(cfg, *never)):
@@ -2308,7 +2297,11 @@ def reap(s, cfg, now):
         deadline = time.time() + EXIT_WAIT_SECONDS
         while time.time() < deadline:
             time.sleep(1)
-            if s["pid"] not in ps_table():
+            try:
+                gone = s["pid"] not in ps_table()
+            except subprocess.TimeoutExpired:  # not known yet: the deadline decides, never a half-closed record (cc-reaper#173)
+                continue
+            if gone:
                 break
             state = pane_state(s["pane"])
             if state and MENU_TEXT in state["screen"]:

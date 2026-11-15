@@ -197,11 +197,10 @@ def _judge(s, r, cfg, now):
                                      "unpushed": any(p.startswith("unpushed:") for p in probs),
                                      "unchecked": any(p.startswith("unchecked:") for p in probs)})
         bg = rec["bg_work"]
-        released = r.bg_released(s, cfg) if hasattr(r, "bg_released") else False  # idle past BG_RELEASE_HOURS (cc-reaper#173)
-        bg += ["shell-child"] if s.get("bg_shells") and not released else []
+        bg += ["shell-child"] if s.get("bg_shells") else []
         bg += ["loop-pending"] if s.get("loop") else []
         bg += ["scheduled-task"] if (s.get("crons") or 0) > 0 or s.get("scheduled") else []
-        bg += ["subagent-active"] if s.get("sub_active") and not released else []
+        bg += ["subagent-active"] if s.get("sub_active") else []
         # a never-kill pid or a child process: B (the dispatcher) stops a DONE session, so these are never DONE
         bg += ["never-kill:" + ",".join(str(p) for p in s["never_kill"])] if s.get("never_kill") else []
         bg += [f"child-process:{s['descendants']}"] if (s.get("descendants") or 0) > 0 else []
