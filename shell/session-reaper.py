@@ -121,7 +121,6 @@ SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
 MARKER = "claude-task-worktree"
 TAIL_BYTES = 4 << 20
-KEEP_EXITING_OUTCOMES = ("skipped:close-unconfirmed", "skipped:exit-unconfirmed")
 EXIT_WAIT_SECONDS = 20
 DONE_RE = re.compile(r"(?m)^\W*SESSION-DONE:\s*(.+)$")
 STATE_IDLE_RE = re.compile(r"(?m)^\W*SESSION-STATE:\s*IDLE_NO_WORK\b")
@@ -2315,8 +2314,8 @@ def reap(s, cfg, now):
                     return "skipped:menu-stuck", [f"exit menu still open in {s['tmux']} after Esc"]
                 return "skipped:background-tasks", []
         else:
-            if ps_unknown:  # /exit was sent and ps never answered: recover_exiting verifies pid and pane later
-                return "skipped:exit-unconfirmed", [f"{s['tmux']}: ps timed out in the exit wait; record stays exiting"]
+            if ps_unknown:  # /exit sent, ps never answered: claude may still run, so main marks the record aborted (fail closed, never handed to recover_exiting)
+                return "skipped:exit-unconfirmed", [f"{s['tmux']}: ps timed out in the exit wait; nothing closed"]
             return "skipped:exit-timeout", [f"claude pid {s['pid']} did not exit within {EXIT_WAIT_SECONDS}s"]
     except Exception:
         mark_record(s["record"], "exception")
@@ -2784,7 +2783,7 @@ def main(argv=None):
                         outcome, fails = reap(s, cfg, now)
                     finally:
                         IN_REAP = False
-                    if s.get("record") and outcome not in KEEP_EXITING_OUTCOMES:  # stays "exiting" for recovery
+                    if s.get("record") and outcome != "skipped:close-unconfirmed":  # stays "exiting" for recovery
                         mark_record(s["record"], outcome)
                     reaped += outcome == "reaped"
                     failures += [f"{s['tmux']} ({s['sid']}): {f}" for f in fails]

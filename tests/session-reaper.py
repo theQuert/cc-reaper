@@ -972,11 +972,12 @@ class FinishAndReap(unittest.TestCase):
             out = reaper.reap(s, self.cfg, 0)
         return s, out, tmux
 
-    def test_a_ps_timeout_through_the_exit_wait_leaves_the_record_exiting(self):
-        s, out, _ = self.exit_wait_with_ps_timeouts("")
+    def test_a_ps_timeout_through_the_exit_wait_closes_nothing(self):
+        # claude may still run: main() marks the record aborted, so recover_exiting never acts on it
+        s, out, tmux = self.exit_wait_with_ps_timeouts("")
         self.assertEqual(out[0], "skipped:exit-unconfirmed")
-        self.assertIn(out[0], reaper.KEEP_EXITING_OUTCOMES)  # main() does not mark these aborted
-        self.assertEqual(json.loads(s["record"].read_text())["status"], "exiting")
+        self.assertNotEqual(out[0], "skipped:close-unconfirmed")
+        self.assertNotIn(mock.call("kill-session", "-t", "$3"), tmux.call_args_list)
 
     def test_a_ps_timeout_does_not_skip_the_exit_menu_check(self):
         _, out, tmux = self.exit_wait_with_ps_timeouts(reaper.MENU_TEXT)
