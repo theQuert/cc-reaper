@@ -43,6 +43,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -252,10 +253,51 @@ def judge_all(r, sessions, cfg, now, workers=8):
         return (0 if closable else 1, -float(s.get("idle_min") or 0))
     order = sorted(range(len(sessions)), key=key)
     out = [None] * len(sessions)
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        for i, rec in zip(order, pool.map(lambda i: judge(sessions[i], r, cfg, now), order)):
-            out[i] = rec
+    limit = float(cfg.get("JUDGE_TIMEOUT_SECONDS") or 0) or None
+    started, done, lock = {}, {}, threading.Lock()
+
+    def work(i):
+        with lock:
+            started[i] = time.monotonic()
+        err = None
+        try:
+            rec = judge(sessions[i], r, cfg, now)
+        except Exception as e:  # judge() answers its own failures; this is the last net
+            rec = None
+            err = f"error:{type(e).__name__}: {e}"[:200]
+        with lock:
+            done[i] = rec if rec is not None else _timeout_record(sessions[i], r, cfg, err)
+
+    # One daemon thread per judgement, `workers` live at a time. A judgement stuck past its deadline is abandoned (a
+    # thread cannot be killed; its subprocesses have their own timeouts) and its slot is given to the next session, so
+    # one hung read cannot cost the round (cc-reaper#173).
+    pending, live, threads = list(order), set(), {}
+    while pending or live:
+        while pending and len(live) < max(1, workers):
+            i = pending.pop(0)
+            th = threading.Thread(target=work, args=(i,), daemon=True)
+            threads[i] = th
+            live.add(i)
+            th.start()
+        time.sleep(0.02)
+        with lock:
+            for i in list(live):
+                if i in done:
+                    out[i] = done[i]
+                    live.discard(i)
+                elif limit and i in started and time.monotonic() - started[i] > limit:
+                    out[i] = _timeout_record(sessions[i], r, cfg)
+                    live.discard(i)
     return out
+
+
+def _timeout_record(s, r, cfg, error=None):
+    """KEEP: UNKNOWN is never closed; the reason names what happened."""
+    return {"name": s.get("name") or s.get("tmux") or (s.get("sid") or "")[:8], "tmux": s.get("tmux") or "",
+            "sid": s.get("sid") or "", "pid": s.get("pid"), "kind": s.get("kind") or "interactive",
+            "status": s.get("status"), "status_at": s.get("status_at"),
+            "idle_min": round(float(s.get("idle_min") or 0), 1), "claims": [], "worktrees": [], "bg_work": [],
+            "state": "UNKNOWN", "reasons": [error or "judge-timeout"]}
 
 
 def document(records, now, unjudged=()):

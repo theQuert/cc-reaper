@@ -304,6 +304,26 @@ class Judge(unittest.TestCase):
             self.assertEqual(reaper._decide(dict(s), CFG, NOW), ["issue-unknown:#6837"])
 
 
+class JudgeTimeout(unittest.TestCase):
+    def test_hung_judgement_is_kept_and_others_judged(self):
+        sessions = [session(sid="hang", name="hang"), session(sid="ok1", name="ok1"), session(sid="ok2", name="ok2")]
+        real = ss.judge
+
+        def fake(s, r, cfg, now):
+            if s["sid"] == "hang":
+                time.sleep(30)
+            return real(s, r, cfg, now)
+        with mock.patch.object(ss, "judge", side_effect=fake), \
+             mock.patch.object(reaper, "worktree_state", return_value=[]), \
+             mock.patch.object(reaper, "oracle_claims", return_value=[]):
+            t0 = time.monotonic()
+            recs = ss.judge_all(reaper, sessions, dict(CFG, JUDGE_TIMEOUT_SECONDS="0.3"), NOW, workers=1)
+            took = time.monotonic() - t0
+        self.assertLess(took, 5)
+        self.assertEqual((recs[0]["state"], recs[0]["reasons"]), ("UNKNOWN", ["judge-timeout"]))
+        self.assertEqual([r["state"] for r in recs[1:]], ["DONE", "DONE"])
+
+
 class OracleReads(unittest.TestCase):
     """stima-api#7904: only a session a run can close pays for the oracle."""
 

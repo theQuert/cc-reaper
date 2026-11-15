@@ -73,6 +73,7 @@ DEFAULTS = {
     # Longer than the 30-minute launchd interval, so a brief read by one run serves the next (stima-api#7904: at 10 the
     # cache never outlived a run). A session about to close re-reads its claims fresh first (confirm_close()).
     "ORACLE_CACHE_MINUTES": "45",
+    "JUDGE_TIMEOUT_SECONDS": "120",  # one session's judgement; past it the session is KEEP judge-timeout (cc-reaper#173)
     "ORACLE_TIMEOUT_SECONDS": "60",  # one --brief read; 30 s timed out under load with 8 parallel reads (stima-api #7061)
     "NEVER_CLOSE": "uiux* homepage*",  # fnmatch over tmux/session names, case-insensitive: never `would-close`
     "DISPATCH_FILE": "~/.claude/state/dispatcher-routes.json",  # dispatcher routes a card to a live session; empty: off
@@ -173,11 +174,29 @@ def load_config(path):
 
 
 def run(cmd, timeout=30, cwd=None):
+    """(rc, stdout). On a timeout the whole process group is killed: subprocess.run() alone waits for the pipes a
+    grandchild still holds, which is how one stuck `gh` cost a round its whole budget (cc-reaper#173)."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
-        return p.returncode, p.stdout
-    except (OSError, subprocess.TimeoutExpired):
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd,
+                             start_new_session=True)
+    except OSError:
         return 1, ""
+    try:
+        out, _ = p.communicate(timeout=timeout)
+        return p.returncode, out
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            p.kill()
+        try:
+            p.communicate(timeout=5)
+        except Exception:
+            pass
+        return 1, ""
+    except OSError:
+        return 1, ""
+
 
 
 # ---------- processes ----------
@@ -185,8 +204,8 @@ def run(cmd, timeout=30, cwd=None):
 def ps_table():
     """{pid: (ppid, lstart, command)}; lstart in UTC, the form session files record."""
     env = dict(os.environ, LC_ALL="C", TZ="UTC")
-    out = subprocess.run(
-        ["ps", "-A", "-o", "pid=,ppid=,lstart=,command="], capture_output=True, text=True, env=env
+    out = subprocess.run(  # a timeout raises: an empty table would read as every session gone
+        ["ps", "-A", "-o", "pid=,ppid=,lstart=,command="], capture_output=True, text=True, env=env, timeout=60
     ).stdout
     table = {}
     for line in out.splitlines():
@@ -2276,9 +2295,15 @@ def reap(s, cfg, now):
             return "skipped:input-not-empty", []
         tmux("send-keys", "-t", s["pane"], "Enter")
         deadline = time.time() + EXIT_WAIT_SECONDS
+        ps_unknown = False
         while time.time() < deadline:
             time.sleep(1)
-            if s["pid"] not in ps_table():
+            try:
+                gone = s["pid"] not in ps_table()
+                ps_unknown = False
+            except subprocess.TimeoutExpired:  # state unknown: still check the menu below (cc-reaper#173)
+                gone, ps_unknown = False, True
+            if gone:
                 break
             state = pane_state(s["pane"])
             if state and MENU_TEXT in state["screen"]:
@@ -2289,6 +2314,8 @@ def reap(s, cfg, now):
                     return "skipped:menu-stuck", [f"exit menu still open in {s['tmux']} after Esc"]
                 return "skipped:background-tasks", []
         else:
+            if ps_unknown:  # /exit sent, ps never answered: claude may still run, so main marks the record aborted (fail closed, never handed to recover_exiting)
+                return "skipped:exit-unconfirmed", [f"{s['tmux']}: ps timed out in the exit wait; nothing closed"]
             return "skipped:exit-timeout", [f"claude pid {s['pid']} did not exit within {EXIT_WAIT_SECONDS}s"]
     except Exception:
         mark_record(s["record"], "exception")

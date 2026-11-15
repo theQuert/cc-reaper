@@ -31,6 +31,16 @@ def session(**kw):
     return s
 
 
+class RunTimeout(unittest.TestCase):
+    """cc-reaper#173: a timeout kills the whole process group."""
+
+    def test_run_kills_a_grandchild_holding_the_pipe(self):
+        t0 = time.monotonic()
+        rc, out = reaper.run(["sh", "-c", "sleep 30 & wait"], timeout=1)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertLess(time.monotonic() - t0, 10)
+
+
 class Decide(unittest.TestCase):
     def keep(self, **kw):
         def brief(r, n, cfg, now):  # the oracle's view follows self.states: CLOSED ends, anything else is owed to sid-1
@@ -932,6 +942,47 @@ class FinishAndReap(unittest.TestCase):
             out = reaper.reap(s, self.cfg, 0)
         self.assertEqual(out[0], "skipped:close-unconfirmed")
         self.assertEqual(json.loads(s["record"].read_text())["status"], "exiting")
+
+    def exit_wait_with_ps_timeouts(self, screen):
+        """reap() with /exit sent and every ps_table call after the first timing out."""
+        import itertools
+        from contextlib import ExitStack
+        s = self.sess()
+        table = {4242: (500, "t0", "claude"), 500: (1, "x", "-zsh")}
+        calls = iter([table])
+        def ps():
+            try:
+                return next(calls)
+            except StopIteration:
+                raise subprocess.TimeoutExpired("ps", 60)
+        st = {"session": "work", "session_id": "$3", "alone": True, "pane_pid": 500, "screen": screen}
+        clock = itertools.count(1000, 5)
+        tmux = mock.MagicMock()
+        with ExitStack() as es:
+            for m in [mock.patch.object(reaper, "ps_table", side_effect=ps),
+                      mock.patch.object(reaper, "foreground", return_value=True),
+                      mock.patch.object(reaper, "pane_state", return_value=st),
+                      mock.patch.object(reaper, "empty_prompt", return_value=True),
+                      mock.patch.object(reaper, "protected", return_value=False),
+                      mock.patch.object(reaper, "cursor_line", return_value="❯ /exit"),
+                      mock.patch.object(reaper, "tmux", tmux),
+                      mock.patch.object(reaper.time, "sleep"),
+                      mock.patch.object(reaper.time, "time", side_effect=lambda: next(clock))]:
+                es.enter_context(m)
+            out = reaper.reap(s, self.cfg, 0)
+        return s, out, tmux
+
+    def test_a_ps_timeout_through_the_exit_wait_closes_nothing(self):
+        # claude may still run: main() marks the record aborted, so recover_exiting never acts on it
+        s, out, tmux = self.exit_wait_with_ps_timeouts("")
+        self.assertEqual(out[0], "skipped:exit-unconfirmed")
+        self.assertNotEqual(out[0], "skipped:close-unconfirmed")
+        self.assertNotIn(mock.call("kill-session", "-t", "$3"), tmux.call_args_list)
+
+    def test_a_ps_timeout_does_not_skip_the_exit_menu_check(self):
+        _, out, tmux = self.exit_wait_with_ps_timeouts(reaper.MENU_TEXT)
+        self.assertIn(mock.call("send-keys", "-t", "%9", "Escape"), tmux.call_args_list)
+        self.assertEqual(out[0], "skipped:menu-stuck")
 
     def test_an_exception_in_reap_before_claude_exits_marks_the_record_aborted(self):
         s = self.sess()
