@@ -319,6 +319,23 @@ _cc_wj_with_timeout() {
     exit $rc;' "$secs" "$@"
 }
 
+# Reap expired InstaBox runner VMs (stima-api#8631): `reap --expired`, once per scheduled run.
+# The runner deletes only VMs tagged stima-runner=1. Best effort: a missing runner, python3 or instabox
+# is skipped with one line, and a failing or slow reap (bounded like every other external here) is
+# logged with its exit code and never changes the caller's status. The runner's own output is dropped,
+# so nothing it prints reaches the log.
+_cc_wj_instabox_reap() { # --expired
+  local runner="${CC_WJ_INSTABOX_RUNNER:-${CC_WJ_STIMA_API_DIR:-$HOME/GitHub/stima-api}/scripts/ci/instabox_task_runner.py}" rc=0
+  if [ ! -f "$runner" ] || ! command -v python3 >/dev/null 2>&1 || ! command -v instabox >/dev/null 2>&1; then
+    echo "worktree-janitor: instabox reap $1 skipped: runner, python3 or instabox is missing"
+    return 0
+  fi
+  _cc_wj_with_timeout "$(_cc_wj_seconds "${CC_WJ_INSTABOX_REAP_TIMEOUT_SECONDS:-120}" || echo 120)" \
+    python3 "$runner" reap "$@" >/dev/null 2>&1 </dev/null || rc=$?
+  echo "worktree-janitor: instabox reap $1 exit=$rc"
+  return 0
+}
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 # Bound a log to one live file plus one previous generation. cc-reaper reaps
@@ -6435,6 +6452,8 @@ _cc_wj_run() {
     started="$(date +%s)"
     printf '== worktree-janitor scheduled sweep started %s pid=%s\n' \
       "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$$"
+    # Before the host sweep lock, so a round that yields to another sweep still reaps.
+    _cc_wj_instabox_reap --expired
   fi
   # One applying sweep on the host at a time, decided before any scan. The launchd hour, every
   # SessionEnd, resource-watch's act and disk-janitor's trim each start one; each paid the

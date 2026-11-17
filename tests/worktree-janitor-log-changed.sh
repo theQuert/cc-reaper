@@ -4,6 +4,7 @@
 #   text differs from what the previous sweep wrote; a changed value is written, and so is a value that returns.
 # Real git repositories under a sandbox HOME; gh is a failing stub. TAP-style; set WJ_SCRIPT to test another copy.
 set -uo pipefail
+export CC_WJ_INSTABOX_RUNNER=/nonexistent/instabox_task_runner.py  # the real runner reaps real VMs (stima-api#8631)
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WJ="${WJ_SCRIPT:-$ROOT_DIR/shell/worktree-janitor.sh}"

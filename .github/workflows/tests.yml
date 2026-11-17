@@ -62,6 +62,8 @@ jobs:
         run: bash tests/worktree-janitor-sweep-lock-first.sh
       - name: worktree-janitor-log-changed
         run: bash tests/worktree-janitor-log-changed.sh
+      - name: worktree-janitor-instabox-reap
+        run: bash tests/worktree-janitor-instabox-reap.sh
       - name: worktree-active-sessions
         run: bash tests/worktree-active-sessions.sh
       - name: resource-watch

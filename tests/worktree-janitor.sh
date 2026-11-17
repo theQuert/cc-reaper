@@ -2,6 +2,7 @@
 # Tests for shell/worktree-janitor.sh
 # TAP-style: prints "ok - ..." / "not ok - ...", exits non-zero on any failure.
 set -uo pipefail
+export CC_WJ_INSTABOX_RUNNER=/nonexistent/instabox_task_runner.py  # the real runner reaps real VMs (stima-api#8631)
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
