@@ -1307,10 +1307,32 @@ UNPARSED_TRANSCRIPTS
   return 0
 }
 
+# Whether live pid $1 is the process registry record $2 was written for, when its command line
+# carries no session id. The record's procStart is the process's start time in UTC, as
+# `ps -o lstart=` prints it under TZ=UTC; the local-zone spelling is accepted too. One ps read
+# per such process, no lsof. Status 0: bound. 1: the process started at another time, so the pid
+# was reused. 2: unknown (no procStart, a procStart not in the lstart shape, or a start time
+# that cannot be read): the caller keeps it in use.
+_cc_wj_claude_proc_binding() { # <pid> <record file>
+  local pid="$1" f="$2" want utc loc
+  want="$(jq -r '(.procStart // "") | tostring' "$f" 2>/dev/null | head -n 1 | awk '{$1=$1} 1')"
+  [ -n "$want" ] || return 2
+  utc="$(LC_ALL=C TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | awk '{$1=$1} 1')"
+  [ -n "$utc" ] || return 2
+  [ "$utc" = "$want" ] && return 0
+  loc="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null | awk '{$1=$1} 1')"
+  [ -n "$loc" ] && [ "$loc" = "$want" ] && return 0
+  # A different start time proves a reused pid only when procStart is in the lstart shape; any
+  # other spelling (an epoch number, an ISO date, a zero-padded day) is a format this cannot
+  # compare, so it stays unknown and in use.
+  printf '%s\n' "$want" | LC_ALL=C grep -Eq '^[A-Z][a-z]{2} [A-Z][a-z]{2} ([1-9]|[12][0-9]|3[01]) [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$' || return 2
+  return 1
+}
+
 _cc_wj_scan_claude_sessions() {
   local registry="${CC_WJ_CLAUDE_SESSIONS:-$HOME/.claude/sessions}"
   local projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
-  local f files base row pid sid cwd cmd resolved transcripts count transcript sname t rr
+  local f files base row pid sid cwd cmd resolved transcripts count transcript sname t rr bound
   local unknown_attrs=()
   [ -e "$registry" ] || return 0
   if [ ! -d "$registry" ] || [ ! -r "$registry" ] || [ ! -x "$registry" ]; then
@@ -1389,8 +1411,25 @@ _cc_wj_scan_claude_sessions() {
       continue
     }
     # A live pid may have been reused.  The opaque session id in its command line binds
-    # the registry record to this process.
-    case "$cmd" in *"$sid"*) ;; *) continue ;; esac
+    # the registry record to this process.  A session started plainly, or resumed without the
+    # id (`claude --dangerously-skip-permissions`), carries none: its record's procStart, the
+    # process's own start time, binds it instead (stima-api#8774).  A mismatch is another
+    # process on a reused pid; no binding at all is unknown, and unknown stays in use.
+    case "$cmd" in
+      *"$sid"*) ;;
+      *)
+        _cc_wj_claude_proc_binding "$pid" "$f" && bound=0 || bound=$?
+        case "$bound" in
+          0) ;;
+          1) continue ;;
+          *)
+            kill -0 "$pid" 2>/dev/null || continue
+            _cc_wj_tail_attrs_claude "$sid"
+            _cc_wj_unknown_add "claude-session:$sid" "live Claude pid $pid has no session id on its command line and could not be bound to its record" \
+              live yes cwd "$(_cc_wj_pid_cwd "$pid")" cwd "$cwd" "${_CC_WJ_TAIL_ATTRS[@]}"
+            continue ;;
+        esac ;;
+    esac
     resolved="$(_cc_wj_claim_cwd "$cwd")" || {
       _cc_wj_tail_attrs_claude "$sid"
       _cc_wj_unknown_add "claude-session:$sid" "live Claude session $sid could not map cwd ${cwd:-<empty>}" \
