@@ -266,6 +266,15 @@ run_wj --apply >/dev/null 2>&1
 check "a procStart in a shape ps cannot be compared to stays in use, not reclaimed" test -d "$WT"
 kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
 
+new_fixture claude-no-sid-on-cmdline-zero-padded-procstart
+age_worktree 72
+sid=cdcdcdcd-bbbb-4ccc-8ddd-eeeeeeeeeeee
+python3 -c 'import time; time.sleep(120)' --dangerously-skip-permissions </dev/null >/dev/null 2>&1 & claude_pid=$!
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","procStart":"Mon Nov 03 09:44:51 2026"}\n' "$claude_pid" "$sid" "$WT" > "$CLAUDE_SESSIONS/$claude_pid.json"
+run_wj --apply >/dev/null 2>&1
+check "a zero-padded-day procStart is not the lstart shape and stays in use" test -d "$WT"
+kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
+
 new_fixture claude-historical-tool-workdir
 age_worktree 72
 sid=abababab-bbbb-4ccc-8ddd-eeeeeeeeeeee

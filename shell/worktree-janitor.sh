@@ -1325,7 +1325,7 @@ _cc_wj_claude_proc_binding() { # <pid> <record file>
   # A different start time proves a reused pid only when procStart is in the lstart shape; any
   # other spelling (an epoch number, an ISO date, a zero-padded day) is a format this cannot
   # compare, so it stays unknown and in use.
-  printf '%s\n' "$want" | LC_ALL=C grep -Eq '^[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$' || return 2
+  printf '%s\n' "$want" | LC_ALL=C grep -Eq '^[A-Z][a-z]{2} [A-Z][a-z]{2} ([1-9]|[12][0-9]|3[01]) [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$' || return 2
   return 1
 }
 
