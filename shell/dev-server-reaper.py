@@ -40,6 +40,10 @@ A launcher tree is stopped only when every one of these holds:
   (a review front such as ~/stima-review/tailnet_review.mjs <worktree> <port>), and no
   `tailscale serve` handler proxies to a port the tree listens on - unless its owning
   session has ended (below), when a `tailscale serve` entry no longer keeps it;
+- no live session's own listening process forwards to it: a proxy a live or in-grace worktree
+  claim or session scratchpad owns, listening itself, whose command line or script file (one under
+  a scratchpad or a linked worktree, the first 64 KB) names a port the tree listens on - a
+  `frameproxy.mjs` carries its target in a constant, not on its command line;
 - the root is at least the minimum age, so a server still starting is not judged;
 - the worktree janitor's `--claims <worktree>` names no live session cwd and no live
   session tool call for that worktree (this session's own mentions excepted, as the
@@ -196,6 +200,63 @@ def scratch_server(rows, ports, members):
     return (bool(args) and os.path.basename(args[0]) in SERVER_ROOTS
             and any(ports.get(pid) for pid in members)
             and bool(scratch_sessions(None, [rows[pid][4] for pid in members])))
+
+
+SCRIPT_BYTES = 64 * 1024
+
+
+def script_text(path):
+    """The first SCRIPT_BYTES of a file a command line names, only when it lies under a session
+    scratchpad or a linked worktree; "" otherwise. Returns (text, worktree or None)."""
+    try:
+        if not os.path.isfile(path):
+            return "", None
+        owned = SCRATCH.search(f"{path}") is not None
+        worktree = None if owned else linked_worktree(Path(path).parent)
+        if not owned and worktree is None:
+            return "", None
+        with open(path, "rb") as f:
+            return f.read(SCRIPT_BYTES).decode(errors="replace"), worktree
+    except OSError:
+        return "", None
+
+
+def forwarder(rows, ports, members, targets, janitor, claims, claim_timeout):
+    """The pid of a listening process outside the tree, owned by a live session or worktree
+    claim, that names one of the target ports in its command line or its script; None if none.
+    Live means what the janitor's --claims says is live or still inside its grace period: it
+    reports a running `claude` whose command line lacks its session id (every one started
+    without --resume) as RECENT only, and 7f116ef5's two proxies, running for 2 days, were
+    exactly that. An owner nobody can attribute vouches for nothing, and a failed claim
+    check counts as live."""
+    if not targets:
+        return None
+    named = re.compile(r"(?<!\d)(?:%s)(?!\d)" % "|".join(str(t) for t in sorted(targets)))
+    for pid, held in sorted(ports.items()):
+        if not held or pid in members or pid not in rows:
+            continue
+        command = rows[pid][4]
+        owners, text = set(scratch_sessions(None, [command])), command
+        for arg in command.split()[1:]:
+            if arg.startswith("/"):
+                body, worktree = script_text(arg)
+                text += "\n" + body
+                if worktree is not None:
+                    owners.add(worktree)
+                if body:
+                    owners.update(scratch_sessions(None, [arg]))
+        if not owners or not named.search(text):
+            continue
+        for key in sorted(owners, key=str):
+            if ("level", key) not in claims:
+                claims[("level", key)] = claim_level(key, janitor, claim_timeout)
+            if claims[("level", key)] >= 1:
+                return pid
+    return None
+
+
+def listened_ports(ports, members, port):
+    return {p for pid in members for p in ports.get(pid, ())} | ({port} if port > 0 else set())
 
 
 def processes():
@@ -583,16 +644,23 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
         # Unused starts counting again when the publisher goes, not from before it came.
         forget_idle(state_dir, root, begun)
         return "serving", published_by, worktree, members, port, "serving", False
+    idle = 0
+    if state == "static" and not ended:
+        forget_idle(state_dir, root, begun)
+        return "serving", why, worktree, members, port, state, False
+    if state == "idle" and not ended:
+        idle = idle_for(state_dir, root, begun, now)
+        if idle < idle_hours * 3600:
+            return "keep", f"{why}; unused for {idle / 3600:.1f}h of the {idle_hours}h it must be", worktree, [], port, state, False
+    # Decided: stop it. Unless a live session's proxy forwards to it.
+    front = forwarder(rows, ports, members, listened_ports(ports, members, port), janitor, claims, claim_timeout)
+    if front:
+        forget_idle(state_dir, root, begun)
+        return "serving", f"forwarded to by live pid {front}", worktree, members, port, "serving", False
     if state == "unserved":
         return "reap", why, worktree, members, port, state, ended
     if ended:
         return "reap", f"{why}; its session ended", worktree, members, port, state, True
-    if state == "static":
-        forget_idle(state_dir, root, begun)
-        return "serving", why, worktree, members, port, state, False
-    idle = idle_for(state_dir, root, begun, now)
-    if idle < idle_hours * 3600:
-        return "keep", f"{why}; unused for {idle / 3600:.1f}h of the {idle_hours}h it must be", worktree, [], port, state, False
     return "reap", f"{why} for {idle / 3600:.1f}h", worktree, members, port, state, False
 
 
@@ -722,6 +790,8 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
         # that listens now is a server that came up, whatever its connections say.
         now_state, _ = serving(fresh, members, port, rows=fresh_rows)
         if (now_state != state or published(fresh_rows, fresh, members, worktree, tailscale=not ended)
+                or forwarder(fresh_rows, fresh, members, listened_ports(fresh, members, port),
+                             janitor, claims, claim_timeout)
                 or any(AGENT.search(fresh_rows[p][4]) for p in members)):
             print(f"KEEP {label} (serving, or an agent joined, at the recheck)")
             continue

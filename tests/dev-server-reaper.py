@@ -751,6 +751,121 @@ class EndedOwnerTest(Fixture):
         self.assertEqual(self.run_reap(), (0, 0))
         self.assertEqual(self.sent, [])
 
+    # a live session's proxy forwards to it: the port is in its script, not on its command line
+    def proxy_script(self, body, sid=LIVE_SID, name="frameproxy8478.mjs"):
+        directory = Path(self.state) / "claude-501" / "-p" / sid / "scratchpad"
+        directory.mkdir(parents=True, exist_ok=True)
+        script = directory / name
+        script.write_text(body)
+        return script
+
+    def fronting_proxy(self, body="const TARGET = 4162, PORT = 4164;\n", pid=800, **kw):
+        script = self.proxy_script(body, **kw)
+        self.rows[pid] = (1, pid, 3000, OLD, f"node {script}")
+        self.ports[pid] = {4164}
+        return script
+
+    def test_a_server_a_live_sessions_proxy_forwards_to_is_kept(self):
+        self.next_dev()
+        self.fronting_proxy()
+        self.claims.add(LIVE_SID)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_port_on_the_proxys_command_line_is_enough(self):
+        self.next_dev()
+        self.rows[800] = (1, 800, 3000, OLD, f"node /private/tmp/claude-501/-p/{LIVE_SID}/scratchpad/p.mjs --to 4162")
+        self.ports[800] = {4164}
+        self.claims.add(LIVE_SID)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_proxy_in_a_live_worktree_forwards_too(self):
+        self.next_dev()
+        other = Path("/wt/other")
+        script = Path(self.state) / "wt" / "proxy.mjs"
+        script.parent.mkdir()
+        script.write_text("const TARGET = 4162;")
+        self.worktrees[script.parent] = other
+        self.rows[800] = (1, 800, 3000, OLD, f"node {script}")
+        self.ports[800] = {4164}
+        self.claims.add(other)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_proxy_whose_owner_has_ended_does_not_keep_it(self):
+        self.next_dev()
+        self.fronting_proxy()
+        self.assertEqual(self.run_reap(), (2, 2))     # the server, and the dead session's proxy
+        self.assertEqual(self.terms(), [100, 101, 102, 800])
+
+    def test_a_proxy_whose_session_is_only_inside_its_grace_period_keeps_it(self):
+        # The janitor lists a running claude without its session id on the command line as
+        # RECENT, never LIVE: the 2026-11-17 proxies of 7f116ef5 were exactly that.
+        self.next_dev()
+        self.fronting_proxy()
+        self.recent.add(LIVE_SID)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_proxy_that_does_not_listen_does_not_keep_it(self):
+        self.next_dev()
+        self.fronting_proxy()
+        self.ports.pop(800)
+        self.claims.add(LIVE_SID)
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_a_proxy_naming_another_port_or_a_longer_number_does_not_keep_it(self):
+        self.next_dev()
+        self.fronting_proxy("const TARGET = 41620, PORT = 4164, OTHER = 14162;\n")
+        self.claims.add(LIVE_SID)
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_a_script_outside_a_scratchpad_or_worktree_is_not_read(self):
+        self.next_dev()
+        script = Path(self.state) / "elsewhere.mjs"
+        script.write_text("const TARGET = 4162;")
+        self.rows[800] = (1, 800, 3000, OLD, f"node {script}")
+        self.ports[800] = {4164}
+        self.claims.add(LIVE_SID)
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_only_the_first_64_kb_of_a_script_is_read(self):
+        self.next_dev()
+        self.fronting_proxy("x" * reaper.SCRIPT_BYTES + "const TARGET = 4162;\n")
+        self.claims.add(LIVE_SID)
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_a_proxy_that_appears_by_the_recheck_keeps_it(self):
+        self.next_dev()
+        script = self.proxy_script("const TARGET = 4162;")
+        self.claims.add(LIVE_SID)
+        scans = []
+        original = reaper.processes.side_effect
+
+        def proxy_appears():
+            scans.append(1)
+            rows = original()
+            if len(scans) > 1:
+                rows[800] = (1, 800, 3000, OLD, f"node {script}")
+            return rows
+        reaper.processes.side_effect = proxy_appears
+        reaper.listening.side_effect = lambda: {**self.ports, 800: {4164}} if len(scans) > 1 else dict(self.ports)
+        self.assertEqual(self.run_reap(), (0, 1))
+        self.assertEqual(self.sent, [])
+
+    def test_a_live_proxy_keeps_an_unused_hot_reload_server_past_its_window_too(self):
+        self.recent.add(WT)           # owner not ended: the idle window decides
+        self.next_dev()
+        self.forwarded = set()
+        self.fronting_proxy()
+        self.claims.add(LIVE_SID)
+        marker = self.state / f"100-{int(reaper.started(OLD))}"
+        marker.write_text(f"{NOW - 0.5 * HOUR}\n")
+        os.utime(marker, (NOW - 13 * HOUR, NOW - 13 * HOUR))
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
     # the dry run
     def test_the_dry_run_lists_what_would_stop_and_signals_nothing(self):
         self.next_dev()
