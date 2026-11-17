@@ -70,6 +70,10 @@ no socket but its dead stdio pair, the minimum age, no agent or launcher left in
 group, cwd in a linked worktree with no live claim. Twelve sat 5-7 days on 2026-10-06 while
 swap was 13.6 of 14.3 GB, each holding memory for a dev server that no longer existed.
 
+After the verdicts, `STALE-SERVE backend port N` names each `tailscale serve` handler whose
+backend nothing listens on any more. It is a list for a person: nothing here edits the serve
+configuration.
+
 Stopping is SIGTERM to every process in the tree, then SIGKILL to those
 still alive after the grace period; each pid is signalled only while its start time still
 matches the scan, so a reused pid is never hit.
@@ -351,6 +355,16 @@ def served_ports():
                 found.add(int(match.group(1)))
     walk(config)   # values only: TCPForward targets count, listen-port keys do not
     return found
+
+
+def stale_serves():
+    """Backend ports a `tailscale serve` handler still forwards to that nothing listens on,
+    sorted. Only a list: the serve configuration is never changed from here. Empty when
+    either probe cannot answer, because a failed probe is not a stale entry."""
+    forwarded, live = served_ports(), listening()
+    if not forwarded or not live:
+        return []
+    return sorted(forwarded - {p for held in live.values() for p in held})
 
 
 def published(rows, ports, members, worktree, tailscale=True):
@@ -826,6 +840,8 @@ def reap(apply=False, min_age=6 * 3600, grace=10, now=None, janitor=None, send=o
             else:
                 print(f"KEEP {label} (changed before it could be stopped"
                       + (", not permitted to signal it)" if pid in denied else ")"))
+    for port in stale_serves():
+        print(f"STALE-SERVE backend port {port} (nothing listens; listed only, the serve config is untouched)")
     print(f"dev servers: stopped={reaped}/{candidates} rss={rss_kb // 1024}MB idle-window={window}h"
           + (f" ({short_why})" if short else "") + ("" if apply else " (report only)"))
     return reaped, candidates

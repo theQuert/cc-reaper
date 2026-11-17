@@ -878,6 +878,41 @@ class EndedOwnerTest(Fixture):
         self.assertIn("its session ended", out.getvalue())
 
 
+class StaleServeTest(Fixture):
+    def lines(self, apply=False):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.run_reap(apply=apply)
+        return [l for l in out.getvalue().splitlines() if l.startswith("STALE-SERVE")]
+
+    def test_a_forward_to_a_port_nobody_listens_on_is_listed(self):
+        self.ports[900] = {4162}
+        self.forwarded = {4162, 4176}
+        self.assertEqual(len(self.lines()), 1)
+        self.assertIn("backend port 4176", self.lines()[0])
+
+    def test_nothing_is_listed_when_every_backend_listens(self):
+        self.ports[900] = {4162}
+        self.forwarded = {4162}
+        self.assertEqual(self.lines(), [])
+
+    def test_a_probe_that_cannot_answer_lists_nothing(self):
+        self.ports[900] = {4162}
+        self.forwarded = {4176}
+        reaper.served_ports.side_effect = lambda: None
+        self.assertEqual(self.lines(), [])
+        reaper.served_ports.side_effect = lambda: set(self.forwarded)
+        reaper.listening.side_effect = lambda: None
+        self.assertEqual(reaper.stale_serves(), [])
+
+    def test_listing_changes_nothing_in_either_mode(self):
+        self.ports[900] = {4162}
+        self.forwarded = {4176}
+        with mock.patch.object(reaper.subprocess, "run", side_effect=AssertionError("ran a command")):
+            self.assertEqual(len(self.lines(apply=False)), 1)
+            self.assertEqual(len(self.lines(apply=True)), 1)
+        self.assertEqual(self.sent, [])
+
+
 class ClaimLevelTest(unittest.TestCase):
     def level(self, stdout, rc=0, own=None):
         result = mock.Mock(returncode=rc, stdout=stdout)
