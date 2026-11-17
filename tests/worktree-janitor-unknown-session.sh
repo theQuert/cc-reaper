@@ -420,13 +420,14 @@ python3 -c 'import time; time.sleep(600)' </dev/null >/dev/null 2>&1 &
 race_pid2=$!
 printf '{"pid":%s,"sessionId":"%s","cwd":"%s","na' "$race_pid2" "$SID_R" "$T/wt-G" > "$SESSIONS/$race_pid2.json"
 RACE_FILE="$SESSIONS/$race_pid2.json" RACE_MODE=whole \
-  RACE_WHOLE="{\"pid\":$race_pid2,\"sessionId\":\"$SID_R\",\"cwd\":\"$T/wt-G\"}" CC_WJ_NEW_RULES_MODE=auto \
+  RACE_WHOLE="{\"pid\":$race_pid2,\"sessionId\":\"$SID_R\",\"cwd\":\"$T/wt-G\",\"procStart\":\"Mon Jan  1 00:00:00 2001\"}" CC_WJ_NEW_RULES_MODE=auto \
   wj > "$T/race-whole.txt"; race_rc=$?
 check "race whole: the stub tore the first read" test -e "$SESSIONS/$race_pid2.json.raced"
 refute "race whole: nothing says a record could not be parsed" grep -qF "could not be parsed" "$T/race-whole.txt"
 check "race whole: the run exits 0" test "$race_rc" -eq 0
-# Its pid is on no command line here, so the whole record binds to no session and claims nothing,
-# as any readable record whose command line lacks its id: what matters is that it was read.
+# Its pid is on no command line here, and its procStart is another process's start (a reused pid),
+# so the whole record binds to no live process and claims nothing, as any readable record that
+# names a process which is not this one: what matters is that it was read.
 check "race whole: H is removable" judged "$T/race-whole.txt" H REMOVABLE
 kill "$race_pid2" 2>/dev/null; rm -f "$SESSIONS/$race_pid2.json"
 

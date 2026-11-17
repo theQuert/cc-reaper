@@ -257,6 +257,15 @@ run_wj --apply >/dev/null 2>&1
 check "a live record with no procStart and no id on the command line counts as in use" test -d "$WT"
 kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
 
+new_fixture claude-no-sid-on-cmdline-epoch-procstart
+age_worktree 72
+sid=cdcdcdcd-bbbb-4ccc-8ddd-eeeeeeeeeeee
+python3 -c 'import time; time.sleep(120)' --dangerously-skip-permissions </dev/null >/dev/null 2>&1 & claude_pid=$!
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","procStart":1794550400}\n' "$claude_pid" "$sid" "$WT" > "$CLAUDE_SESSIONS/$claude_pid.json"
+run_wj --apply >/dev/null 2>&1
+check "a procStart in a shape ps cannot be compared to stays in use, not reclaimed" test -d "$WT"
+kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
+
 new_fixture claude-historical-tool-workdir
 age_worktree 72
 sid=abababab-bbbb-4ccc-8ddd-eeeeeeeeeeee
