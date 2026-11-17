@@ -34,6 +34,10 @@ class Fixture(unittest.TestCase):
         self.cwds = {}
         self.worktrees = {WT / "site": WT}
         self.claims = set()
+        # Owners a session still inside its grace period names. The worktree starts here, so a
+        # test is about its own rule and not about its session having ended; the ended-owner
+        # tests clear it.
+        self.recent = {WT}
         self.connections = {443}
         self.forwarded = set()
         self.short = (False, "")
@@ -51,6 +55,7 @@ class Fixture(unittest.TestCase):
                            ("served_ports", lambda: set(self.forwarded)),
                            ("pressure", lambda: self.short),
                            ("claimed", self.fake_claimed),
+                           ("claim_level", self.fake_level),
                            ("sockets", lambda pid: pid in self.socket_pids)):
             patcher = mock.patch.object(reaper, name, side_effect=fake)
             patcher.start()
@@ -59,6 +64,10 @@ class Fixture(unittest.TestCase):
     def fake_claimed(self, worktree, janitor, timeout=900):
         self.claim_calls.append(worktree)
         return worktree in self.claims
+
+    def fake_level(self, key, janitor, timeout=900):
+        self.claim_calls.append(key)
+        return 2 if key in self.claims else 1 if key in self.recent else 0
 
     def server(self, root, port=8811, ppid=1, lstart=OLD, cmd=None, where=WT / "site", pgid=None):
         """A launcher root, its wrangler child and its workerd grandchild."""
@@ -543,6 +552,262 @@ class ReaperTest(Fixture):
 
 
 ESBUILD = f"{WT}/site/node_modules/wrangler/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.27.3 --ping"
+
+
+SID = "d0c1504a-1111-4222-8333-444455556666"
+LIVE_SID = "7f116ef5-06f7-4403-8e86-43bb0f3e9eab"
+SCRATCH = f"/private/tmp/claude-501/-Users-stimaclaw-GitHub-stima-api/{SID}/scratchpad"
+
+
+class EndedOwnerTest(Fixture):
+    """2026-11-17: 23 dev servers 4 to 35 days old, each kept by a rule that could never end:
+    a `tailscale serve` entry, `next start`, or a path under a scratchpad. A tree whose owner
+    has ended goes; one whose owner lives, or cannot be told, stays."""
+
+    def setUp(self):
+        super().setUp()
+        self.recent.clear()           # the owner has ended unless a test says otherwise
+        self.forwarded = {4162}
+
+    def next_dev(self, root=100, port=4162, **kw):
+        self.server(root, cmd=f"node ./node_modules/.bin/next dev --hostname 127.0.0.1 --port {port}", **kw)
+        self.rows[root + 1] = (root, root, 2000, OLD, "next-server (v16.4.3)")
+        self.ports[root + 1] = {port}
+
+    def standalone(self, root=200, port=4400, sid=SID, where=None):
+        """`next start` from a standalone copy in a dead session's scratchpad."""
+        self.server(root, cmd=f"node ./node_modules/.bin/next start --port {port}",
+                    where=where or Path(f"/private/tmp/claude-501/-p/{sid}/scratchpad/standalone-1/next"))
+        self.ports[root] = {port}
+
+    def proxy(self, root=300, port=4166, sid=SID, wrapped=True):
+        """`node frameproxy.mjs` from a scratchpad, under the zsh -c the Bash tool ran."""
+        node = f"node /private/tmp/claude-501/-p/{sid}/scratchpad/frameproxy{port}.mjs"
+        if wrapped:
+            self.rows[root] = (1, root, 1000, OLD, f"/bin/zsh -c source /x/snap.sh && eval '{node}' < /dev/null")
+            self.rows[root + 1] = (root, root, 3000, OLD, node)
+        else:
+            self.rows[root + 1] = (1, root, 3000, OLD, node)
+        self.ports[root + 1] = {port}
+
+    # worktree dev server published by tailscale serve (23 of 23 on 2026-11-17 were)
+    def test_a_published_dev_server_whose_session_ended_is_stopped(self):
+        self.next_dev()
+        self.assertEqual(self.run_reap(), (1, 1))
+        self.assertEqual(self.terms(), [100, 101, 102])
+
+    def test_a_published_dev_server_inside_the_grace_period_is_kept(self):
+        self.next_dev()
+        self.recent.add(WT)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_published_dev_server_a_live_session_claims_is_kept(self):
+        self.next_dev()
+        self.claims.add(WT)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_an_ended_owner_with_a_connection_is_kept(self):
+        self.next_dev()
+        self.connections.add(4162)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_an_ended_owner_with_a_review_front_is_kept(self):
+        self.next_dev()
+        self.rows[500] = (1, 500, 10, OLD, f"node /x/tailnet_review.mjs {WT} 4162")
+        self.ports[500] = {4162}
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_an_unreadable_tailscale_does_not_keep_an_ended_owner_and_is_not_asked(self):
+        self.next_dev()
+        reaper.served_ports.side_effect = lambda: None
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_a_connection_made_by_the_recheck_keeps_an_ended_owner(self):
+        self.next_dev()
+        calls = []
+
+        def appears():
+            calls.append(1)
+            return {4162} if len(calls) > 1 else {443}
+        reaper.connected.side_effect = appears
+        self.assertEqual(self.run_reap(), (0, 1))
+        self.assertEqual(self.sent, [])
+
+    # next start in a dead session's scratchpad (cwd is no worktree)
+    def test_next_start_in_a_dead_sessions_scratchpad_is_stopped(self):
+        self.standalone()
+        self.assertEqual(self.run_reap(), (1, 1))
+        self.assertEqual(self.terms(), [200, 201, 202])
+        self.assertEqual(self.claim_calls, [SID])
+
+    def test_next_start_in_a_live_sessions_scratchpad_is_kept(self):
+        self.standalone(sid=LIVE_SID)
+        self.claims.add(LIVE_SID)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_next_start_in_a_scratchpad_of_a_recent_session_is_kept(self):
+        self.standalone()
+        self.recent.add(SID)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_next_start_with_a_connection_is_kept(self):
+        self.standalone()
+        self.connections.add(4400)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_next_start_outside_any_worktree_or_scratchpad_is_kept(self):
+        self.standalone(where=Path("/Users/x/Downloads/site"))
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.claim_calls, [])
+
+    def test_next_start_in_a_live_worktree_whose_session_is_over_but_recent_is_kept(self):
+        self.server(100, cmd="node ./node_modules/.bin/next start --port 4400")
+        self.ports[100] = {4400}
+        self.recent.add(WT)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_next_start_in_a_worktree_whose_session_ended_is_stopped(self):
+        self.server(100, cmd="node ./node_modules/.bin/next start --port 4400")
+        self.ports[100] = {4400}
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    # node proxy.mjs / frameproxy.mjs from a dead session's scratchpad
+    def test_a_scratchpad_proxy_of_a_dead_session_is_stopped_with_its_shell(self):
+        self.proxy()
+        self.assertEqual(self.run_reap(), (1, 1))
+        self.assertEqual(self.terms(), [300, 301])
+        self.assertEqual(self.claim_calls, [SID])
+
+    def test_a_scratchpad_proxy_with_no_wrapper_is_stopped(self):
+        self.proxy(wrapped=False)
+        self.assertEqual(self.run_reap(), (1, 1))
+        self.assertEqual(self.terms(), [301])
+
+    def test_a_scratchpad_proxy_of_a_live_session_is_kept(self):
+        self.proxy(sid=LIVE_SID)
+        self.claims.add(LIVE_SID)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_scratchpad_proxy_of_a_recent_session_is_kept(self):
+        self.proxy()
+        self.recent.add(SID)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_scratchpad_proxy_still_attached_to_its_shell_is_kept(self):
+        self.proxy()
+        self.rows[300] = (55, 300, 1000, OLD, self.rows[300][4])
+        self.rows[55] = (1, 55, 10, OLD, "claude --dangerously-skip-permissions")
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_scratchpad_proxy_with_a_client_is_kept(self):
+        self.proxy()
+        self.connections.add(4166)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_scratchpad_process_that_listens_nowhere_is_not_a_server(self):
+        self.proxy()
+        self.ports.clear()
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.claim_calls, [])
+
+    def test_a_listening_process_with_no_scratchpad_path_is_not_judged(self):
+        self.rows[400] = (1, 400, 1000, OLD, "node /Users/x/tools/proxy.mjs")
+        self.ports[400] = {4166}
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.claim_calls, [])
+
+    def test_a_tmux_server_carrying_a_scratchpad_pane_is_not_a_server_root(self):
+        self.proxy()
+        self.rows[300] = (1, 300, 1000, OLD, "tmux new-session -d node frameproxy")
+        self.rows[301] = (300, 300, 3000, OLD, self.rows[301][4])
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_young_scratchpad_proxy_is_kept(self):
+        self.proxy()
+        self.rows[301] = (300, 300, 3000, NEW, self.rows[301][4])
+        self.rows[300] = (1, 300, 1000, NEW, self.rows[300][4])
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_a_janitor_that_cannot_say_keeps_the_tree(self):
+        self.standalone()
+        reaper.claim_level.side_effect = lambda *a, **k: 2
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    # the dry run
+    def test_the_dry_run_lists_what_would_stop_and_signals_nothing(self):
+        self.next_dev()
+        self.standalone()
+        self.proxy()
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(self.run_reap(apply=False), (0, 3))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(out.getvalue().count("CANDIDATE"), 3)
+        self.assertIn("its session ended", out.getvalue())
+
+
+class ClaimLevelTest(unittest.TestCase):
+    def level(self, stdout, rc=0, own=None):
+        result = mock.Mock(returncode=rc, stdout=stdout)
+        env = {"CLAUDE_CODE_SESSION_ID": own} if own else {}
+        with mock.patch.object(reaper.subprocess, "run", return_value=result), \
+             mock.patch.dict(reaper.os.environ, env, clear=True):
+            return reaper.claim_level(SID, Path("/janitor"))
+
+    def test_levels(self):
+        head = "CLAIMS session_grace_hours=24\n"
+        self.assertEqual(self.level(head), 0)
+        self.assertEqual(self.level(head + f"LIVE\tharness=Claude\tid={SID}\tcwd=/x\n"), 2)
+        self.assertEqual(self.level(head + f"RECENT\tharness=Claude\tid={SID}\tstate=transcript\tcwd=/x\t"
+                                           "last_activity=t\tage=5s\tremaining=100s\n"), 1)
+        self.assertEqual(self.level(head + f"RECENT\tharness=Claude\tid={SID}\tstate=transcript\tcwd=/x\t"
+                                           "last_activity=t\tage=9s\tremaining=0s\n"), 0)
+        self.assertEqual(self.level(head + "RECENT\tharness=Claude\tid=a\tcwd=/x\n"), 1)   # no grace figure: claims
+        self.assertEqual(self.level(head + "RECENT_TOOL\tid=a\tremaining=9s\tscope=x\n"
+                                           "LIVE_TOOL\tharness=Codex\tid=b\tpath=/x\tscope=x\n"), 2)
+
+    def test_failure_and_garbage_cannot_say(self):
+        self.assertEqual(self.level("", rc=2), 2)
+        self.assertEqual(self.level("ERROR\tharness=Claude\n"), 2)
+        with mock.patch.object(reaper.subprocess, "run",
+                               side_effect=reaper.subprocess.TimeoutExpired("janitor", 900)):
+            self.assertEqual(reaper.claim_level(SID, Path("/janitor")), 2)
+
+    def test_own_session_does_not_count(self):
+        self.assertEqual(self.level(f"CLAIMS x\nLIVE_TOOL\tharness=Claude\tid=me\tpath=/x\tscope=x\n", own="me"), 0)
+
+
+class ScratchTest(unittest.TestCase):
+    def test_a_session_id_is_read_from_a_scratchpad_or_task_path_only(self):
+        for text in (f"/private/tmp/claude-501/-p/{SID}/scratchpad/a.mjs",
+                     f"/tmp/claude-501/-p/{SID}/tasks/x.output",
+                     f"node /private/tmp/claude-501/-Users-x-y/{SID}"):
+            self.assertEqual(reaper.scratch_sessions(None, [text]), {SID}, text)
+        for text in (f"/Users/x/{SID}/scratchpad/a.mjs", f"/private/tmp/claude-501/{SID}/a",
+                     "/private/tmp/claude-501/-p/not-a-session-id/scratchpad/a.mjs", "node proxy.mjs"):
+            self.assertEqual(reaper.scratch_sessions(None, [text]), set(), text)
+
+    def test_the_working_directory_names_a_session_too(self):
+        self.assertEqual(reaper.scratch_sessions(Path(SCRATCH) / "standalone-1" / "next", []), {SID})
+        self.assertEqual(reaper.scratch_sessions(Path(SCRATCH), []), {SID})
+        self.assertEqual(reaper.scratch_sessions(None, []), set())
 
 
 class EsbuildTest(Fixture):
