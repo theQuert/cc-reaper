@@ -220,9 +220,42 @@ kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
 new_fixture claude-stale
 age_worktree 72
 sid=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
-printf '{"pid":%s,"sessionId":"%s","cwd":"%s"}\n' "$$" "$sid" "$WT" > "$CLAUDE_SESSIONS/$$.json"
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","procStart":"Mon Jan  1 00:00:00 2001"}\n' "$$" "$sid" "$WT" > "$CLAUDE_SESSIONS/$$.json"
 run_wj --apply >/dev/null 2>&1
 check "a reused Claude PID record does not pin a worktree" test ! -d "$WT"
+
+# stima-api#8774: a live `claude` started as `claude --dangerously-skip-permissions` has no session
+# id on its command line. The record's procStart (UTC, ps lstart) binds it to the process instead.
+new_fixture claude-no-sid-on-cmdline-bound-by-procstart
+age_worktree 72
+sid=cdcdcdcd-bbbb-4ccc-8ddd-eeeeeeeeeeee
+python3 -c 'import time; time.sleep(120)' --dangerously-skip-permissions </dev/null >/dev/null 2>&1 & claude_pid=$!
+sleep 0.3
+proc_start="$(TZ=UTC LC_ALL=C ps -p "$claude_pid" -o lstart= | awk '{$1=$1} 1')"
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","procStart":"%s","kind":"interactive"}\n' "$claude_pid" "$sid" "$WT" "$proc_start" > "$CLAUDE_SESSIONS/$claude_pid.json"
+mkdir -p "$CLAUDE_PROJECTS/project"
+: > "$CLAUDE_PROJECTS/project/$sid.jsonl"
+claims="$(run_wj --claims "$WT" 2>&1)"
+case "$claims" in *'LIVE'*'Claude'*"$sid"*) ok "--claims reports a no-session-id Claude process LIVE" ;; *) bad "--claims reports a no-session-id Claude process LIVE"; printf '# claims output: %s\n' "$claims" ;; esac
+run_wj --apply >/dev/null 2>&1
+check "a live Claude process without its session id on the command line keeps its worktree" test -d "$WT"
+kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
+
+new_fixture claude-no-sid-on-cmdline-reused-pid
+age_worktree 72
+sid=cdcdcdcd-bbbb-4ccc-8ddd-eeeeeeeeeeee
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","procStart":"Mon Jan  1 00:00:00 2001"}\n' "$$" "$sid" "$WT" > "$CLAUDE_SESSIONS/$$.json"
+run_wj --apply >/dev/null 2>&1
+check "a record whose procStart is another process's start does not pin a worktree" test ! -d "$WT"
+
+new_fixture claude-no-sid-on-cmdline-unknown-binding
+age_worktree 72
+sid=cdcdcdcd-bbbb-4ccc-8ddd-eeeeeeeeeeee
+python3 -c 'import time; time.sleep(120)' --dangerously-skip-permissions </dev/null >/dev/null 2>&1 & claude_pid=$!
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s"}\n' "$claude_pid" "$sid" "$WT" > "$CLAUDE_SESSIONS/$claude_pid.json"
+run_wj --apply >/dev/null 2>&1
+check "a live record with no procStart and no id on the command line counts as in use" test -d "$WT"
+kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
 
 new_fixture claude-historical-tool-workdir
 age_worktree 72
