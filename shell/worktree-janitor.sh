@@ -319,6 +319,23 @@ _cc_wj_with_timeout() {
     exit $rc;' "$secs" "$@"
 }
 
+# Reap the InstaBox runner VMs (stima-api#8631): `reap --session <id>` for the session that ended,
+# `reap --expired` once per scheduled run. The runner deletes only VMs tagged stima-runner=1. Best
+# effort: a missing runner, python3 or instabox is skipped with one line, and a failing or slow reap
+# (bounded like every other external here) is logged with its exit code and never changes the caller's
+# status. The runner's own output is dropped, so nothing it prints reaches the log.
+_cc_wj_instabox_reap() { # --session <id> | --expired
+  local runner="${CC_WJ_INSTABOX_RUNNER:-${CC_WJ_STIMA_API_DIR:-$HOME/GitHub/stima-api}/scripts/ci/instabox_task_runner.py}" rc=0
+  if [ ! -f "$runner" ] || ! command -v python3 >/dev/null 2>&1 || ! command -v instabox >/dev/null 2>&1; then
+    echo "worktree-janitor: instabox reap $1 skipped: runner, python3 or instabox is missing"
+    return 0
+  fi
+  _cc_wj_with_timeout "$(_cc_wj_seconds "${CC_WJ_INSTABOX_REAP_TIMEOUT_SECONDS:-120}" || echo 120)" \
+    python3 "$runner" reap "$@" >/dev/null 2>&1 </dev/null || rc=$?
+  echo "worktree-janitor: instabox reap $1 exit=$rc"
+  return 0
+}
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 # Bound a log to one live file plus one previous generation. cc-reaper reaps
@@ -5167,6 +5184,9 @@ _cc_wj_run_inner() {
     fi
   fi
 
+  # Once per scheduled run, before any sweep that can defer or fail.
+  [ "$scheduled" -ne 1 ] || _cc_wj_instabox_reap --expired
+
   if [ -n "$_CC_WJ_CONFIG_ERROR" ]; then
     echo "worktree-janitor: $_CC_WJ_CONFIG_ERROR; scanned and removed nothing" >&2
     return 2
@@ -6551,7 +6571,7 @@ _cc_wj_session() {
     return 1
   fi
   if [ "${CC_WJ_DETACHED:-}" != "1" ]; then
-    local log script input="" hook_cwd="" unparsed=""
+    local log script input="" hook_cwd="" hook_sid="" unparsed=""
     # A SessionEnd hook receives JSON on stdin, and its `cwd` is where the session stood -
     # which need not be CLAUDE_PROJECT_DIR when it worked in a linked worktree. Read only
     # from a pipe or file, so a terminal invocation does not wait for input.
@@ -6580,6 +6600,11 @@ _cc_wj_session() {
           esac ;;
       esac
       case "$hook_cwd" in /*) ;; *) unparsed=1 ;; esac
+      case "$input" in
+        *'"session_id"'*)
+          hook_sid="$(printf '%s\n' "${input#*\"session_id\"}" |
+            sed -n '1s/^[[:space:]]*:[[:space:]]*"\([A-Za-z0-9._-]*\)".*/\1/p')" ;;
+      esac
     fi
     log="${CC_WJ_SESSION_LOG:-$HOME/.cc-reaper/logs/worktree-janitor-session.log}"
     mkdir -p "$(dirname "$log")" 2>/dev/null
@@ -6588,7 +6613,8 @@ _cc_wj_session() {
     export CC_WJ_DETACHED=1 \
       CC_WJ_SESSION_DIR="${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}" \
       CC_WJ_SESSION_CWD="$hook_cwd" \
-      CC_WJ_SESSION_CWD_UNPARSED="$unparsed"
+      CC_WJ_SESSION_CWD_UNPARSED="$unparsed" \
+      CC_WJ_SESSION_ID="$hook_sid"
     if command -v perl >/dev/null 2>&1; then
       perl -MPOSIX -e 'pipe(my $r, my $w) or exit 1; defined(my $p = fork) or exit 1;
         if ($p) { close $w; my $done = <$r>; exit 0 }
@@ -6612,6 +6638,9 @@ _cc_wj_session() {
   t0="$(date +%s)"
   free0="$(_cc_wj_free_kb)"
   echo "== worktree-janitor ${CC_WJ_HARNESS:-unknown} session sweep $(date '+%Y-%m-%dT%H:%M:%S%z') $dir (pid $$)"
+  # First, before the slow sweep: the ending session's VMs cost money while it runs. The id is the
+  # hook's own session_id, charset-checked at the launcher; an empty one reaps nothing.
+  [ -z "${CC_WJ_SESSION_ID:-}" ] || _cc_wj_instabox_reap --session "$CC_WJ_SESSION_ID"
   common="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   if [ -z "$common" ]; then
     echo "worktree-janitor: $dir is not inside a git repository; swept nothing"
