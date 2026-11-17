@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Shared Claude/Codex worktree activity claims and scheduling policy.
 set -uo pipefail
+export CC_WJ_INSTABOX_RUNNER=/nonexistent/instabox_task_runner.py  # the real runner reaps real VMs (stima-api#8631)
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WJ="${WJ_SCRIPT:-$ROOT_DIR/shell/worktree-janitor.sh}"
