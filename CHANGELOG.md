@@ -12,9 +12,12 @@
   On 2026-11-17 23 dev servers had run 4 to 35 days, and the log of the hourly `--check` showed why: 292 of 352
   verdicts were "published by tailscale serve", 44 "no hot-reload socket to judge use by", and a `node proxy.mjs` or a
   standalone `next start` under a dead session's `/tmp/claude-*/<id>/scratchpad` was never in a linked worktree or never a
-  known launcher, so nothing ever stopped. A tree whose owner (worktree, or scratchpad session id) the janitor's
-  `--claims` shows ended, outside the grace period, is now stopped when nothing is connected, whatever `tailscale serve`
-  says; a live or recent owner, a connection, a review front, or an owner it cannot attribute still keeps it.
+  known launcher, so nothing ever stopped. A tree is now stopped when nothing is connected and its owner is proven
+  ended, whatever `tailscale serve` says: no live or in-grace claim, and for a worktree nothing touched it for 3 days, and
+  for a scratchpad session its transcript unwritten for 24h and held open by nobody. A missing claim alone is not proof
+  (a session in the primary checkout can have started a server and moved on). The owner is read from the root's cwd or
+  script only. A live or in-grace owner, a listening proxy of one that names the server's port, a connection, a review
+  front, or an owner it cannot attribute still keeps it, and a grace-level owner's proxy is never idle-reaped.
 
 ### Added
 - **worktree-janitor: evidence that has expired no longer keeps a landed idle tree (stima-api #7895).** After #7881 the

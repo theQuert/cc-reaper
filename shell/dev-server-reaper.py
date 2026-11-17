@@ -49,15 +49,27 @@ A launcher tree is stopped only when every one of these holds:
   session tool call for that worktree (this session's own mentions excepted, as the
   janitor does).
 
-The owner is who started it, read from where it stands: the linked worktree it runs in, or
-the session id in a `/tmp/claude-<uid>/<project>/<session id>/` path in its working directory
-or on any command line of its tree (a scratchpad: `next start` standalone copies, `node
-proxy.mjs`). The owner has ended when the janitor's `--claims <worktree or session id>` names
-no live session and no session still inside its grace period. A tree whose owner has ended is
-stopped when nothing is connected to it, even though it listens and even if `tailscale serve`
-forwards to it (2026-11-17: 23 servers, 4 to 35 days old, every one of them published, or
-`next start`, or under a scratchpad, so none of the rules above could ever reach them). A
-tree whose owner cannot be told stays, and so does one whose owner is alive.
+The owner is who started it, read from the root only: the linked worktree of its working
+directory, or the session id in a `/tmp/claude-<uid>/<project>/<session id>/` path in that
+directory or in the script the root runs (`node /tmp/claude-.../scratchpad/proxy.mjs`, also
+inside a `zsh -c 'eval node ...'` wrapper). An argument, or a child's command line, that
+names a scratchpad attributes nothing. A missing claim is not proof the owner is gone: the
+janitor sees a worktree only through a live session's cwd or its last two turns, and a
+session working from the primary checkout can have started a server and moved on. The owner
+has ended only on positive evidence, all of it, for every owner of the tree:
+
+- the janitor's `--claims` names no live session and none inside its grace period, and
+- for a worktree, nothing has touched it for 3 days: no commit, no change to a file `git
+  status` names, no stack file (the evidence local_stack.sh's stale-idle uses);
+- for a session, its transcript `~/.claude/projects/*/<id>.jsonl` has not been written for
+  24h and no process holds it open.
+
+A tree whose owner has ended is stopped when nothing is connected to it, even though it
+listens and even if `tailscale serve` forwards to it (2026-11-17: 23 servers, 4 to 35 days
+old, every one of them published, or `next start`, or under a scratchpad, so none of the rules
+above could ever reach them). A tree whose owner is alive, inside the grace period, not yet
+proven ended, or unknown keeps every protection above, `next start` and `tailscale serve`
+included.
 
 Nothing is judged by file times: a page being viewed writes no file, and a stack with
 its own ticker writes one every minute. A tree something is connected to, or that is
@@ -97,6 +109,9 @@ AGENT = re.compile(r"(?:^|/)(?:claude|codex)(?:\s|$)")
 PORT_SHIFT = 20
 # `react-scripts start` reads PORT from the environment; its port is whatever it listens on.
 ANY_PORT = -1
+# A script a session's scratchpad runs names no port either, and unlike react-scripts it has no
+# hot-reload socket: judged by what it listens on, and static (never idle-reaped) until its owner ended.
+PROXY_PORT = -2
 # How long a listening tree must have had no connection at every run before it is stopped,
 # and the shorter window while memory is short.
 IDLE_HOURS = 12
@@ -112,6 +127,13 @@ STATE_DIR = Path.home() / ".cc-reaper" / "state" / "dev-server-idle"
 # A Claude session's scratchpad and task directories: /tmp/claude-<uid>/<project>/<session id>/...
 SCRATCH = re.compile(r"/claude-\d+/[^/\s]+/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})(?:/|\s|$)")
 SERVER_ROOTS = {"node", "bun", "deno", "npm", "npx", "python", "python3", "zsh", "bash", "sh"}
+RUNTIMES = {"node", "bun", "deno", "python", "python3"}
+SHELLS = {"zsh", "bash", "sh"}
+SCRIPT_EXT = (".js", ".mjs", ".cjs", ".ts", ".py", ".sh")
+# How long an owner must have been quiet before a missing claim counts as an ended session.
+WORKTREE_IDLE_SECONDS = 3 * 86400
+TRANSCRIPT_IDLE_SECONDS = 24 * 3600
+PROJECTS = Path.home() / ".claude" / "projects"
 ESBUILD = re.compile(r"/node_modules/(?:\.bin|(?:.+/)?@esbuild/[^/]+/bin)/esbuild$")
 
 
@@ -194,35 +216,63 @@ def scratch_sessions(where, commands):
     return found
 
 
+def script_paths(command):
+    """Absolute script paths a command line runs: the first word after a runtime (`node
+    /x/proxy.mjs`), where the line starts with the runtime or with a shell that runs it
+    (`zsh -c '... eval node /x/proxy.mjs'`). Any other argument is not the script."""
+    tokens = [t.strip("'\"") for t in command.split()]
+    shell = bool(tokens) and os.path.basename(tokens[0]) in SHELLS
+    found = []
+    for i, token in enumerate(tokens):
+        if os.path.basename(token) not in RUNTIMES or not (i == 0 or shell):
+            continue
+        script = next((t for t in tokens[i + 1:] if t and not t.startswith("-")), "")
+        if script.startswith("/") and script.endswith(SCRIPT_EXT):
+            found.append(script)
+    return found
+
+
 def scratch_server(rows, ports, members):
     """Whether a tree that is not a known launcher is a server a session's scratchpad started:
-    something in it listens and a command line of it names a scratchpad. Every command in the
-    tree counts, so a `zsh -c 'node proxy.mjs'` wrapper is read the same as the node under it.
-    The root must be a runtime or a shell: a tmux or screen server keeps every pane in its
-    tree, and one pane's scratchpad path must not condemn the others."""
-    args = rows[members[0]][4].split()
+    something in it listens and its root runs a script from a scratchpad. Only the root's
+    script counts: a tool that merely has a scratchpad path among its arguments, or a child
+    that does, is not owned by that session. The root must be a runtime or a shell: a tmux or
+    screen server keeps every pane in its tree, and one pane's path must not condemn the rest."""
+    command = rows[members[0]][4]
+    args = command.split()
     return (bool(args) and os.path.basename(args[0]) in SERVER_ROOTS
             and any(ports.get(pid) for pid in members)
-            and bool(scratch_sessions(None, [rows[pid][4] for pid in members])))
+            and bool(scratch_sessions(None, script_paths(command))))
 
 
 SCRIPT_BYTES = 64 * 1024
 
 
-def script_text(path):
-    """The first SCRIPT_BYTES of a file a command line names, only when it lies under a session
-    scratchpad or a linked worktree; "" otherwise. Returns (text, worktree or None)."""
+def script_text(path, cache=None):
+    """The first SCRIPT_BYTES of a script a command line names, only when it lies under a
+    session scratchpad or a linked worktree; "" otherwise. Returns (text, worktree or None).
+    `cache` (a dict kept for the run) holds each file and each directory's worktree, so one
+    `git` call serves every process that names the directory."""
+    cache = {} if cache is None else cache
+    if ("script", path) in cache:
+        return cache[("script", path)]
+    result = ("", None)
     try:
-        if not os.path.isfile(path):
-            return "", None
-        owned = SCRATCH.search(f"{path}") is not None
-        worktree = None if owned else linked_worktree(Path(path).parent)
-        if not owned and worktree is None:
-            return "", None
-        with open(path, "rb") as f:
-            return f.read(SCRIPT_BYTES).decode(errors="replace"), worktree
+        if os.path.isfile(path):
+            owned = SCRATCH.search(path) is not None
+            directory = Path(path).parent
+            worktree = None
+            if not owned:
+                if ("wtdir", directory) not in cache:
+                    cache[("wtdir", directory)] = linked_worktree(directory)
+                worktree = cache[("wtdir", directory)]
+            if owned or worktree is not None:
+                with open(path, "rb") as f:
+                    result = (f.read(SCRIPT_BYTES).decode(errors="replace"), worktree)
     except OSError:
-        return "", None
+        pass
+    cache[("script", path)] = result
+    return result
 
 
 def forwarder(rows, ports, members, targets, janitor, claims, claim_timeout):
@@ -231,8 +281,8 @@ def forwarder(rows, ports, members, targets, janitor, claims, claim_timeout):
     Live means what the janitor's --claims says is live or still inside its grace period: it
     reports a running `claude` whose command line lacks its session id (every one started
     without --resume) as RECENT only, and 7f116ef5's two proxies, running for 2 days, were
-    exactly that. An owner nobody can attribute vouches for nothing, and a failed claim
-    check counts as live."""
+    exactly that. The owner is read from the script it runs, as for a tree; one nobody can
+    attribute vouches for nothing, and a failed claim check counts as live."""
     if not targets:
         return None
     named = re.compile(r"(?<!\d)(?:%s)(?!\d)" % "|".join(str(t) for t in sorted(targets)))
@@ -240,15 +290,13 @@ def forwarder(rows, ports, members, targets, janitor, claims, claim_timeout):
         if not held or pid in members or pid not in rows:
             continue
         command = rows[pid][4]
-        owners, text = set(scratch_sessions(None, [command])), command
-        for arg in command.split()[1:]:
-            if arg.startswith("/"):
-                body, worktree = script_text(arg)
-                text += "\n" + body
-                if worktree is not None:
-                    owners.add(worktree)
-                if body:
-                    owners.update(scratch_sessions(None, [arg]))
+        scripts = script_paths(command)
+        owners, text = set(scratch_sessions(None, scripts)), command
+        for script in scripts:
+            body, worktree = script_text(script, claims)
+            text += "\n" + body
+            if worktree is not None:
+                owners.add(worktree)
         if not owners or not named.search(text):
             continue
         for key in sorted(owners, key=str):
@@ -261,6 +309,64 @@ def forwarder(rows, ports, members, targets, janitor, claims, claim_timeout):
 
 def listened_ports(ports, members, port):
     return {p for pid in members for p in ports.get(pid, ())} | ({port} if port > 0 else set())
+
+
+def worktree_idle(worktree, now):
+    """Seconds since anything touched the worktree, or None when git cannot say: HEAD's
+    commit time, the stack's files, and every file `git status` names. The same evidence as
+    local_stack.sh's last_activity, read the same way: not the index (status rewrites it), no
+    optional locks, and what the stack itself keeps is counted once, by its own files."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(worktree), "--no-optional-locks", *args],
+                              capture_output=True, text=True, timeout=120, check=True).stdout
+    try:
+        newest = float(git("log", "-1", "--format=%ct").strip() or 0)
+        status = subprocess.run(["git", "-C", str(worktree), "--no-optional-locks", "status", "--porcelain", "-z"],
+                                capture_output=True, text=True, timeout=120, check=True).stdout.split("\0")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    names = [worktree / ".local-stack.env", worktree / ".local-stack" / "api.pid"]
+    skip = False
+    for entry in status:
+        if skip:                      # a rename's old name
+            skip = False
+            continue
+        if len(entry) < 4:
+            continue
+        skip = entry[0] in "RC"
+        if not re.match(r"\.local-stack(\.env|/)", entry[3:]):
+            names.append(worktree / entry[3:])
+    for name in names:
+        try:
+            newest = max(newest, name.stat().st_mtime)
+        except OSError:
+            continue
+    return max(0.0, now - newest)
+
+
+def transcripts_ended(sids, now):
+    """The session ids among sids whose transcript was written more than TRANSCRIPT_IDLE_SECONDS
+    ago and is held open by no process. A session with no transcript, one with several, or an
+    lsof that cannot answer is not proven: the caller keeps it."""
+    files = {}
+    for sid in sids:
+        found = list(PROJECTS.glob(f"*/{sid}.jsonl"))
+        try:
+            if len(found) == 1 and now - found[0].stat().st_mtime >= TRANSCRIPT_IDLE_SECONDS:
+                files[sid] = found[0]
+        except OSError:
+            continue
+    if not files:
+        return set()
+    try:
+        probe = subprocess.run(["lsof", "-nP", "-Fpn", "--", *map(str, files.values())],
+                               capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if probe.returncode not in (0, 1):
+        return set()
+    held = {line[1:] for line in probe.stdout.splitlines() if line.startswith("n")}
+    return {sid for sid, path in files.items() if str(path) not in held}
 
 
 def processes():
@@ -538,7 +644,7 @@ def linked_worktree(path):
 def claim_level(key, janitor, timeout=900):
     """What the janitor's `--claims <key>` says about a worktree path or a session id: 2 when
     a live session claims it or the janitor cannot say, 1 when only a session still inside its
-    grace period does, 0 when none does."""
+    grace period does, 0 when none does. 0 is only the absence of a claim."""
     try:
         # Minutes, not seconds: it reads every live and recent transcript, and took 5m11s
         # under load on 2026-10-05. A timeout is a claim, so too short keeps everything.
@@ -554,7 +660,9 @@ def claim_level(key, janitor, timeout=900):
         kind, _, rest = line.partition("\t")
         if kind not in ("LIVE", "LIVE_TOOL", "RECENT", "RECENT_TOOL"):
             continue
-        if own and f"id={own}\t" in rest + "\t":
+        # The session's own mentions of a path are what running this from a session adds, so those
+        # are left out; its own record is not: a session is the owner of the servers it started.
+        if own and kind.endswith("_TOOL") and f"id={own}\t" in rest + "\t":
             continue
         if kind.startswith("LIVE"):
             return 2
@@ -589,7 +697,7 @@ def serving(ports, members, port, hot=True, rows=None):
     listens and nothing is connected right now; it holds no connection between requests, so
     one empty moment is no proof it is unused and only an ended owner lets it be stopped."""
     listens = {p for pid in members for p in ports.get(pid, ())}
-    if port == ANY_PORT:
+    if port in (ANY_PORT, PROXY_PORT):
         used_on = listens
         if not used_on:
             return "idle", "listens on nothing"
@@ -613,6 +721,23 @@ def serving(ports, members, port, hot=True, rows=None):
     return "idle", f"listens on {min(used_on)} with no connection"
 
 
+def owners_ended(worktree, sessions, claims, now):
+    """Whether every owner of the tree is proven gone, not only unclaimed: the worktree idle
+    for WORKTREE_IDLE_SECONDS, each session's transcript quiet and closed. Cached for the run."""
+    if worktree is not None:
+        if ("idle", worktree) not in claims:
+            claims[("idle", worktree)] = worktree_idle(worktree, now)
+        idle = claims[("idle", worktree)]
+        if idle is None or idle < WORKTREE_IDLE_SECONDS:
+            return False
+    unknown = sorted(sid for sid in sessions if ("ended", sid) not in claims)
+    if unknown:
+        proven = transcripts_ended(set(unknown), now)
+        for sid in unknown:
+            claims[("ended", sid)] = sid in proven
+    return all(claims[("ended", sid)] for sid in sessions)
+
+
 def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=900,
           state_dir=STATE_DIR, idle_hours=IDLE_HOURS):
     """(verdict, reason, worktree, members, port, state, ended); verdict is reap, serving or
@@ -622,7 +747,7 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
     members = tree(rows, root)
     port = launcher(command)
     if port is None and scratch_server(rows, ports, members):
-        port = ANY_PORT
+        port = PROXY_PORT
     if not port:
         return "keep", "no port on the command line", None, [], port, None, False
     begun = started(lstart)
@@ -638,7 +763,7 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
         return "keep", "an agent process is in the tree or its process group", None, [], port, state, False
     where = cwd(root)
     worktree = linked_worktree(where) if where else None
-    sessions = scratch_sessions(where, [rows[pid][4] for pid in members])
+    sessions = scratch_sessions(where, script_paths(command))
     if worktree is None and not sessions:
         return "keep", "not in a linked worktree or a session scratchpad", None, [], port, state, False
     # One janitor --claims call per owner per run: it reads every live transcript, and
@@ -652,7 +777,7 @@ def judge(rows, ports, root, min_age, now, janitor, claims=None, claim_timeout=9
     if level == 2:
         return ("keep", "a live session claims the worktree or scratchpad, or the claim check failed",
                 worktree, [], port, state, False)
-    ended = level == 0
+    ended = level == 0 and owners_ended(worktree, sessions, claims, now)
     published_by = published(rows, ports, members, worktree, tailscale=not ended)
     if published_by:
         # Unused starts counting again when the publisher goes, not from before it came.

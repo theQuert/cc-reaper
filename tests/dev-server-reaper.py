@@ -21,6 +21,7 @@ reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
 
 HOUR = 3600
+DAY = 24 * HOUR
 NOW = time.mktime(time.strptime("Sun Oct  4 12:00:00 2026", "%a %b %d %H:%M:%S %Y"))
 OLD = "Tue Sep 29 20:48:04 2026"
 NEW = "Sun Oct  4 11:30:00 2026"
@@ -47,10 +48,17 @@ class Fixture(unittest.TestCase):
         self.sent = []
         self.claim_calls = []
         self.socket_pids = set()
+        # What proves an owner ended, beyond a missing claim: a worktree untouched for 3 days,
+        # a session transcript unwritten for 24h with nothing holding it open.
+        self.idle = {}             # worktree -> seconds since anything touched it (default 10 days)
+        self.written = set()       # session ids whose transcript is recent or held open
+        self.worktree_calls = []
         for name, fake in (("processes", lambda: dict(self.rows)),
                            ("listening", lambda: dict(self.ports)),
                            ("cwd", lambda pid: self.cwds.get(pid)),
-                           ("linked_worktree", lambda path: self.worktrees.get(path)),
+                           ("linked_worktree", self.fake_linked),
+                           ("worktree_idle", lambda wt, now: self.idle.get(wt, 10 * DAY)),
+                           ("transcripts_ended", lambda sids, now: {x for x in sids if x not in self.written}),
                            ("connected", lambda: set(self.connections) or None),
                            ("served_ports", lambda: set(self.forwarded)),
                            ("pressure", lambda: self.short),
@@ -60,6 +68,10 @@ class Fixture(unittest.TestCase):
             patcher = mock.patch.object(reaper, name, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def fake_linked(self, path):
+        self.worktree_calls.append(path)
+        return self.worktrees.get(path)
 
     def fake_claimed(self, worktree, janitor, timeout=900):
         self.claim_calls.append(worktree)
@@ -866,6 +878,125 @@ class EndedOwnerTest(Fixture):
         self.assertEqual(self.run_reap(), (0, 0))
         self.assertEqual(self.sent, [])
 
+    # review of #175 (Opus): a missing claim is not proof the owner ended
+    def test_p1_a_worktree_touched_within_three_days_is_not_ended(self):
+        # A live session whose cwd is the primary checkout started `next dev`, published it for
+        # review and moved on: the janitor sees no claim, but the worktree was touched yesterday.
+        self.next_dev()
+        self.idle[WT] = 1 * DAY
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_p1_a_worktree_untouched_for_three_days_is_ended(self):
+        self.next_dev()
+        self.idle[WT] = 3 * DAY
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_p1_a_worktree_whose_idle_time_is_unknown_is_not_ended(self):
+        self.next_dev()
+        reaper.worktree_idle.side_effect = lambda wt, now: None
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_p1_next_start_published_by_a_session_that_moved_on_is_kept(self):
+        self.server(100, cmd="node ./node_modules/.bin/next start --port 4400")
+        self.ports[100] = {4400}
+        self.forwarded = {4400}
+        self.idle[WT] = 2 * DAY
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_p1_a_tree_that_serves_nothing_still_goes_without_ended_proof(self):
+        self.server(100)
+        self.idle[WT] = 1 * DAY
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_p1_a_scratchpad_whose_transcript_is_recent_or_held_open_is_not_ended(self):
+        self.standalone()
+        self.written.add(SID)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_p1_both_owners_must_be_ended(self):
+        # cwd in a worktree, command running a script from a scratchpad
+        self.server(100, cmd=f"node {SCRATCH}/serve.mjs --port 4400")
+        self.ports[100] = {4400}
+        self.idle[WT] = 1 * DAY
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.idle[WT] = 5 * DAY
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_p2_a_grace_owners_scratchpad_proxy_is_never_idle_reaped(self):
+        self.proxy()
+        self.recent.add(SID)
+        for hours in (13, 40):
+            marker = self.state / f"300-{int(reaper.started(OLD))}"
+            marker.write_text(f"{NOW - 0.5 * HOUR}\n")
+            os.utime(marker, (NOW - hours * HOUR, NOW - hours * HOUR))
+            self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_p2_a_grace_owners_standalone_next_start_is_never_idle_reaped(self):
+        self.standalone()
+        self.recent.add(SID)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_p2_a_cra_server_is_still_idle_reaped_after_its_window(self):
+        # ANY_PORT without hot reload is the proxy's case only: react-scripts stays hot.
+        self.server(100, cmd="node ./node_modules/.bin/react-scripts start")
+        self.ports[101] = {3633}
+        self.recent.add(WT)
+        marker = self.state / f"100-{int(reaper.started(OLD))}"
+        marker.write_text(f"{NOW - 0.5 * HOUR}\n")
+        os.utime(marker, (NOW - 13 * HOUR, NOW - 13 * HOUR))
+        self.forwarded = set()
+        self.assertEqual(self.run_reap(), (1, 1))
+
+    def test_p2b_an_argument_naming_a_dead_scratchpad_does_not_make_a_tool_a_scratchpad_server(self):
+        self.rows[400] = (1, 400, 1000, OLD, f"node /Users/x/tools/proxy.mjs --out {SCRATCH}/log")
+        self.ports[400] = {4166}
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(self.run_reap(), (0, 0))
+        self.assertNotIn("pid=400", out.getvalue())      # not judged at all
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.claim_calls, [])
+
+    def test_p2b_a_live_proxys_argument_naming_a_dead_scratchpad_does_not_decide_it(self):
+        script = f"/private/tmp/claude-501/-p/{LIVE_SID}/scratchpad/p.mjs"
+        self.rows[400] = (1, 400, 1000, OLD, f"node {script} --cfg {SCRATCH}/x.json")
+        self.ports[400] = {4166}
+        self.claims.add(LIVE_SID)
+        self.assertEqual(self.run_reap(), (0, 0))
+        self.assertEqual(self.claim_calls, [LIVE_SID])
+
+    def test_p2b_a_child_command_naming_a_scratchpad_does_not_attribute_the_tree(self):
+        self.rows[400] = (1, 400, 1000, OLD, "node /Users/x/tools/serve.mjs")
+        self.rows[401] = (400, 400, 1000, OLD, f"node {SCRATCH}/helper.mjs")
+        self.ports[401] = {4166}
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(self.run_reap(), (0, 0))
+        self.assertNotIn("pid=400", out.getvalue())
+        self.assertEqual(self.claim_calls, [])
+
+    def test_p3_script_directories_are_resolved_once_per_run(self):
+        script = self.proxy_script("const TARGET = 4162;")
+        other = Path(self.state) / "wt" / "lib.mjs"
+        other.parent.mkdir()
+        other.write_text("x")
+        self.worktrees[other.parent] = Path("/wt/other")
+        self.next_dev()
+        self.next_dev(root=500, port=4176)
+        second = other.parent / "lib2.mjs"      # another script in the same directory
+        second.write_text("x")
+        self.rows[800] = (1, 800, 3000, OLD, f"node {other} {script} --data /var/db/data.bin")
+        self.ports[800] = {4164}
+        self.rows[801] = (1, 801, 3000, OLD, f"node {second}")
+        self.ports[801] = {4165}
+        self.run_reap()
+        self.assertEqual(self.worktree_calls.count(other.parent), 1)
+        self.assertNotIn(Path("/var/db"), self.worktree_calls)
+
     # the dry run
     def test_the_dry_run_lists_what_would_stop_and_signals_nothing(self):
         self.next_dev()
@@ -913,6 +1044,128 @@ class StaleServeTest(Fixture):
         self.assertEqual(self.sent, [])
 
 
+class EvidenceTest(unittest.TestCase):
+    """What proves an owner ended: the transcript and the worktree, read for real."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.projects = self.root / "projects"
+        (self.projects / "-p").mkdir(parents=True)
+        patcher = mock.patch.object(reaper, "PROJECTS", self.projects)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.now = time.time()
+
+    def transcript(self, sid, age):
+        path = self.projects / "-p" / f"{sid}.jsonl"
+        path.write_text("{}\n")
+        os.utime(path, (self.now - age, self.now - age))
+        return path
+
+    def lsof(self, held=(), rc=None):
+        out = "".join(f"p{pid}\nn{path}\n" for pid, path in held)
+        result = mock.Mock(returncode=(1 if not out else 0) if rc is None else rc, stdout=out)
+        return mock.patch.object(reaper.subprocess, "run", return_value=result)
+
+    def test_a_transcript_unwritten_for_a_day_and_not_held_is_ended(self):
+        self.transcript(SID, 25 * HOUR)
+        with self.lsof() as run:
+            self.assertEqual(reaper.transcripts_ended({SID}, self.now), {SID})
+        self.assertEqual(run.call_count, 1)
+
+    def test_a_recent_transcript_is_not_ended_and_needs_no_lsof(self):
+        self.transcript(SID, 23 * HOUR)
+        with self.lsof() as run:
+            self.assertEqual(reaper.transcripts_ended({SID}, self.now), set())
+        self.assertEqual(run.call_count, 0)
+
+    def test_a_missing_transcript_is_not_proof(self):
+        with self.lsof():
+            self.assertEqual(reaper.transcripts_ended({SID}, self.now), set())
+
+    def test_a_transcript_a_process_holds_open_is_not_ended(self):
+        path = self.transcript(SID, 30 * HOUR)
+        with self.lsof(held=[(77, path)]):
+            self.assertEqual(reaper.transcripts_ended({SID}, self.now), set())
+
+    def test_one_lsof_serves_every_session_and_names_who_holds_what(self):
+        a, b = SID, "aaaaaaaa-1111-4222-8333-444455556666"
+        pa, pb = self.transcript(a, 30 * HOUR), self.transcript(b, 30 * HOUR)
+        with self.lsof(held=[(77, pb)]) as run:
+            self.assertEqual(reaper.transcripts_ended({a, b}, self.now), {a})
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(sorted(run.call_args[0][0][-2:]), sorted([str(pa), str(pb)]))
+
+    def test_an_lsof_that_cannot_answer_is_not_proof(self):
+        self.transcript(SID, 30 * HOUR)
+        with self.lsof(rc=2):
+            self.assertEqual(reaper.transcripts_ended({SID}, self.now), set())
+        with mock.patch.object(reaper.subprocess, "run", side_effect=OSError("no lsof")):
+            self.assertEqual(reaper.transcripts_ended({SID}, self.now), set())
+
+    def git(self, repo, *args, when=None):
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+        if when:
+            env["GIT_COMMITTER_DATE"] = env["GIT_AUTHOR_DATE"] = f"@{int(when)} +0000"
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
+
+    def repo(self, commit_age=10 * DAY):
+        repo = self.root / "repo"
+        repo.mkdir()
+        self.git(repo, "init", "-q")
+        (repo / "a.txt").write_text("a")
+        self.git(repo, "add", "a.txt")
+        self.git(repo, "commit", "-q", "-m", "a", when=self.now - commit_age)
+        os.utime(repo / "a.txt", (self.now - 10 * DAY,) * 2)
+        return repo
+
+    def test_a_clean_old_worktree_is_idle_since_its_commit(self):
+        repo = self.repo(commit_age=10 * DAY)
+        idle = reaper.worktree_idle(repo, self.now)
+        self.assertTrue(10 * DAY - 5 <= idle <= 10 * DAY + 5, idle)
+
+    def test_a_commit_a_changed_file_or_a_stack_file_is_a_touch(self):
+        repo = self.repo(commit_age=1 * DAY)
+        self.assertLess(reaper.worktree_idle(repo, self.now), 1 * DAY + 5)
+        repo = self.root / "repo"
+        # old commit, then each other signal on its own
+        for name in ("modified", "untracked", "stack"):
+            shutil_target = self.root / name
+            shutil_target.mkdir()
+            self.git(shutil_target, "init", "-q")
+            (shutil_target / "a.txt").write_text("a")
+            self.git(shutil_target, "add", "a.txt")
+            self.git(shutil_target, "commit", "-q", "-m", "a", when=self.now - 10 * DAY)
+            os.utime(shutil_target / "a.txt", (self.now - 10 * DAY,) * 2)
+            if name == "modified":
+                (shutil_target / "a.txt").write_text("b")
+            elif name == "untracked":
+                (shutil_target / "new.txt").write_text("n")
+            else:
+                (shutil_target / ".local-stack").mkdir()
+                (shutil_target / ".local-stack" / "api.pid").write_text("1")
+            self.assertLess(reaper.worktree_idle(shutil_target, self.now), 60, name)
+
+    def test_an_ignored_file_is_not_a_touch(self):
+        repo = self.repo(commit_age=10 * DAY)
+        (repo / ".gitignore").write_text(".next/\n")
+        self.git(repo, "add", ".gitignore")
+        self.git(repo, "commit", "-q", "-m", "ignore", when=self.now - 10 * DAY)
+        os.utime(repo / ".gitignore", (self.now - 10 * DAY,) * 2)
+        (repo / ".next").mkdir()
+        (repo / ".next" / "cache").write_text("x")
+        self.assertGreater(reaper.worktree_idle(repo, self.now), 9 * DAY)
+
+    def test_a_directory_git_cannot_read_has_no_idle_time(self):
+        self.assertIsNone(reaper.worktree_idle(self.root / "nowhere", self.now))
+        plain = self.root / "plain"
+        plain.mkdir()
+        self.assertIsNone(reaper.worktree_idle(plain, self.now))
+
+
 class ClaimLevelTest(unittest.TestCase):
     def level(self, stdout, rc=0, own=None):
         result = mock.Mock(returncode=rc, stdout=stdout)
@@ -939,6 +1192,11 @@ class ClaimLevelTest(unittest.TestCase):
         with mock.patch.object(reaper.subprocess, "run",
                                side_effect=reaper.subprocess.TimeoutExpired("janitor", 900)):
             self.assertEqual(reaper.claim_level(SID, Path("/janitor")), 2)
+
+    def test_p3_the_session_running_the_reaper_is_not_excluded_from_its_own_claim(self):
+        head = "CLAIMS x\n"
+        self.assertEqual(self.level(head + "LIVE\tharness=Claude\tid=me\tcwd=/x\n", own="me"), 2)
+        self.assertEqual(self.level(head + "RECENT\tharness=Claude\tid=me\tcwd=/x\tremaining=9s\n", own="me"), 1)
 
     def test_own_session_does_not_count(self):
         self.assertEqual(self.level(f"CLAIMS x\nLIVE_TOOL\tharness=Claude\tid=me\tpath=/x\tscope=x\n", own="me"), 0)
