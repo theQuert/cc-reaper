@@ -63,5 +63,111 @@ python3 "$ROOT_DIR/integrations/install-session-hook.py" --harness claude --file
 check "a broken settings symlink is refused" test "$rc" -ne 0
 check "a refused broken settings symlink is preserved" test -L "$BROKEN_SETTINGS"
 
+# ─── Interpreter-started hook commands (stima-api#9010) ───────────────────────
+# A script started through its #! line leaks kernel memory on macOS 26 on every start,
+# so the commands written for the hosts name the interpreter. An entry in either form is
+# recognised by its script path, and a by-path one is upgraded in place.
+INSTALLER="$ROOT_DIR/integrations/install-session-hook.py"
+WANT_END='bash "$HOME"/.cc-reaper/worktree-session-end.sh'
+WANT_STOP='/bin/bash "$HOME"/.cc-reaper/stop-cleanup-orphans.sh'
+
+# count_entries <file> <event> <script-substring>: entries of that event holding the script
+count_entries() {
+  python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(sum(1 for g in d["hooks"].get(sys.argv[2],[]) for h in g.get("hooks",[]) if sys.argv[3] in h.get("command","")))' "$@"
+}
+# commands <file> <event> <script-substring>: the matching commands, one per line
+commands() {
+  python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print("\n".join(h["command"] for g in d["hooks"].get(sys.argv[2],[]) for h in g.get("hooks",[]) if sys.argv[3] in h.get("command","")))' "$@"
+}
+
+for harness in claude codex; do
+  # (c) an empty file gets the new forms
+  F="$TMP/empty-$harness.json"
+  printf '{}\n' > "$F"
+  python3 "$INSTALLER" --harness "$harness" --file "$F" >/dev/null
+  check "$harness: an empty file gets the interpreter SessionEnd command" test "$(commands "$F" SessionEnd worktree-session-end.sh)" = "$WANT_END $harness"
+  check "$harness: an empty file gets the interpreter Stop command" test "$(commands "$F" Stop stop-cleanup-orphans.sh)" = "$WANT_STOP"
+
+  # (a) the new form is already there: no change, one entry
+  F="$TMP/new-$harness.json"
+  cat > "$F" <<JSON
+{"hooks":{
+  "Stop":[{"hooks":[{"type":"command","command":"/bin/bash \"\$HOME\"/.cc-reaper/stop-cleanup-orphans.sh","timeout":15}]}],
+  "SessionEnd":[{"hooks":[{"type":"command","command":"bash \"\$HOME\"/.cc-reaper/worktree-session-end.sh $harness","timeout":10}]}]}}
+JSON
+  before="$(shasum -a 256 "$F")"
+  out="$(python3 "$INSTALLER" --harness "$harness" --file "$F")"
+  check "$harness: the interpreter forms are reported as already configured" bash -c 'case "$1" in *"already configured"*) exit 0;; esac; exit 1' _ "$out"
+  check "$harness: the interpreter forms leave the file byte-identical" test "$before" = "$(shasum -a 256 "$F")"
+  check "$harness: the interpreter SessionEnd form stays one entry" test "$(count_entries "$F" SessionEnd worktree-session-end.sh)" = 1
+  check "$harness: the interpreter Stop form stays one entry" test "$(count_entries "$F" Stop stop-cleanup-orphans.sh)" = 1
+
+  # (b) the by-path form is rewritten in place, never doubled
+  F="$TMP/old-$harness.json"
+  cat > "$F" <<JSON
+{"hooks":{
+  "Stop":[{"hooks":[{"type":"command","command":"\"\$HOME\"/.cc-reaper/stop-cleanup-orphans.sh","timeout":15}]}],
+  "SessionEnd":[{"hooks":[{"type":"command","command":"\"\$HOME\"/.cc-reaper/worktree-session-end.sh $harness","timeout":7},{"type":"command","command":"keep-me"}]}]}}
+JSON
+  python3 "$INSTALLER" --harness "$harness" --file "$F" >/dev/null
+  check "$harness: a by-path SessionEnd entry is rewritten to the interpreter form" test "$(commands "$F" SessionEnd worktree-session-end.sh)" = "$WANT_END $harness"
+  check "$harness: a by-path Stop entry is rewritten to the interpreter form" test "$(commands "$F" Stop stop-cleanup-orphans.sh)" = "$WANT_STOP"
+  check "$harness: the rewritten SessionEnd entry keeps its timeout" python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"]==7' "$F"
+  check "$harness: the rewrite keeps unrelated hooks" grep -q 'keep-me' "$F"
+  before="$(shasum -a 256 "$F")"
+  python3 "$INSTALLER" --harness "$harness" --file "$F" >/dev/null
+  check "$harness: a second run after the rewrite changes nothing" test "$before" = "$(shasum -a 256 "$F")"
+
+  # both forms side by side collapse to one interpreter entry
+  F="$TMP/both-$harness.json"
+  cat > "$F" <<JSON
+{"hooks":{
+  "Stop":[{"hooks":[{"type":"command","command":"/bin/bash \"\$HOME\"/.cc-reaper/stop-cleanup-orphans.sh"},{"type":"command","command":"\"\$HOME\"/.cc-reaper/stop-cleanup-orphans.sh"}]}],
+  "SessionEnd":[{"hooks":[{"type":"command","command":"bash \"\$HOME\"/.cc-reaper/worktree-session-end.sh $harness"},{"type":"command","command":"\"\$HOME\"/.cc-reaper/worktree-session-end.sh $harness"}]}]}}
+JSON
+  python3 "$INSTALLER" --harness "$harness" --file "$F" >/dev/null
+  check "$harness: duplicate SessionEnd entries collapse to one" test "$(count_entries "$F" SessionEnd worktree-session-end.sh)" = 1
+  check "$harness: duplicate Stop entries collapse to one" test "$(count_entries "$F" Stop stop-cleanup-orphans.sh)" = 1
+done
+
+# the other harness's entry is not this harness's entry
+F="$TMP/other-harness.json"
+cat > "$F" <<JSON
+{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"bash \"\$HOME\"/.cc-reaper/worktree-session-end.sh codex"}]}]}}
+JSON
+python3 "$INSTALLER" --harness claude --file "$F" >/dev/null
+check "an entry for another harness is kept beside the new one" test "$(count_entries "$F" SessionEnd worktree-session-end.sh)" = 2
+
+# A hook that only mentions the Stop script (an argument after it, another file name, a log
+# line) is someone else's: it is neither removed nor rewritten.
+F="$TMP/stop-lookalikes.json"
+cat > "$F" <<JSON
+{"hooks":{"Stop":[{"hooks":[
+  {"type":"command","command":"\"\$HOME\"/.cc-reaper/stop-cleanup-orphans.sh --dry-run || exit 2"},
+  {"type":"command","command":"/bin/bash \"\$HOME\"/.cc-reaper/stop-cleanup-orphans.sh"},
+  {"type":"command","command":"echo \"\$HOME/.cc-reaper/stop-cleanup-orphans.sh\" >> /tmp/log"},
+  {"type":"command","command":"/bin/bash \"\$HOME\"/.cc-reaper/stop-cleanup-orphans.sh.v2"}]}]}}
+JSON
+python3 "$INSTALLER" --harness claude --file "$F" >/dev/null
+check "a Stop hook with an argument after the script is kept as written" grep -q 'stop-cleanup-orphans.sh --dry-run || exit 2' "$F"
+check "a Stop hook that only prints the script path is kept" grep -q '>> /tmp/log' "$F"
+check "a Stop hook for another file name is kept" grep -q 'stop-cleanup-orphans.sh.v2' "$F"
+check "the lookalikes leave cc-reaper's own Stop entry single" test "$(count_entries "$F" Stop stop-cleanup-orphans.sh)" = 4
+
+# The SessionEnd entrypoint starts the janitor through its interpreter, never its #! line.
+# The stub's #! names an interpreter that does not exist, so only `bash <path>` can run it.
+H="$TMP/session-home"
+mkdir -p "$H/.cc-reaper"
+cp "$ROOT_DIR/hooks/worktree-session-end.sh" "$H/.cc-reaper/worktree-session-end.sh"
+printf '#!/nonexistent/interpreter\necho "ran $* harness=$CC_WJ_HARNESS" > "%s/ran"\n' "$TMP" > "$H/.cc-reaper/worktree-janitor.sh"
+chmod +x "$H/.cc-reaper/worktree-janitor.sh"
+HOME="$H" bash "$H/.cc-reaper/worktree-session-end.sh" codex </dev/null >/dev/null 2>&1
+check "the SessionEnd entrypoint starts the janitor by its interpreter" test "$(cat "$TMP/ran" 2>/dev/null)" = "ran --session harness=codex"
+check "the SessionEnd entrypoint has no by-path exec" bash -c '! grep -q "exec \"\$janitor\"" "$1"' _ "$ROOT_DIR/hooks/worktree-session-end.sh"
+
 [ "$failures" -eq 0 ] || exit 1
 echo "install-session-hook: all tests passed"

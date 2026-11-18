@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -18,14 +19,35 @@ LEGACY_WORKTREE_COMMANDS = (
 LEGACY_WORKTREE_ENV = ("WORKTREE_IDLE_HOURS", "WORKTREE_DRY_RUN")
 LEGACY_STOP_COMMAND = "/.claude/hooks/stop-cleanup-orphans.sh"
 SHARED_STOP_COMMAND = "/.cc-reaper/stop-cleanup-orphans.sh"
+SESSION_END_SCRIPT = "/.cc-reaper/worktree-session-end.sh"
+
+# On macOS 26 every start of a script through its #! line leaks kernel memory that only a
+# restart frees, so hooks that run often are started by their interpreter, never by path
+# (theQuert/stima-api#9010).  worktree-session-end.sh begins `#!/usr/bin/env bash` and
+# stop-cleanup-orphans.sh begins `#!/bin/bash`; the interpreter named here matches.
 
 
 def command_for(harness: str) -> str:
-    return f'"$HOME"/.cc-reaper/worktree-session-end.sh {harness}'
+    return f'bash "$HOME"{SESSION_END_SCRIPT} {harness}'
 
 
 def stop_command() -> str:
-    return '"$HOME"/.cc-reaper/stop-cleanup-orphans.sh'
+    return f'/bin/bash "$HOME"{SHARED_STOP_COMMAND}'
+
+
+def is_session_end_command(command: str, harness: str) -> bool:
+    """True for this harness's SessionEnd entry, whatever precedes the script path."""
+    pattern = re.escape(SESSION_END_SCRIPT) + r'"?\s+' + re.escape(harness) + r"\s*$"
+    return re.search(pattern, command) is not None
+
+
+def is_stop_command(command: str) -> bool:
+    """True for cc-reaper's own Stop entry: the script path ends the command, no argument after it.
+
+    A hook that only mentions the path (another script name, an argument, a log line) is someone
+    else's and is left alone.
+    """
+    return re.search(re.escape(SHARED_STOP_COMMAND) + r'"?\s*$', command) is not None
 
 
 def install(path: Path, harness: str) -> bool:
@@ -81,12 +103,16 @@ def install(path: Path, harness: str) -> bool:
                     command = command.replace(LEGACY_STOP_COMMAND, SHARED_STOP_COMMAND)
                     hook["command"] = command
                     changed = True
-                if SHARED_STOP_COMMAND in command:
-                    if event == "Stop":
-                        found_stop = True
-                        kept.append(hook)
-                    else:
+                if is_stop_command(command):
+                    if event != "Stop" or found_stop:
+                        # Misplaced, or a second entry beside the one already kept.
                         changed = True
+                        continue
+                    found_stop = True
+                    if command != stop_command():
+                        hook["command"] = stop_command()
+                        changed = True
+                    kept.append(hook)
                     continue
                 kept.append(hook)
             if kept != commands:
@@ -127,11 +153,22 @@ def install(path: Path, harness: str) -> bool:
                 kept.append(hook)
                 continue
             command = hook.get("command", "")
+            if not isinstance(command, str):
+                kept.append(hook)
+                continue
             if any(marker in command for marker in LEGACY_WORKTREE_COMMANDS):
                 changed = True
                 continue
-            if command == wanted:
+            if is_session_end_command(command, harness):
+                if found:
+                    # A second entry for this harness beside the one already kept.
+                    changed = True
+                    continue
                 found = True
+                if command != wanted:
+                    # By-path (or any other) form: rewrite in place, keep its timeout.
+                    hook["command"] = wanted
+                    changed = True
             kept.append(hook)
         if kept != commands:
             group["hooks"] = kept

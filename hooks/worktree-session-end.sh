@@ -15,4 +15,6 @@ if [ ! -x "$janitor" ]; then
   exit 0
 fi
 
-CC_WJ_HARNESS="$harness" exec "$janitor" --session
+# Started by its interpreter, not its #! line: on macOS 26 each #! start leaks kernel
+# memory that only a restart frees (theQuert/stima-api#9010).
+CC_WJ_HARNESS="$harness" exec bash "$janitor" --session

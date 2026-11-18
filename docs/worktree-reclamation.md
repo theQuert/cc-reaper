@@ -475,7 +475,7 @@ The common hook command is:
 {
   "hooks": {
     "SessionEnd": [
-      { "hooks": [ { "type": "command", "command": "\"$HOME\"/.cc-reaper/worktree-session-end.sh codex" } ] }
+      { "hooks": [ { "type": "command", "command": "bash \"$HOME\"/.cc-reaper/worktree-session-end.sh codex" } ] }
     ]
   }
 }
