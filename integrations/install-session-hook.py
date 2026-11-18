@@ -41,6 +41,15 @@ def is_session_end_command(command: str, harness: str) -> bool:
     return re.search(pattern, command) is not None
 
 
+def is_stop_command(command: str) -> bool:
+    """True for cc-reaper's own Stop entry: the script path ends the command, no argument after it.
+
+    A hook that only mentions the path (another script name, an argument, a log line) is someone
+    else's and is left alone.
+    """
+    return re.search(re.escape(SHARED_STOP_COMMAND) + r'"?\s*$', command) is not None
+
+
 def install(path: Path, harness: str) -> bool:
     if path.is_symlink():
         # Update the managed target atomically without replacing the symlink entry.
@@ -94,7 +103,7 @@ def install(path: Path, harness: str) -> bool:
                     command = command.replace(LEGACY_STOP_COMMAND, SHARED_STOP_COMMAND)
                     hook["command"] = command
                     changed = True
-                if SHARED_STOP_COMMAND in command:
+                if is_stop_command(command):
                     if event != "Stop" or found_stop:
                         # Misplaced, or a second entry beside the one already kept.
                         changed = True

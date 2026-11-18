@@ -142,6 +142,22 @@ JSON
 python3 "$INSTALLER" --harness claude --file "$F" >/dev/null
 check "an entry for another harness is kept beside the new one" test "$(count_entries "$F" SessionEnd worktree-session-end.sh)" = 2
 
+# A hook that only mentions the Stop script (an argument after it, another file name, a log
+# line) is someone else's: it is neither removed nor rewritten.
+F="$TMP/stop-lookalikes.json"
+cat > "$F" <<JSON
+{"hooks":{"Stop":[{"hooks":[
+  {"type":"command","command":"\"\$HOME\"/.cc-reaper/stop-cleanup-orphans.sh --dry-run || exit 2"},
+  {"type":"command","command":"/bin/bash \"\$HOME\"/.cc-reaper/stop-cleanup-orphans.sh"},
+  {"type":"command","command":"echo \"\$HOME/.cc-reaper/stop-cleanup-orphans.sh\" >> /tmp/log"},
+  {"type":"command","command":"/bin/bash \"\$HOME\"/.cc-reaper/stop-cleanup-orphans.sh.v2"}]}]}}
+JSON
+python3 "$INSTALLER" --harness claude --file "$F" >/dev/null
+check "a Stop hook with an argument after the script is kept as written" grep -q 'stop-cleanup-orphans.sh --dry-run || exit 2' "$F"
+check "a Stop hook that only prints the script path is kept" grep -q '>> /tmp/log' "$F"
+check "a Stop hook for another file name is kept" grep -q 'stop-cleanup-orphans.sh.v2' "$F"
+check "the lookalikes leave cc-reaper's own Stop entry single" test "$(count_entries "$F" Stop stop-cleanup-orphans.sh)" = 4
+
 # The SessionEnd entrypoint starts the janitor through its interpreter, never its #! line.
 # The stub's #! names an interpreter that does not exist, so only `bash <path>` can run it.
 H="$TMP/session-home"
