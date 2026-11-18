@@ -14,8 +14,11 @@ report of the survivors; there is no SIGKILL.
    `CLAUDE_CODE_SESSION_ID` in the environment of any process in the tree (one `ps eww` for the host;
    only that key is kept, no environment value is printed or logged), a session scratchpad path
    (`/tmp/claude-<uid>/<project>/<session id>/`) in the root's command line or working directory, the
-   `claude-task-worktree` marker of the root's linked worktree (its creator: a weaker owner, so a live
-   claim on the worktree keeps it). The owner is dead only on positive evidence, all of it:
+   `claude-task-worktree` marker of the root's linked worktree (its creator, a weaker owner). Only a root
+   shaped like a Claude-started tree (a runtime or shell, the local stack's binary, a scratchpad) is judged,
+   never a shared daemon that carries one session's helper. The owner is dead only on positive evidence,
+   all of it, and a live claim on the root's linked worktree (`worktree-janitor.sh --claims`) keeps the tree
+   whoever the owner is, since a session's id can change while it lives (`/clear`):
    - no live pid in `~/.claude/sessions/*.json`, none in the daemon roster `~/.claude/daemon/roster.json`
      (a hosted session is live while its pty host or repl pid is), none in the session state file;
    - the host has a record of it (a transcript under `~/.claude/projects`, or a job directory), so an id
@@ -26,13 +29,15 @@ report of the survivors; there is no SIGKILL.
 2. A live session's own Bash-tool shell (`shell-snapshots/snapshot-zsh-` in its command, its parent that
    session's claude process) whose command is a wait loop (`until` or `while` ... `done`) older than
    --loop-hours, or whose loop body does nothing (`do :; done`, no `sleep`, no command) older than
-   --spin-minutes. A wait loop with a descendant older than 10 minutes that is not `sleep` or `tail` is kept
-   (the loop ended; the shell runs something). Both kinds keep the lease and serving rules of 1.
+   --spin-minutes. A shell with a descendant older than 10 minutes that is not `sleep` or `tail` is kept,
+   spin-shaped or not (the loop ended; the shell runs something). Both kinds keep the lease and serving
+   rules of 1.
 
-Never touched, owner or no owner: the tmux server, a launchd job (`tech.stima.*`, `com.cc-reaper.*`,
-so the ci-runner-macos and gce-jit-broker families), docker and OrbStack, a claude daemon, a pid the
+Never touched, owner or no owner: the tmux server, any process `launchctl list` names (whatever the label:
+the ci-runner-macos and gce-jit-broker families, Chrome), docker and OrbStack, a claude daemon, a pid the
 registry or roster lists as live, any claude or codex process in the tree, a tree holding a live
-resource lease (`with_local_resource.py`), a listening tree something is connected to, a never-kill
+resource lease (`with_local_resource.py`; while any live lease names no owner pid, such as a
+`--detach --ttl` one, every rule-1 tree is kept), a listening tree something is connected to, a never-kill
 pid and its descendants, and the reaper's own tree.
 """
 
@@ -75,13 +80,18 @@ PROTECTED_COMMAND = re.compile(
     r"ci-runner-macos|gce-jit-broker|ops/ci-runner/|Runner\.Listener|actions-runner"
     r"|claude\s+(?:daemon|bg-pty-host|bg-spare)\b|/Applications/(?:Docker|OrbStack)")
 PROTECTED_TOOL = re.compile(r"(?:tmux|docker|dockerd|containerd|com\.docker\..*|orbstack.*|tailscaled)", re.I)
-PROTECTED_LABEL = re.compile(r"(?:tech\.stima\.|com\.cc-reaper\.)")
 # What a Claude-spawned detached tree looks like, for the unknown-owner report: a runtime or shell
 # root, the local stack's binary, a session scratchpad. Anything else owned by launchd is not reported.
 LOOKS = re.compile(r"/\.local-stack/|/claude-\d+/")
 OWNER_QUIET_SECONDS = 3600
 LONG_CHILD_SECONDS = 600
-MASK = re.compile(r"(?i)((?:token|key|secret|password)=)\S+")
+# What a log line must not carry: a credential flag or pair, a bearer token, the password of a URL.
+MASK = re.compile(r"(?i)\b(--?)?(token|key|secret|password)([ =])\S+|Bearer \S+|(://[^/@\s]+:)[^/@\s]+@")
+
+
+def mask(text):
+    return MASK.sub(lambda m: (f"{m.group(1) or ''}{m.group(2)}{m.group(3)}<masked>" if m.group(2)
+                               else "Bearer <masked>" if m.group(0).startswith(("B", "b")) else f"{m.group(4)}<masked>@"), text)
 
 
 def pid_alive(pid):
@@ -189,11 +199,14 @@ def marker_owner(where):
 
 
 def lease_owners(home, alive, now):
-    """Pids that own a resource lease (`with_local_resource.py`) still live: its owner pid alive and
-    not past its ttl."""
+    """(owner pids, unowned) of the resource leases (`with_local_resource.py`) still live. A lease is
+    live while its ttl has not run out and, when it names an owner pid, that pid is alive. `unowned`
+    is true while any live lease names no owner pid: a `--detach --ttl` lease deliberately has none,
+    and the resource it covers lives in some other tree, so nothing can say whose it is and every
+    tree is kept (conservative on purpose)."""
     root = os.environ.get("STIMA_LOCAL_RESOURCE_LOCK_DIR")
     base = Path(root).expanduser() if root else home / ".cache" / "stima-api" / "resource-locks"
-    owners = set()
+    owners, unowned = set(), False
     for path in (base / "leases").glob("*.lease"):
         try:
             record = json.loads(path.read_text())
@@ -201,9 +214,13 @@ def lease_owners(home, alive, now):
             expired = bool(ttl) and now > float(record.get("started") or 0) + float(ttl)
         except (OSError, ValueError, TypeError):
             continue
-        if owner and alive(owner) and not expired:
+        if expired:
+            continue
+        if owner and alive(owner):
             owners.add(owner)
-    return owners
+        elif not owner and ttl:
+            unowned = True
+    return owners, unowned
 
 
 def wait_loop(command):
@@ -228,9 +245,17 @@ def long_lived_child(rows, members, root, now):
     return False
 
 
+def describe(command):
+    """What a log line says of a process: the basename of argv[0]; for a tool shell also the start of
+    the command it evals (credentials masked first, then cut)."""
+    text = os.path.basename((command.split() or ["?"])[0])
+    if SNAPSHOT in command and "eval '" in command:
+        text += " eval '" + mask(command.split("eval '", 1)[1].replace("\\012", " "))[:80]
+    return text
+
+
 def label(pid, row, owner=None):
-    command = MASK.sub(r"\1<masked>", row[4])[:100]
-    return f"pid={pid} owner={(owner or '-')[:8]} cmd={command!r}"
+    return f"pid={pid} owner={(owner or '-')[:8]} cmd={describe(row[4])!r}"
 
 
 def ancestors(rows, pid):
@@ -250,7 +275,7 @@ def why_protected(rows, members, own, live_pids, labels, keep):
             return "the reaper's own tree"
         if pid in live_pids:
             return f"live session process {pid}"
-        if PROTECTED_LABEL.match(labels.get(pid, "")):
+        if pid in labels:
             return f"launchd job {labels[pid]}"
         if PROTECTED_COMMAND.search(command) or PROTECTED_TOOL.fullmatch(tool):
             return f"protected family at pid {pid}"
@@ -261,7 +286,7 @@ def why_protected(rows, members, own, live_pids, labels, keep):
     return None
 
 
-def reap(apply=False, loop_hours=6, spin_minutes=10, grace=10, now=None, home=None, send=os.kill,
+def reap(apply=False, loop_hours=24, spin_minutes=10, grace=10, now=None, home=None, send=os.kill,
          sleep=time.sleep, alive=pid_alive, janitor=None, self_pid=None, keep_pids=None):
     """Print one line per decision and a summary; return (stopped, candidates)."""
     now = time.time() if now is None else now
@@ -276,7 +301,7 @@ def reap(apply=False, loop_hours=6, spin_minutes=10, grace=10, now=None, home=No
         raise RuntimeError("ps, launchctl or the session registry could not answer; kept everything")
     live_ids, live_pids = live
     own = ancestors(rows, os.getpid() if self_pid is None else self_pid)
-    leases = lease_owners(home, alive, now)
+    leases, unowned_lease = lease_owners(home, alive, now)
     cache = {}
     verdicts = []   # (root, label text, reason)
     kept = 0
@@ -307,27 +332,23 @@ def reap(apply=False, loop_hours=6, spin_minutes=10, grace=10, now=None, home=No
         if ppid != 1:
             continue
         members = dsr.tree(rows, root)
-        ids = sorted({owners[p] for p in members if p in owners})
         tool = os.path.basename((command.split() or [""])[0])
-        shaped = tool in dsr.SERVER_ROOTS or LOOKS.search(command)
-        if not ids and not shaped:
-            continue
+        if not (tool in dsr.SERVER_ROOTS or LOOKS.search(command)):
+            continue   # a shared daemon carrying one session's helper is not that session's tree
+        ids = sorted({owners[p] for p in members if p in owners})
         sid = ids[0] if ids else None
         protected = why_protected(rows, members, own, live_pids, labels, keep)
         if protected:
-            if ids or shaped:
-                keep_line(f"protected: {protected}", root, sid)
+            keep_line(f"protected: {protected}", root, sid)
             continue
-        weak = None
+        where = None
         if not ids:
             ids = sorted(set(dsr.scratch_sessions(None, [command])))
-            where = None
             if not ids:
                 where = dsr.cwd(root)
                 ids = sorted(dsr.scratch_sessions(where, []))
             if not ids:
-                creator, weak = marker_owner(where)
-                ids = [creator] if creator else []
+                ids = [i for i in [marker_owner(where)[0]] if i]
         if not ids:
             keep_line("unknown-owner", root)
             continue
@@ -342,10 +363,14 @@ def reap(apply=False, loop_hours=6, spin_minutes=10, grace=10, now=None, home=No
         if any(a < OWNER_QUIET_SECONDS for a in ages):
             keep_line("owner-recent", root, sid)
             continue
-        if weak is not None and cache.setdefault(("claim", weak), dsr.claim_level(weak, janitor)) != 0:
+        # A session's id can change while it lives (/clear), so a dead id proves nothing about a
+        # worktree a live session still claims, whoever the owner was found to be.
+        where = where or dsr.cwd(root)
+        worktree = dsr.linked_worktree(where) if where else None
+        if worktree is not None and cache.setdefault(("claim", worktree), dsr.claim_level(worktree, janitor)) != 0:
             keep_line("owner-claimed", root, sid)
             continue
-        if leases & set(members):
+        if unowned_lease or leases & set(members):
             keep_line("lease", root, sid)
             continue
         busy = serving(members)
@@ -373,7 +398,7 @@ def reap(apply=False, loop_hours=6, spin_minutes=10, grace=10, now=None, home=No
         if protected:
             keep_line(f"protected: {protected}", pid, live_pids[ppid])
             continue
-        if not spin and long_lived_child(rows, members, pid, now):
+        if long_lived_child(rows, members, pid, now):
             keep_line("long-child", pid, live_pids[ppid])
             continue
         if leases & set(members):
@@ -427,8 +452,7 @@ def reap(apply=False, loop_hours=6, spin_minutes=10, grace=10, now=None, home=No
             else:
                 print(f"KEEP(changed) {text}")
         for pid in left:
-            text = MASK.sub(r"\1<masked>", after[pid][4])[:100]
-            print(f"SURVIVOR pid={pid} cmd={text!r} (still running {grace}s after SIGTERM; not killed)")
+            print(f"SURVIVOR pid={pid} cmd={describe(after[pid][4])!r} (still running {grace}s after SIGTERM; not killed)")
     print(f"orphan processes: stopped={stopped}/{len(verdicts)} kept={kept}" + ("" if apply else " (report only)"))
     return stopped, len(verdicts)
 
@@ -436,7 +460,7 @@ def reap(apply=False, loop_hours=6, spin_minutes=10, grace=10, now=None, home=No
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("mode", choices=("report", "apply"))
-    parser.add_argument("--loop-hours", type=float, default=6)
+    parser.add_argument("--loop-hours", type=float, default=24)
     parser.add_argument("--spin-minutes", type=float, default=10)
     parser.add_argument("--grace-seconds", type=int, default=10)
     args = parser.parse_args()

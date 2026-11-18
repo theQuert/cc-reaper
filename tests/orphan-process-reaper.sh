@@ -275,51 +275,54 @@ def shell(w, pid, age, body, parent=7000100, sid=LIVE):
 
 
 w = World(); w.session(7000100, LIVE)
-shell(w, 7000040, 7 * HOUR, loop); shell(w, 7000041, 2 * MIN, loop)
-shell(w, 7000042, 7 * HOUR, "npm test -- --watchAll=false")        # long, but not a wait loop
-shell(w, 7000043, 5 * HOUR, loop)                                  # inside the bound
+shell(w, 7000040, 25 * HOUR, loop); shell(w, 7000041, 2 * MIN, loop)
+shell(w, 7000042, 25 * HOUR, "npm test -- --watchAll=false")        # long, but not a wait loop
+shell(w, 7000043, 23 * HOUR, loop)                                  # inside the bound
 shell(w, 7000044, 11 * MIN, tight); shell(w, 7000045, 2 * MIN, tight)
 shell(w, 7000046, 11 * MIN, loop)                                  # sleeps: the 6 h bound applies
 shell(w, 7000047, 11 * MIN, "while true; do\\012  :\\012done")   # ps shows a newline as \012
-w.proc(7000048, 7000040, 7 * HOUR, "sleep 30")
+w.proc(7000048, 7000040, 25 * HOUR, "sleep 30")
 w.run()
 check(sorted(w.stopped()) == [7000040, 7000044, 7000047, 7000048],
       f"wait loops over their bound are stopped (got {sorted(w.stopped())})")
 check(7000041 not in w.stopped() and 7000045 not in w.stopped(), "a 2-minute-old wait loop is kept, tight or not")
 check(7000042 not in w.stopped() and 7000043 not in w.stopped() and 7000046 not in w.stopped(),
-      "a long non-loop, a loop inside 6 h and a sleeping loop of 11 minutes are kept")
+      "a long non-loop, a loop inside 24 h and a sleeping loop of 11 minutes are kept")
+import inspect
+check(inspect.signature(opr.reap).parameters["loop_hours"].default == 24 and "--loop-hours\", type=float, default=24" in Path(SOURCE).read_text(),
+      "the wait-loop bound defaults to 24 hours, in reap and on the command line")
 check(w.stopped().index(7000048) < w.stopped().index(7000040), "the loop's child goes before the loop")
 check(7000100 not in w.stopped(), "the session's own claude process is never signalled")
-w.run(loop_hours=8)
-check(7000040 not in w.stopped(), "the bound is configurable: a 7 h loop is kept under an 8 h bound")
+w.run(loop_hours=30)
+check(7000040 not in w.stopped(), "the bound is configurable: a 25 h loop is kept under a 30 h bound")
 w = World(); w.session(7000100, LIVE); w.proc(7000101, 1, 86400, "/bin/zsh -c x", None)
-shell(w, 7000049, 7 * HOUR, loop, parent=7000101)                  # parent is not a claude process
+shell(w, 7000049, 25 * HOUR, loop, parent=7000101)                  # parent is not a claude process
 w.run()
 check(7000049 not in w.stopped(), "a snapshot shell whose parent is not the live session's claude process is not judged as a tool shell")
-w = World(); w.session(7000100, LIVE); shell(w, 7000049, 7 * HOUR, loop, sid=DEAD2)
+w = World(); w.session(7000100, LIVE); shell(w, 7000049, 25 * HOUR, loop, sid=DEAD2)
 w.run()
 check(7000049 not in w.stopped(), "a tool shell whose own session id differs from its parent's is kept")
 
 # 5b. A loop that already ended is not a stuck loop: a long-lived child keeps the shell.
 started = "npm run dev & " + loop + "; wait"
 w = World(); w.session(7000100, LIVE)
-shell(w, 7000060, 7 * HOUR, started); w.proc(7000061, 7000060, 2 * HOUR, "node server.js")
+shell(w, 7000060, 25 * HOUR, started); w.proc(7000061, 7000060, 2 * HOUR, "node server.js")
 w.run()
 check(w.sent == [] and "KEEP(long-child)" in w.out, "a wait loop shell with a 2 h old node child is kept as long-child")
 w = World(); w.session(7000100, LIVE)
-shell(w, 7000060, 7 * HOUR, loop); w.proc(7000061, 7000060, 20, "sleep 30")
+shell(w, 7000060, 25 * HOUR, loop); w.proc(7000061, 7000060, 20, "sleep 30")
 w.run()
 check(sorted(w.stopped()) == [7000060, 7000061], "a 20 s old sleep child does not keep a stuck loop")
 w = World(); w.session(7000100, LIVE)
-shell(w, 7000060, 7 * HOUR, loop); w.proc(7000061, 7000060, 7 * HOUR, "tail -f /tmp/log")
+shell(w, 7000060, 25 * HOUR, loop); w.proc(7000061, 7000060, 25 * HOUR, "tail -f /tmp/log")
 w.run()
-check(sorted(w.stopped()) == [7000060, 7000061], "a 7 h old tail child does not keep a stuck loop")
+check(sorted(w.stopped()) == [7000060, 7000061], "a 25 h old tail child does not keep a stuck loop")
 w = World(); w.session(7000100, LIVE)
-shell(w, 7000060, 7 * HOUR, loop); w.proc(7000061, 7000060, 2 * HOUR, "sleep 30")
+shell(w, 7000060, 25 * HOUR, loop); w.proc(7000061, 7000060, 2 * HOUR, "sleep 30")
 w.run()
 check(sorted(w.stopped()) == [7000060, 7000061], "a sleep child is never long-lived, whatever its age")
 w = World(); w.session(7000100, LIVE)
-shell(w, 7000060, 7 * HOUR, loop); w.proc(7000061, 7000060, 2 * HOUR, "node server.js")
+shell(w, 7000060, 25 * HOUR, loop); w.proc(7000061, 7000060, 2 * HOUR, "node server.js")
 w.write()
 # a start time that cannot be read counts as long-lived
 table = (FAKE / "ps.table").read_text().replace(lstart(2 * HOUR), "Xxx Xxx 99 99:99:99 9999")
@@ -332,10 +335,14 @@ check(w.sent == [], "a child whose start time cannot be read counts as long-live
 w = World(); w.session(7000100, LIVE)
 shell(w, 7000062, 11 * MIN, tight)
 w.run()
-check(w.stopped() == [7000062], "a spin loop has no child to judge and keeps its rule")
+check(w.stopped() == [7000062], "a spin loop with no child still gets the verdict")
+w = World(); w.session(7000100, LIVE)
+shell(w, 7000062, 11 * MIN, "until pg_isready -h localhost; do :; done && go run main.go"); w.proc(7000063, 7000062, 2 * HOUR, "node server.js")
+w.run()
+check(w.sent == [] and "KEEP(long-child)" in w.out, "a spin-shaped line whose loop ended and runs a 2 h old child is kept as long-child")
 
 # 5c. Verdict 2 applies the lease and serving keeps of verdict 1, spin or not.
-for body, age, what in ((loop, 7 * HOUR, "wait loop"), (tight, 11 * MIN, "spin loop")):
+for body, age, what in ((loop, 25 * HOUR, "wait loop"), (tight, 11 * MIN, "spin loop")):
     w = World(); w.session(7000100, LIVE)
     shell(w, 7000070, age, body)
     (HOME / ".cache/stima-api/resource-locks/leases/x.abc.lease").write_text(json.dumps(
@@ -348,6 +355,45 @@ for body, age, what in ((loop, 7 * HOUR, "wait loop"), (tight, 11 * MIN, "spin l
     (FAKE / "lsof.established").write_text("n127.0.0.1:55555->127.0.0.1:4165\n")
     w.run()
     check(w.sent == [] and "KEEP(serving)" in w.out, f"a {what} shell listening with a connection is kept")
+
+# 5d. The log carries the tool's name, and a tool shell's eval text with credentials masked.
+w = World(); w.session(7000100, LIVE)
+shell(w, 7000071, 25 * HOUR, "until curl --token eyJabc.def.ghi -s x; do sleep 5; done")
+shell(w, 7000072, 25 * HOUR, 'until curl -H "Authorization: Bearer abc123tok" x; do sleep 5; done')
+shell(w, 7000073, 25 * HOUR, "until psql postgres://dbuser:pw0rd@host/db -c x; do sleep 5; done")
+w.proc(7000074, 1, 3 * 86400, "/usr/bin/python3 -m http.server 8790 --password hunter2", DEAD)
+w.transcript(DEAD, 5 * 86400)
+w.run(apply=False)
+check(all(secret not in w.out for secret in ("eyJabc", "abc123tok", "pw0rd", "hunter2")),
+      "the log carries no --token value, Bearer token, URL password or --password value")
+check("until curl" in w.out and "until psql" in w.out and "zsh eval 'until" in w.out and "cmd='python3'" in w.out,
+      "a tool shell logs its basename and the start of its eval text; any other process only its basename")
+
+# 5e. Launchd jobs, whatever their label; unowned leases; a shell and an unshaped root.
+w = World(); w.transcript(DEAD, 5 * 86400)
+w.proc(7000080, 1, 3 * 86400, "node /x/chrome-launcher.js"); w.proc(7000081, 7000080, 3 * 86400, "node /x/h.js", DEAD)
+(FAKE / "launchctl.out").write_text("PID\tStatus\tLabel\n7000080\t0\tapplication.com.google.Chrome.1\n")
+w.run()
+check(w.sent == [] and "KEEP(protected: launchd job application.com.google.Chrome.1)" in w.out,
+      "a tree whose root is a launchd job of any label is kept, the reason naming the label")
+lease = HOME / ".cache/stima-api/resource-locks/leases/x.abc.lease"
+w = World(); w.transcript(DEAD, 5 * 86400); tree(w, DEAD)
+lease.write_text(json.dumps({"resource": "next", "detached": True, "owner_pid": None, "ttl": 3600, "started": NOW - 100}))
+w.run()
+check(w.sent == [] and "KEEP(lease)" in w.out, "a live lease with no owner pid, inside its ttl, keeps every dead-owner tree")
+lease.write_text(json.dumps({"resource": "next", "detached": True, "owner_pid": None, "ttl": 3600, "started": NOW - 7200}))
+w.run()
+check(w.stopped() == [7000012, 7000011, 7000010], "the same lease past its ttl does not")
+w = World(); w.transcript(DEAD, 5 * 86400)
+w.proc(7000090, 1, 3 * 86400, "/usr/libexec/shared-helper --daemon"); w.proc(7000091, 7000090, 3 * 86400, "/x/native-host", DEAD)
+w.run()
+check(w.sent == [] and "7000090" not in w.out, "a root that is not shaped like a Claude-started tree is not judged and prints nothing")
+w = World(); w.transcript(DEAD, 5 * 86400); tree(w, DEAD)
+(FAKE / "cwd.7000010").write_text(str(wt))
+w.run(janitor=str(SANDBOX / "janitor-live.sh"))
+check(w.sent == [] and "KEEP(owner-claimed)" in w.out, "a dead environment owner whose root runs in a worktree a live session claims: kept")
+w.run()
+check(w.stopped() == [7000012, 7000011, 7000010], "the same worktree with no claim: stopped")
 
 # 6. Protected families, kept even when the owner is dead and when it cannot be resolved.
 FAMILIES = {

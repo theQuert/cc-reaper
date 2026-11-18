@@ -1064,8 +1064,8 @@ FAKE
 export CC_DJ_ORPHAN_PROC_SCRIPT="$FAKE_OPR"
 : > "$SANDBOX/dj.log"
 _run_dj --check 80 0
-expect_yes "orphan processes: --check reports by default, with the 6 h and 10 min bounds" \
-  grep -q "orphan processes: opr args: report --loop-hours 6 --spin-minutes 10" "$SANDBOX/dj.log"
+expect_yes "orphan processes: --check reports by default, with the 24 h and 10 min bounds" \
+  grep -q "orphan processes: opr args: report --loop-hours 24 --spin-minutes 10" "$SANDBOX/dj.log"
 expect_yes "orphan processes: the reaper's summary line reaches the log" \
   grep -q "orphan processes: orphan processes: stopped=0/0" "$SANDBOX/dj.log"
 : > "$SANDBOX/dj.log"

@@ -46,7 +46,7 @@ Environment:
   CC_DJ_DEV_SERVER_REAP off, report or apply: dev servers serving nothing (default: report)
   CC_DJ_DEV_SERVER_MIN_HOURS  Never judge a dev server younger than this (default: 6)
   CC_DJ_ORPHAN_PROC_REAP off, report or apply: processes of dead Claude sessions, and a live session's stale wait-loop shells (default: report)
-  CC_DJ_ORPHAN_PROC_LOOP_HOURS  A live session's wait-loop shell older than this is stopped (default: 6)
+  CC_DJ_ORPHAN_PROC_LOOP_HOURS  A live session's wait-loop shell older than this is stopped (default: 24)
   CC_DJ_ORPHAN_PROC_SPIN_MINUTES  So is one whose loop body runs nothing, after this (default: 10)
   CC_DJ_ACT_FREE_GB     --check acts below this many free GB, or `off` (default: 30)
   CC_DJ_ACT_COOLDOWN_SECS  Seconds between two low-disk actions (default: 10800)
@@ -130,7 +130,7 @@ CC_DJ_HOST_TEMP_IDLE_MINUTES="${CC_DJ_HOST_TEMP_IDLE_MINUTES:-60}"
 CC_DJ_DEV_SERVER_REAP="${CC_DJ_DEV_SERVER_REAP:-report}"
 CC_DJ_DEV_SERVER_MIN_HOURS="${CC_DJ_DEV_SERVER_MIN_HOURS:-6}"
 CC_DJ_ORPHAN_PROC_REAP="${CC_DJ_ORPHAN_PROC_REAP:-report}"
-CC_DJ_ORPHAN_PROC_LOOP_HOURS="${CC_DJ_ORPHAN_PROC_LOOP_HOURS:-6}"
+CC_DJ_ORPHAN_PROC_LOOP_HOURS="${CC_DJ_ORPHAN_PROC_LOOP_HOURS:-24}"
 CC_DJ_ORPHAN_PROC_SPIN_MINUTES="${CC_DJ_ORPHAN_PROC_SPIN_MINUTES:-10}"
 CC_DJ_CHROME_CLONE_MIN_AGE_DAYS="${CC_DJ_CHROME_CLONE_MIN_AGE_DAYS:-1}"
 CC_DJ_BUILDER_PRUNE_UNTIL="${CC_DJ_BUILDER_PRUNE_UNTIL:-24h}"
@@ -1913,7 +1913,8 @@ _cc_dj_orphan_proc_reap() {
     _cc_dj_skip "orphan processes (script or python3 not found)"
     return 0
   fi
-  out="$(python3 "$script" "$CC_DJ_ORPHAN_PROC_REAP" --loop-hours "$((10#$CC_DJ_ORPHAN_PROC_LOOP_HOURS))" \
+  # Bounded: a hung ps or lsof must not hold --check, which waits for this pass.
+  out="$(_cc_dj_run_bounded 600 python3 "$script" "$CC_DJ_ORPHAN_PROC_REAP" --loop-hours "$((10#$CC_DJ_ORPHAN_PROC_LOOP_HOURS))" \
     --spin-minutes "$((10#$CC_DJ_ORPHAN_PROC_SPIN_MINUTES))" 2>&1)" || rc=$?
   while IFS= read -r line; do [ -n "$line" ] && _cc_dj_log "orphan processes: $line"; done <<< "$out"
   return 0

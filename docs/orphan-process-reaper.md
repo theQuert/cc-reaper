@@ -15,8 +15,11 @@ by argv[0] inside a linked worktree, `session-reaper.py` closes tmux panes and s
    - Owner, in this order: `CLAUDE_CODE_SESSION_ID` in the environment of any process in the tree (one
      `ps eww -axo pid=,command=` for the host; only that one key is kept, no environment value is printed or
      logged), then a `/tmp/claude-<uid>/<project>/<session id>/` path in the root's command line or working
-     directory, then the `claude-task-worktree` marker of the root's linked worktree. The marker names the
-     creator, a weaker owner: a live claim on the worktree (`worktree-janitor.sh --claims`) keeps the tree.
+     directory, then the `claude-task-worktree` marker of the root's linked worktree (its creator). Only a
+     root shaped like a Claude-started tree (runtime or shell, the local stack's binary, a scratchpad path) is
+     judged: a shared daemon carrying one session's helper is not that session's tree. Whoever the owner is
+     found to be, a live claim on the root's linked worktree (`worktree-janitor.sh --claims`) keeps the tree,
+     because a session's id can change while it lives (`/clear`).
    - Dead means all of: no live pid in `~/.claude/sessions/*.json`; no live `pid` or `replPid` in the
      daemon roster `~/.claude/daemon/roster.json` (a hosted session is live while either is); not in the
      fresh session state file; the host has a record of the id (a transcript under `~/.claude/projects` or a
@@ -27,22 +30,23 @@ by argv[0] inside a linked worktree, `session-reaper.py` closes tmux panes and s
      a decision.
 2. **A live session's own Bash-tool shell that waits.** The command contains
    `shell-snapshots/snapshot-zsh-`, its parent is that session's claude process, and it is an
-   `until`/`while` ... `done` loop older than `CC_DJ_ORPHAN_PROC_LOOP_HOURS` (6); or the loop body runs
-   nothing (`do :; done`, `do true`) and it is older than `CC_DJ_ORPHAN_PROC_SPIN_MINUTES` (10). The 6 hour
-   bound sits above `gh run watch` and a 30-minute suite; the first Mac mini report run (2026-11-19) listed 22
+   `until`/`while` ... `done` loop older than `CC_DJ_ORPHAN_PROC_LOOP_HOURS` (24); or the loop body runs
+   nothing (`do :; done`, `do true`) and it is older than `CC_DJ_ORPHAN_PROC_SPIN_MINUTES` (10). The 24 hour
+   bound sits above any background wait the standing rule allows (it exits on an event) and above `gh run watch`; the first Mac mini report run (2026-11-19) listed 22
    such shells of one session, 25 to 37 hours old, every one an `until grep ... ; do sleep N; done` on a file or
-   process that never appeared. A loop whose shell has a descendant older than 10 minutes other than `sleep` or `tail`
-(or one whose start time cannot be read) has already ended and the shell runs something: `KEEP(long-child)`. A
+   process that never appeared. A shell with a descendant older than 10 minutes other than `sleep` or `tail`, spin-shaped or not
+(or one whose start time cannot be read), has already ended its loop and the shell runs something: `KEEP(long-child)`. A
 tool shell holding a live lease or listening with a connection is kept like a tree of rule 1 (`KEEP(lease)`,
 `KEEP(serving)`), spin loops included.
 
 ## What it never stops
 
-Kept even when the owner cannot be resolved: the tmux server; any launchd job whose label starts with
-`tech.stima.` or `com.cc-reaper.` (the `ci-runner-macos` and `gce-jit-broker` families, `run-loop.sh`,
-`Runner.Listener`); docker and OrbStack; a `claude daemon`, `bg-pty-host` or `bg-spare`; a pid the
+Kept even when the owner cannot be resolved: the tmux server; any process `launchctl list` names, whatever
+its label (the `ci-runner-macos` and `gce-jit-broker` families, `run-loop.sh`, `Runner.Listener`, Chrome); docker and OrbStack; a `claude daemon`, `bg-pty-host` or `bg-spare`; a pid the
 registry or roster lists as live; any claude or codex process in the tree; a tree whose pid owns a live
-`with_local_resource.py` lease (its `owner_pid` alive, not past its `ttl`); a tree that listens on a port something
+`with_local_resource.py` lease (its `owner_pid` alive, not past its `ttl`), and every tree of rule 1 while
+any live lease names no owner pid (a `--detach --ttl` lease deliberately has none, and its resource lives in
+another tree; conservative on purpose); a tree that listens on a port something
 is connected to (`KEEP(serving)`); a never-kill pid (`CC_NEVER_KILL_PIDS`) and its descendants; the
 reaper's own process tree.
 
@@ -67,8 +71,9 @@ SURVIVOR  pid=... (still running 10s after SIGTERM; not killed)
 orphan processes: stopped=0/25 kept=18 (report only)                               # one summary per run
 ```
 
-Command lines are logged cut to 100 characters with `token|key|secret|password=` values masked, and the
-session id as its first 8 characters. A failure of the reaper is logged and never fails the janitor.
+A process is logged as the basename of argv[0] only; a tool shell also gets its first 80 characters after
+`eval '`, with `--token X`, `key=X`, `Bearer X` and the password of a `://user:pw@` URL masked first. The
+session id is logged as its first 8 characters. A failure of the reaper is logged and never fails the janitor.
 
 Rollout (SCRIPT-SAFE-RULE): ships in `report`; after five clean scheduled runs, spot-checked against the
 process table, the host's `disk-janitor.conf` sets `apply`. Rollback is `CC_DJ_ORPHAN_PROC_REAP=off`.
