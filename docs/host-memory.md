@@ -5,8 +5,11 @@
 On macOS 26 a process that was started through a `#!` line and then starts another script
 through its own `#!` line leaks about 1 KiB of kernel memory. The memory sits in the kernel
 zone `kalloc.1024` (shown as `data_shared.kalloc.1024`, or `data.kalloc.1024` on some builds)
-and counts as wired memory. Nothing frees it except a restart. The cause is a macOS bug; it is
-not something cc-reaper or a session does wrong that we can stop from the outside.
+and counts as wired memory. Nothing frees it except a restart. The cause is a macOS bug, so the
+only defence is to start scripts by their interpreter (`python3 x.py`, `/bin/sh x.sh`) wherever
+one script starts another often. The largest source, the stima-api hook dispatcher, was changed
+that way in theQuert/stima-api#9010: measured there, a guard started by path leaks a median 1.12
+elements a launch, started by its interpreter 0.31 or less.
 
 ## The three fields
 
