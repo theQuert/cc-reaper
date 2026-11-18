@@ -60,13 +60,13 @@ STUB
 # compressor = 10% of phys = 419430 pages → ~1.60 GB (below 50% of 16GB = 8GB threshold)
 cat > "$stub_dir/vm_stat" <<'STUB'
 #!/usr/bin/env bash
-echo "Mach Virtual Memory Statistics: (page size of 4096 bytes)"
+echo "Mach Virtual Memory Statistics: (page size of ${CC_RW_TEST_PAGESIZE:-4096} bytes)"
 echo "Pages free:                          209715."
 echo "Pages active:                        500000."
 echo "Pages inactive:                      200000."
 echo "Pages speculative:                    50000."
 echo "Pages throttled:                          0."
-echo "Pages wired down:                    300000."
+echo "Pages wired down:                    ${CC_RW_TEST_WIRED_PAGES:-300000}."
 echo "Pages purgeable:                      10000."
 echo "Translation faults:               10000000."
 echo "Pages copy-on-write:                 500000."
@@ -103,7 +103,14 @@ cat > "$stub_dir/osascript" <<'STUB'
 echo "$@" >> "${CC_RW_OSASCRIPT_LOG:-/dev/null}"
 STUB
 
-chmod +x "$stub_dir/top" "$stub_dir/df" "$stub_dir/vm_stat" \
+# fake zprint: prints the file named by CC_RW_TEST_ZPRINT; unset = fails, as a missing zprint does
+cat > "$stub_dir/zprint" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${CC_RW_TEST_ZPRINT:-}" ] || exit 127
+cat "$CC_RW_TEST_ZPRINT"
+STUB
+
+chmod +x "$stub_dir/zprint" "$stub_dir/top" "$stub_dir/df" "$stub_dir/vm_stat" \
          "$stub_dir/sysctl" "$stub_dir/osascript"
 
 # Hermetic: no case may reach the deployed reclaim scripts (a real go cache cap or sweep).
@@ -1085,6 +1092,74 @@ expect_no  "T22g: CC_RW_CHROME_CLONE_GB=0 disables it" grep -q 'chrome-clone' "$
 expect_no  "T22g: and measures nothing" test -e "$(cat "$t22g.statedir")/chrome-clone.checked"
 t22h=$(t22_case CC_RW_CHROME_CLONE_GB=20)
 expect_no  "T22h: under a raised line (12 GB < 20): no alert" grep -q 'quit Chrome' "$t22h"
+
+# ---------------------------------------------------------------------------
+# T23: wired memory and the kalloc.1024 zone (stima-api #9010)
+# ---------------------------------------------------------------------------
+
+zp_head='zone name                   size        size        size      #elts       #elts       inuse   size  count'
+zp_a="$TMPDIR_ROOT/zprint-shared"   # real shape: the leak under data_shared
+{ echo "$zp_head"
+  echo 'data.kalloc.1024            1024          0K          0K          0           0         121     0K      0'
+  echo 'data_shared.kalloc.1024     1024          0K          0K          0           0    16102699     0K      0'
+  echo 'kalloc.1024                 1024          0K          0K          0           0        1045     0K      0'; } > "$zp_a"
+zp_b="$TMPDIR_ROOT/zprint-data"     # other builds: the leak under data.
+{ echo "$zp_head"
+  echo 'data.kalloc.1024            1024          0K          0K          0           0     9000000     0K      0'
+  echo 'data_shared.kalloc.1024     1024          0K          0K          0           0         500     0K      0'; } > "$zp_b"
+# 16 KiB pages: 1187106 pages = 18.1 GB; 4 KiB: 300000 = 1.1 GB
+w_hi="CC_RW_TEST_PAGESIZE=16384 CC_RW_TEST_WIRED_PAGES=1187106"
+
+t23a=$(run_snapshot $w_hi CC_RW_TEST_ZPRINT="$zp_a"); t23a_log=$(cat "$t23a.logpath")
+expect_yes "T23a: wired=18.1 (16 KiB pages)" grep -q ' wired=18.1 ' "$t23a_log"
+expect_yes "T23a: kzone is the data_shared count" grep -q ' kzone=16102699 ' "$t23a_log"
+expect_yes "T23a: first run, no previous sample: kzone_rate=?" grep -q ' kzone_rate=? ' "$t23a_log"
+expect_yes "T23a: wired at 18.1 >= 12 raises ALERT:wired" grep -q 'ALERT:wired' "$t23a_log"
+expect_yes "T23a: and notifies" grep -q 'wired' "$t23a"
+expect_yes "T23a: the sample is stored" grep -q '16102699' "$(cat "$t23a.statedir")/kzone-last"
+
+t23b=$(run_snapshot CC_RW_TEST_ZPRINT="$zp_b"); t23b_log=$(cat "$t23b.logpath")
+expect_yes "T23b: the data. variant counts: kzone=9000000" grep -q ' kzone=9000000 ' "$t23b_log"
+expect_yes "T23b: wired=1.1 under 12: " grep -q ' wired=1.1 ' "$t23b_log"
+expect_no  "T23b: no ALERT:wired under the threshold" grep -q 'ALERT:wired' "$t23b_log"
+expect_no  "T23b: no notification" grep -q 'wired' "$t23b"
+
+t23c=$(run_snapshot)
+expect_yes "T23c: zprint failing: kzone=?" grep -qE ' kzone=\? kzone_rate=\?( |$)' "$(cat "$t23c.logpath")"
+expect_no  "T23c: nothing stored" test -e "$(cat "$t23c.statedir")/kzone-last"
+
+# rate: previous sample 1800 s ago at 16000000 -> now 16102699 : 102699 / 0.5 h = 205398/h
+t23d_state=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+echo "$(( $(date +%s) - 1800 )) 16000000" > "$t23d_state/kzone-last"
+t23d=$(run_snapshot CC_RW_STATE_DIR="$t23d_state" CC_RW_TEST_ZPRINT="$zp_a")
+expect_yes "T23d: kzone_rate=205398 elements/hour (+-1%)" \
+  awk '{ for (i=1;i<=NF;i++) if ($i ~ /^kzone_rate=/) { sub(/kzone_rate=/,"",$i); exit !($i>203300 && $i<207500) } exit 1 }' "$(cat "$t23d.logpath")"
+
+# exactly at the threshold alerts: 12 GB = 786432 pages of 16 KiB
+t23e=$(run_snapshot CC_RW_TEST_PAGESIZE=16384 CC_RW_TEST_WIRED_PAGES=786432)
+expect_yes "T23e: wired exactly 12.0 alerts" grep -q 'wired=12.0 .*ALERT:wired' "$(cat "$t23e.logpath")"
+t23f=$(run_snapshot CC_RW_TEST_PAGESIZE=16384 CC_RW_TEST_WIRED_PAGES=786431)
+expect_no  "T23f: just under 12 does not" grep -q 'ALERT:wired' "$(cat "$t23f.logpath")"
+t23g=$(run_snapshot CC_RW_TEST_PAGESIZE=16384 CC_RW_TEST_WIRED_PAGES=786432 CC_RW_WIRED_ALERT_GB=20)
+expect_no  "T23g: CC_RW_WIRED_ALERT_GB=20 raises the line" grep -q 'ALERT:wired' "$(cat "$t23g.logpath")"
+# repeat suppression: a second round inside the cooldown logs the alert but does not notify again
+t23h_state=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+t23h1=$(run_snapshot CC_RW_STATE_DIR="$t23h_state" $w_hi)
+t23h2=$(run_snapshot CC_RW_STATE_DIR="$t23h_state" $w_hi)
+expect_yes "T23h: first round notifies" grep -q 'wired' "$t23h1"
+expect_no  "T23h: second round inside the cooldown does not" grep -q 'wired' "$t23h2"
+# once per breach, not once per cooldown: with no cooldown a standing breach stays quiet until wired falls
+t23i_state=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+t23i1=$(run_snapshot CC_RW_STATE_DIR="$t23i_state" CC_RW_COOLDOWN_SECS=0 $w_hi)
+t23i2=$(run_snapshot CC_RW_STATE_DIR="$t23i_state" CC_RW_COOLDOWN_SECS=0 $w_hi)
+t23i3=$(run_snapshot CC_RW_STATE_DIR="$t23i_state" CC_RW_COOLDOWN_SECS=0)
+t23i4=$(run_snapshot CC_RW_STATE_DIR="$t23i_state" CC_RW_COOLDOWN_SECS=0 $w_hi)
+expect_yes "T23i: a breach notifies" grep -q 'wired' "$t23i1"
+expect_no  "T23i: the same breach, cooldown over, does not notify again" grep -q 'wired' "$t23i2"
+expect_yes "T23i: but its line still carries ALERT:wired" grep -q 'ALERT:wired' "$(cat "$t23i2.logpath")"
+expect_no  "T23i: a reading under the line notifies nothing" grep -q 'wired' "$t23i3"
+expect_yes "T23i: and the next breach notifies again" grep -q 'wired' "$t23i4"
+
 
 if [ "$failures" -gt 0 ]; then
   printf "%s test failure(s)\n" "$failures"
