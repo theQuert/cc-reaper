@@ -300,6 +300,55 @@ w = World(); w.session(7000100, LIVE); shell(w, 7000049, 7 * HOUR, loop, sid=DEA
 w.run()
 check(7000049 not in w.stopped(), "a tool shell whose own session id differs from its parent's is kept")
 
+# 5b. A loop that already ended is not a stuck loop: a long-lived child keeps the shell.
+started = "npm run dev & " + loop + "; wait"
+w = World(); w.session(7000100, LIVE)
+shell(w, 7000060, 7 * HOUR, started); w.proc(7000061, 7000060, 2 * HOUR, "node server.js")
+w.run()
+check(w.sent == [] and "KEEP(long-child)" in w.out, "a wait loop shell with a 2 h old node child is kept as long-child")
+w = World(); w.session(7000100, LIVE)
+shell(w, 7000060, 7 * HOUR, loop); w.proc(7000061, 7000060, 20, "sleep 30")
+w.run()
+check(sorted(w.stopped()) == [7000060, 7000061], "a 20 s old sleep child does not keep a stuck loop")
+w = World(); w.session(7000100, LIVE)
+shell(w, 7000060, 7 * HOUR, loop); w.proc(7000061, 7000060, 7 * HOUR, "tail -f /tmp/log")
+w.run()
+check(sorted(w.stopped()) == [7000060, 7000061], "a 7 h old tail child does not keep a stuck loop")
+w = World(); w.session(7000100, LIVE)
+shell(w, 7000060, 7 * HOUR, loop); w.proc(7000061, 7000060, 2 * HOUR, "sleep 30")
+w.run()
+check(sorted(w.stopped()) == [7000060, 7000061], "a sleep child is never long-lived, whatever its age")
+w = World(); w.session(7000100, LIVE)
+shell(w, 7000060, 7 * HOUR, loop); w.proc(7000061, 7000060, 2 * HOUR, "node server.js")
+w.write()
+# a start time that cannot be read counts as long-lived
+table = (FAKE / "ps.table").read_text().replace(lstart(2 * HOUR), "Xxx Xxx 99 99:99:99 9999")
+(FAKE / "ps.table").write_text(table)
+buf = io.StringIO(); w.sent = []
+with contextlib.redirect_stdout(buf):
+    opr.reap(apply=True, now=NOW, send=lambda p, s: w.sent.append((p, s)), sleep=lambda s: None, home=HOME,
+             alive=lambda pid: pid in w.alive, self_pid=7999999, janitor=str(SANDBOX / "janitor-free.sh"))
+check(w.sent == [], "a child whose start time cannot be read counts as long-lived")
+w = World(); w.session(7000100, LIVE)
+shell(w, 7000062, 11 * MIN, tight)
+w.run()
+check(w.stopped() == [7000062], "a spin loop has no child to judge and keeps its rule")
+
+# 5c. Verdict 2 applies the lease and serving keeps of verdict 1, spin or not.
+for body, age, what in ((loop, 7 * HOUR, "wait loop"), (tight, 11 * MIN, "spin loop")):
+    w = World(); w.session(7000100, LIVE)
+    shell(w, 7000070, age, body)
+    (HOME / ".cache/stima-api/resource-locks/leases/x.abc.lease").write_text(json.dumps(
+        {"resource": "next", "detached": True, "owner_pid": 7000070, "started": NOW - 100, "ttl": None, "worktree": "/w"}))
+    w.run()
+    check(w.sent == [] and "KEEP(lease)" in w.out, f"a {what} shell holding a live lease is kept")
+    w = World(); w.session(7000100, LIVE)
+    shell(w, 7000070, age, body)
+    (FAKE / "lsof.listen").write_text("p7000070\nn*:4165\n")
+    (FAKE / "lsof.established").write_text("n127.0.0.1:55555->127.0.0.1:4165\n")
+    w.run()
+    check(w.sent == [] and "KEEP(serving)" in w.out, f"a {what} shell listening with a connection is kept")
+
 # 6. Protected families, kept even when the owner is dead and when it cannot be resolved.
 FAMILIES = {
     "tmux server": ("tmux: server", None),

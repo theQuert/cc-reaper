@@ -31,7 +31,10 @@ by argv[0] inside a linked worktree, `session-reaper.py` closes tmux panes and s
    nothing (`do :; done`, `do true`) and it is older than `CC_DJ_ORPHAN_PROC_SPIN_MINUTES` (10). The 6 hour
    bound sits above `gh run watch` and a 30-minute suite; the first Mac mini report run (2026-11-19) listed 22
    such shells of one session, 25 to 37 hours old, every one an `until grep ... ; do sleep N; done` on a file or
-   process that never appeared.
+   process that never appeared. A loop whose shell has a descendant older than 10 minutes other than `sleep` or `tail`
+(or one whose start time cannot be read) has already ended and the shell runs something: `KEEP(long-child)`. A
+tool shell holding a live lease or listening with a connection is kept like a tree of rule 1 (`KEEP(lease)`,
+`KEEP(serving)`), spin loops included.
 
 ## What it never stops
 

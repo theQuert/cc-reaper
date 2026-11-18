@@ -26,7 +26,8 @@ report of the survivors; there is no SIGKILL.
 2. A live session's own Bash-tool shell (`shell-snapshots/snapshot-zsh-` in its command, its parent that
    session's claude process) whose command is a wait loop (`until` or `while` ... `done`) older than
    --loop-hours, or whose loop body does nothing (`do :; done`, no `sleep`, no command) older than
-   --spin-minutes.
+   --spin-minutes. A wait loop with a descendant older than 10 minutes that is not `sleep` or `tail` is kept
+   (the loop ended; the shell runs something). Both kinds keep the lease and serving rules of 1.
 
 Never touched, owner or no owner: the tmux server, a launchd job (`tech.stima.*`, `com.cc-reaper.*`,
 so the ci-runner-macos and gce-jit-broker families), docker and OrbStack, a claude daemon, a pid the
@@ -79,6 +80,7 @@ PROTECTED_LABEL = re.compile(r"(?:tech\.stima\.|com\.cc-reaper\.)")
 # root, the local stack's binary, a session scratchpad. Anything else owned by launchd is not reported.
 LOOKS = re.compile(r"/\.local-stack/|/claude-\d+/")
 OWNER_QUIET_SECONDS = 3600
+LONG_CHILD_SECONDS = 600
 MASK = re.compile(r"(?i)((?:token|key|secret|password)=)\S+")
 
 
@@ -210,6 +212,20 @@ def wait_loop(command):
     if not match:
         return False, False
     return True, EMPTY_BODY.fullmatch(match.group(1)) is not None
+
+
+def long_lived_child(rows, members, root, now):
+    """Whether a descendant of the shell, other than sleep or tail, is older than LONG_CHILD_SECONDS.
+    A shell stuck in its loop has only seconds-old condition commands under it; a long-lived child
+    means the loop ended and the shell is running something. A start time that cannot be read counts."""
+    for pid in members:
+        tool = os.path.basename((rows[pid][4].split() or [""])[0])
+        if pid == root or tool in ("sleep", "tail"):
+            continue
+        begun = dsr.started(rows[pid][3])
+        if begun is None or now - begun > LONG_CHILD_SECONDS:
+            return True
+    return False
 
 
 def label(pid, row, owner=None):
@@ -356,6 +372,16 @@ def reap(apply=False, loop_hours=6, spin_minutes=10, grace=10, now=None, home=No
         protected = why_protected(rows, members, own, live_pids, labels, keep)
         if protected:
             keep_line(f"protected: {protected}", pid, live_pids[ppid])
+            continue
+        if not spin and long_lived_child(rows, members, pid, now):
+            keep_line("long-child", pid, live_pids[ppid])
+            continue
+        if leases & set(members):
+            keep_line("lease", pid, live_pids[ppid])
+            continue
+        busy = serving(members)
+        if busy:
+            keep_line(busy, pid, live_pids[ppid])
             continue
         shape = "a loop that runs nothing" if spin else "a wait loop"
         verdicts.append((pid, live_pids[ppid], f"{shape} of a live session for {age / 3600:.1f}h; {len(members)} processes"))
