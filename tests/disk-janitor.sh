@@ -1049,6 +1049,46 @@ expect_yes "dev servers: and --check waits for it before it ends" \
 rm -f "$SANDBOX/state/cooldown-act"
 unset CC_DJ_DEV_SERVER_SCRIPT; rm -f "$FAKE_BIN/gh"
 
+# The orphan-process reaper's own rules are tests/orphan-process-reaper.sh. Here only the contract
+# with --check: report by default, the two age bounds passed on, off and a bad value do not run it,
+# and a failing reaper is logged without failing the janitor.
+FAKE_OPR="$SANDBOX/fake-opr.py"
+cat > "$FAKE_OPR" <<'FAKE'
+import os, sys
+print("opr args: " + " ".join(sys.argv[1:]))
+if os.environ.get("FAKE_OPR_FAIL"):
+    print("orphan processes: SKIP the registry could not be read", file=sys.stderr)
+    sys.exit(1)
+print("orphan processes: stopped=0/0 kept=1 (report only)")
+FAKE
+export CC_DJ_ORPHAN_PROC_SCRIPT="$FAKE_OPR"
+: > "$SANDBOX/dj.log"
+_run_dj --check 80 0
+expect_yes "orphan processes: --check reports by default, with the 6 h and 10 min bounds" \
+  grep -q "orphan processes: opr args: report --loop-hours 6 --spin-minutes 10" "$SANDBOX/dj.log"
+expect_yes "orphan processes: the reaper's summary line reaches the log" \
+  grep -q "orphan processes: orphan processes: stopped=0/0" "$SANDBOX/dj.log"
+: > "$SANDBOX/dj.log"
+CC_DJ_ORPHAN_PROC_REAP=apply CC_DJ_ORPHAN_PROC_LOOP_HOURS=08 CC_DJ_ORPHAN_PROC_SPIN_MINUTES=15 _run_dj --check 80 0
+expect_yes "orphan processes: apply passes the mode and both bounds (08 is eight)" \
+  grep -q "opr args: apply --loop-hours 8 --spin-minutes 15" "$SANDBOX/dj.log"
+: > "$SANDBOX/dj.log"
+CC_DJ_ORPHAN_PROC_REAP=off _run_dj --check 80 0
+expect_no "orphan processes: off does not run it" grep -q "opr args" "$SANDBOX/dj.log"
+: > "$SANDBOX/dj.log"
+CC_DJ_ORPHAN_PROC_REAP=yes _run_dj --check 80 0
+expect_yes "orphan processes: an unknown mode is logged and not run" \
+  sh -c "grep -q 'CC_DJ_ORPHAN_PROC_REAP=yes is not off, report or apply' '$SANDBOX/dj.log' && ! grep -q 'opr args' '$SANDBOX/dj.log'"
+: > "$SANDBOX/dj.log"
+CC_DJ_ORPHAN_PROC_LOOP_HOURS=six _run_dj --check 80 0
+expect_yes "orphan processes: a bound that is not a number is logged and not run" \
+  sh -c "grep -q 'CC_DJ_ORPHAN_PROC_LOOP_HOURS=six is not a number' '$SANDBOX/dj.log' && ! grep -q 'opr args' '$SANDBOX/dj.log'"
+: > "$SANDBOX/dj.log"
+FAKE_OPR_FAIL=1 _run_dj --check 80 0
+expect_yes "orphan processes: a failing reaper is logged, and --check still ends normally" \
+  sh -c "grep -q 'orphan processes: .*SKIP the registry could not be read' '$SANDBOX/dj.log' && grep -q 'check: OK' '$SANDBOX/dj.log'"
+unset CC_DJ_ORPHAN_PROC_SCRIPT
+
 printf "\n# Test group 4: --clean all targets present\n"
 _reset_captures
 
