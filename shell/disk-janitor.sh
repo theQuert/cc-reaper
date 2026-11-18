@@ -45,6 +45,9 @@ Environment:
   CC_DJ_BUILDER_PRUNE_UNTIL  Daily --check builder prune filter, or `off` (default: 24h)
   CC_DJ_DEV_SERVER_REAP off, report or apply: dev servers serving nothing (default: report)
   CC_DJ_DEV_SERVER_MIN_HOURS  Never judge a dev server younger than this (default: 6)
+  CC_DJ_ORPHAN_PROC_REAP off, report or apply: processes of dead Claude sessions, and a live session's stale wait-loop shells (default: report)
+  CC_DJ_ORPHAN_PROC_LOOP_HOURS  A live session's wait-loop shell older than this is stopped (default: 24)
+  CC_DJ_ORPHAN_PROC_SPIN_MINUTES  So is one whose loop body runs nothing, after this (default: 10)
   CC_DJ_ACT_FREE_GB     --check acts below this many free GB, or `off` (default: 30)
   CC_DJ_ACT_COOLDOWN_SECS  Seconds between two low-disk actions (default: 10800)
   CC_DJ_ACT_LOW_FREE_GB    Under this many free GB the shorter cooldown below applies (default: 20,
@@ -126,6 +129,9 @@ CC_DJ_HOST_TEMP_REAP="${CC_DJ_HOST_TEMP_REAP:-1}"
 CC_DJ_HOST_TEMP_IDLE_MINUTES="${CC_DJ_HOST_TEMP_IDLE_MINUTES:-60}"
 CC_DJ_DEV_SERVER_REAP="${CC_DJ_DEV_SERVER_REAP:-report}"
 CC_DJ_DEV_SERVER_MIN_HOURS="${CC_DJ_DEV_SERVER_MIN_HOURS:-6}"
+CC_DJ_ORPHAN_PROC_REAP="${CC_DJ_ORPHAN_PROC_REAP:-report}"
+CC_DJ_ORPHAN_PROC_LOOP_HOURS="${CC_DJ_ORPHAN_PROC_LOOP_HOURS:-24}"
+CC_DJ_ORPHAN_PROC_SPIN_MINUTES="${CC_DJ_ORPHAN_PROC_SPIN_MINUTES:-10}"
 CC_DJ_CHROME_CLONE_MIN_AGE_DAYS="${CC_DJ_CHROME_CLONE_MIN_AGE_DAYS:-1}"
 CC_DJ_BUILDER_PRUNE_UNTIL="${CC_DJ_BUILDER_PRUNE_UNTIL:-24h}"
 CC_DJ_ACT_FREE_GB="${CC_DJ_ACT_FREE_GB:-30}"
@@ -1488,9 +1494,11 @@ _cc_dj_check() {
   # Alongside the disk work, not after it: memory is short exactly when the disk is too, and
   # behind the low-disk trim and the growth watch the pass ran 30+ minutes late or not at all
   # in an hour (2026-10-05, 14:47). Its claim checks take minutes per worktree.
-  local dev_server_pid
+  local dev_server_pid orphan_proc_pid
   _cc_dj_dev_server_reap &
   dev_server_pid=$!
+  _cc_dj_orphan_proc_reap &
+  orphan_proc_pid=$!
 
   local snapshots
   snapshots="$(_cc_dj_tm_snapshots)"
@@ -1541,6 +1549,7 @@ _cc_dj_check() {
   # filling must not wait that long for its alert.
   _cc_dj_growth_watch
   wait "$dev_server_pid" 2>/dev/null || true
+  wait "$orphan_proc_pid" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -1884,6 +1893,33 @@ $stopped
 $(printf '%s\n' "$out" | tail -1)
 Still serving (listed only, not stopped):
 $(printf '%s\n' "$out" | grep '^SERVING ' || echo '- none')"
+}
+
+# Hourly: processes no live Claude Code session owns (dev servers, proxies and shells of a dead
+# session, found by the session id in their environment) and a live session's own Bash-tool shells
+# stuck in a wait loop. 2026-11-18: load 98-127 at 0% CPU, 23 stale shells of one live session
+# (stima-api#9007). orphan-process-reaper.py stops only on positive evidence the owner is dead or
+# the loop is stale; report lists, apply stops. A failure here never fails the janitor.
+_cc_dj_orphan_proc_reap() {
+  local script="${CC_DJ_ORPHAN_PROC_SCRIPT:-$HOME/.cc-reaper/orphan-process-reaper.py}" out rc=0 line
+  case "$CC_DJ_ORPHAN_PROC_REAP" in
+    off) return 0 ;;
+    report|apply) ;;
+    *) _cc_dj_log "orphan processes: CC_DJ_ORPHAN_PROC_REAP=$CC_DJ_ORPHAN_PROC_REAP is not off, report or apply; not run"; return 0 ;;
+  esac
+  case "$CC_DJ_ORPHAN_PROC_LOOP_HOURS" in ''|*[!0-9]*) _cc_dj_log "orphan processes: CC_DJ_ORPHAN_PROC_LOOP_HOURS=$CC_DJ_ORPHAN_PROC_LOOP_HOURS is not a number; not run"; return 0 ;; esac
+  case "$CC_DJ_ORPHAN_PROC_SPIN_MINUTES" in ''|*[!0-9]*) _cc_dj_log "orphan processes: CC_DJ_ORPHAN_PROC_SPIN_MINUTES=$CC_DJ_ORPHAN_PROC_SPIN_MINUTES is not a number; not run"; return 0 ;; esac
+  if [ ! -r "$script" ] || ! command -v python3 >/dev/null 2>&1; then
+    _cc_dj_skip "orphan processes (script or python3 not found)"
+    return 0
+  fi
+  # Bounded: a hung ps or lsof must not hold --check, which waits for this pass. Unbuffered, so the
+  # lines printed before the bound fires are still logged.
+  out="$(_cc_dj_run_bounded 600 python3 -u "$script" "$CC_DJ_ORPHAN_PROC_REAP" --loop-hours "$((10#$CC_DJ_ORPHAN_PROC_LOOP_HOURS))" \
+    --spin-minutes "$((10#$CC_DJ_ORPHAN_PROC_SPIN_MINUTES))" 2>&1)" || rc=$?
+  while IFS= read -r line; do [ -n "$line" ] && _cc_dj_log "orphan processes: $line"; done <<< "$out"
+  [ "$rc" -eq 0 ] || _cc_dj_log "orphan processes: stopped early (rc=$rc)"
+  return 0
 }
 
 # Once per day from the hourly check: builder cache grew 24.7 GB in two days here
