@@ -57,6 +57,9 @@ Environment:
   CC_RW_SWAP_USED_GB   Test seam: used swap in GB, replacing the sysctl read; set but empty = unreadable
   CC_RW_VM_PRESSURE_LEVEL  Test seam: kern.memorystatus_vm_pressure_level; set but empty = unreadable
   CC_RW_SWAPOUTS       Test seam: vm_stat's Swapouts count; set but empty = unreadable
+  CC_RW_WIRED_ALERT_GB Wired memory (vm_stat) at or above this many GB raises ALERT:wired; 0 disables
+                       (default: 12). Every line also carries wired=<GB>, kzone=<in-use count of the
+                       kalloc.1024 zone, from zprint> and kzone_rate=<elements/hour>; docs/host-memory.md
   CC_RW_GO_CAP_MAX_SECONDS The go cache cap is ended, by pid, past this many seconds (default: 120); 0 = no bound
   CC_RW_ROUND_MAX_SECONDS  A whole round past this many seconds ends its own process tree (never a detached
                        act), with ERROR and ALERT:round-overrun, so launchd can start the next (default: 240); 0 = no bound
@@ -737,6 +740,42 @@ _cc_rw_run_bounded() {
 }
 
 # ---------------------------------------------------------------------------
+# Wired memory and the kalloc.1024 zone (stima-api #9010)
+# ---------------------------------------------------------------------------
+#
+# A macOS 26 kernel bug leaks ~1 KiB per script started through a `#!` line from a `#!` process, into
+# kalloc.1024; only a restart frees it. docs/host-memory.md. zprint prints zone sizes as 0K without root,
+# so the in-use count (7th column) is read, from both zone names, and the larger is kept.
+
+# Prints "<wired GB, 3 decimals>" from one vm_stat, or nothing.
+_cc_rw_collect_wired() {
+  vm_stat 2>/dev/null | awk '
+    /^Mach Virtual Memory Statistics/ { if (match($0, /page size of [0-9]+/)) ps = substr($0, RSTART + 13, RLENGTH - 13) }
+    /^Pages wired down:/ { v = $4; sub(/\.$/, "", v); w = v }
+    END { if (ps + 0 > 0 && w ~ /^[0-9]+$/) printf "%.6f\n", w * ps / (1024 * 1024 * 1024) }'
+}
+
+# Prints the larger in-use count of data.kalloc.1024 / data_shared.kalloc.1024, or nothing.
+_cc_rw_collect_kzone() {
+  zprint 2>/dev/null | awk '
+    $1 == "data.kalloc.1024" || $1 == "data_shared.kalloc.1024" { if ($7 ~ /^[0-9]+$/ && $7 + 0 > m) m = $7 + 0; seen = 1 }
+    END { if (seen) printf "%.0f\n", m }'
+}
+
+# Args: <count> <now epoch>. Prints elements/hour against <state>/kzone-last (`<epoch> <count>`), or
+# nothing (no previous sample, a count that fell after a restart, no elapsed time); stores the sample.
+_cc_rw_kzone_rate() {
+  local count=$1 now=$2 file prev_t="" prev_c=""
+  file="$(_cc_rw_state_dir)/kzone-last"
+  [[ "$count" =~ ^[0-9]+$ ]] || return 0
+  read -r prev_t prev_c < "$file" 2>/dev/null || true
+  printf '%s %s\n' "$now" "$count" > "$file" 2>/dev/null || true
+  [[ "$prev_t" =~ ^[0-9]+$ && "$prev_c" =~ ^[0-9]+$ ]] || return 0
+  awk -v n="$count" -v c="$prev_c" -v t="$now" -v p="$prev_t" \
+    'BEGIN { if (t > p && n >= c) printf "%.0f\n", (n - c) * 3600 / (t - p) }'
+}
+
+# ---------------------------------------------------------------------------
 # Formatting helper
 # ---------------------------------------------------------------------------
 
@@ -969,6 +1008,17 @@ _cc_rw_snapshot() {
   elif [ "$swap_keep" != "true" ] && [[ "$swap_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     rm -f "${state_dir}/swap-high" 2>/dev/null
   fi
+  # --- wired memory and the kalloc.1024 zone: one vm_stat and one zprint per round ---
+  local wired_gb kzone kzone_rate wired_alert wired_breach=false
+  wired_gb=$(_cc_rw_collect_wired)
+  kzone=$(_cc_rw_collect_kzone)
+  kzone_rate=$(_cc_rw_kzone_rate "$kzone" "$now")
+  wired_alert=$(_cc_rw_num CC_RW_WIRED_ALERT_GB 12)
+  [[ "$wired_gb" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v w="$wired_gb" -v a="$wired_alert" \
+    'BEGIN { exit !(a + 0 > 0 && w + 0 >= a + 0) }' && wired_breach=true
+
+  local wired_txt="?"
+  [ -n "$wired_gb" ] && wired_txt=$(printf '%.1f' "$wired_gb")
   local swap_hot=0
   if [ "$swap_flag" = "true" ]; then swap_hot=1
   elif [ "$swap_keep" = "true" ] || ! [[ "$swap_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then swap_hot="?"
@@ -1013,6 +1063,7 @@ _cc_rw_snapshot() {
   [ "$_CC_RW_ACT_STATE" = "overrun" ] && markers="${markers} ALERT:disk-act-overrun"
   [ "$_CC_RW_ACT_STATE" = "held" ]    && markers="${markers} ALERT:disk-act-held ACT:held:${_CC_RW_ACT_PID}"
   [ "$mem_breach"  = "true" ] && markers="${markers} ALERT:mem"
+  [ "$wired_breach" = "true" ] && markers="${markers} ALERT:wired"
   [ -n "$_CC_RW_RECLAIM_STALL_FIRE" ] && markers="${markers} ALERT:reclaim-stalled"
   [ "$act_started" = "true" ] && markers="${markers} ACT:started:${_CC_RW_ACT_PID}"
   [ "$_CC_RW_ACT_STATE" = "running" ] && markers="${markers} ACT:running:${_CC_RW_ACT_PID:-spawning}"
@@ -1022,11 +1073,12 @@ _cc_rw_snapshot() {
   # --- write log line ---
   local ts
   ts=$(date '+%Y-%m-%dT%H:%M:%S')
-  printf '%s load=%s/%s/%s cpu_idle=%s%% mem_free=%s%% compressor=%sGB disk_free=%sGB/%s%% swap=%s rate=%s swap_hot=%s%s\n' \
+  printf '%s load=%s/%s/%s cpu_idle=%s%% mem_free=%s%% compressor=%sGB disk_free=%sGB/%s%% swap=%s rate=%s swap_hot=%s wired=%s kzone=%s kzone_rate=%s%s\n' \
     "$ts" "$load1" "$load5" "$load15" \
     "$cpu_idle" "$mem_free_pct" "$compressor_gb" \
     "$disk_free_gb" "$disk_free_pct" \
     "$(_cc_rw_val "$swap_gb" GB)" "$(_cc_rw_val "$rate_gbh" GB/h)" "$swap_hot" \
+    "$wired_txt" "${kzone:-?}" "${kzone_rate:-?}" \
     "${markers:+ ${markers}}" \
     >> "$log_file" 2>/dev/null || true
 
@@ -1059,6 +1111,9 @@ _cc_rw_snapshot() {
 
   [ "$mem_breach"  = "true" ] && _cc_rw_maybe_notify "mem" \
     "mem free ${mem_free_pct}% below ${mem_min_pct}% and compressor ${compressor_gb}GB above ${comp_threshold_gb}GB" "$now"
+
+  [ "$wired_breach" = "true" ] && _cc_rw_maybe_notify "wired" \
+    "wired memory ${wired_gb}GB at or above ${wired_alert}GB, kzone=${kzone:-?} (see docs/host-memory.md)" "$now"
 
   _cc_rw_chrome_clone "$now"
 
