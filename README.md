@@ -140,7 +140,7 @@ Add the process cleanup command to the `"Stop"` array in Claude's global
 ```json
 {
   "type": "command",
-  "command": "\"$HOME\"/.cc-reaper/stop-cleanup-orphans.sh",
+  "command": "/bin/bash \"$HOME\"/.cc-reaper/stop-cleanup-orphans.sh",
   "timeout": 15
 }
 ```
@@ -156,7 +156,7 @@ Add the process cleanup command to the `"Stop"` array in Claude's global
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME\"/.cc-reaper/stop-cleanup-orphans.sh",
+            "command": "/bin/bash \"$HOME\"/.cc-reaper/stop-cleanup-orphans.sh",
             "timeout": 15
           }
         ]
@@ -177,7 +177,7 @@ payload, protects its `cwd`, detaches the sweep, and returns promptly:
 ```json
 {
   "type": "command",
-  "command": "\"$HOME\"/.cc-reaper/worktree-session-end.sh codex",
+  "command": "bash \"$HOME\"/.cc-reaper/worktree-session-end.sh codex",
   "timeout": 10
 }
 ```
@@ -699,8 +699,8 @@ handoff, and repository-specific hooks remain owned by Claude/Codex or by the re
 
 | Event | Typical frequency | Extracted into cc-reaper | Shared command |
 |---|---|---|---|
-| `Stop` | after each completed assistant turn | process-orphan cleanup | `~/.cc-reaper/stop-cleanup-orphans.sh` |
-| `SessionEnd` | once when the host closes a session/task | worktree inventory and gated reclamation | `~/.cc-reaper/worktree-session-end.sh <claude\|codex>` |
+| `Stop` | after each completed assistant turn | process-orphan cleanup | `/bin/bash "$HOME"/.cc-reaper/stop-cleanup-orphans.sh` |
+| `SessionEnd` | once when the host closes a session/task | worktree inventory and gated reclamation | `bash "$HOME"/.cc-reaper/worktree-session-end.sh <claude\|codex>` |
 | `SessionStart`, `PreToolUse`, `PostToolUse`, `Notification` | host/repository-specific | no | remains in harness settings |
 
 Safety boundaries (hard): never touches user data (`~/Documents`, `~/Downloads`, `~/Desktop`) unless an operator explicitly adds a repository root there, runs no `docker prune` except the weekly `docker builder prune --force --filter until=168h`, never removes an image, never removes **any** volume, worktree cleanup never kills processes or deletes branches, and a hook payload whose own cwd cannot be established turns that SessionEnd sweep into a report.
@@ -719,10 +719,10 @@ colon-separated list in `CC_REAPER_CODEX_REPOS` when installing):
 {
   "hooks": {
     "Stop": [
-      {"hooks": [{"type": "command", "command": "\"$HOME\"/.cc-reaper/stop-cleanup-orphans.sh", "timeout": 15}]}
+      {"hooks": [{"type": "command", "command": "/bin/bash \"$HOME\"/.cc-reaper/stop-cleanup-orphans.sh", "timeout": 15}]}
     ],
     "SessionEnd": [
-      {"hooks": [{"type": "command", "command": "\"$HOME\"/.cc-reaper/worktree-session-end.sh codex", "timeout": 10}]}
+      {"hooks": [{"type": "command", "command": "bash \"$HOME\"/.cc-reaper/worktree-session-end.sh codex", "timeout": 10}]}
     ]
   }
 }

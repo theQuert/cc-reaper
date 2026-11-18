@@ -731,7 +731,7 @@ echo "  resource-watch: snapshot every 3 min (alerts on load/disk/memory thresho
 echo "  disk-check:     read-only disk + TM-snapshot check every hour"
 echo "  weekly-clean:   rebuildable-cache cleanup every Sunday 04:00"
 echo "  worktree-janitor: every $WORKTREE_INTERVAL_SECONDS seconds + at load; 48h idle policy from ~/.cc-reaper/worktree-janitor.conf"
-echo "                    SessionEnd trigger: ~/.cc-reaper/worktree-session-end.sh <claude|codex>"
+echo '                    SessionEnd trigger: bash "$HOME"/.cc-reaper/worktree-session-end.sh <claude|codex>'
 echo "  session-reaper: every 30 min, report-only until APPLY=1 in ~/.cc-reaper/session-reaper.conf"
 echo "  reclaim-byproducts: every 2h and at load, if the last reap is over an hour old"
 echo "  gce-disk-watch: every 10 min, reads the GCE CI hosts' root disk over IAP; shadow until GDW_APPLY=1 in ~/.cc-reaper/gce-disk-watch.conf"
@@ -752,7 +752,9 @@ if command -v python3 >/dev/null 2>&1; then
   fi
 else
   echo "  WARNING: python3 is unavailable; SessionEnd hook JSON was not migrated."
-  echo "           Add ~/.cc-reaper/worktree-session-end.sh manually (see README)."
+  echo "           Add these hook commands manually (see README):"
+  echo '             Stop:       /bin/bash "$HOME"/.cc-reaper/stop-cleanup-orphans.sh'
+  echo '             SessionEnd: bash "$HOME"/.cc-reaper/worktree-session-end.sh claude'
 fi
 
 # ─── 5b. TCC probe ────────────────────────────────────────────────────────────
