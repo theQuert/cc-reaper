@@ -1148,6 +1148,17 @@ t23h1=$(run_snapshot CC_RW_STATE_DIR="$t23h_state" $w_hi)
 t23h2=$(run_snapshot CC_RW_STATE_DIR="$t23h_state" $w_hi)
 expect_yes "T23h: first round notifies" grep -q 'wired' "$t23h1"
 expect_no  "T23h: second round inside the cooldown does not" grep -q 'wired' "$t23h2"
+# once per breach, not once per cooldown: with no cooldown a standing breach stays quiet until wired falls
+t23i_state=$(mktemp -d "$TMPDIR_ROOT/XXXXXX")
+t23i1=$(run_snapshot CC_RW_STATE_DIR="$t23i_state" CC_RW_COOLDOWN_SECS=0 $w_hi)
+t23i2=$(run_snapshot CC_RW_STATE_DIR="$t23i_state" CC_RW_COOLDOWN_SECS=0 $w_hi)
+t23i3=$(run_snapshot CC_RW_STATE_DIR="$t23i_state" CC_RW_COOLDOWN_SECS=0)
+t23i4=$(run_snapshot CC_RW_STATE_DIR="$t23i_state" CC_RW_COOLDOWN_SECS=0 $w_hi)
+expect_yes "T23i: a breach notifies" grep -q 'wired' "$t23i1"
+expect_no  "T23i: the same breach, cooldown over, does not notify again" grep -q 'wired' "$t23i2"
+expect_yes "T23i: but its line still carries ALERT:wired" grep -q 'ALERT:wired' "$(cat "$t23i2.logpath")"
+expect_no  "T23i: a reading under the line notifies nothing" grep -q 'wired' "$t23i3"
+expect_yes "T23i: and the next breach notifies again" grep -q 'wired' "$t23i4"
 
 
 if [ "$failures" -gt 0 ]; then

@@ -16,8 +16,9 @@ elements a launch, started by its interpreter 0.31 or less.
 `resource-watch` writes them on every line (every 180 s):
 
 - `wired=<GB>`: wired memory from `vm_stat`, in GB with one decimal. `ALERT:wired` is added
-  when it is at or above `CC_RW_WIRED_ALERT_GB` (default 12). The notification follows the
-  usual per-metric cooldown (`CC_RW_COOLDOWN_SECS`, one hour by default).
+  when it is at or above `CC_RW_WIRED_ALERT_GB` (default 12). The notification is sent once per
+  breach: the leak only grows until a restart, so it stays quiet until wired has read under the
+  line again. Every line keeps `ALERT:wired` while the breach lasts.
 - `kzone=<count>`: elements in use in the `kalloc.1024` zone, the larger of the `data` and
   `data_shared` zones, read with `zprint` (needs no root). Each element is 1024 bytes.
   `kzone=?` means `zprint` is missing or failed.

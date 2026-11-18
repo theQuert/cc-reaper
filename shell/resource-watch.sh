@@ -757,7 +757,7 @@ _cc_rw_collect_wired() {
 
 # Prints the larger in-use count of data.kalloc.1024 / data_shared.kalloc.1024, or nothing.
 _cc_rw_collect_kzone() {
-  zprint 2>/dev/null | awk '
+  _cc_rw_run_bounded 20 zprint 2>/dev/null | awk '
     $1 == "data.kalloc.1024" || $1 == "data_shared.kalloc.1024" { if ($7 ~ /^[0-9]+$/ && $7 + 0 > m) m = $7 + 0; seen = 1 }
     END { if (seen) printf "%.0f\n", m }'
 }
@@ -768,7 +768,7 @@ _cc_rw_kzone_rate() {
   local count=$1 now=$2 file prev_t="" prev_c=""
   file="$(_cc_rw_state_dir)/kzone-last"
   [[ "$count" =~ ^[0-9]+$ ]] || return 0
-  read -r prev_t prev_c < "$file" 2>/dev/null || true
+  [ -r "$file" ] && read -r prev_t prev_c < "$file"
   printf '%s %s\n' "$now" "$count" > "$file" 2>/dev/null || true
   [[ "$prev_t" =~ ^[0-9]+$ && "$prev_c" =~ ^[0-9]+$ ]] || return 0
   awk -v n="$count" -v c="$prev_c" -v t="$now" -v p="$prev_t" \
@@ -1112,8 +1112,17 @@ _cc_rw_snapshot() {
   [ "$mem_breach"  = "true" ] && _cc_rw_maybe_notify "mem" \
     "mem free ${mem_free_pct}% below ${mem_min_pct}% and compressor ${compressor_gb}GB above ${comp_threshold_gb}GB" "$now"
 
-  [ "$wired_breach" = "true" ] && _cc_rw_maybe_notify "wired" \
-    "wired memory ${wired_gb}GB at or above ${wired_alert}GB, kzone=${kzone:-?} (see docs/host-memory.md)" "$now"
+  # Once per breach, as reclaim-stalled is: the leak only grows until a restart, so a repeat every cooldown
+  # would run for days. <state>/wired.alerted is removed by the first reading under the line.
+  if [ "$wired_breach" = "true" ]; then
+    if [ ! -e "${state_dir}/wired.alerted" ]; then
+      _cc_rw_maybe_notify "wired" \
+        "wired memory ${wired_gb}GB at or above ${wired_alert}GB, kzone=${kzone:-?} (see docs/host-memory.md)" "$now"
+      : > "${state_dir}/wired.alerted" 2>/dev/null || true
+    fi
+  elif [ -n "$wired_gb" ]; then
+    rm -f "${state_dir}/wired.alerted" 2>/dev/null
+  fi
 
   _cc_rw_chrome_clone "$now"
 
