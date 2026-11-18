@@ -12,14 +12,16 @@ by argv[0] inside a linked worktree, `session-reaper.py` closes tmux panes and s
 ## What it stops
 
 1. **A process tree reparented to launchd whose owning session is dead.**
-   - Owner, in this order: `CLAUDE_CODE_SESSION_ID` in the environment of any process in the tree (one
+   - Owner, in this order: `CLAUDE_CODE_SESSION_ID` in the environment of the root (one
      `ps eww -axo pid=,command=` for the host; only that one key is kept, no environment value is printed or
-     logged), then a `/tmp/claude-<uid>/<project>/<session id>/` path in the root's command line or working
+     logged; a root with an id is judged by every id in its tree, a root without one never takes its owner
+     from a child), then a `/tmp/claude-<uid>/<project>/<session id>/` path in the root's command line or working
      directory, then the `claude-task-worktree` marker of the root's linked worktree (its creator). Only a
      root shaped like a Claude-started tree (runtime or shell, the local stack's binary, a scratchpad path) is
      judged: a shared daemon carrying one session's helper is not that session's tree. Whoever the owner is
      found to be, a live claim on the root's linked worktree (`worktree-janitor.sh --claims`) keeps the tree,
-     because a session's id can change while it lives (`/clear`).
+     because a session's id can change while it lives (`/clear`). A claim probe that times out (120 s) reads as
+     claimed; a working directory that cannot be read keeps the tree (`KEEP(probe-failed)`).
    - Dead means all of: no live pid in `~/.claude/sessions/*.json`; no live `pid` or `replPid` in the
      daemon roster `~/.claude/daemon/roster.json` (a hosted session is live while either is); not in the
      fresh session state file; the host has a record of the id (a transcript under `~/.claude/projects` or a
@@ -72,8 +74,11 @@ orphan processes: stopped=0/25 kept=18 (report only)                            
 ```
 
 A process is logged as the basename of argv[0] only; a tool shell also gets its first 80 characters after
-`eval '`, with `--token X`, `key=X`, `Bearer X` and the password of a `://user:pw@` URL masked first. The
-session id is logged as its first 8 characters. A failure of the reaper is logged and never fails the janitor.
+`eval '`, with credentials masked first: `--token X`, any `NAME_KEY=X`/`TOKEN`/`SECRET`/`PASSWORD` variable,
+a `x-api-key: X` header, `Bearer X`, `Basic X`, the password of `curl -u user:pw` and of a `://user:pw@` URL. The
+session id is logged as its first 8 characters. A failure of the reaper is logged and never fails the janitor. The janitor runs it unbuffered with a 600 s
+bound; a non-zero exit, 124 for the bound, is logged as `orphan processes: stopped early (rc=N)` after the
+lines it had printed.
 
 Rollout (SCRIPT-SAFE-RULE): ships in `report`; after five clean scheduled runs, spot-checked against the
 process table, the host's `disk-janitor.conf` sets `apply`. Rollback is `CC_DJ_ORPHAN_PROC_REAP=off`.

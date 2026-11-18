@@ -1055,7 +1055,9 @@ unset CC_DJ_DEV_SERVER_SCRIPT; rm -f "$FAKE_BIN/gh"
 FAKE_OPR="$SANDBOX/fake-opr.py"
 cat > "$FAKE_OPR" <<'FAKE'
 import os, sys
-print("opr args: " + " ".join(sys.argv[1:]))
+print("opr args: " + " ".join(sys.argv[1:]) + " unbuffered=%d" % sys.stdout.write_through)
+if os.environ.get("FAKE_OPR_RC"):
+    sys.exit(int(os.environ["FAKE_OPR_RC"]))
 if os.environ.get("FAKE_OPR_FAIL"):
     print("orphan processes: SKIP the registry could not be read", file=sys.stderr)
     sys.exit(1)
@@ -1083,6 +1085,12 @@ expect_yes "orphan processes: an unknown mode is logged and not run" \
 CC_DJ_ORPHAN_PROC_LOOP_HOURS=six _run_dj --check 80 0
 expect_yes "orphan processes: a bound that is not a number is logged and not run" \
   sh -c "grep -q 'CC_DJ_ORPHAN_PROC_LOOP_HOURS=six is not a number' '$SANDBOX/dj.log' && ! grep -q 'opr args' '$SANDBOX/dj.log'"
+: > "$SANDBOX/dj.log"
+FAKE_OPR_FAIL=1 _run_dj --check 80 0
+: > "$SANDBOX/dj.log"
+FAKE_OPR_RC=124 _run_dj --check 80 0
+expect_yes "orphan processes: a reaper that ran out of time (rc 124) is logged as stopped early, its lines kept, and run unbuffered" \
+  sh -c "grep -q 'orphan processes: stopped early (rc=124)' '$SANDBOX/dj.log' && grep -q 'unbuffered=1' '$SANDBOX/dj.log'"
 : > "$SANDBOX/dj.log"
 FAKE_OPR_FAIL=1 _run_dj --check 80 0
 expect_yes "orphan processes: a failing reaper is logged, and --check still ends normally" \

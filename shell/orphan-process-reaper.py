@@ -11,14 +11,17 @@ Two kinds of verdict, both stopped by SIGTERM to the whole tree (children first)
 report of the survivors; there is no SIGKILL.
 
 1. A tree reparented to launchd whose owner session is dead. The owner is read, in this order, from
-   `CLAUDE_CODE_SESSION_ID` in the environment of any process in the tree (one `ps eww` for the host;
-   only that key is kept, no environment value is printed or logged), a session scratchpad path
+   `CLAUDE_CODE_SESSION_ID` in the environment of the root (one `ps eww` for the host; only that key is
+   kept, no environment value is printed or logged; a root with an id is judged by every id in its tree,
+   but a root without one never takes its owner from a child), a session scratchpad path
    (`/tmp/claude-<uid>/<project>/<session id>/`) in the root's command line or working directory, the
    `claude-task-worktree` marker of the root's linked worktree (its creator, a weaker owner). Only a root
    shaped like a Claude-started tree (a runtime or shell, the local stack's binary, a scratchpad) is judged,
    never a shared daemon that carries one session's helper. The owner is dead only on positive evidence,
    all of it, and a live claim on the root's linked worktree (`worktree-janitor.sh --claims`) keeps the tree
-   whoever the owner is, since a session's id can change while it lives (`/clear`):
+   whoever the owner is, since a session's id can change while it lives (`/clear`); a claim probe that
+   times out (120 s) reads as claimed, and a working directory that cannot be read keeps the tree
+   (`KEEP(probe-failed)`):
    - no live pid in `~/.claude/sessions/*.json`, none in the daemon roster `~/.claude/daemon/roster.json`
      (a hosted session is live while its pty host or repl pid is), none in the session state file;
    - the host has a record of it (a transcript under `~/.claude/projects`, or a job directory), so an id
@@ -85,13 +88,28 @@ PROTECTED_TOOL = re.compile(r"(?:tmux|docker|dockerd|containerd|com\.docker\..*|
 LOOKS = re.compile(r"/\.local-stack/|/claude-\d+/")
 OWNER_QUIET_SECONDS = 3600
 LONG_CHILD_SECONDS = 600
-# What a log line must not carry: a credential flag or pair, a bearer token, the password of a URL.
-MASK = re.compile(r"(?i)\b(--?)?(token|key|secret|password)([ =])\S+|Bearer \S+|(://[^/@\s]+:)[^/@\s]+@")
+# What a log line must not carry, applied in order: a credential variable, flag or header (the name may
+# carry a prefix: OPENAI_API_KEY=, x-api-key:), a Bearer or Basic token, the password of `curl -u`,
+# the password of a URL.
+MASKS = [
+    (re.compile(r"(?i)(--?)?([A-Za-z0-9_-]*?(?:token|key|secret|password|passwd))([ =:]+)\S+"), r"\1\2\3<masked>"),
+    (re.compile(r"(?i)\b(Bearer|Basic) \S+"), r"\1 <masked>"),
+    (re.compile(r"(?<!\S)(-u \S+?:)\S+"), r"\1<masked>"),
+    (re.compile(r"(://[^/@\s]+:)[^/@\s]+@"), r"\1<masked>@"),
+]
+PYTHON = re.compile(r"(?i)python(?:3(?:\.\d+)?)?")
 
 
 def mask(text):
-    return MASK.sub(lambda m: (f"{m.group(1) or ''}{m.group(2)}{m.group(3)}<masked>" if m.group(2)
-                               else "Bearer <masked>" if m.group(0).startswith(("B", "b")) else f"{m.group(4)}<masked>@"), text)
+    for pattern, replacement in MASKS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def tool_of(command):
+    """The basename of argv[0]; any python (python3.14, a framework `Python`) reads as python3."""
+    tool = os.path.basename((command.split() or [""])[0])
+    return "python3" if PYTHON.fullmatch(tool) else tool
 
 
 def pid_alive(pid):
@@ -248,7 +266,7 @@ def long_lived_child(rows, members, root, now):
 def describe(command):
     """What a log line says of a process: the basename of argv[0]; for a tool shell also the start of
     the command it evals (credentials masked first, then cut)."""
-    text = os.path.basename((command.split() or ["?"])[0])
+    text = tool_of(command) or "?"
     if SNAPSHOT in command and "eval '" in command:
         text += " eval '" + mask(command.split("eval '", 1)[1].replace("\\012", " "))[:80]
     return text
@@ -270,7 +288,7 @@ def why_protected(rows, members, own, live_pids, labels, keep):
     parents = {p: r[0] for p, r in rows.items()}
     for pid in members:
         command = rows[pid][4]
-        tool = os.path.basename((command.split() or [""])[0]).rstrip(":")
+        tool = tool_of(command).rstrip(":")
         if pid in own:
             return "the reaper's own tree"
         if pid in live_pids:
@@ -286,7 +304,7 @@ def why_protected(rows, members, own, live_pids, labels, keep):
     return None
 
 
-def reap(apply=False, loop_hours=24, spin_minutes=10, grace=10, now=None, home=None, send=os.kill,
+def reap(apply=False, loop_hours=24, spin_minutes=10, grace=10, claim_timeout=120, now=None, home=None, send=os.kill,
          sleep=time.sleep, alive=pid_alive, janitor=None, self_pid=None, keep_pids=None):
     """Print one line per decision and a summary; return (stopped, candidates)."""
     now = time.time() if now is None else now
@@ -332,10 +350,11 @@ def reap(apply=False, loop_hours=24, spin_minutes=10, grace=10, now=None, home=N
         if ppid != 1:
             continue
         members = dsr.tree(rows, root)
-        tool = os.path.basename((command.split() or [""])[0])
-        if not (tool in dsr.SERVER_ROOTS or LOOKS.search(command)):
+        if not (tool_of(command) in dsr.SERVER_ROOTS or LOOKS.search(command)):
             continue   # a shared daemon carrying one session's helper is not that session's tree
-        ids = sorted({owners[p] for p in members if p in owners})
+        # A root with an id of its own is judged by every id in its tree; one without takes its owner
+        # from its own scratchpad path, working directory or marker, never from a child.
+        ids = sorted({owners[p] for p in members if p in owners}) if root in owners else []
         sid = ids[0] if ids else None
         protected = why_protected(rows, members, own, live_pids, labels, keep)
         if protected:
@@ -366,8 +385,13 @@ def reap(apply=False, loop_hours=24, spin_minutes=10, grace=10, now=None, home=N
         # A session's id can change while it lives (/clear), so a dead id proves nothing about a
         # worktree a live session still claims, whoever the owner was found to be.
         where = where or dsr.cwd(root)
-        worktree = dsr.linked_worktree(where) if where else None
-        if worktree is not None and cache.setdefault(("claim", worktree), dsr.claim_level(worktree, janitor)) != 0:
+        if where is None:
+            keep_line("probe-failed", root, sid)
+            continue
+        worktree = dsr.linked_worktree(where)
+        # A claim probe that times out reads as claimed (dsr.claim_level answers 2): the tree is kept.
+        if worktree is not None and cache.setdefault(
+                ("claim", worktree), dsr.claim_level(worktree, janitor, claim_timeout)) != 0:
             keep_line("owner-claimed", root, sid)
             continue
         if unowned_lease or leases & set(members):

@@ -1913,10 +1913,12 @@ _cc_dj_orphan_proc_reap() {
     _cc_dj_skip "orphan processes (script or python3 not found)"
     return 0
   fi
-  # Bounded: a hung ps or lsof must not hold --check, which waits for this pass.
-  out="$(_cc_dj_run_bounded 600 python3 "$script" "$CC_DJ_ORPHAN_PROC_REAP" --loop-hours "$((10#$CC_DJ_ORPHAN_PROC_LOOP_HOURS))" \
+  # Bounded: a hung ps or lsof must not hold --check, which waits for this pass. Unbuffered, so the
+  # lines printed before the bound fires are still logged.
+  out="$(_cc_dj_run_bounded 600 python3 -u "$script" "$CC_DJ_ORPHAN_PROC_REAP" --loop-hours "$((10#$CC_DJ_ORPHAN_PROC_LOOP_HOURS))" \
     --spin-minutes "$((10#$CC_DJ_ORPHAN_PROC_SPIN_MINUTES))" 2>&1)" || rc=$?
   while IFS= read -r line; do [ -n "$line" ] && _cc_dj_log "orphan processes: $line"; done <<< "$out"
+  [ "$rc" -eq 0 ] || _cc_dj_log "orphan processes: stopped early (rc=$rc)"
   return 0
 }
 

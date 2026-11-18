@@ -33,7 +33,10 @@ case " $* " in
   *" -d cwd "*)
     pid=""; prev=""
     for a in "$@"; do [ "$prev" = "-p" ] && pid="$a"; prev="$a"; done
-    if [ -f "$F/cwd.$pid" ]; then printf 'p%s\nn%s\n' "$pid" "$(cat "$F/cwd.$pid")"; else exit 1; fi ;;
+    # A process with no fixture runs in /, not a repository; cwd.<pid>.fail is a probe that fails.
+    if [ -f "$F/cwd.$pid.fail" ]; then exit 1
+    elif [ -f "$F/cwd.$pid" ]; then printf 'p%s\nn%s\n' "$pid" "$(cat "$F/cwd.$pid")"
+    else printf 'p%s\nn/\n' "$pid"; fi ;;
   *) exit 1 ;;
 esac
 FAKE
@@ -180,8 +183,9 @@ write_janitor("janitor-live.sh", 'printf "CLAIMS\\nLIVE\\tid=x\\n"')
 
 
 def tree(w, sid, root=7000010, age=2 * 86400, root_command="/bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'cd /w && npx next dev --port 4165'"):
-    """The leftover shape of 2026-11-18: a wrapper shell with no environment id, an npm exec, a node child."""
-    w.proc(root, 1, age, root_command)
+    """The leftover shape of 2026-11-18: a wrapper shell, an npm exec, a node child; the id is on the
+    root and the node child (a root without its own id takes no owner from a child)."""
+    w.proc(root, 1, age, root_command, sid)
     w.proc(root + 1, root, age, "npm exec next dev --port 4165")
     w.proc(root + 2, root + 1, age, "node /w/node_modules/.bin/next dev --port 4165", sid)
     return root
@@ -279,7 +283,7 @@ shell(w, 7000040, 25 * HOUR, loop); shell(w, 7000041, 2 * MIN, loop)
 shell(w, 7000042, 25 * HOUR, "npm test -- --watchAll=false")        # long, but not a wait loop
 shell(w, 7000043, 23 * HOUR, loop)                                  # inside the bound
 shell(w, 7000044, 11 * MIN, tight); shell(w, 7000045, 2 * MIN, tight)
-shell(w, 7000046, 11 * MIN, loop)                                  # sleeps: the 6 h bound applies
+shell(w, 7000046, 11 * MIN, loop)                                  # sleeps: the 24 h bound applies
 shell(w, 7000047, 11 * MIN, "while true; do\\012  :\\012done")   # ps shows a newline as \012
 w.proc(7000048, 7000040, 25 * HOUR, "sleep 30")
 w.run()
@@ -368,6 +372,44 @@ check(all(secret not in w.out for secret in ("eyJabc", "abc123tok", "pw0rd", "hu
       "the log carries no --token value, Bearer token, URL password or --password value")
 check("until curl" in w.out and "until psql" in w.out and "zsh eval 'until" in w.out and "cmd='python3'" in w.out,
       "a tool shell logs its basename and the start of its eval text; any other process only its basename")
+
+# 5e0. Credentials in a prefixed environment variable, a header, -u, whatever the form.
+for body, secret in (("OPENAI_API_KEY=sk-FAKE-abc123 python3 x.py", "sk-FAKE-abc123"),
+                     ("GITHUB_TOKEN=ghp_FAKEAAAA gh pr list", "ghp_FAKEAAAA"),
+                     ("PGPASSWORD=fakehunter2 psql -h db", "fakehunter2"),
+                     ("STRIPE_SECRET_KEY=sk_test_FAKEx node a.js", "sk_test_FAKEx"),
+                     ('curl -H "x-api-key: FAKEVALUE1" x', "FAKEVALUE1"),
+                     ('curl -H "Authorization: Basic ZmFrZTpmYWtl" x', "ZmFrZTpmYWtl"),
+                     ("curl -u fakeuser:fakepass123 x", "fakepass123"),
+                     ("curl --token FAKEeyJ1 x", "FAKEeyJ1"), ("run key=FAKEKEY9 x", "FAKEKEY9"),
+                     ('curl -H "Authorization: Bearer FAKEBEARER7" x', "FAKEBEARER7"),
+                     ("psql postgres://fakeu:fakepw5@host/db", "fakepw5")):
+    text = opr.describe(snap % body)
+    check(secret not in text and "<masked>" in text and text.startswith("zsh eval '"), f"masked in the log: {body.split()[0]} ... {secret[:6]}")
+check("fakeuser" in opr.describe(snap % "curl -u fakeuser:fakepass123 x"), "the user of -u user:pass stays, the password goes")
+
+# 5f. A root without an id of its own takes no owner from a child; a framework python root is python3.
+w = World(); w.transcript(DEAD, 5 * 86400)
+w.proc(7000092, 1, 3 * 86400, "/usr/local/bin/node /x/shared-server.js"); w.proc(7000093, 7000092, 3 * 86400, "/x/helper", DEAD)
+w.run()
+check(w.sent == [] and "KEEP(unknown-owner)" in w.out, "a shaped root with no id of its own is not judged by a child's dead id")
+py = "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"
+w = World(); w.transcript(DEAD, 5 * 86400)
+w.proc(7000094, 1, 3 * 86400, py + " -m http.server 8790", DEAD)
+w.run(apply=False)
+check("CANDIDATE pid=7000094" in w.out and "cmd='python3'" in w.out, "a Homebrew framework Python root is judged and printed as python3")
+
+# 5g. A cwd probe that fails keeps the tree; a claim probe that times out keeps it too.
+w = World(); w.transcript(DEAD, 5 * 86400); tree(w, DEAD)
+(FAKE / "cwd.7000010.fail").write_text("")
+w.run()
+check(w.sent == [] and "KEEP(probe-failed)" in w.out, "a dead-owner root whose working directory cannot be read is kept")
+write_janitor("janitor-slow.sh", 'sleep 4; echo CLAIMS')
+w = World(); w.transcript(DEAD, 5 * 86400); tree(w, DEAD)
+(FAKE / "cwd.7000010").write_text(str(wt))
+w.run(janitor=str(SANDBOX / "janitor-slow.sh"), claim_timeout=1)
+check(w.sent == [] and "KEEP(owner-claimed)" in w.out, "a claim probe that times out reads as claimed: the tree is kept")
+check(inspect.signature(opr.reap).parameters["claim_timeout"].default == 120, "the claim probe's default timeout is 120 s, under the janitor's 600 s bound")
 
 # 5e. Launchd jobs, whatever their label; unowned leases; a shell and an unshaped root.
 w = World(); w.transcript(DEAD, 5 * 86400)
