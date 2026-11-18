@@ -2,14 +2,17 @@
 
 ## What it is
 
-On macOS 26 a process that was started through a `#!` line and then starts another script
-through its own `#!` line leaks about 1 KiB of kernel memory. The memory sits in the kernel
-zone `kalloc.1024` (shown as `data_shared.kalloc.1024`, or `data.kalloc.1024` on some builds)
-and counts as wired memory. Nothing frees it except a restart. The cause is a macOS bug, so the
-only defence is to start scripts by their interpreter (`python3 x.py`, `/bin/sh x.sh`) wherever
-one script starts another often. The largest source, the stima-api hook dispatcher, was changed
-that way in theQuert/stima-api#9010: measured there, a guard started by path leaks a median 1.12
-elements a launch, started by its interpreter 0.31 or less.
+On macOS 26 every start of a script through its `#!` line leaks about 1 KiB of kernel memory,
+whatever started it. The memory sits in the kernel zone `kalloc.1024` (shown as
+`data_shared.kalloc.1024`, or `data.kalloc.1024` on some builds) and counts as wired memory.
+Nothing frees it except a restart. The cause is a macOS bug, so the only defence is to start
+scripts by their interpreter (`python3 x.py`, `/bin/sh x.sh`) wherever a script is started often.
+
+Measured on this host on 2026-11-18 (theQuert/stima-api#9010), 100 starts a block, six blocks,
+from a parent that was itself started by its interpreter: by path a median +113 elements, by
+interpreter -16, an idle block of the same length +20. Hooks are the frequent case: the session
+event logs counted about 2,300 tool calls an hour across the host, and each one started five or
+more hook scripts by path.
 
 ## The three fields
 
