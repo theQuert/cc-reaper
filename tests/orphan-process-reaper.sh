@@ -393,6 +393,11 @@ w = World(); w.transcript(DEAD, 5 * 86400)
 w.proc(7000092, 1, 3 * 86400, "/usr/local/bin/node /x/shared-server.js"); w.proc(7000093, 7000092, 3 * 86400, "/x/helper", DEAD)
 w.run()
 check(w.sent == [] and "KEEP(unknown-owner)" in w.out, "a shaped root with no id of its own is not judged by a child's dead id")
+# A child's id never proves the owner dead, but a live one anywhere in the tree keeps it.
+w = World(); w.session(7000100, LIVE); w.transcript(LIVE, 5 * 86400); w.transcript(DEAD, 5 * 86400)
+w.proc(7000094, 1, 3 * 86400, "/usr/bin/python3 " + pad % DEAD + "/broker.py"); w.proc(7000095, 7000094, 3 * 86400, "/x/helper", LIVE)
+w.run()
+check(w.sent == [] and "KEEP(owner-live)" in w.out, "a root with a dead scratchpad owner and a child of a live session: kept")
 py = "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"
 w = World(); w.transcript(DEAD, 5 * 86400)
 w.proc(7000094, 1, 3 * 86400, py + " -m http.server 8790", DEAD)

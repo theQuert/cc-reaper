@@ -354,11 +354,17 @@ def reap(apply=False, loop_hours=24, spin_minutes=10, grace=10, claim_timeout=12
             continue   # a shared daemon carrying one session's helper is not that session's tree
         # A root with an id of its own is judged by every id in its tree; one without takes its owner
         # from its own scratchpad path, working directory or marker, never from a child.
-        ids = sorted({owners[p] for p in members if p in owners}) if root in owners else []
+        tree_ids = sorted({owners[p] for p in members if p in owners})
+        ids = tree_ids if root in owners else []
         sid = ids[0] if ids else None
         protected = why_protected(rows, members, own, live_pids, labels, keep)
         if protected:
             keep_line(f"protected: {protected}", root, sid)
+            continue
+        # A child's id never proves the owner dead, but a live one anywhere in the tree is evidence against it.
+        live_member = next((i for i in tree_ids if i in live_ids), None)
+        if live_member:
+            keep_line("owner-live", root, live_member)
             continue
         where = None
         if not ids:

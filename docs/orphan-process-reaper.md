@@ -15,7 +15,7 @@ by argv[0] inside a linked worktree, `session-reaper.py` closes tmux panes and s
    - Owner, in this order: `CLAUDE_CODE_SESSION_ID` in the environment of the root (one
      `ps eww -axo pid=,command=` for the host; only that one key is kept, no environment value is printed or
      logged; a root with an id is judged by every id in its tree, a root without one never takes its owner
-     from a child), then a `/tmp/claude-<uid>/<project>/<session id>/` path in the root's command line or working
+     from a child, though a live id anywhere in the tree keeps it), then a `/tmp/claude-<uid>/<project>/<session id>/` path in the root's command line or working
      directory, then the `claude-task-worktree` marker of the root's linked worktree (its creator). Only a
      root shaped like a Claude-started tree (runtime or shell, the local stack's binary, a scratchpad path) is
      judged: a shared daemon carrying one session's helper is not that session's tree. Whoever the owner is
