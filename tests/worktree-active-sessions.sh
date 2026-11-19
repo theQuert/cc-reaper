@@ -276,6 +276,74 @@ run_wj --apply >/dev/null 2>&1
 check "a zero-padded-day procStart is not the lstart shape and stays in use" test -d "$WT"
 kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
 
+# stima-api#7026: a session started as `claude --resume <dir>/<other-uuid>.jsonl` records a session
+# id that has no transcript file of its own (the release-owner background session). Its pid is
+# bound to the record by procStart; its transcript is the one its --resume argument names. Mapped,
+# it keeps exactly the trees that transcript names. Unmapped, it is `session-unknown` and keeps
+# every tree with activity inside the session grace.
+# resume_case <bound|reused|unbound> <argv word...> (@PROJ@ stands for the projects directory): a live process with that argv word list and a record bound by
+# procStart, in a fixture with an unnamed landed clean tree (WT) and one the resume transcript
+# names (NAMED), both active two hours ago. Sets RESUME_OUT (the report), RESUME_TRANSCRIPT, claude_pid.
+resume_case() { # <procStart: bound|reused|unbound> <argv word>...
+  local mode=$1; shift
+  new_fixture "resume-$RESUME_N"; RESUME_N=$((RESUME_N + 1))
+  NAMED="$CASE/named"
+  git -C "$PRIMARY" worktree add -q -b named "$NAMED" origin/main
+  age_worktree 2; age_worktree 2 "$NAMED"
+  sid=44060df1-f9ac-47fe-adc9-0480896c5c35
+  other=dc4daaea-e7d8-4bbf-804c-8f006e5c980b
+  mkdir -p "$CLAUDE_PROJECTS/project"
+  RESUME_TRANSCRIPT="$CLAUDE_PROJECTS/project/$other.jsonl"
+  printf '{"type":"assistant","message":{"content":[{"type":"tool_use","input":{"workdir":"%s"}}]}}\n' "$NAMED" > "$RESUME_TRANSCRIPT"
+  touch -t 200101010000 "$RESUME_TRANSCRIPT"
+  set -- "${@//@PROJ@/$CLAUDE_PROJECTS}"
+  python3 -c 'import time; time.sleep(120)' "$@" </dev/null >/dev/null 2>&1 & claude_pid=$!
+  case "$mode" in
+    bound) proc_start="$(TZ=UTC LC_ALL=C ps -p "$claude_pid" -o lstart= | awk '{$1=$1} 1')" ;;
+    reused) proc_start="Mon Jan  1 00:00:00 2001" ;;
+    unbound) proc_start="" ;;
+  esac
+  printf '{"pid":%s,"sessionId":"%s","cwd":"%s","procStart":"%s","kind":"bg"}\n' "$claude_pid" "$sid" "$PRIMARY" "$proc_start" > "$CLAUDE_SESSIONS/$claude_pid.json"
+  RESUME_OUT="$(CC_WJ_IDLE_HOURS=0 CC_WJ_SESSION_GRACE_HOURS=24 run_wj 2>&1)"
+  kill "$claude_pid" 2>/dev/null; wait "$claude_pid" 2>/dev/null || true
+}
+# The report block of the worktree at path $1.
+resume_block() { printf '%s\n' "$RESUME_OUT" | awk -v tail="/${1##*/}" '/^  WORKTREE  / { on = (substr($0, length($0) - length(tail) + 1) == tail) } on'; }
+RESUME_N=1
+
+resume_case bound --resume "@PROJ@/project/dc4daaea-e7d8-4bbf-804c-8f006e5c980b.jsonl"
+if resume_block "$WT" | grep -q 'KEEP(session-unknown'; then bad "resume path, bound by procStart: the tree its transcript does not name is not kept by the unknown fallback"; printf '%s\n' "$RESUME_OUT" | sed 's/^/# /'; else ok "resume path, bound by procStart: the tree its transcript does not name is not kept by the unknown fallback"; fi
+case "$(resume_block "$NAMED")" in *'KEEP(active-session)'*) ok "  and the tree its transcript names is kept as active-session" ;; *) bad "  and the tree its transcript names is kept as active-session" ;; esac
+case "$(cat "$CASE/wj.log" 2>/dev/null)" in *'resolved-by=resume-arg'*) ok "  and the log says resolved-by=resume-arg" ;; *) bad "  and the log says resolved-by=resume-arg" ;; esac
+case "$RESUME_OUT" in *'did not map to exactly one transcript'*) bad "  and no unknown record is raised" ;; *) ok "  and no unknown record is raised" ;; esac
+
+resume_case bound --resume=dc4daaea-e7d8-4bbf-804c-8f006e5c980b
+case "$(resume_block "$NAMED")" in *'KEEP(active-session)'*) ok "--resume=<bare uuid> maps: the named tree is kept as active-session" ;; *) bad "--resume=<bare uuid> maps: the named tree is kept as active-session" ;; esac
+if resume_block "$WT" | grep -q 'KEEP(session-unknown'; then bad "  and the unnamed tree is not kept by the unknown fallback"; else ok "  and the unnamed tree is not kept by the unknown fallback"; fi
+
+resume_case bound -r dc4daaea-e7d8-4bbf-804c-8f006e5c980b
+case "$(resume_block "$NAMED")" in *'KEEP(active-session)'*) ok "-r <bare uuid> maps: the named tree is kept as active-session" ;; *) bad "-r <bare uuid> maps: the named tree is kept as active-session" ;; esac
+
+resume_case bound --dangerously-skip-permissions
+case "$(resume_block "$WT")" in *'KEEP(session-unknown'*) ok "no resume value: unknown, the unnamed recent tree is kept by the fallback" ;; *) bad "no resume value: unknown, the unnamed recent tree is kept by the fallback"; printf '%s\n' "$RESUME_OUT" | sed 's/^/# /' ;; esac
+case "$(resume_block "$NAMED")" in *'KEEP(session-unknown'*) ok "  and so is the tree the unresolved transcript would have named" ;; *) bad "  and so is the tree the unresolved transcript would have named" ;; esac
+
+resume_case bound --resume "@PROJ@/project/99999999-e7d8-4bbf-804c-8f006e5c980b.jsonl"
+case "$(resume_block "$WT")" in *'KEEP(session-unknown'*) ok "a resume value naming a transcript that does not exist: unknown, the recent tree is kept" ;; *) bad "a resume value naming a transcript that does not exist: unknown, the recent tree is kept" ;; esac
+
+resume_case bound --resume "@PROJ@/other-project/dc4daaea-e7d8-4bbf-804c-8f006e5c980b.jsonl"
+case "$(resume_block "$WT")" in *'KEEP(session-unknown'*) ok "a resume path in another directory than the one transcript found: unknown" ;; *) bad "a resume path in another directory than the one transcript found: unknown" ;; esac
+
+resume_case bound --resume dc4daaea-e7d8-4bbf-804c-8f006e5c980b --resume 99999999-e7d8-4bbf-804c-8f006e5c980b
+case "$(resume_block "$WT")" in *'KEEP(session-unknown'*) ok "two different resume values: unknown" ;; *) bad "two different resume values: unknown" ;; esac
+
+resume_case unbound --resume "@PROJ@/project/dc4daaea-e7d8-4bbf-804c-8f006e5c980b.jsonl"
+case "$(resume_block "$WT")" in *'KEEP(session-unknown'*) ok "no procStart and no id on the command line: not bound, so the resume argument is not read and the tree is kept as unknown" ;; *) bad "no procStart and no id on the command line: not bound, so the resume argument is not read and the tree is kept as unknown" ;; esac
+
+resume_case reused --resume "@PROJ@/project/dc4daaea-e7d8-4bbf-804c-8f006e5c980b.jsonl"
+case "$(cat "$CASE/wj.log" 2>/dev/null)" in *'resolved-by=resume-arg'*) bad "pid reuse (procStart mismatch): the resume argument is not trusted" ;; *) ok "pid reuse (procStart mismatch): the resume argument is not trusted" ;; esac
+case "$(resume_block "$NAMED")" in *'KEEP(active-session)'*) bad "  and the other process's transcript claims no tree" ;; *) ok "  and the other process's transcript claims no tree" ;; esac
+
 new_fixture claude-historical-tool-workdir
 age_worktree 72
 sid=abababab-bbbb-4ccc-8ddd-eeeeeeeeeeee

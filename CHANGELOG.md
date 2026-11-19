@@ -8,6 +8,16 @@
   the `STALL_MARK_*` keys are gone; a leftover key in an installed conf is ignored.
 
 ### Fixed
+- **`worktree-janitor.sh`: a session resumed from another session's transcript maps to that transcript instead of being
+  `session-unknown` (stima-api #7026).** A background session started as `claude --resume <dir>/<other-uuid>.jsonl`
+  (the release-owner session) records an id that has no `<id>.jsonl`, so it counted as unmapped and the fallback kept
+  every tree with activity inside the session grace; with about 13 acceptance trees made a day the window never emptied
+  (51 landed clean trees held). When the id has no transcript at all, the janitor now reads the `--resume <v>`,
+  `--resume=<v>` or `-r <v>` value (an absolute `<uuid>.jsonl` path or a bare uuid) off the session's own command line,
+  once the pid is bound to the record by its id or its `procStart`, and maps the one transcript it names (re-reading the
+  command line to prove the pid was not reused). The session then keeps exactly the trees that transcript names, and the
+  log says `resolved-by=resume-arg`. No `--resume` value, two different values, a value naming no transcript or a
+  different directory, or an unbound pid stays `session-unknown` with the old fallback.
 - **dev-server-reaper: a server whose session ended is stopped even when it is published, `next start`, or in a scratchpad (stima-api #8763).**
   On 2026-11-17 23 dev servers had run 4 to 35 days, and the log of the hourly `--check` showed why: 292 of 352
   verdicts were "published by tailscale serve", 44 "no hot-reload socket to judge use by", and a `node proxy.mjs` or a
