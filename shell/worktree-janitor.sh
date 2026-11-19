@@ -1346,6 +1346,50 @@ _cc_wj_claude_proc_binding() { # <pid> <record file>
   return 1
 }
 
+# The transcript a live Claude session was started from, read off its own command line
+# (stima-api#7026). A session started as `claude --resume <dir>/<uuid>.jsonl` (the release-owner
+# background session) records a session id that has no <id>.jsonl of its own: its transcript is the
+# one it was resumed from. The value is `--resume <v>`, `--resume=<v>` or `-r <v>`, and is either a
+# bare uuid or an absolute path whose basename is `<uuid>.jsonl`. It maps only when exactly one such
+# file exists under the projects directory and, for a path, that file is the one the path names. Two
+# different resume values, a value that is neither shape, or a command line the process no longer
+# has (the pid was reused after the caller read it and bound it to the record) map to nothing.
+# Prints the transcript path; status 1 when it cannot be resolved.
+_cc_wj_resume_arg_transcript() { # <pid> <command line the caller bound> <projects dir>
+  local pid="$1" cmd="$2" projects="$3" toks=() n i tok val vals="" uuid found dir base want got
+  [ -n "$cmd" ] || return 1
+  # Still the process whose command line was read and bound to the record.
+  [ "$(ps -p "$pid" -o command= 2>/dev/null)" = "$cmd" ] || return 1
+  read -ra toks <<< "$cmd"
+  n=${#toks[@]}
+  for ((i = 0; i < n; i++)); do
+    tok="${toks[i]}"
+    case "$tok" in
+      --resume=*) val="${tok#--resume=}" ;;
+      --resume|-r) val=""; [ $((i + 1)) -lt "$n" ] && val="${toks[i + 1]}" ;;
+      *) continue ;;
+    esac
+    [ -n "$val" ] || return 1
+    case $'\n'"$vals" in *$'\n'"$val"$'\n'*) ;; *) vals="${vals}${val}"$'\n' ;; esac
+  done
+  [ "$(printf '%s' "$vals" | grep -c .)" -eq 1 ] || return 1
+  val="${vals%$'\n'}"
+  case "$val" in
+    /*.jsonl) base="${val##*/}"; uuid="${base%.jsonl}"; dir="${val%/*}" ;;
+    *) uuid="$val"; dir="" ;;
+  esac
+  printf '%s\n' "$uuid" | grep -Eqx "$_CC_WJ_UUID_RE" || return 1
+  found="$(find "$projects" -type f -name "$uuid.jsonl" -print 2>/dev/null)" || return 1
+  [ "$(printf '%s\n' "$found" | grep -c .)" -eq 1 ] || return 1
+  case "$found" in *$'\t'*) return 1 ;; esac
+  if [ -n "$dir" ]; then
+    want="$(builtin cd -P -- "$dir" >/dev/null 2>&1 && pwd -P)" || return 1
+    got="$(builtin cd -P -- "${found%/*}" >/dev/null 2>&1 && pwd -P)" || return 1
+    [ "$want" = "$got" ] || return 1
+  fi
+  printf '%s\n' "$found"
+}
+
 _cc_wj_scan_claude_sessions() {
   local registry="${CC_WJ_CLAUDE_SESSIONS:-$HOME/.claude/sessions}"
   local projects="${CC_WJ_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
@@ -1471,6 +1515,14 @@ _cc_wj_scan_claude_sessions() {
       continue
     }
     count="$(printf '%s\n' "$transcripts" | grep -c .)"
+    # A session resumed from another session's transcript has none under its own id. By here its
+    # pid is bound to the record (its id, or its procStart, matched the live process), so the
+    # transcript its command line names is its own. Only a session with no <id>.jsonl at all; two
+    # copies of one id stay ambiguous.
+    if [ "$count" -eq 0 ] && transcript="$(_cc_wj_resume_arg_transcript "$pid" "$cmd" "$projects")"; then
+      transcripts="$transcript"; count=1
+      _cc_wj_log_write_changed "resume-arg-$sid" "live Claude session $sid has no transcript of its own id; mapped to $transcript named by --resume on pid $pid (resolved-by=resume-arg)"
+    fi
     [ "$count" -eq 1 ] || {
       _cc_wj_tail_attrs_claude "$sid"
       unknown_attrs=(live yes cwd "$resolved" projdir "$(_cc_wj_project_dir_name "$resolved")" "${_CC_WJ_TAIL_ATTRS[@]}")
