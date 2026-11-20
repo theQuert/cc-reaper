@@ -35,16 +35,18 @@ more hook scripts by path.
 - `data_shared.kalloc.1024`: 16.1 million elements, about 15.7 GB, most of the wired memory.
 - Growth 4-8 elements/s, about 14-28 MB/h.
 
-## When to restart
+## The host is not restarted
 
-Recommend a restart when wired is at or above 12 GB, or `kzone` is above 10 million, at a time
-when no release or staging window is running.
+The Mac mini stays online and is not restarted (founder, 2026-11-20): a restart would end every tmux and Claude Code
+session and the CI runners. The memory the zone holds therefore stays held, and no script, alert or report
+recommends a restart.
 
-A restart interrupts every tmux and Claude Code session and the CI runners. FileVault is off and
-auto-login is set, so the host comes back by itself; sessions return with
-`claude --resume <id>`.
+When wired is at or above 12 GB, or `kzone` is above 10 million, the host has that much less memory for good. What
+is left to do:
 
-No script restarts the host. The founder decides.
+- Move CPU and memory work off the host: tests, builds and verification run on InstaBox VMs (stima-api #9371, #9359).
+- Stop what makes the zone grow: name the interpreter when one script starts another (see above), and fix the launch
+  paths `kzone_rate` points at.
 
 ## Does a macOS update fix it
 
