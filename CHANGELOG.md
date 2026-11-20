@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+- **`docs/host-memory.md`: the host is not restarted.** The "When to restart" section recommended a restart at wired
+  12 GB or `kzone` 10 million; the founder ruled on 2026-11-20 that the Mac mini stays online, so the section now says
+  what to do at that number instead (move work to InstaBox, stop the launch paths that grow the zone).
+
 ### Removed
 - **`session-reaper.py` and `session_state.py` no longer read stall marks (stima-api #7904).** `stall-watch.py` was retired
   and nothing writes `STALL_MARK_DIR/<session id>.json`, so the `stalled:<fingerprint>` keep reason, `stall_mark()` and
