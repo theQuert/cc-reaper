@@ -2,7 +2,7 @@
 """Reclaim what headless-Chrome scripts, wrangler, failed test builds and finished
 background Claude jobs leave in this user's temp space.
 
-Seven kinds, each proved abandoned before it is touched:
+Eight kinds, each proved abandoned before it is touched:
 
 - an orphaned headless Chrome: launched with --headless, --remote-debugging-port and a
   --user-data-dir directly under this user's temp directory, reparented to launchd (its
@@ -49,6 +49,20 @@ Seven kinds, each proved abandoned before it is touched:
   stderr is a holder). One lsof +D is ~0.25 s, so a run spends at most `--tmpdir-budget-seconds`
   on them and leaves the rest for the next; each removal and the run's total are logged with
   their bytes.
+
+- any other prefix-named mkdtemp directory directly under the temp directory (`AGED_NAME`,
+  stima-api#7106): `<prefix><-, . or _><tail>`, the tail being 6 of [A-Za-z0-9] with a digit or an
+  upper-case letter (Node `mkdtemp`, `mktemp XXXXXX`) or 8 of [a-z0-9_] with a digit (Python
+  `mkdtemp`), or a bare `.tmp` plus such a 6. On 2026-11-20 the temp directory held 65,848 entries,
+  63,929 older than 3 days and 57,092 older than 7 days, and the new leaks had stopped: what was left
+  were tests' own names (`security-review-gate-z94a16f_` 14,175, `.tmpHXQE3i` 7,820, `restart-mbpJmx`
+  7,072, `neo-rot-…`, `stale-claim-release-…`, `stable-version-…` and a long tail) that no rule above
+  names; the file's history adds one name at a time, this takes the class. A name an earlier kind
+  owns stays with it, and a `com.apple.` name is the system's. The shape alone proves nothing about
+  a person's `my-folder`, so the proof is time: nothing under it changed for AGED_IDLE_SECONDS (7
+  days), then the same holder checks as `tmpdir`, `lsof +D` just before each removal included. It
+  shares `--tmpdir-budget-seconds` with `tmpdir` (that kind first), oldest first, and what the
+  budget does not reach is left for the next run and logged as `not reached`.
 
 Every probe that fails or cannot decide keeps the item. Chrome is sent SIGTERM only, so
 it shuts down on its own terms. Tests drive the seams (`processes`, `listening_ports`,
@@ -105,6 +119,14 @@ LEFTOVER_MENTION = re.compile(r"(?<![A-Za-z0-9_.-])(tmp[a-z0-9_]{8}|tmp\.[A-Za-z
 USER_TEMP_PREFIX = "/private/var/folders/"
 TMPDIR_NAME = re.compile(r"tmp[A-Za-z0-9_]{8}|tmp\.[A-Za-z0-9]{10}")
 TMPDIR_IDLE_SECONDS = 48 * 3600
+# A directory named <prefix><-, . or _><random tail> by a test's mkdtemp. The tail must look random
+# (a digit, or for 6 characters an upper-case letter) so a person's `my-folder` or `data-pre_post` is
+# not one; the prefix is free, which is the point: the names of tests are not a list anyone keeps.
+AGED_NAME = re.compile(r"(?!com\.apple\.)(?:"
+                       r"[A-Za-z0-9][A-Za-z0-9._-]*[-._](?=[A-Za-z0-9]*[0-9A-Z])[A-Za-z0-9]{6}"
+                       r"|[A-Za-z0-9][A-Za-z0-9._-]*[-._](?=[a-z0-9_]*[0-9])[a-z0-9_]{8}"
+                       r"|\.tmp(?=[A-Za-z0-9]*[0-9A-Z])[A-Za-z0-9]{6})")
+AGED_IDLE_SECONDS = 7 * 24 * 3600
 TMPDIR_BUDGET_SECONDS = 600
 # A fresh picture of what is open, at least this often while removing.
 HOLDERS_MAX_AGE = 60
@@ -336,7 +358,7 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
     if rows is None:
         raise RuntimeError("ps failed; kept everything")
     counts = {"chrome": [0, 0], "profile": [0, 0], "wrangler": [0, 0], "build": [0, 0],
-              "jobvenv": [0, 0], "leftover": [0, 0], "tmpdir": [0, 0]}
+              "jobvenv": [0, 0], "leftover": [0, 0], "tmpdir": [0, 0], "aged": [0, 0]}
 
     for row in rows:
         if not orphan_chrome(row, root, idle_seconds):
@@ -435,40 +457,63 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
         except OSError as error:
             print(f"KEEP leftover {path.name} ({error.strerror or error})")
 
-    # The seventh kind: TMPDIR_NAME directories the leftover rule does not take.
-    deadline, freed, deferred = time.monotonic() + tmpdir_budget, 0, 0
-    for path in sorted(root.iterdir()) if sweep else []:
-        try:
-            if not TMPDIR_NAME.fullmatch(path.name) or leftover_rule(path.name) is not None:
-                continue
-            if path.is_symlink() or not path.is_dir() or now - path.lstat().st_mtime < TMPDIR_IDLE_SECONDS:
-                continue
-            if time.monotonic() > deadline:
-                deferred += 1
-                continue
-            newest = newest_change(path)
-            if newest is None or now - newest < TMPDIR_IDLE_SECONDS:
-                continue
-            if held_names is None or rows_now is None or time.time() - held_at > HOLDERS_MAX_AGE:
-                rows_now = processes(env=True)
-                held_names = None if rows_now is None else holders(root, rows_now)
-                held_at = time.time()
-                if held_names is None:
-                    print("KEEP tmpdir (lsof could not answer; kept them all)")
-                    break
-            if path.name in held_names or any(path.name in r[3] for r in rows_now) or held(path):
-                continue
-            counts["tmpdir"][0] += 1
-            size = tree_bytes(path)
-            if clean:
-                shutil.rmtree(path)
-                counts["tmpdir"][1] += 1
-                freed += size
-            print(f"{'REMOVED' if clean else 'CANDIDATE'} tmpdir {path.name} bytes={size}")
-        except OSError as error:
-            print(f"KEEP tmpdir {path.name} ({error.strerror or error})")
-    print(f"tmpdir: {counts['tmpdir'][1]} removed of {counts['tmpdir'][0]}, bytes={freed}, "
-          f"not reached={deferred} (budget {tmpdir_budget}s)")
+    # The seventh and eighth kinds: TMPDIR_NAME directories the leftover rule does not take, then any
+    # other mkdtemp-shaped name that has been untouched for AGED_IDLE_SECONDS. One budget for both.
+    def owned_earlier(name):
+        return (leftover_rule(name) is not None or PROFILE_NAME.fullmatch(name) is not None
+                or BUILD_COPY.fullmatch(name) is not None)
+
+    def oldest_first(entries):
+        stamped = []
+        for path in entries:
+            try:
+                stamped.append((path.lstat().st_mtime, path.name, path))
+            except OSError:
+                pass
+        return [path for _, _, path in sorted(stamped)]
+
+    deadline = time.monotonic() + tmpdir_budget
+    entries = oldest_first(root.iterdir()) if sweep else []
+    for kind, wanted, limit in (
+            ("tmpdir", lambda name: TMPDIR_NAME.fullmatch(name) and not owned_earlier(name), TMPDIR_IDLE_SECONDS),
+            ("aged", lambda name: (AGED_NAME.fullmatch(name) and not TMPDIR_NAME.fullmatch(name)
+                                   and not owned_earlier(name)), AGED_IDLE_SECONDS)):
+        freed, deferred, gave_up = 0, 0, False
+        for path in entries:
+            try:
+                if not wanted(path.name):
+                    continue
+                if path.is_symlink() or not path.is_dir() or now - path.lstat().st_mtime < limit:
+                    continue
+                if time.monotonic() > deadline:
+                    deferred += 1
+                    continue
+                newest = newest_change(path)
+                if newest is None or now - newest < limit:
+                    continue
+                if held_names is None or rows_now is None or time.time() - held_at > HOLDERS_MAX_AGE:
+                    rows_now = processes(env=True)
+                    held_names = None if rows_now is None else holders(root, rows_now)
+                    held_at = time.time()
+                    if held_names is None:
+                        print(f"KEEP {kind} (lsof could not answer; kept them all)")
+                        gave_up = True
+                        break
+                if path.name in held_names or any(path.name in r[3] for r in rows_now) or held(path):
+                    continue
+                counts[kind][0] += 1
+                size = tree_bytes(path)
+                if clean:
+                    shutil.rmtree(path)
+                    counts[kind][1] += 1
+                    freed += size
+                print(f"{'REMOVED' if clean else 'CANDIDATE'} {kind} {path.name} bytes={size}")
+            except OSError as error:
+                print(f"KEEP {kind} {path.name} ({error.strerror or error})")
+        print(f"{kind}: {counts[kind][1]} removed of {counts[kind][0]}, bytes={freed}, "
+              f"not reached={deferred} (budget {tmpdir_budget}s)")
+        if gave_up:
+            break
 
     jobs = jobs_dir.resolve() if jobs_dir is not None and jobs_dir.is_dir() else None
     for job in sorted(jobs.iterdir()) if jobs is not None else []:

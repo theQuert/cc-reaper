@@ -12,6 +12,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -275,6 +276,135 @@ class ReaperTest(unittest.TestCase):
         self.assertEqual(counts["leftover"], [1, 1])  # tmp___6x43l has a digit: the leftover rule's, at a day
         self.assertRegex(out.getvalue(), r"REMOVED tmpdir tmp_sriaqhi bytes=\d+")
         self.assertRegex(out.getvalue(), r"tmpdir: 4 removed of 4, bytes=[1-9]\d*, not reached=0")
+
+    # stima-api#7106: the eighth kind, a prefix-named mkdtemp directory untouched for 7 days.
+    AGED_GONE = ("security-review-gate-z94a16f_", "restart-mbpJmx", ".tmpHXQE3i", "stable-version-E7IlyN")
+
+    def test_only_old_unheld_prefix_named_mkdtemp_dirs_are_removed_and_check_lists_them(self):
+        gone = [self.leftover(name, 8 * DAY) for name in self.AGED_GONE]
+        kept = [self.leftover("restart-mbpJmy", 6 * DAY),               # 7 days not yet up
+                self.leftover("restart-deepchg1", 9 * DAY, inner_age=DAY),  # changed deep inside
+                self.leftover("restart-heldnam1", 9 * DAY),             # open file or cwd (snapshot)
+                self.leftover("restart-lsofsee1", 9 * DAY),             # lsof +D finds a holder
+                self.leftover("restart-cmdline1", 9 * DAY),             # named on a command line
+                self.leftover("restart-AbCd12", 9 * DAY, file=True),    # a file
+                self.leftover("com.apple.foo-AbC123", 9 * DAY),         # the system's
+                self.leftover("my-project", 9 * DAY),
+                self.leftover("delivery-state-etag", 9 * DAY),
+                self.leftover("claude-501", 9 * DAY),
+                self.leftover("node-compile-cache", 9 * DAY),
+                self.leftover("my-folder", 9 * DAY),                    # six letters, nothing random
+                self.leftover("data-pre_post", 9 * DAY),                # eight characters, no digit
+                self.leftover("restart-toolong12", 9 * DAY)]            # nine characters
+        target = self.leftover("delivery-target", 9 * DAY)
+        link = self.root / "restart-lnk123"
+        link.symlink_to(target)
+        old = time.time() - 9 * DAY
+        os.utime(link, (old, old), follow_symlinks=False)
+        self.rows.append((77, 1, 10, "node run.js --dir=/x/restart-cmdline1/out"))
+        lsof_held = {self.root / "restart-lsofsee1"}
+        def run(clean):
+            out = io.StringIO()
+            with mock.patch.object(reaper, "held", side_effect=lambda path: path in lsof_held), \
+                 mock.patch.object(reaper, "holders", side_effect=lambda root, rows: {"restart-heldnam1"}), \
+                 mock.patch("sys.stdout", out):
+                counts = reaper.reap(self.root, self.logs, clean=clean, idle_seconds=HOUR,
+                                     send=lambda pid, sig: None)
+            return counts, out.getvalue()
+        counts, out = run(clean=False)
+        self.assertEqual(counts["aged"], [4, 0])
+        self.assertTrue(all(path.exists() for path in gone))
+        self.assertRegex(out, r"CANDIDATE aged restart-mbpJmx bytes=\d+")
+        counts, out = run(clean=True)
+        for path in gone:
+            self.assertFalse(path.exists(), path)
+        for path in kept + [target]:
+            self.assertTrue(path.exists(), path)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(counts["aged"], [4, 4])
+        self.assertRegex(out, r"REMOVED aged restart-mbpJmx bytes=\d+")
+        self.assertRegex(out, r"aged: 4 removed of 4, bytes=[1-9]\d*, not reached=0")
+
+    def test_an_aged_dir_a_failing_lsof_cannot_clear_is_kept(self):
+        path = self.leftover("restart-unsure1", 9 * DAY)
+        with mock.patch.object(reaper, "held", side_effect=REAL_HELD), \
+             mock.patch.object(reaper.subprocess, "run", side_effect=OSError("no lsof")):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["aged"], [0, 0])
+
+    def test_an_aged_dir_a_real_process_cwd_holds_is_kept(self):
+        path = self.leftover("restart-cwdhold1", 9 * DAY)
+        child = subprocess.Popen(["sleep", "30"], cwd=path / "deep")
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        with mock.patch.object(reaper, "held", side_effect=REAL_HELD), \
+             mock.patch.object(reaper, "holders", side_effect=REAL_HOLDERS):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["aged"], [0, 0])
+
+    def test_no_holder_snapshot_keeps_every_aged_dir(self):
+        path = self.leftover("restart-nosnap01", 9 * DAY)
+        with mock.patch.object(reaper, "holders", return_value=None):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["aged"], [0, 0])
+
+    def test_a_name_an_earlier_rule_owns_keeps_that_rules_idle_limit(self):
+        taken = [self.leftover("tmpab12cd34", DAY + HOUR),          # leftover rule: a day, not seven
+                 self.leftover("go-build123456", 3 * HOUR),         # go: two hours
+                 self.leftover("tmp_sriaqhi", 2 * DAY + HOUR),      # tmpdir rule: 48 h
+                 self.leftover("hold-Ab12Cd", 2 * DAY),             # a name that also has the aged shape
+                 self.leftover("neo-rot-Ab12Cd", 2 * DAY),
+                 self.leftover("cdp-AbCd12", 8 * DAY),              # profile rule, held: no aged takeover
+                 self.leftover("nimbus-articles-build-Ab12Cd", 8 * DAY)]  # build rule, held
+        young = [self.leftover("tmpab12cd35", DAY - HOUR),
+                 self.leftover("go-build123457", HOUR),
+                 self.leftover("tmp_sriaqhj", 2 * DAY - HOUR),
+                 self.leftover("hold-Ab12Ce", 12 * HOUR),           # a day not yet up for the leftover rule
+                 self.leftover("restart-Zz12Cd", 6 * DAY)]          # aged proper, 7 days not yet up
+        self.holders.update({self.root / "cdp-AbCd12", self.root / "nimbus-articles-build-Ab12Cd"})
+        counts = self.run_clean()
+        for path in taken[:5]:
+            self.assertFalse(path.exists(), path)
+        for path in taken[5:] + young:
+            self.assertTrue(path.exists(), path)
+        self.assertEqual(counts["aged"], [0, 0])
+        self.assertEqual((counts["leftover"], counts["tmpdir"]), ([4, 4], [1, 1]))
+
+    def test_the_budget_is_shared_with_tmpdir_and_leaves_the_rest_not_reached_oldest_first(self):
+        self.leftover("tmp_budgetx", 4 * DAY)
+        names = ["restart-Ab12Cd", "restart-Bb12Cd", "restart-Cb12Cd", "restart-Db12Cd", "restart-Eb12Cd"]
+        for i, name in enumerate(names):
+            self.leftover(name, (9 + i) * DAY)       # Eb12Cd is the oldest
+        clock = [0.0]
+        real = reaper.shutil.rmtree
+        def rmtree(path, *a, **k):
+            clock[0] += 1.0                           # every removal costs a second
+            return real(path, *a, **k)
+        fake = types.SimpleNamespace(time=time.time, monotonic=lambda: clock[0])
+        out = io.StringIO()
+        with mock.patch.object(reaper, "time", fake), \
+             mock.patch.object(reaper.shutil, "rmtree", side_effect=rmtree), mock.patch("sys.stdout", out):
+            # tmpdir takes the first second; the budget (2.5 s) then lets two aged ones go.
+            counts = reaper.reap(self.root, self.logs, clean=True, idle_seconds=HOUR, tmpdir_budget=2.5,
+                                 send=lambda pid, sig: None)
+        self.assertEqual(counts["tmpdir"], [1, 1])
+        self.assertEqual(counts["aged"], [2, 2])
+        self.assertEqual([n for n in names if not (self.root / n).exists()],
+                         ["restart-Db12Cd", "restart-Eb12Cd"])
+        self.assertRegex(out.getvalue(), r"aged: 2 removed of 2, bytes=[1-9]\d*, not reached=3 \(budget 2.5s\)")
+        self.assertRegex(out.getvalue(), r"tmpdir: 1 removed of 1, bytes=[1-9]\d*, not reached=0")
+        summary = " ".join(f"{k}={v[1]}/{v[0]}" for k, v in counts.items())
+        self.assertTrue(summary.endswith("tmpdir=1/1 aged=2/2"), summary)
+
+    def test_aged_dirs_outside_the_per_user_temp_directory_are_never_swept(self):
+        path = self.leftover("restart-outside1", 9 * DAY)
+        with mock.patch.object(reaper, "USER_TEMP_PREFIX", "/no/such/prefix/"):
+            counts = self.run_clean()
+        self.assertTrue(path.exists())
+        self.assertEqual(counts["aged"], [0, 0])
 
     def test_a_tmp_dir_link_is_never_followed(self):
         target = self.leftover("tmp_targetx", 3 * DAY)
