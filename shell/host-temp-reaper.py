@@ -2,7 +2,7 @@
 """Reclaim what headless-Chrome scripts, wrangler, failed test builds and finished
 background Claude jobs leave in this user's temp space.
 
-Seven kinds, each proved abandoned before it is touched:
+Eight kinds, each proved abandoned before it is touched:
 
 - an orphaned headless Chrome: launched with --headless, --remote-debugging-port and a
   --user-data-dir directly under this user's temp directory, reparented to launchd (its
@@ -50,12 +50,33 @@ Seven kinds, each proved abandoned before it is touched:
   on them and leaves the rest for the next; each removal and the run's total are logged with
   their bytes.
 
+- any other prefix-named mkdtemp directory directly under the temp directory (`aged_prefix`,
+  stima-api#7106): `<prefix><-, . or _><tail>`, the tail being 6 of [A-Za-z0-9] (Node `mkdtemp`,
+  `mktemp XXXXXX`) or 8 of [a-z0-9_] (Python `mkdtemp`), or a bare `.tmp` plus a 6. On 2026-11-20 the
+  temp directory held 65,848 entries, 63,929 older than 3 days and 57,092 older than 7 days, and the
+  new leaks had stopped: what was left were tests' own names (`security-review-gate-z94a16f_` 14,175,
+  `.tmpHXQE3i` 7,820, `restart-mbpJmx` 7,072, `neo-rot-…`, `stale-claim-release-…`, `stable-version-…`
+  and a long tail) that no rule above names; the file's history adds one name at a time, this takes the
+  class. A shape alone proves nothing about a person's directory, so a name is a candidate only when
+  all of these hold: the tail looks random (a digit, or for 6 characters two upper-case letters or one
+  not in first position; never digits only; 8 lower-case characters need a digit and a non-digit); it
+  is not a reverse-DNS name (`com.`, `org.`, `net.`, `io.`, `dev.`, `app.` + a label + `.`); at least
+  AGED_MIN_SIBLINGS entries of the same pass have the same prefix, which is what a leak has and a
+  user's directory does not (on 2026-11-20 the leaks were a few dozen prefixes with hundreds to 10,000
+  siblings each, everything else 322 names); an earlier kind does not own it; and, as the proof,
+  nothing under it changed (mtime or ctime, which `tar -x`, `cp -Rp` and `mv` cannot carry in) for
+  AGED_IDLE_SECONDS (7 days), no socket is inside it (lsof +D cannot see a listening Unix socket), and
+  the same holder checks as `tmpdir`, `lsof +D` just before each removal included. It shares
+  `--tmpdir-budget-seconds` with `tmpdir` (that kind first), oldest first, and what the budget does not
+  reach is left for the next run and logged as `not reached`.
+
 Every probe that fails or cannot decide keeps the item. Chrome is sent SIGTERM only, so
 it shuts down on its own terms. Tests drive the seams (`processes`, `listening_ports`,
 `has_client`, `held`) with fixtures; no CLI option names an arbitrary root.
 """
 
 import argparse
+from collections import Counter
 from datetime import datetime
 import json
 import os
@@ -63,6 +84,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -105,6 +127,15 @@ LEFTOVER_MENTION = re.compile(r"(?<![A-Za-z0-9_.-])(tmp[a-z0-9_]{8}|tmp\.[A-Za-z
 USER_TEMP_PREFIX = "/private/var/folders/"
 TMPDIR_NAME = re.compile(r"tmp[A-Za-z0-9_]{8}|tmp\.[A-Za-z0-9]{10}")
 TMPDIR_IDLE_SECONDS = 48 * 3600
+# A directory named <prefix><-, . or _><random tail> by a test's mkdtemp. The prefix is free, which is the
+# point: the names of tests are not a list anyone keeps. What makes it a leak and not a person's directory is
+# the siblings: a producer leaves hundreds, a person's `my-folder` has none.
+AGED_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+AGED_TAIL = {6: re.compile(r"[A-Za-z0-9]{6}"), 8: re.compile(r"[a-z0-9_]{8}")}
+BARE_TMP = re.compile(r"\.tmp[A-Za-z0-9]{6}")
+REVERSE_DNS = re.compile(r"(com|org|net|io|dev|app)\.[A-Za-z0-9_-]+\.", re.IGNORECASE)
+AGED_MIN_SIBLINGS = 20
+AGED_IDLE_SECONDS = 7 * 24 * 3600
 TMPDIR_BUDGET_SECONDS = 600
 # A fresh picture of what is open, at least this often while removing.
 HOLDERS_MAX_AGE = 60
@@ -233,13 +264,53 @@ def leftover_rule(name):
     return next(((idle, dirs) for pattern, idle, dirs in LEFTOVERS if pattern.fullmatch(name)), None)
 
 
-def newest_change(path):
-    """The newest mtime of path and everything under it, links not followed; None when
-    any part cannot be read or lies on another filesystem - a share mounted on a temp
-    directory is not the temp directory's to delete."""
+def random_tail(tail):
+    """True when a 6 or 8 character tail looks like mkdtemp's and not like a word or a number."""
+    if tail.isdigit():
+        return False
+    if len(tail) == 8:
+        return any(c.isdigit() for c in tail)
+    uppers = [i for i, c in enumerate(tail) if c.isupper()]
+    return any(c.isdigit() for c in tail) or len(uppers) >= 2 or (len(uppers) == 1 and uppers[0] > 0)
+
+
+def aged_prefix(name):
+    """The prefix of a name `<prefix><-, . or _><random tail>`, or None for any other name."""
+    if REVERSE_DNS.match(name):
+        return None
+    if BARE_TMP.fullmatch(name):
+        return ".tmp" if random_tail(name[4:]) else None
+    for length, pattern in AGED_TAIL.items():
+        cut = len(name) - length - 1
+        if (cut >= 1 and name[cut] in "-._" and pattern.fullmatch(name[cut + 1:]) and random_tail(name[cut + 1:])
+                and AGED_PREFIX.fullmatch(name[:cut])):
+            return name[:cut]
+    return None
+
+
+def owned_earlier(name):
+    """True for a name one of the kinds that run before `aged` takes (or leaves) by its own rule."""
+    return (leftover_rule(name) is not None or TMPDIR_NAME.fullmatch(name) is not None
+            or PROFILE_NAME.fullmatch(name) is not None or BUILD_COPY.fullmatch(name) is not None)
+
+
+def aged_candidate_prefix(name):
+    return None if owned_earlier(name) else aged_prefix(name)
+
+
+def newest_change(path, why=None):
+    """The newest mtime or ctime of path and everything under it, links not followed (a tree
+    unpacked with tar -x, cp -Rp or mv keeps its old mtimes, not its ctimes); None when any part
+    cannot be read, lies on another filesystem - a share mounted on a temp directory is not the
+    temp directory's to delete - or is a socket (a listening Unix socket is invisible to lsof +D;
+    `why` then gets "socket")."""
     try:
-        top_stat = path.lstat()
-        newest, device = top_stat.st_mtime, top_stat.st_dev
+        top_stat = os.lstat(path)
+        if stat.S_ISSOCK(top_stat.st_mode):
+            if why is not None:
+                why.append("socket")
+            return None
+        newest, device = max(top_stat.st_mtime, top_stat.st_ctime), top_stat.st_dev
         if path.is_dir() and not path.is_symlink():
             if os.path.ismount(path):
                 return None
@@ -248,7 +319,11 @@ def newest_change(path):
                     st = os.lstat(os.path.join(top, name))
                     if st.st_dev != device:
                         return None
-                    newest = max(newest, st.st_mtime)
+                    if stat.S_ISSOCK(st.st_mode):
+                        if why is not None:
+                            why.append("socket")
+                        return None
+                    newest = max(newest, st.st_mtime, st.st_ctime)
     except OSError:
         return None
     return newest
@@ -277,9 +352,13 @@ def holders(root, rows):
         prefixes.add(os.fsencode(str(root)[len("/private"):]) + b"/")
     for field in probe.stdout.split(b"\0"):
         field = field.lstrip(b"\n")
+        # `T//x/y` is `T/x/y`: the name under the root is read from the normalised path.
+        if not field.startswith(b"n/"):
+            continue
+        path = os.path.normpath(field[1:])
         for prefix in prefixes:
-            if field.startswith(b"n" + prefix):
-                names.add(os.fsdecode(field[len(prefix) + 1:].split(b"/", 1)[0]))
+            if path.startswith(prefix):
+                names.add(os.fsdecode(path[len(prefix):].split(b"/", 1)[0]))
     for row in rows:
         names.update(LEFTOVER_MENTION.findall(row[3]))
     return names
@@ -336,7 +415,7 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
     if rows is None:
         raise RuntimeError("ps failed; kept everything")
     counts = {"chrome": [0, 0], "profile": [0, 0], "wrangler": [0, 0], "build": [0, 0],
-              "jobvenv": [0, 0], "leftover": [0, 0], "tmpdir": [0, 0]}
+              "jobvenv": [0, 0], "leftover": [0, 0], "tmpdir": [0, 0], "aged": [0, 0]}
 
     for row in rows:
         if not orphan_chrome(row, root, idle_seconds):
@@ -412,7 +491,10 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
             # The entry's own time first: most are recent, and a deep walk costs.
             if now - path.lstat().st_mtime < limit:
                 continue
-            newest = newest_change(path)
+            why = []
+            newest = newest_change(path, why)
+            if why:
+                print(f"KEEP leftover {path.name} ({why[0]})")
             if newest is None or now - newest < limit:
                 continue
             if held_names is None or time.time() - held_at > HOLDERS_MAX_AGE:
@@ -435,40 +517,70 @@ def reap(root, logs_dir, clean=False, idle_seconds=3600, now=None, send=os.kill,
         except OSError as error:
             print(f"KEEP leftover {path.name} ({error.strerror or error})")
 
-    # The seventh kind: TMPDIR_NAME directories the leftover rule does not take.
-    deadline, freed, deferred = time.monotonic() + tmpdir_budget, 0, 0
-    for path in sorted(root.iterdir()) if sweep else []:
-        try:
-            if not TMPDIR_NAME.fullmatch(path.name) or leftover_rule(path.name) is not None:
-                continue
-            if path.is_symlink() or not path.is_dir() or now - path.lstat().st_mtime < TMPDIR_IDLE_SECONDS:
-                continue
-            if time.monotonic() > deadline:
-                deferred += 1
-                continue
-            newest = newest_change(path)
-            if newest is None or now - newest < TMPDIR_IDLE_SECONDS:
-                continue
-            if held_names is None or rows_now is None or time.time() - held_at > HOLDERS_MAX_AGE:
-                rows_now = processes(env=True)
-                held_names = None if rows_now is None else holders(root, rows_now)
-                held_at = time.time()
-                if held_names is None:
-                    print("KEEP tmpdir (lsof could not answer; kept them all)")
-                    break
-            if path.name in held_names or any(path.name in r[3] for r in rows_now) or held(path):
-                continue
-            counts["tmpdir"][0] += 1
-            size = tree_bytes(path)
-            if clean:
-                shutil.rmtree(path)
-                counts["tmpdir"][1] += 1
-                freed += size
-            print(f"{'REMOVED' if clean else 'CANDIDATE'} tmpdir {path.name} bytes={size}")
-        except OSError as error:
-            print(f"KEEP tmpdir {path.name} ({error.strerror or error})")
-    print(f"tmpdir: {counts['tmpdir'][1]} removed of {counts['tmpdir'][0]}, bytes={freed}, "
-          f"not reached={deferred} (budget {tmpdir_budget}s)")
+    # The seventh and eighth kinds: TMPDIR_NAME directories the leftover rule does not take, then any
+    # other mkdtemp-shaped name that has been untouched for AGED_IDLE_SECONDS. One budget for both.
+    def oldest_first(entries):
+        stamped = []
+        for path in entries:
+            try:
+                stamped.append((path.lstat().st_mtime, path.name, path))
+            except OSError:
+                pass
+        return [path for _, _, path in sorted(stamped)]
+
+    deadline = time.monotonic() + tmpdir_budget
+    entries = oldest_first(root.iterdir()) if sweep else []
+    # What a leak has and a person's directory does not: siblings, counted over this pass's own listing.
+    siblings = Counter(filter(None, (aged_candidate_prefix(path.name) for path in entries)))
+
+    def aged_wanted(name):
+        prefix = aged_candidate_prefix(name)
+        return prefix is not None and siblings[prefix] >= AGED_MIN_SIBLINGS
+
+    for kind, wanted, limit in (
+            ("tmpdir", lambda name: TMPDIR_NAME.fullmatch(name) and leftover_rule(name) is None, TMPDIR_IDLE_SECONDS),
+            ("aged", aged_wanted, AGED_IDLE_SECONDS)):
+        freed, deferred, gave_up = 0, 0, False
+        for path in entries:
+            try:
+                if not wanted(path.name):
+                    continue
+                if path.is_symlink() or not path.is_dir() or now - path.lstat().st_mtime < limit:
+                    continue
+                if time.monotonic() > deadline:
+                    deferred += 1
+                    continue
+                why = []
+                newest = newest_change(path, why)
+                if why:
+                    print(f"KEEP {kind} {path.name} ({why[0]})")
+                if newest is None or now - newest < limit:
+                    continue
+                if held_names is None or rows_now is None or time.time() - held_at > HOLDERS_MAX_AGE:
+                    rows_now = processes(env=True)
+                    held_names = None if rows_now is None else holders(root, rows_now)
+                    held_at = time.time()
+                    if held_names is None:
+                        print(f"KEEP {kind} (lsof could not answer; kept them all)")
+                        gave_up = True
+                        break
+                if path.name in held_names or any(path.name in r[3] for r in rows_now) or held(path):
+                    continue
+                counts[kind][0] += 1
+                size = tree_bytes(path)
+                if clean:
+                    shutil.rmtree(path)
+                    counts[kind][1] += 1
+                    freed += size
+                print(f"{'REMOVED' if clean else 'CANDIDATE'} {kind} {path.name} bytes={size}")
+            except OSError as error:
+                print(f"KEEP {kind} {path.name} ({error.strerror or error})")
+        print(f"{kind}: {counts[kind][1]} removed of {counts[kind][0]}, bytes={freed}, "
+              f"not reached={deferred} (budget {tmpdir_budget}s)")
+        if gave_up:
+            if kind == "tmpdir":
+                print("aged: skipped (no holder snapshot)")
+            break
 
     jobs = jobs_dir.resolve() if jobs_dir is not None and jobs_dir.is_dir() else None
     for job in sorted(jobs.iterdir()) if jobs is not None else []:

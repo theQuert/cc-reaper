@@ -30,6 +30,16 @@
   front, or an owner it cannot attribute still keeps it, and a grace-level owner's proxy is never idle-reaped.
 
 ### Added
+- **host-temp-reaper: a prefix-named mkdtemp directory untouched for 7 days and held by nothing is reclaimed (stima-api #7106).**
+  On 2026-11-20 `$TMPDIR` held 65,848 entries, 57,092 of them older than 7 days: `security-review-gate-XXXXXXXX`,
+  `.tmpXXXXXX`, `restart-XXXXXX`, `neo-rot-…`, `stable-version-…` and a long tail of tests' own names, none of them in
+  any list. The new `aged` kind takes the shape (`<prefix><-, . or _>` plus a random 6 or 8 character tail) instead of
+  one more name, and only where a leak shows: at least 20 entries of the same pass share the prefix, the tail is not a
+  word or a number, and the name is not reverse-DNS (`com.*`, `org.*`, ...). A directory only, under the per-user temp
+  directory only, nothing under it changed (mtime or ctime) for 7 days, no socket inside it, no open file, cwd or
+  command line reaches it, and `lsof +D` finds no holder. It shares `--tmpdir-budget-seconds` with `tmpdir`, oldest
+  first; the run's summary gains `aged=x/y`. Every kind now also keeps a tree that holds a socket or whose ctime is
+  recent, and the holder scan reads `T//x` as `x`.
 - **worktree-janitor: evidence that has expired no longer keeps a landed idle tree (stima-api #7895).** After #7881 the
   installed janitor still kept 67 of 137 trees as unrebuildable, most for files under `.codex/evidence/` that the
   `archive:` line cannot copy (bigger than 1 MiB, or not a regular file). A landed, idle tree whose only unrebuildable
