@@ -63,7 +63,15 @@ Eight kinds, each proved abandoned before it is touched:
   is not a reverse-DNS name (`com.`, `org.`, `net.`, `io.`, `dev.`, `app.` + a label + `.`); at least
   AGED_MIN_SIBLINGS entries of the same pass have the same prefix, which is what a leak has and a
   user's directory does not (on 2026-11-20 the leaks were a few dozen prefixes with hundreds to 10,000
-  siblings each, everything else 322 names); an earlier kind does not own it; and, as the proof,
+  siblings each, everything else 322 names). A tail that does not look random is no proof against a
+  leak either: one Python name in twelve has no digit, and on 2026-11-21 a pass that ended
+  `not reached=0` left 2,000 such directories idle past the 7 days (`security-review-gate-srpllrrv`). Such a name
+  is a candidate when AGED_MIN_SIBLINGS entries share its prefix and have such a tail of the same length
+  themselves, so a `my-Folder` among a leak's `my-Ab12Cd` still has no company; a tail of digits only
+  never is. The edge this leaves: under a prefix that has such a crowd, a directory someone named with a
+  word of that length (`restart-backup` beside twenty `restart-wycuml`) is a candidate too, and goes once
+  the proof below holds for it; a word of another length (`restart-fixtures`) is not. An
+  earlier kind does not own it; and, as the proof,
   nothing under it changed (mtime or ctime, which `tar -x`, `cp -Rp` and `mv` cannot carry in) for
   AGED_IDLE_SECONDS (7 days), no socket is inside it (lsof +D cannot see a listening Unix socket), and
   the same holder checks as `tmpdir`, `lsof +D` just before each removal included. It shares
@@ -131,7 +139,8 @@ TMPDIR_IDLE_SECONDS = 48 * 3600
 # point: the names of tests are not a list anyone keeps. What makes it a leak and not a person's directory is
 # the siblings: a producer leaves hundreds, a person's `my-folder` has none.
 AGED_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-AGED_TAIL = {6: re.compile(r"[A-Za-z0-9]{6}"), 8: re.compile(r"[a-z0-9_]{8}")}
+# Eight first: Python's `r_2chwxv` also reads as six characters after `_`, under the prefix `…-r` nothing shares.
+AGED_TAIL = {8: re.compile(r"[a-z0-9_]{8}"), 6: re.compile(r"[A-Za-z0-9]{6}")}
 BARE_TMP = re.compile(r"\.tmp[A-Za-z0-9]{6}")
 REVERSE_DNS = re.compile(r"(com|org|net|io|dev|app)\.[A-Za-z0-9_-]+\.", re.IGNORECASE)
 AGED_MIN_SIBLINGS = 20
@@ -274,15 +283,20 @@ def random_tail(tail):
     return any(c.isdigit() for c in tail) or len(uppers) >= 2 or (len(uppers) == 1 and uppers[0] > 0)
 
 
-def aged_prefix(name):
-    """The prefix of a name `<prefix><-, . or _><random tail>`, or None for any other name."""
+def aged_prefix(name, plain=False):
+    """The prefix of a name `<prefix><-, . or _><random tail>`, or None for any other name. With
+    `plain`, of a name whose tail does not look random instead; digits only is neither."""
     if REVERSE_DNS.match(name):
         return None
+
+    def fits(tail):
+        return not tail.isdigit() and random_tail(tail) != plain
+
     if BARE_TMP.fullmatch(name):
-        return ".tmp" if random_tail(name[4:]) else None
+        return ".tmp" if fits(name[4:]) else None
     for length, pattern in AGED_TAIL.items():
         cut = len(name) - length - 1
-        if (cut >= 1 and name[cut] in "-._" and pattern.fullmatch(name[cut + 1:]) and random_tail(name[cut + 1:])
+        if (cut >= 1 and name[cut] in "-._" and pattern.fullmatch(name[cut + 1:]) and fits(name[cut + 1:])
                 and AGED_PREFIX.fullmatch(name[:cut])):
             return name[:cut]
     return None
@@ -295,7 +309,16 @@ def owned_earlier(name):
 
 
 def aged_candidate_prefix(name):
-    return None if owned_earlier(name) else aged_prefix(name)
+    """What a name's siblings are counted under, or None: (prefix, 0) for a tail that looks random,
+    (prefix, the tail's length with its separator) for one that does not. Two crowds, and the plain one
+    is per length: a producer's tails are one length, a word beside them usually is not."""
+    if owned_earlier(name):
+        return None
+    for plain in (False, True):
+        prefix = aged_prefix(name, plain)
+        if prefix is not None:
+            return prefix, len(name) - len(prefix) if plain else 0
+    return None
 
 
 def newest_change(path, why=None):
