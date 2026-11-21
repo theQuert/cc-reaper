@@ -398,6 +398,40 @@ class ReaperTest(unittest.TestCase):
         self.assertEqual(reaper.aged_prefix("security-review-gate-z94a16f_"), "security-review-gate")
         self.assertEqual(reaper.aged_prefix(".tmpHXQE3i"), ".tmp")
 
+    def plain(self, prefix, count, tail="rpllrrv", age=9 * DAY):
+        """`count` old directories of a prefix whose tails have no digit, as one in twelve of Python's do."""
+        return [self.leftover(f"{prefix}-{'abcdefghijklmnopqrstuvwxyz'[i]}{tail}", age) for i in range(count)]
+
+    def test_a_tail_that_does_not_look_random_goes_with_twenty_siblings_like_it(self):
+        # 2026-11-21: a pass that ended `not reached=0` left 2,000 directories idle past the 7 days whose tails
+        # do not look random: `security-review-gate-srpllrrv`, `preview-unpack-ymqbwn`, `restart-Wycuml`.
+        gone = (self.plain("security-review-gate", 20) + self.plain("preview-unpack", 20, tail="mqbwn")
+                + [self.leftover(f"restart-{c}ycuml", 9 * DAY) for c in "ABCDEFGHIJKLMNOPQRST"])
+        self.crowd("neo-feed")                                           # siblings that look random are not its company
+        kept = (self.plain("neo-feed", 19)
+                + [self.leftover(f"report-202611{i:02d}", 9 * DAY) for i in range(20)]   # dated, however many
+                + [self.leftover(f"log-2026{i:02d}", 9 * DAY) for i in range(20)]
+                + self.plain("stall-audit-selftest", 20, age=6 * DAY))   # 7 days not yet up
+        counts, out = self.run_quiet(clean=False)
+        self.assertEqual(counts["aged"], [60, 0])
+        self.assertRegex(out, r"CANDIDATE aged security-review-gate-arpllrrv bytes=\d+")
+        counts, out = self.run_quiet(clean=True)
+        for path in gone:
+            self.assertFalse(path.exists(), path)
+        for path in kept:
+            self.assertTrue(path.exists(), path)
+        self.assertEqual(counts["aged"], [60, 60])
+
+    def test_a_python_tail_with_an_underscore_second_is_read_as_its_eight_characters(self):
+        # Read as six characters after `_`, `security-review-gate-r_2chwxv` had the prefix `security-review-gate-r`:
+        # one name in 37 of a leak, split 37 ways with no twenty among them (386 left on 2026-11-21).
+        self.assertEqual(reaper.aged_prefix("security-review-gate-r_2chwxv"), "security-review-gate")
+        gone = [self.leftover(f"security-review-gate-{c}_2chwxv", 9 * DAY) for c in "abcdefghijklmnopqrst"]
+        counts, out = self.run_quiet(clean=True)
+        for path in gone:
+            self.assertFalse(path.exists(), path)
+        self.assertEqual(counts["aged"], [20, 20])
+
     def test_a_tree_with_an_old_mtime_and_a_fresh_ctime_is_kept(self):
         self.crowd("restart")
         carried = self.leftover("restart-carried1", 9 * DAY)        # a file unpacked with its old mtime
