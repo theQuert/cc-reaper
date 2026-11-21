@@ -2,17 +2,31 @@
 
 ## What it is
 
-On macOS 26 every start of a script through its `#!` line leaks about 1 KiB of kernel memory,
-whatever started it. The memory sits in the kernel zone `kalloc.1024` (shown as
+On macOS 26 a script started through its `#!` line by a process that was itself started through a
+`#!` line leaks about 1 KiB of kernel memory. The memory sits in the kernel zone `kalloc.1024` (shown as
 `data_shared.kalloc.1024`, or `data.kalloc.1024` on some builds) and counts as wired memory.
-Nothing frees it except a restart. The cause is a macOS bug, so the only defence is to start
-scripts by their interpreter (`python3 x.py`, `/bin/sh x.sh`) wherever a script is started often.
+Nothing frees it except a restart. The cause is a macOS bug, so the defence is to start scripts by
+their interpreter (`python3 x.py`, `/bin/sh x.sh`) wherever a script is started often. Naming the
+interpreter for the parent is enough: a parent started as `bash parent.sh` or `python3 parent.py`
+can start `#!` children by path without leaking.
 
-Measured on this host on 2026-11-18 (theQuert/stima-api#9010), 100 starts a block, six blocks,
-from a parent that was itself started by its interpreter: by path a median +113 elements, by
-interpreter -16, an idle block of the same length +20. Hooks are the frequent case: the session
-event logs counted about 2,300 tool calls an hour across the host, and each one started five or
-more hook scripts by path.
+Measured on this host on 2026-11-21 after a boot (theQuert/stima-api#9608), 2000 starts of a
+`#!/bin/sh` leaf by path per row, two rounds:
+
+| Parent started as | Elements added |
+|---|---|
+| `./parent.sh` or `./parent.py` (through `#!`) | +1929 to +2175 |
+| `/bin/sh parent.sh`, `/bin/bash parent.sh` or `python3 parent.py` | -4 to +181 (idle drift) |
+| a binary (`/usr/bin/python3 -c`) | +29, +97 |
+
+The same `#!`-started parent starting `/bin/sh leaf.sh` added +6 and +19. The 2026-11-18 reading
+(stima-api#9010), which reported a leak from an interpreter-started parent, did not hold up in this
+measurement.
+
+The host went down on 2026-11-21 holding 16.6 million elements after 43 days without a restart.
+Every Claude Code session in stima-api now prints one `host: kernel zone` line at start when the zone
+is at or above 4 million elements or growing 20,000 an hour or more (`scripts/ci/with_local_resource.py
+--host-status`, stima-api#9608), since `ALERT:wired` below reaches only a desktop notification.
 
 ## The three fields
 
