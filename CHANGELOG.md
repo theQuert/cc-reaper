@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+- **`host-temp-reaper.py`: the `aged` kind left leak directories whose tail has no digit (stima-api #7106).** One Python
+  `mkdtemp` name in twelve has an all-lowercase tail, and a tail whose second character is `_` was read as six
+  characters under a prefix nothing shares; a pass that ended `not reached=0` left about 2,400 directories idle past the
+  7 days. A tail that does not look random is now a candidate when 20 entries of the pass share its prefix and have such
+  a tail themselves, counted apart from the random-looking ones; the eight character tail is read before the six; a
+  tail of digits only is never a candidate. The 7 day bound and the holder checks are unchanged.
+
 ### Changed
 - **`docs/host-memory.md`: the host is not restarted.** The "When to restart" section recommended a restart at wired
   12 GB or `kzone` 10 million; the founder ruled on 2026-11-20 that the Mac mini stays online, so the section now says
