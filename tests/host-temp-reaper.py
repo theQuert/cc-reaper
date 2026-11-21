@@ -387,6 +387,9 @@ class ReaperTest(unittest.TestCase):
         self.assertIsNone(reaper.aged_prefix("backup-20261101"))
         self.assertIsNone(reaper.aged_prefix("backup-202611"))
         self.assertIsNone(reaper.aged_prefix("my-Folder"))
+        self.assertEqual(reaper.aged_prefix("my-Folder", plain=True), "my")       # the plain reading, per crowd
+        self.assertEqual(reaper.aged_prefix(".tmpabcdef", plain=True), ".tmp")
+        self.assertIsNone(reaper.aged_prefix(".tmp123456", plain=True))
         self.assertIsNone(reaper.aged_prefix("data-lowerabc"))     # eight lower case, no digit
         self.assertIsNone(reaper.aged_prefix("com.microsoft.VSCode"))
         for name in ("io.sentry.Ab12Cd", "app.x.Ab12Cd", "net.y.z0z0z0"):
@@ -406,21 +409,23 @@ class ReaperTest(unittest.TestCase):
         # 2026-11-21: a pass that ended `not reached=0` left 2,000 directories idle past the 7 days whose tails
         # do not look random: `security-review-gate-srpllrrv`, `preview-unpack-ymqbwn`, `restart-Wycuml`.
         gone = (self.plain("security-review-gate", 20) + self.plain("preview-unpack", 20, tail="mqbwn")
-                + [self.leftover(f"restart-{c}ycuml", 9 * DAY) for c in "ABCDEFGHIJKLMNOPQRST"])
+                + [self.leftover(f"restart-{c}ycuml", 9 * DAY) for c in "ABCDEFGHIJKLMNOPQRST"]
+                + [self.leftover("restart-backup", 9 * DAY)])            # a word of the crowd's length goes with it
         self.crowd("neo-feed")                                           # siblings that look random are not its company
         kept = (self.plain("neo-feed", 19)
                 + [self.leftover(f"report-202611{i:02d}", 9 * DAY) for i in range(20)]   # dated, however many
                 + [self.leftover(f"log-2026{i:02d}", 9 * DAY) for i in range(20)]
-                + self.plain("stall-audit-selftest", 20, age=6 * DAY))   # 7 days not yet up
+                + self.plain("stall-audit-selftest", 20, age=6 * DAY)    # 7 days not yet up
+                + [self.leftover("restart-fixtures", 9 * DAY)])          # a word of another length has no company
         counts, out = self.run_quiet(clean=False)
-        self.assertEqual(counts["aged"], [60, 0])
+        self.assertEqual(counts["aged"], [61, 0])
         self.assertRegex(out, r"CANDIDATE aged security-review-gate-arpllrrv bytes=\d+")
         counts, out = self.run_quiet(clean=True)
         for path in gone:
             self.assertFalse(path.exists(), path)
         for path in kept:
             self.assertTrue(path.exists(), path)
-        self.assertEqual(counts["aged"], [60, 60])
+        self.assertEqual(counts["aged"], [61, 61])
 
     def test_a_python_tail_with_an_underscore_second_is_read_as_its_eight_characters(self):
         # Read as six characters after `_`, `security-review-gate-r_2chwxv` had the prefix `security-review-gate-r`:

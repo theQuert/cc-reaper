@@ -66,8 +66,11 @@ Eight kinds, each proved abandoned before it is touched:
   siblings each, everything else 322 names). A tail that does not look random is no proof against a
   leak either: one Python name in twelve has no digit, and on 2026-11-21 a pass that ended
   `not reached=0` left 2,000 such directories idle past the 7 days (`security-review-gate-srpllrrv`). Such a name
-  is a candidate when AGED_MIN_SIBLINGS entries share its prefix and have such a tail themselves, so a
-  `my-Folder` among a leak's `my-Ab12Cd` still has no company; a tail of digits only never is. An
+  is a candidate when AGED_MIN_SIBLINGS entries share its prefix and have such a tail of the same length
+  themselves, so a `my-Folder` among a leak's `my-Ab12Cd` still has no company; a tail of digits only
+  never is. The edge this leaves: under a prefix that has such a crowd, a directory someone named with a
+  word of that length (`restart-backup` beside twenty `restart-wycuml`) is a candidate too, and goes once
+  the proof below holds for it; a word of another length (`restart-fixtures`) is not. An
   earlier kind does not own it; and, as the proof,
   nothing under it changed (mtime or ctime, which `tar -x`, `cp -Rp` and `mv` cannot carry in) for
   AGED_IDLE_SECONDS (7 days), no socket is inside it (lsof +D cannot see a listening Unix socket), and
@@ -306,14 +309,15 @@ def owned_earlier(name):
 
 
 def aged_candidate_prefix(name):
-    """What a name's siblings are counted under, (prefix, plain), or None: the tails that look random
-    and those that do not are two crowds."""
+    """What a name's siblings are counted under, or None: (prefix, 0) for a tail that looks random,
+    (prefix, the tail's length with its separator) for one that does not. Two crowds, and the plain one
+    is per length: a producer's tails are one length, a word beside them usually is not."""
     if owned_earlier(name):
         return None
     for plain in (False, True):
         prefix = aged_prefix(name, plain)
         if prefix is not None:
-            return prefix, plain
+            return prefix, len(name) - len(prefix) if plain else 0
     return None
 
 

@@ -7,8 +7,10 @@
   `mkdtemp` name in twelve has an all-lowercase tail, and a tail whose second character is `_` was read as six
   characters under a prefix nothing shares; a pass that ended `not reached=0` left about 2,400 directories idle past the
   7 days. A tail that does not look random is now a candidate when 20 entries of the pass share its prefix and have such
-  a tail themselves, counted apart from the random-looking ones; the eight character tail is read before the six; a
-  tail of digits only is never a candidate. The 7 day bound and the holder checks are unchanged.
+  a tail of the same length themselves, counted apart from the random-looking ones; the eight character tail is read
+  before the six; a tail of digits only is never a candidate. Under a prefix with such a crowd, a directory named with
+  a word of that length (`restart-backup` beside twenty `restart-wycuml`) goes too once it is idle 7 days with no
+  holder. The 7 day bound and the holder checks are unchanged.
 
 ### Changed
 - **`docs/host-memory.md`: the host is not restarted.** The "When to restart" section recommended a restart at wired
