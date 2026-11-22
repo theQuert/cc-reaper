@@ -124,11 +124,29 @@ def _open_parent(root, path):
     return fd, parts[-1]
 
 
+def _rmtree_at(name, parent_fd):
+    """Remove the directory `name` inside the open directory `parent_fd`, descriptor-relative all
+    the way down: a symlink inside the tree is unlinked, never entered. shutil.rmtree takes
+    dir_fd only from Python 3.11, and launchd runs this with /usr/bin/python3 (3.9)."""
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        with os.scandir(fd) as it:
+            entries = list(it)
+        for e in entries:
+            if e.is_dir(follow_symlinks=False):
+                _rmtree_at(e.name, fd)
+            else:
+                os.unlink(e.name, dir_fd=fd)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
 def safe_rmtree(root, path):
     """Remove the directory tree `path` under `root` without ever following a symlink: the root is
     opened O_NOFOLLOW and its ownership and mode are checked on the descriptor, every component
     down to the parent is opened O_NOFOLLOW|O_DIRECTORY relative to the one before, and the leaf
-    is removed with shutil.rmtree(dir_fd=...). A path swapped for a symlink after it was listed
+    is removed the same way by _rmtree_at. A path swapped for a symlink after it was listed
     fails the open. Raises OSError (with the reason) when it refuses."""
     fd, leaf = _open_parent(root, path)
     try:
@@ -137,7 +155,7 @@ def safe_rmtree(root, path):
             raise OSError("is a symlink")
         if not stat.S_ISDIR(st.st_mode):
             raise OSError("is not a directory")
-        shutil.rmtree(leaf, dir_fd=fd)
+        _rmtree_at(leaf, fd)
     finally:
         os.close(fd)
 
