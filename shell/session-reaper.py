@@ -116,7 +116,15 @@ DEFAULTS = {
     "DEAD_CLAIMS_HOURS": "6",
     "DEAD_CLAIMS_MAX": "40",
     "DEAD_CLAIMS_CACHE": "~/.cc-reaper/state/dead-claims-cache.json",  # issue -> claimant, kept while its updated_at holds
+    # stima-api#8959: a tmux session no claude runs in, whose every pane is an idle shell with no child process, that no
+    # client is attached to and whose windows have been quiet BARE_TMUX_HOURS, is killed. `apply` (when the run
+    # applies), `shadow` (report only, the default until its rounds are clean) or `off`. PROTECT and NEVER_CLOSE names
+    # and a pane holding a CC_NEVER_KILL_PIDS pid are never touched.
+    "BARE_TMUX": "shadow",
+    "BARE_TMUX_HOURS": "6",
 }
+BARE_SHELLS = {"zsh", "bash", "sh", "fish", "-zsh", "-bash", "-sh", "login"}
+STATUS_SESSION_RE = re.compile(r"^\s*session:\s*`?([^`\s]+)`?\s*$", re.I)
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
 MARKER = "claude-task-worktree"
@@ -2518,12 +2526,18 @@ def claim_facts(ds, comments, updated):
         return facts | {"claimant": who, "claim_id": "", "claim_at": None, "last_at": None, "marked": []}
     claim_at = _gh_epoch(claim["createdAt"])
     last = claim_at
+    aliases = set()
+    for c in comments[at + 1:]:
+        lines = [x for x in str(c["body"]).splitlines() if x.strip()]
+        if lines and lines[0].strip().upper().startswith("STATUS "):
+            aliases |= {m.group(1).lower() for x in lines[1:] if (m := STATUS_SESSION_RE.match(x))}
     for c in comments[at + 1:]:
         t = _gh_epoch(c["createdAt"])
         if t is not None and sid[:8] in c["body"].lower() and (last is None or t > last):
             last = t
     marked = sorted({m.group(1) for c in comments for m in re.finditer(re.escape(DEAD_CLAIM_MARK) + r"(\S+?) -->", c["body"])})
-    return facts | {"claimant": who, "claim_id": claim["id"], "claim_at": claim_at, "last_at": last, "marked": marked}
+    return facts | {"claimant": who, "claim_id": claim["id"], "claim_at": claim_at, "last_at": last, "marked": marked,
+                    "aliases": sorted(aliases)}
 
 
 def dead_claim_comment(who, label, claim_id, since):
@@ -2601,7 +2615,8 @@ def release_dead_claims(cfg, now, apply, extra=((), ())):
         if not who or e.get("updated") != updated_of[n]:
             continue
         label = (who.get("name") or "").strip() or str(who["session"])
-        if (label.lower() in names and who.get("name")) or any(_same_id(who["session"], s) for s in sids):
+        if ((label.lower() in names and who.get("name")) or any(a in names for a in e.get("aliases", []))
+                or any(_same_id(who["session"], s) for s in sids)):
             out["alive"] += 1
         elif not e.get("claim_id") or e.get("last_at") is None:
             out["notes"].append(f"dead claims: #{n} claimant {label}: claim comment not placed, left alone")
@@ -2611,6 +2626,10 @@ def release_dead_claims(cfg, now, apply, extra=((), ())):
             continue
         else:
             due.append((n, label, e["last_at"], who, e["claim_id"]))
+    held = [d for d in due if checkby_state(repo, d[0], cfg) != "CLEAR"]
+    for n, label, *_ in held:
+        out["notes"].append(f"dead claims: #{n} claimant {label}: check-by open or unread, claim kept for its wake")
+    due = [d for d in due if d not in held]
     for n, label, since, who, claim_id in due:
         if mode != "apply" or not apply:
             out["would"].append((n, label, since))
@@ -2625,6 +2644,9 @@ def release_dead_claims(cfg, now, apply, extra=((), ())):
             facts = claim_facts(ds, fresh, "")
             if facts.get("claim_id") != claim_id or (facts["last_at"] or 0) != since:
                 continue
+            if any(a in names for a in facts.get("aliases", [])):
+                out["alive"] += 1
+                continue
             if comment((repo, str(n)), dead_claim_comment(who, label, claim_id, since)):
                 out["released"].append((n, label, since))
                 cache.get(str(n), {})["updated"] = ""  # our own comment moved the issue: read it again
@@ -2635,6 +2657,61 @@ def release_dead_claims(cfg, now, apply, extra=((), ())):
     except OSError:
         pass
     return out
+
+
+def bare_tmux_sessions(cfg, now, table=None):
+    """[(name, session id, idle hours)] of the tmux sessions to close: unattached, every window quiet BARE_TMUX_HOURS
+    (session_activity moves only on input, window_activity on output), every pane an idle shell with no descendant in
+    one ps snapshot and no never-kill pid, not PROTECT or NEVER_CLOSE. None when tmux cannot say; a ps that fails
+    raises, so nothing is closed on a guess."""
+    rc, out = tmux("list-panes", "-a", "-F", "#{session_name}\t#{session_id}\t#{session_attached}\t"
+                   "#{session_activity}\t#{window_activity}\t#{pane_pid}\t#{pane_current_command}")
+    if rc != 0:
+        return None
+    by = {}
+    for line in out.splitlines():
+        f = line.split("\t")
+        if len(f) == 7:
+            by.setdefault((f[0], f[1]), []).append(f)
+    hours = float(cfg.get("BARE_TMUX_HOURS", "6"))
+    keep = never_kill_pids(cfg)
+    found = []
+    for (name, sid), panes in sorted(by.items()):
+        try:
+            attached = int(panes[0][2])
+            activity = max(max(int(p[3]), int(p[4])) for p in panes)
+            pids = [int(p[5]) for p in panes]
+        except ValueError:
+            continue
+        idle = (now - activity) / 3600
+        if attached or idle < hours or protected(cfg, name) or never_close({"tmux": name}, cfg):
+            continue
+        if not all(p[6].strip().lower() in BARE_SHELLS for p in panes):
+            continue
+        table = ps_table() if table is None else table
+        if any(pid not in table or pid in keep or descendants(table, pid) for pid in pids):
+            continue
+        found.append((name, sid, idle))
+    return found
+
+
+def close_bare_tmux(cfg, now, apply):
+    """Kill the sessions bare_tmux_sessions() names (apply), or list them. Returns report notes."""
+    mode = cfg.get("BARE_TMUX", DEFAULTS["BARE_TMUX"])
+    if mode == "off":
+        return []
+    found = bare_tmux_sessions(cfg, now)
+    if found is None:
+        return ["bare tmux: tmux not readable; closed nothing"]
+    notes = []
+    for name, sid, idle in found:
+        if mode != "apply" or not apply:
+            notes.append(f"bare tmux: would close {name} (idle {idle:.1f} h, only an idle shell)")
+        elif tmux("kill-session", "-t", sid)[0] == 0:
+            notes.append(f"bare tmux: closed {name} (idle {idle:.1f} h, only an idle shell)")
+        else:
+            notes.append(f"bare tmux: could not close {name}")
+    return notes
 
 
 def dead_claim_lines(res, stamp=lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))):
@@ -2823,6 +2900,11 @@ def main(argv=None):
             notes += dead_claims["notes"]
     except Exception as e:  # a claim left held is the state before this pass: never fail the sweep over it
         notes.append(f"dead claims: {type(e).__name__}: {e}")
+    try:
+        if live_run and not args.only:
+            notes += close_bare_tmux(cfg, now, apply)
+    except Exception as e:  # a shell left open is the state before this pass
+        notes.append(f"bare tmux: {type(e).__name__}: {e}")
     signal.alarm(0)
     faulthandler.cancel_dump_traceback_later()
     mode = "apply" if apply else "report-only"
