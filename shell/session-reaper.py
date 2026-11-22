@@ -116,7 +116,14 @@ DEFAULTS = {
     "DEAD_CLAIMS_HOURS": "6",
     "DEAD_CLAIMS_MAX": "40",
     "DEAD_CLAIMS_CACHE": "~/.cc-reaper/state/dead-claims-cache.json",  # issue -> claimant, kept while its updated_at holds
+    # stima-api#8959: a tmux session no claude runs in, whose every pane is an idle shell with no child process, that no
+    # client is attached to and that has been quiet BARE_TMUX_HOURS, is killed. `apply` (when the run applies), `shadow`
+    # (report only) or `off`. PROTECT and NEVER_CLOSE names are never touched.
+    "BARE_TMUX": "apply",
+    "BARE_TMUX_HOURS": "6",
 }
+BARE_SHELLS = {"zsh", "bash", "sh", "fish", "-zsh", "-bash", "-sh", "login"}
+STATUS_SESSION_RE = re.compile(r"^\s*session:\s*`?([^`\s]+)`?\s*$", re.I)
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
 MARKER = "claude-task-worktree"
@@ -2518,12 +2525,18 @@ def claim_facts(ds, comments, updated):
         return facts | {"claimant": who, "claim_id": "", "claim_at": None, "last_at": None, "marked": []}
     claim_at = _gh_epoch(claim["createdAt"])
     last = claim_at
+    aliases = set()
+    for c in comments[at + 1:]:
+        lines = [x for x in str(c["body"]).splitlines() if x.strip()]
+        if lines and lines[0].strip().upper().startswith("STATUS "):
+            aliases |= {m.group(1).lower() for x in lines[1:] if (m := STATUS_SESSION_RE.match(x))}
     for c in comments[at + 1:]:
         t = _gh_epoch(c["createdAt"])
         if t is not None and sid[:8] in c["body"].lower() and (last is None or t > last):
             last = t
     marked = sorted({m.group(1) for c in comments for m in re.finditer(re.escape(DEAD_CLAIM_MARK) + r"(\S+?) -->", c["body"])})
-    return facts | {"claimant": who, "claim_id": claim["id"], "claim_at": claim_at, "last_at": last, "marked": marked}
+    return facts | {"claimant": who, "claim_id": claim["id"], "claim_at": claim_at, "last_at": last, "marked": marked,
+                    "aliases": sorted(aliases)}
 
 
 def dead_claim_comment(who, label, claim_id, since):
@@ -2601,7 +2614,8 @@ def release_dead_claims(cfg, now, apply, extra=((), ())):
         if not who or e.get("updated") != updated_of[n]:
             continue
         label = (who.get("name") or "").strip() or str(who["session"])
-        if (label.lower() in names and who.get("name")) or any(_same_id(who["session"], s) for s in sids):
+        if ((label.lower() in names and who.get("name")) or any(a in names for a in e.get("aliases", []))
+                or any(_same_id(who["session"], s) for s in sids)):
             out["alive"] += 1
         elif not e.get("claim_id") or e.get("last_at") is None:
             out["notes"].append(f"dead claims: #{n} claimant {label}: claim comment not placed, left alone")
@@ -2611,6 +2625,10 @@ def release_dead_claims(cfg, now, apply, extra=((), ())):
             continue
         else:
             due.append((n, label, e["last_at"], who, e["claim_id"]))
+    held = [d for d in due if checkby_state(repo, d[0], cfg) != "CLEAR"]
+    for n, label, *_ in held:
+        out["notes"].append(f"dead claims: #{n} claimant {label}: check-by open or unread, claim kept for its wake")
+    due = [d for d in due if d not in held]
     for n, label, since, who, claim_id in due:
         if mode != "apply" or not apply:
             out["would"].append((n, label, since))
@@ -2635,6 +2653,55 @@ def release_dead_claims(cfg, now, apply, extra=((), ())):
     except OSError:
         pass
     return out
+
+
+def bare_tmux_sessions(cfg, now):
+    """[(name, idle hours)] of the tmux sessions to close: unattached, quiet BARE_TMUX_HOURS, every pane an idle shell
+    with no child process, not PROTECT or NEVER_CLOSE. None when tmux cannot say."""
+    rc, out = tmux("list-panes", "-a", "-F",
+                   "#{session_name}\t#{session_attached}\t#{session_activity}\t#{pane_pid}\t#{pane_current_command}")
+    if rc != 0:
+        return None
+    by = {}
+    for line in out.splitlines():
+        f = line.split("\t")
+        if len(f) == 5:
+            by.setdefault(f[0], []).append(f)
+    hours = float(cfg.get("BARE_TMUX_HOURS", "6"))
+    found = []
+    for name, panes in sorted(by.items()):
+        try:
+            attached, activity = int(panes[0][1]), int(panes[0][2])
+        except ValueError:
+            continue
+        idle = (now - activity) / 3600
+        if attached or idle < hours or protected(cfg, name) or never_close({"tmux": name}, cfg):
+            continue
+        if not all(p[4].strip().lower() in BARE_SHELLS for p in panes):
+            continue
+        if any(run(["pgrep", "-P", p[3]], 10)[0] != 1 for p in panes):
+            continue
+        found.append((name, idle))
+    return found
+
+
+def close_bare_tmux(cfg, now, apply):
+    """Kill the sessions bare_tmux_sessions() names (apply), or list them. Returns report notes."""
+    mode = cfg.get("BARE_TMUX", "apply")
+    if mode == "off":
+        return []
+    found = bare_tmux_sessions(cfg, now)
+    if found is None:
+        return ["bare tmux: tmux not readable; closed nothing"]
+    notes = []
+    for name, idle in found:
+        if mode != "apply" or not apply:
+            notes.append(f"bare tmux: would close {name} (idle {idle:.1f} h, only an idle shell)")
+        elif tmux("kill-session", "-t", f"={name}")[0] == 0:
+            notes.append(f"bare tmux: closed {name} (idle {idle:.1f} h, only an idle shell)")
+        else:
+            notes.append(f"bare tmux: could not close {name}")
+    return notes
 
 
 def dead_claim_lines(res, stamp=lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))):
@@ -2823,6 +2890,11 @@ def main(argv=None):
             notes += dead_claims["notes"]
     except Exception as e:  # a claim left held is the state before this pass: never fail the sweep over it
         notes.append(f"dead claims: {type(e).__name__}: {e}")
+    try:
+        if live_run and not args.only:
+            notes += close_bare_tmux(cfg, now, apply)
+    except Exception as e:  # a shell left open is the state before this pass
+        notes.append(f"bare tmux: {type(e).__name__}: {e}")
     signal.alarm(0)
     faulthandler.cancel_dump_traceback_later()
     mode = "apply" if apply else "report-only"
