@@ -636,6 +636,18 @@ PY
   [ "$out" = REMOVED ] && [ ! -e "$R/plain" ] || { echo "  control: a plain unlink failed: $out"; r=1; }
   out="$(u normal "$R" "$R/a/b/leaf")"
   [ "$out" = REMOVED ] && [ ! -d "$R/a/b/leaf" ] || { echo "  control: a plain removal failed: $out"; r=1; }
+  # a nested tree with a symlink to a directory outside it, under every interpreter the job can
+  # meet: launchd runs /usr/bin/python3 (3.9), where shutil.rmtree has no dir_fd (stima-api#7106)
+  local py n=0
+  for py in python3 /usr/bin/python3; do
+    command -v "$py" >/dev/null 2>&1 || continue
+    n=$((n + 1)); mkdir -p "$R/tree$n/d1/d2"; echo f > "$R/tree$n/d1/d2/f"; echo f > "$R/tree$n/f"
+    ln -s "$T/out/leaf" "$R/tree$n/d1/outlink"
+    out="$("$py" -I "$T/unit.py" "$sd/retention-helper.py" normal "$R" "$R/tree$n" 2>&1)"
+    [ "$out" = REMOVED ] && [ ! -e "$R/tree$n" ] || { echo "  a nested tree was not removed under $py: $out"; r=1; }
+    [ -f "$T/out/leaf/f" ] || { echo "  $py removed the directory behind a symlink inside the tree"; r=1; }
+  done
+  [ "$n" -ge 1 ] || { echo "  no python3 ran the nested removal"; r=1; }
   return $r
 }
 
@@ -1009,6 +1021,8 @@ mutant "removal: root descriptor not re-checked" $H '        if not trusted_stat
 mutant "removal: components followed through symlinks" $H 'flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW' 'flags = os.O_RDONLY | os.O_DIRECTORY' t_safe_rmtree t_swap_after_listing t_remove_guards
 mutant "removal: unsafe rmtree allowed" $H 'if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):' 'if False:' t_safe_rmtree
 mutant "removal: .. components allowed" $H 'if any(p in ("", ".", "..") for p in parts):' 'if False:' t_safe_rmtree
+mutant "removal: the tree is removed by shutil.rmtree(dir_fd=), absent before Python 3.11" $H '        _rmtree_at(leaf, fd)' '        shutil.rmtree(leaf, dir_fd=fd)' t_safe_rmtree
+mutant "removal: a symlink to a directory inside the tree is entered" $H '            if e.is_dir(follow_symlinks=False):' '            if e.is_dir():' t_safe_rmtree
 mutant "not wired into --check" $J '  _cc_dj_retention
 
   # By GB' '
