@@ -2697,7 +2697,7 @@ def bare_tmux_sessions(cfg, now, table=None):
 
 def close_bare_tmux(cfg, now, apply):
     """Kill the sessions bare_tmux_sessions() names (apply), or list them. Returns report notes."""
-    mode = cfg.get("BARE_TMUX", "apply")
+    mode = cfg.get("BARE_TMUX", DEFAULTS["BARE_TMUX"])
     if mode == "off":
         return []
     found = bare_tmux_sessions(cfg, now)
