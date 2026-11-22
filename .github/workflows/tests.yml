@@ -31,6 +31,10 @@ jobs:
         run: python3 tests/test_session_state.py
       - name: session-reaper-release
         run: python3 tests/test_session_reaper_release.py
+      - name: session-reaper-dead-claims
+        run: python3 tests/test_session_reaper_dead_claims.py
+      - name: session-reaper-oracle-gate
+        run: python3 tests/test_session_reaper_oracle_gate.py
       - name: gce-disk-watch
         run: python3 tests/gce-disk-watch.py
       - name: disk-janitor
