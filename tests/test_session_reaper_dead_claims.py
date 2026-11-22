@@ -307,6 +307,15 @@ class StatusSessionName(Base):
         self.run_pass(w)
         self.assertEqual(len(w.posted), 1)
 
+    def test_a_cache_entry_from_before_aliases_is_checked_again_on_the_fresh_read(self):
+        w = World({9633: [claim("IC_1", SID_DEAD, "release-cadence", 30), self.status("uiux", 29)]})
+        old = reaper.claim_facts(types.SimpleNamespace(claimant=stub_claimant), w.issues[9633], "2026-11-01T00:00:00Z")
+        old.pop("aliases")
+        Path(self.cfg["DEAD_CLAIMS_CACHE"]).write_text(json.dumps({"9633": old}))
+        r = self.run_pass(w)
+        self.assertEqual(w.posted, [])
+        self.assertEqual(r["alive"], 1)
+
     def test_a_status_before_the_claim_is_not_the_claimant(self):
         w = World({9633: [self.status("uiux", 31), claim("IC_1", SID_DEAD, "release-cadence", 30)]})
         self.run_pass(w)
@@ -316,34 +325,59 @@ class StatusSessionName(Base):
 class BareTmux(unittest.TestCase):
     """stima-api#8959: tmux sessions left with only an idle shell (claude exited) are closed."""
 
-    def panes(self, *rows):
-        return (0, "".join("\t".join(map(str, r)) + "\n" for r in rows))
+    OLD, NEW = NOW - 7 * H, NOW - 1 * H
 
-    def pick(self, out, children=(), **cfg):
-        c = dict(reaper.DEFAULTS, PROTECT="keep*", **cfg)
-        kids = set(map(str, children))
+    def row(self, name, attached, sact, wact, pid, cmd):
+        return "\t".join(map(str, (name, f"${abs(hash(name)) % 1000}", attached, sact, wact, pid, cmd)))
+
+    def pick(self, rows, table, **cfg):
+        c = dict(reaper.DEFAULTS, **{"PROTECT": "keep*", "CC_NEVER_KILL_PIDS": "", **cfg})
+        out = (0, "".join(self.row(*r) + "\n" for r in rows))
         with mock.patch.object(reaper, "tmux", return_value=out), \
-             mock.patch.object(reaper, "run", side_effect=lambda cmd, t=30: (0, "1\n") if cmd[-1] in kids else (1, "")):
-            return reaper.bare_tmux_sessions(c, NOW)
+             mock.patch.dict(os.environ, {"CC_NEVER_KILL_PIDS": c["CC_NEVER_KILL_PIDS"]}):
+            return reaper.bare_tmux_sessions(c, NOW, table)
+
+    def table(self, *pids, children=()):
+        t = {pid: (1, "Sun Nov 22 00:00:00 2026", "-zsh") for pid in pids}
+        t.update({900 + i: (parent, "Sun Nov 22 00:00:00 2026", "sleep 9") for i, parent in enumerate(children)})
+        return t
 
     def test_only_an_unattached_quiet_childless_shell_session_is_picked(self):
-        old, new = NOW - 7 * H, NOW - 1 * H
-        got = self.pick(self.panes(
-            ("release-speed", 0, old, 101, "zsh"),
-            ("mem-leak", 0, old, 102, "-zsh"), ("mem-leak", 0, old, 103, "bash"),
-            ("attached", 1, old, 104, "zsh"),
-            ("recent", 0, new, 105, "zsh"),
-            ("running", 0, old, 106, "zsh"), ("running", 0, old, 107, "node"),
-            ("claude", 0, old, 108, "claude"),
-            ("child", 0, old, 109, "zsh"),
-            ("keep-me", 0, old, 110, "zsh"), ("uiux-1", 0, old, 111, "zsh")), children=[109])
-        self.assertEqual([n for n, _ in got], ["mem-leak", "release-speed"])
+        o, n = self.OLD, self.NEW
+        rows = [("release-speed", 0, o, o, 101, "zsh"),
+                ("mem-leak", 0, o, o, 102, "-zsh"), ("mem-leak", 0, o, o, 103, "bash"),
+                ("attached", 1, o, o, 104, "zsh"),
+                ("recent", 0, n, n, 105, "zsh"),
+                ("output-since", 0, o, n, 112, "zsh"),
+                ("running", 0, o, o, 106, "zsh"), ("running", 0, o, o, 107, "node"),
+                ("claude", 0, o, o, 108, "claude"),
+                ("child", 0, o, o, 109, "zsh"),
+                ("unlisted", 0, o, o, 113, "zsh"),
+                ("keep-me", 0, o, o, 110, "zsh"), ("uiux-1", 0, o, o, 111, "zsh")]
+        t = self.table(101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, children=[109])
+        got = self.pick(rows, t)
+        self.assertEqual([x[0] for x in got], ["mem-leak", "release-speed"])
+        self.assertTrue(all(x[1].startswith("$") for x in got))
+
+    def test_a_never_kill_pid_keeps_its_session(self):
+        rows = [("release-speed", 0, self.OLD, self.OLD, 101, "zsh")]
+        self.assertEqual(self.pick(rows, self.table(101), CC_NEVER_KILL_PIDS="101"), [])
+
+    def test_a_ps_that_fails_closes_nothing(self):
+        rows = [("release-speed", 0, self.OLD, self.OLD, 101, "zsh")]
+        with mock.patch.object(reaper, "ps_table", side_effect=reaper.subprocess.TimeoutExpired("ps", 60)):
+            with self.assertRaises(reaper.subprocess.TimeoutExpired):
+                self.pick(rows, None)
 
     def test_tmux_unreadable_is_none(self):
-        self.assertIsNone(self.pick((1, "")))
+        with mock.patch.object(reaper, "tmux", return_value=(1, "")):
+            self.assertIsNone(reaper.bare_tmux_sessions(dict(reaper.DEFAULTS), NOW, {}))
 
-    def test_shadow_and_report_only_list_and_apply_kills_by_exact_name(self):
-        found = [("release-speed", 7.0)]
+    def test_the_default_is_shadow(self):
+        self.assertEqual(reaper.DEFAULTS["BARE_TMUX"], "shadow")
+
+    def test_shadow_and_report_only_list_and_apply_kills_by_session_id(self):
+        found = [("release-speed", "$7", 7.0)]
         for mode, apply in (("shadow", True), ("apply", False)):
             with mock.patch.object(reaper, "bare_tmux_sessions", return_value=found), \
                  mock.patch.object(reaper, "tmux", side_effect=AssertionError("killed")):
@@ -351,8 +385,8 @@ class BareTmux(unittest.TestCase):
             self.assertEqual(notes, ["bare tmux: would close release-speed (idle 7.0 h, only an idle shell)"])
         with mock.patch.object(reaper, "bare_tmux_sessions", return_value=found), \
              mock.patch.object(reaper, "tmux", return_value=(0, "")) as t:
-            notes = reaper.close_bare_tmux(dict(reaper.DEFAULTS), NOW, True)
-        t.assert_called_once_with("kill-session", "-t", "=release-speed")
+            notes = reaper.close_bare_tmux(dict(reaper.DEFAULTS, BARE_TMUX="apply"), NOW, True)
+        t.assert_called_once_with("kill-session", "-t", "$7")
         self.assertEqual(notes, ["bare tmux: closed release-speed (idle 7.0 h, only an idle shell)"])
         with mock.patch.object(reaper, "bare_tmux_sessions", side_effect=AssertionError("read")):
             self.assertEqual(reaper.close_bare_tmux(dict(reaper.DEFAULTS, BARE_TMUX="off"), NOW, True), [])

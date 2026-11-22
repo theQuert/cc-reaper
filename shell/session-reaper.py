@@ -117,9 +117,10 @@ DEFAULTS = {
     "DEAD_CLAIMS_MAX": "40",
     "DEAD_CLAIMS_CACHE": "~/.cc-reaper/state/dead-claims-cache.json",  # issue -> claimant, kept while its updated_at holds
     # stima-api#8959: a tmux session no claude runs in, whose every pane is an idle shell with no child process, that no
-    # client is attached to and that has been quiet BARE_TMUX_HOURS, is killed. `apply` (when the run applies), `shadow`
-    # (report only) or `off`. PROTECT and NEVER_CLOSE names are never touched.
-    "BARE_TMUX": "apply",
+    # client is attached to and whose windows have been quiet BARE_TMUX_HOURS, is killed. `apply` (when the run
+    # applies), `shadow` (report only, the default until its rounds are clean) or `off`. PROTECT and NEVER_CLOSE names
+    # and a pane holding a CC_NEVER_KILL_PIDS pid are never touched.
+    "BARE_TMUX": "shadow",
     "BARE_TMUX_HOURS": "6",
 }
 BARE_SHELLS = {"zsh", "bash", "sh", "fish", "-zsh", "-bash", "-sh", "login"}
@@ -2643,6 +2644,9 @@ def release_dead_claims(cfg, now, apply, extra=((), ())):
             facts = claim_facts(ds, fresh, "")
             if facts.get("claim_id") != claim_id or (facts["last_at"] or 0) != since:
                 continue
+            if any(a in names for a in facts.get("aliases", [])):
+                out["alive"] += 1
+                continue
             if comment((repo, str(n)), dead_claim_comment(who, label, claim_id, since)):
                 out["released"].append((n, label, since))
                 cache.get(str(n), {})["updated"] = ""  # our own comment moved the issue: read it again
@@ -2655,33 +2659,39 @@ def release_dead_claims(cfg, now, apply, extra=((), ())):
     return out
 
 
-def bare_tmux_sessions(cfg, now):
-    """[(name, idle hours)] of the tmux sessions to close: unattached, quiet BARE_TMUX_HOURS, every pane an idle shell
-    with no child process, not PROTECT or NEVER_CLOSE. None when tmux cannot say."""
-    rc, out = tmux("list-panes", "-a", "-F",
-                   "#{session_name}\t#{session_attached}\t#{session_activity}\t#{pane_pid}\t#{pane_current_command}")
+def bare_tmux_sessions(cfg, now, table=None):
+    """[(name, session id, idle hours)] of the tmux sessions to close: unattached, every window quiet BARE_TMUX_HOURS
+    (session_activity moves only on input, window_activity on output), every pane an idle shell with no descendant in
+    one ps snapshot and no never-kill pid, not PROTECT or NEVER_CLOSE. None when tmux cannot say; a ps that fails
+    raises, so nothing is closed on a guess."""
+    rc, out = tmux("list-panes", "-a", "-F", "#{session_name}\t#{session_id}\t#{session_attached}\t"
+                   "#{session_activity}\t#{window_activity}\t#{pane_pid}\t#{pane_current_command}")
     if rc != 0:
         return None
     by = {}
     for line in out.splitlines():
         f = line.split("\t")
-        if len(f) == 5:
-            by.setdefault(f[0], []).append(f)
+        if len(f) == 7:
+            by.setdefault((f[0], f[1]), []).append(f)
     hours = float(cfg.get("BARE_TMUX_HOURS", "6"))
+    keep = never_kill_pids(cfg)
     found = []
-    for name, panes in sorted(by.items()):
+    for (name, sid), panes in sorted(by.items()):
         try:
-            attached, activity = int(panes[0][1]), int(panes[0][2])
+            attached = int(panes[0][2])
+            activity = max(max(int(p[3]), int(p[4])) for p in panes)
+            pids = [int(p[5]) for p in panes]
         except ValueError:
             continue
         idle = (now - activity) / 3600
         if attached or idle < hours or protected(cfg, name) or never_close({"tmux": name}, cfg):
             continue
-        if not all(p[4].strip().lower() in BARE_SHELLS for p in panes):
+        if not all(p[6].strip().lower() in BARE_SHELLS for p in panes):
             continue
-        if any(run(["pgrep", "-P", p[3]], 10)[0] != 1 for p in panes):
+        table = ps_table() if table is None else table
+        if any(pid not in table or pid in keep or descendants(table, pid) for pid in pids):
             continue
-        found.append((name, idle))
+        found.append((name, sid, idle))
     return found
 
 
@@ -2694,10 +2704,10 @@ def close_bare_tmux(cfg, now, apply):
     if found is None:
         return ["bare tmux: tmux not readable; closed nothing"]
     notes = []
-    for name, idle in found:
+    for name, sid, idle in found:
         if mode != "apply" or not apply:
             notes.append(f"bare tmux: would close {name} (idle {idle:.1f} h, only an idle shell)")
-        elif tmux("kill-session", "-t", f"={name}")[0] == 0:
+        elif tmux("kill-session", "-t", sid)[0] == 0:
             notes.append(f"bare tmux: closed {name} (idle {idle:.1f} h, only an idle shell)")
         else:
             notes.append(f"bare tmux: could not close {name}")
