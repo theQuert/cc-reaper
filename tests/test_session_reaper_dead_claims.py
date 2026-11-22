@@ -301,6 +301,8 @@ class StatusSessionName(Base):
         r = self.run_pass(w)
         self.assertEqual(w.posted, [])
         self.assertEqual(r["alive"], 1)
+        self.cfg["DEAD_CLAIMS_CACHE"] = str(self.d / "shadow.json")
+        self.assertEqual(self.run_pass(w, apply=False)["would"], [])
 
     def test_a_status_naming_a_dead_tmux_does_not(self):
         w = World({9633: [claim("IC_1", SID_DEAD, "release-cadence", 30), self.status("release-speed", 29)]})
