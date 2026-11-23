@@ -71,7 +71,8 @@ class Gate(unittest.TestCase):
         with mock.patch.object(reaper, "oracle_brief", side_effect=lambda r, n, c, at: briefs.get(n)), \
              mock.patch.object(reaper, "issue_state", return_value="OPEN"), \
              mock.patch.object(reaper, "checkby_state", side_effect=cb), \
-             mock.patch.object(reaper, "oracle_json", return_value=MINE_JSON if js is None else js), \
+             mock.patch.object(reaper, "oracle_json", side_effect=js if callable(js) else None,
+                               return_value=MINE_JSON if js is None else js), \
              mock.patch.object(reaper, "issue_comments", return_value=list(comments)), \
              mock.patch.object(reaper, "worktree_state", side_effect=lambda w, c: list(wt)):
             keep = reaper.decide(s, cfg, NOW)
@@ -201,10 +202,10 @@ class Gate(unittest.TestCase):
         clear = dict(MINE_JSON, pending_check_by="")
         theirs = dict(MINE_JSON, claimant={"session": OTHER[:8], "name": "x", "harness": "claude"})
 
-        def held(nums, js=None, rc=0, head=None, idx=None, **kw):
+        def held(nums, js=None, rc=0, head=None, idx=(), **kw):
             out = (head or f"false {len(nums)}") + "".join(f"\n{n}" for n in nums)
             with mock.patch.object(reaper, "run", return_value=(rc, out)) as run, \
-                    mock.patch.object(reaper, "indexed_checkbys", return_value=idx), \
+                    mock.patch.object(reaper, "indexed_checkbys", return_value=set(idx)), \
                     mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.fail("asked twice")):
                 keep = self.decide({}, js=js, **dict(done, **kw))[0]
             return keep, run
@@ -220,10 +221,21 @@ class Gate(unittest.TestCase):
         self.assertEqual(held([], rc=1)[0], ["check-by-unknown"])
         self.assertEqual(held(["9843"], head="true 1")[0], ["check-by-unknown"])
         self.assertEqual(held(["9843"], head="false 140")[0], ["check-by-unknown"])
-        self.assertEqual(held([str(n) for n in range(9000, 9021)])[0], ["check-by-unknown"])
         self.assertEqual(held(["9843"], js=False)[0], ["check-by-unknown"])
-        self.assertEqual(held([str(n) for n in range(9000, 9021)], idx={"9843"})[0], [])
-        self.assertEqual(held(["9843", "8959"], idx={"9843"})[0], ["check-by-open"])
+        self.assertEqual(held(["9843"], js={"claimant": MINE_JSON["claimant"]})[0], ["check-by-unknown"])
+        self.assertEqual(held(["9843"], js=dict(MINE_JSON, state="closed"))[0], [])
+        many = [str(n) for n in range(9000, 9021)]
+        self.assertEqual(held(many, js=theirs)[0], ["check-by-unknown"])
+        asked = []
+
+        def oracle(r, n, c):
+            asked.append(n)
+            return MINE_JSON if n == "9843" else theirs
+
+        self.assertEqual(held([*many, "9843"], js=oracle, idx={"9843"})[0], ["check-by-open"])
+        self.assertEqual(asked, ["9843"])
+        due = dict(MINE_JSON, pending_check_by="", due_check="2026-11-18T05:00:00Z")
+        self.assertEqual(held(["8741"], js=due, idx={"9843"})[0], ["check-by-open"])
         docs = [("apertis-ai/docs", "61")]
         self.assertEqual(held(["9843"], claims=docs, owned=[{"path": Path("/w/d"), "marker": SID}])[0],
                          ["check-by-open"])

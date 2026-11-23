@@ -1220,25 +1220,22 @@ def protected(cfg, *names):
 
 HELD_LOOKUPS = 20  # oracle reads one claim-less session may cost before the reaper stops asking and keeps it
 CHECKBY_INDEX = HOME / ".claude" / "logs" / "stranded-step-dispatcher.checkby-index.json"
-INDEX_FRESH_SECONDS = 2 * 3600  # an older index is a paused dispatcher's (stima-api #9996): not trusted to filter
 
 
-def indexed_checkbys(now):
-    """Issue numbers the stranded-step dispatcher's index lists with a check-by ahead or just due, or None when the
-    index is missing, unreadable or older than INDEX_FRESH_SECONDS."""
+def indexed_checkbys():
+    """Issue numbers in the stranded-step dispatcher's check-by index, or an empty set. The index lists only future
+    wait check-bys its last scan saw, so it orders the oracle reads and never excludes one."""
     try:
-        d = json.loads(CHECKBY_INDEX.read_text())
-        at = calendar.timegm(time.strptime(d["written_at"], "%Y-%m-%dT%H:%M:%SZ"))
-        return {str(n) for n in d["entries"]} if now - at <= INDEX_FRESH_SECONDS else None
+        return {str(n) for n in json.loads(CHECKBY_INDEX.read_text())["entries"]}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return None
+        return set()
 
 
-def held_checkbys(s, cfg, now):
-    """OPEN or CLEAR for each open CHECKBY_REPO issue whose oracle names this session its claimant, found by one search
-    for its id in issue comments (stima-api #10023: AnyFast's branches carry no issue number). A fresh dispatcher index
-    narrows the hits to issues with a check-by before the oracle is asked. ["UNKNOWN"] when the search fails, is
-    incomplete or leaves more than HELD_LOOKUPS issues to ask; an oracle that cannot say counts UNKNOWN."""
+def held_checkbys(s, cfg):
+    """OPEN or CLEAR for the open CHECKBY_REPO issues whose oracle names this session its claimant, found by one
+    search for its id in issue comments (stima-api #10023: AnyFast's branches carry no issue number). Hits the
+    dispatcher's index lists are asked first, and the first OPEN ends the reads. ["UNKNOWN"] when the search fails or
+    is incomplete; UNKNOWN for an oracle that cannot say, or once HELD_LOOKUPS reads found no OPEN."""
     repo = cfg["CHECKBY_REPO"]
     rc, out = run(["gh", "api", "-X", "GET", "search/issues", "-f", f"q=repo:{repo} is:issue is:open "
                    f"{s['sid'][:8]} in:comments", "-f", "per_page=100",
@@ -1246,18 +1243,23 @@ def held_checkbys(s, cfg, now):
     words = out.split()
     if rc != 0 or len(words) < 2 or words[0] != "false" or words[1] != str(len(words) - 2):
         return ["UNKNOWN"]
-    nums, idx = words[2:], indexed_checkbys(now)
-    nums = nums if idx is None else [n for n in nums if n in idx]
-    if len(nums) > HELD_LOOKUPS:
-        return ["UNKNOWN"]
+    idx = indexed_checkbys()
+    nums = sorted(words[2:], key=lambda n: n not in idx)
     mine = [s["sid"].lower(), *(str(w["marker"]).lower() for w in s["owned"] if w.get("marker"))]
     states = []
-    for n in nums:
+    for i, n in enumerate(nums):
+        if i == HELD_LOOKUPS:
+            states.append("UNKNOWN")
+            break
         d = oracle_json(repo, n, cfg)
-        if not isinstance(d, dict) or not isinstance(d.get("pending_check_by", ""), str):
+        if isinstance(d, dict) and d.get("state") == "closed":
+            continue
+        if not isinstance(d, dict) or not all(isinstance(d.get(k), str) for k in ("pending_check_by", "due_check")):
             states.append("UNKNOWN")
         elif any(_same_session(str((d.get("claimant") or {}).get("session") or "").lower(), m) for m in mine):
-            states.append("OPEN" if d.get("pending_check_by") or d.get("due_check") else "CLEAR")
+            states.append("OPEN" if d["pending_check_by"] or d["due_check"] else "CLEAR")
+            if states[-1] == "OPEN":
+                break
     return states
 
 
@@ -1762,7 +1764,7 @@ def _decide(s, cfg, now=None):
             here = [(r, n) for r, n in s["claims"] if r == cfg["CHECKBY_REPO"]]
             cb = [checkby_state(r, n, cfg) for r, n in here
                   if claim_class(oracle_brief(r, n, cfg, at), r, n, s, at, mine, cfg)[0] != "ended"] \
-                if here else held_checkbys(s, cfg, at)
+                if here else held_checkbys(s, cfg)
             if "OPEN" in cb:
                 keep.append("check-by-open")
             elif "UNKNOWN" in cb:
