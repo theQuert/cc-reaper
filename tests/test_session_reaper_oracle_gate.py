@@ -198,27 +198,35 @@ class Gate(unittest.TestCase):
     def test_done_session_without_a_worktree_claim_keeps_its_open_check_by(self):
         # stima-api #10023: AnyFast's worktrees carry no issue number; only the oracle names it claimant of #9843
         done = dict(claims=[], last_text="SESSION-DONE: nothing left here")
-
-        def searched(out, rc=0):
-            return mock.patch.object(reaper, "run", return_value=(rc, out))
-
-        with searched("9843\n8959\n"):
-            self.assertEqual(self.decide({}, checkby="OPEN", **done)[0], ["check-by-open"])
-        with searched("9843\n"):
-            self.assertEqual(self.decide({}, checkby="CLEAR", **done)[0], [])
+        clear = dict(MINE_JSON, pending_check_by="")
         theirs = dict(MINE_JSON, claimant={"session": OTHER[:8], "name": "x", "harness": "claude"})
-        with searched("9843\n"):
-            self.assertEqual(self.decide({}, checkby="OPEN", js=theirs, **done)[0], [])
-        with searched(""):
-            self.assertEqual(self.decide({}, checkby="OPEN", **done)[0], [])
-        with searched("", rc=1):
-            self.assertEqual(self.decide({}, checkby="OPEN", **done)[0], ["check-by-unknown"])
-        with searched("".join(f"{n}\n" for n in range(9000, 9021))):
-            self.assertEqual(self.decide({}, checkby="OPEN", **done)[0], ["check-by-unknown"])
-        with searched("9843\n"), mock.patch.object(reaper, "oracle_json", return_value=None), \
-                mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.fail("unread claimant")):
-            keep = reaper.decide(session(**done), dict(BASE, ORACLE_NOT_MINE="apply"), NOW)
-        self.assertEqual(keep, ["check-by-unknown"])
+
+        def held(nums, js=None, rc=0, head=None, idx=None, **kw):
+            out = (head or f"false {len(nums)}") + "".join(f"\n{n}" for n in nums)
+            with mock.patch.object(reaper, "run", return_value=(rc, out)) as run, \
+                    mock.patch.object(reaper, "indexed_checkbys", return_value=idx), \
+                    mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.fail("asked twice")):
+                keep = self.decide({}, js=js, **dict(done, **kw))[0]
+            return keep, run
+
+        keep, run = held(["9843", "8959"])
+        self.assertEqual(keep, ["check-by-open"])
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:5], ["gh", "api", "-X", "GET", "search/issues"])
+        self.assertIn(f"q=repo:{REPO} is:issue is:open {SID[:8]} in:comments", argv)
+        self.assertEqual(held(["9843"], js=clear)[0], [])
+        self.assertEqual(held(["9843"], js=theirs)[0], [])
+        self.assertEqual(held([])[0], [])
+        self.assertEqual(held([], rc=1)[0], ["check-by-unknown"])
+        self.assertEqual(held(["9843"], head="true 1")[0], ["check-by-unknown"])
+        self.assertEqual(held(["9843"], head="false 140")[0], ["check-by-unknown"])
+        self.assertEqual(held([str(n) for n in range(9000, 9021)])[0], ["check-by-unknown"])
+        self.assertEqual(held(["9843"], js=False)[0], ["check-by-unknown"])
+        self.assertEqual(held([str(n) for n in range(9000, 9021)], idx={"9843"})[0], [])
+        self.assertEqual(held(["9843", "8959"], idx={"9843"})[0], ["check-by-open"])
+        docs = [("apertis-ai/docs", "61")]
+        self.assertEqual(held(["9843"], claims=docs, owned=[{"path": Path("/w/d"), "marker": SID}])[0],
+                         ["check-by-open"])
 
     def test_a_busy_or_recently_idle_session_keeps(self):
         self.assertIn("status:busy", self.decide({"2": STOP}, status="busy")[0])

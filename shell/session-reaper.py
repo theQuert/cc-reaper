@@ -1218,29 +1218,46 @@ def protected(cfg, *names):
     return any(fnmatch.fnmatch(n.lower(), p.lower()) for p in cfg["PROTECT"].split() for n in names if n)
 
 
-HELD_LOOKUPS = 20  # issues a claim-less session's id may be named on before the reaper stops asking and keeps it
+HELD_LOOKUPS = 20  # oracle reads one claim-less session may cost before the reaper stops asking and keeps it
+CHECKBY_INDEX = HOME / ".claude" / "logs" / "stranded-step-dispatcher.checkby-index.json"
+INDEX_FRESH_SECONDS = 2 * 3600  # an older index is a paused dispatcher's (stima-api #9996): not trusted to filter
 
 
-def held_checkbys(s, cfg):
-    """checkby_state() of each open CHECKBY_REPO issue whose oracle names this claim-less session its claimant, found by
-    one search for its id in issue comments (stima-api #10023: AnyFast's branches carry no issue number). ["UNKNOWN"]
-    when the search fails or names more than HELD_LOOKUPS issues; an oracle that cannot say counts UNKNOWN."""
+def indexed_checkbys(now):
+    """Issue numbers the stranded-step dispatcher's index lists with a check-by ahead or just due, or None when the
+    index is missing, unreadable or older than INDEX_FRESH_SECONDS."""
+    try:
+        d = json.loads(CHECKBY_INDEX.read_text())
+        at = calendar.timegm(time.strptime(d["written_at"], "%Y-%m-%dT%H:%M:%SZ"))
+        return {str(n) for n in d["entries"]} if now - at <= INDEX_FRESH_SECONDS else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def held_checkbys(s, cfg, now):
+    """OPEN or CLEAR for each open CHECKBY_REPO issue whose oracle names this session its claimant, found by one search
+    for its id in issue comments (stima-api #10023: AnyFast's branches carry no issue number). A fresh dispatcher index
+    narrows the hits to issues with a check-by before the oracle is asked. ["UNKNOWN"] when the search fails, is
+    incomplete or leaves more than HELD_LOOKUPS issues to ask; an oracle that cannot say counts UNKNOWN."""
     repo = cfg["CHECKBY_REPO"]
     rc, out = run(["gh", "api", "-X", "GET", "search/issues", "-f", f"q=repo:{repo} is:issue is:open "
-                   f"{s['sid'][:8]} in:comments", "-f", "per_page=50", "-q", ".items[].number"], 30)
-    nums = out.split()
-    if rc != 0 or len(nums) > HELD_LOOKUPS:
+                   f"{s['sid'][:8]} in:comments", "-f", "per_page=100",
+                   "-q", r'"\(.incomplete_results) \(.total_count)", .items[].number'], 30)
+    words = out.split()
+    if rc != 0 or len(words) < 2 or words[0] != "false" or words[1] != str(len(words) - 2):
+        return ["UNKNOWN"]
+    nums, idx = words[2:], indexed_checkbys(now)
+    nums = nums if idx is None else [n for n in nums if n in idx]
+    if len(nums) > HELD_LOOKUPS:
         return ["UNKNOWN"]
     mine = [s["sid"].lower(), *(str(w["marker"]).lower() for w in s["owned"] if w.get("marker"))]
     states = []
     for n in nums:
         d = oracle_json(repo, n, cfg)
-        if not isinstance(d, dict):
+        if not isinstance(d, dict) or not isinstance(d.get("pending_check_by", ""), str):
             states.append("UNKNOWN")
-            continue
-        who = str((d.get("claimant") or {}).get("session") or "").lower()
-        if any(_same_session(who, m) for m in mine):
-            states.append(checkby_state(repo, n, cfg))
+        elif any(_same_session(str((d.get("claimant") or {}).get("session") or "").lower(), m) for m in mine):
+            states.append("OPEN" if d.get("pending_check_by") or d.get("due_check") else "CLEAR")
     return states
 
 
@@ -1733,7 +1750,7 @@ def _decide(s, cfg, now=None):
     keep.extend("handoff-missing:" + os.path.basename(p) for p in missing_handoffs(cfg, s["last_text"]))
     done = bool(DONE_RE.search(s["last_text"]) or DONE_PHRASE_RE.search(s["last_text"]))
     if done:
-        if s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg) and (s["claims"] or cfg["CHECKBY_REPO"]):
+        if s["status"] == "idle" and s["idle_min"] >= idle_threshold(s, cfg) and cfg["CHECKBY_REPO"]:
             # A claim the oracle now names another live session for (the issue was handed over) carries that
             # session's check-by, not this one's (EL-T2512: homepage kept by #6515 after pr-drain claimed it).
             at = now if now is not None else time.time()
@@ -1741,9 +1758,11 @@ def _decide(s, cfg, now=None):
             # Check-bys exist only on CHECKBY_REPO issues (the oracle reads no other repo), so a claim elsewhere has
             # none to keep it: homepage's docs worktree `claude/6361-…` was read as apertis-ai/docs#6361, which does
             # not exist, and kept it as check-by-unknown for good.
-            cb = [checkby_state(r, n, cfg) for r, n in s["claims"] if r == cfg["CHECKBY_REPO"]
-                  and claim_class(oracle_brief(r, n, cfg, at), r, n, s, at, mine, cfg)[0] != "ended"] \
-                if s["claims"] else held_checkbys(s, cfg)
+            # A session whose worktrees name no CHECKBY_REPO issue (AnyFast, #10023) is asked by its id instead.
+            here = [(r, n) for r, n in s["claims"] if r == cfg["CHECKBY_REPO"]]
+            cb = [checkby_state(r, n, cfg) for r, n in here
+                  if claim_class(oracle_brief(r, n, cfg, at), r, n, s, at, mine, cfg)[0] != "ended"] \
+                if here else held_checkbys(s, cfg, at)
             if "OPEN" in cb:
                 keep.append("check-by-open")
             elif "UNKNOWN" in cb:
