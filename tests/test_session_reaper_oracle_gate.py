@@ -190,6 +190,36 @@ class Gate(unittest.TestCase):
         self.assertIn("shell-child", self.decide({"2": STOP}, bg_shells=[1])[0])
         self.assertIn("loop-pending", self.decide({"2": STOP}, loop=True)[0])
 
+    def test_protected_ignores_case(self):
+        # stima-api #10023: PROTECT `anyfast*` let the tmux session `AnyFast` close twice
+        self.assertTrue(reaper.protected(dict(BASE, PROTECT="anyfast*"), "AnyFast"))
+        self.assertIn("protected", self.decide({"2": STOP}, tmux="Keep-Me", name="Keep-Me")[0])
+
+    def test_done_session_without_a_worktree_claim_keeps_its_open_check_by(self):
+        # stima-api #10023: AnyFast's worktrees carry no issue number; only the oracle names it claimant of #9843
+        done = dict(claims=[], last_text="SESSION-DONE: nothing left here")
+
+        def searched(out, rc=0):
+            return mock.patch.object(reaper, "run", return_value=(rc, out))
+
+        with searched("9843\n8959\n"):
+            self.assertEqual(self.decide({}, checkby="OPEN", **done)[0], ["check-by-open"])
+        with searched("9843\n"):
+            self.assertEqual(self.decide({}, checkby="CLEAR", **done)[0], [])
+        theirs = dict(MINE_JSON, claimant={"session": OTHER[:8], "name": "x", "harness": "claude"})
+        with searched("9843\n"):
+            self.assertEqual(self.decide({}, checkby="OPEN", js=theirs, **done)[0], [])
+        with searched(""):
+            self.assertEqual(self.decide({}, checkby="OPEN", **done)[0], [])
+        with searched("", rc=1):
+            self.assertEqual(self.decide({}, checkby="OPEN", **done)[0], ["check-by-unknown"])
+        with searched("".join(f"{n}\n" for n in range(9000, 9021))):
+            self.assertEqual(self.decide({}, checkby="OPEN", **done)[0], ["check-by-unknown"])
+        with searched("9843\n"), mock.patch.object(reaper, "oracle_json", return_value=None), \
+                mock.patch.object(reaper, "checkby_state", side_effect=lambda r, n, c: self.fail("unread claimant")):
+            keep = reaper.decide(session(**done), dict(BASE, ORACLE_NOT_MINE="apply"), NOW)
+        self.assertEqual(keep, ["check-by-unknown"])
+
     def test_a_busy_or_recently_idle_session_keeps(self):
         self.assertIn("status:busy", self.decide({"2": STOP}, status="busy")[0])
         self.assertTrue(any(k.startswith("idle:") for k in self.decide({"2": STOP}, idle_min=10)[0]))

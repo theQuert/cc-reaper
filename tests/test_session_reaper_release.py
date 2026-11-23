@@ -16,6 +16,7 @@ SOURCE = Path(__file__).resolve().parents[1] / "shell" / "session-reaper.py"
 spec = importlib.util.spec_from_file_location("session_reaper_release", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
+reaper.held_checkbys = lambda s, cfg: []  # no GitHub search here; test_session_reaper_oracle_gate.py covers it
 
 SID = "0f8e2c4a-1b3d-4e5f-8a9b-0c1d2e3f4a5b"
 NOW = 1793676000  # 2026-11-03T03:20:00Z

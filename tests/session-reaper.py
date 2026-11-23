@@ -19,6 +19,7 @@ SOURCE = Path(__file__).resolve().parents[1] / "shell" / "session-reaper.py"
 spec = importlib.util.spec_from_file_location("session_reaper", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
+reaper.held_checkbys = lambda s, cfg: []  # no GitHub search here; test_session_reaper_oracle_gate.py covers it
 
 CFG = dict(reaper.DEFAULTS, PROTECT="keep-* ci", IDLE_MINUTES="60", DISPATCH_FILE="")
 
