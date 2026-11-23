@@ -22,6 +22,7 @@ SOURCE = Path(__file__).resolve().parents[1] / "shell" / "session-reaper.py"
 spec = importlib.util.spec_from_file_location("session_reaper_dead_claims", SOURCE)
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
+reaper.held_checkbys = lambda *a: []  # no GitHub search here; test_session_reaper_oracle_gate.py covers it
 
 REPO = "theQuert/stima-api"
 NOW = 1794121000  # 2026-11-08T07:16:40Z
