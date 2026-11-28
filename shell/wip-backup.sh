@@ -159,6 +159,7 @@ snapshot_tree() {
   fi
   GIT_INDEX_FILE="$idx" git -C "$wt" ls-files -z -m -o --exclude-standard > "$list" || return 1
   : > "$kept"
+  [ -n "${WIP_TEST_AFTER_LIST:-}" ] && "$WIP_TEST_AFTER_LIST" "$wt"  # test seam: a change between the listing and the add
   while IFS= read -r -d '' f; do
     if [ -f "$wt/$f" ] && [ ! -L "$wt/$f" ] && [ "$(size_of "$wt/$f")" -gt "$MAX_BYTES" ]; then
       log "skip file over ${WIP_MAX_MB:-20} MB: $wt/$f" >&2  # stdout is the tree id
@@ -183,7 +184,13 @@ backup_worktree() {  # $1 = repo, $2 = worktree, $3 = branch, $4 = why
   ref="refs/wip/$LABEL/$branch"; RESULT=""
   : > "$TMP/start"  # taken before the snapshot: an edit during it or the push is newer than the stamp
   head="$(git -C "$wt" rev-parse -q --verify 'HEAD^{commit}')" || { log "skip $wt: no HEAD"; return 0; }
-  tree="$(snapshot_tree "$wt" "$head")" || { log "FAIL snapshot $wt"; FAILED=1; return 0; }
+  # A worktree removed, or a file deleted, between the listing and the add is a race, not a failure:
+  # a removed worktree is skipped, a vanished file gets one more snapshot.
+  tree="$(snapshot_tree "$wt" "$head")" || {
+    [ -d "$wt" ] || { log "skip $wt: worktree removed during snapshot"; return 0; }
+    tree="$(snapshot_tree "$wt" "$head")" || {
+      [ -d "$wt" ] || { log "skip $wt: worktree removed during snapshot"; return 0; }
+      log "FAIL snapshot $wt"; FAILED=1; return 0; }; }
   if [ "$tree" = "$(git -C "$wt" rev-parse "$head^{tree}")" ] &&
      [ "$(remote_sha "refs/heads/$branch")" = "$head" ]; then
     SAME=$((SAME + 1)); RESULT=same; record_sync "$wt" "$head" "$branch"; return 0  # clean and pushed: the branch itself is the backup
