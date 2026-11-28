@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Fixed
+- **`wip-backup.sh`: a vanished worktree or file during the snapshot counted as a failure (stima-api #6207).**
+  The race between `ls-files` and `add` made a run log `add failed` / `FAIL snapshot` and exit 1 (seen 2026-11-20 and
+  2026-11-24). A checkout that is gone when the snapshot fails is now skipped with a `skip` line; a vanished file gets
+  one more snapshot, and only a second failure in a checkout that still exists is a FAIL.
 - **`host-temp-reaper.py`: the `aged` kind left leak directories whose tail has no digit (stima-api #7106).** One Python
   `mkdtemp` name in twelve has an all-lowercase tail, and a tail whose second character is `_` was read as six
   characters under a prefix nothing shares; a pass that ended `not reached=0` left about 2,400 directories idle past the

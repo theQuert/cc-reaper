@@ -278,5 +278,21 @@ PATH="$WORK/findbin:$PATH" run
 check "cost: the walk reaches a worktree (shim sees it) but never the primary checkout on main" \
   'grep -qxF "$WORK/m1" "$WORK/find.log" && ! grep -qxF "$MP" "$WORK/find.log"'
 
+# ---------------------------------------------------------------- snapshot races (stima-api #6207)
+export WIP_REPOS="$P" WIP_STATE_DIR="$WORK/rstate"
+git -C "$P" remote set-url origin "$R"
+printf '#!/bin/sh\nrm -rf "${1:?}"\n' > "$WORK/bin/race-rm-wt"
+printf '#!/bin/sh\n[ -f "$1/race.once" ] || { touch "$1/race.once"; rm -f "${1:?}/racy.txt"; }\n' > "$WORK/bin/race-rm-file"
+chmod +x "$WORK/bin/race-rm-wt" "$WORK/bin/race-rm-file"
+wt rc1 feat/6207-rmwt; echo r > "$WORK/rc1/new1.txt"; age "$WORK/rc1"; echo "$WORK/rc1" > "$WORK/live"   # live session: active
+WIP_TEST_AFTER_LIST="$WORK/bin/race-rm-wt" run
+check "race: a worktree removed mid-snapshot is skipped, not FAILED" \
+  'grep -q "skip .*rc1: worktree removed during snapshot" "$WORK/out" && ! grep -q "FAIL snapshot .*rc1" "$WORK/out"'
+git -C "$P" worktree prune
+wt rc2 feat/6207-rmfile; echo r > "$WORK/rc2/racy.txt"; age "$WORK/rc2"; echo "$WORK/rc2" > "$WORK/live"
+WIP_TEST_AFTER_LIST="$WORK/bin/race-rm-file" run
+check "race: a file deleted mid-snapshot is retried, no FAIL" \
+  '! grep -q "FAIL snapshot .*rc2" "$WORK/out" && grep -q "rc2" "$WORK/out"'
+
 echo "wip-backup: $PASSED passed, $FAILURES failed"
 [ "$FAILURES" -eq 0 ]
